@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SESSION_NAME="${AGW_TMUX_SESSION:-agw_server}"
-PORT="${PORT:-4177}"
+SESSION_NAME="${AGW_TMUX_SESSION:-honeyrail_server}"
+PORT="${PORT:-4178}"
 LOG_FILE="${AGW_LOG_FILE:-$ROOT_DIR/npm_start.log}"
 TMUX_BIN="${TMUX_BIN:-$(command -v tmux || true)}"
 

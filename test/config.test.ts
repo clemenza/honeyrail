@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { assertProductionAuth, loadGatewayConfig } from "../server/config.js";
+import { DEFAULT_PORT, assertProductionAuth, loadGatewayConfig } from "../server/config.js";
 
 async function withEnv(updates: Record<string, string | undefined>, run: () => void | Promise<void>) {
   const previous = Object.fromEntries(Object.keys(updates).map((key) => [key, process.env[key]]));
@@ -61,6 +61,16 @@ test("production mode accepts bearer token auth", async () => {
 test("development mode allows local unauthenticated startup", async () => {
   await withNodeEnv("development", () => {
     assert.doesNotThrow(() => assertProductionAuth({ token: null, accounts: null, sessionSecret: null }));
+  });
+});
+
+test("default port avoids the Agent Gateway runtime port", async (t) => {
+  const tempDir = await mkdtemp(join(tmpdir(), "agw-default-port-"));
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+  await withEnv({ AGENT_GATEWAY_CONFIG: join(tempDir, "missing-config.json"), PORT: undefined }, async () => {
+    const config = await loadGatewayConfig();
+    assert.equal(config.port, DEFAULT_PORT);
+    assert.notEqual(config.port, 4177);
   });
 });
 

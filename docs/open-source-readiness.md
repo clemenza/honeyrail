@@ -50,7 +50,7 @@ The Agent Gateway execution/control-plane subsystem remains the current implemen
 - Internal MCP server name `codex-remote-controller`
 - REST paths
 - SQLite schema/state names
-- tmux session naming conventions such as `agw_server`
+- legacy tmux session naming conventions such as `agw_server`; current HoneyRail ops scripts default to `honeyrail_server`
 
 ## Repository Metadata
 

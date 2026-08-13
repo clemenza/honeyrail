@@ -93,7 +93,7 @@ Start the local runtime:
 npm run ops:start
 ```
 
-Open `http://127.0.0.1:4177`.
+Open `http://127.0.0.1:4178`.
 
 Basic first-project workflow:
 
@@ -103,7 +103,7 @@ Basic first-project workflow:
 4. Create a worktree-backed task.
 5. Watch the agent session, inspect the diff, run checks, commit, and merge after review.
 
-Production-style local ops run the runtime in a tmux session named `agw_server`:
+Production-style local ops run the runtime in a tmux session named `honeyrail_server`:
 
 ```sh
 npm run ops:start
@@ -123,8 +123,8 @@ export AGENT_GATEWAY_SESSION_SECRET='replace-with-a-long-random-secret'
 
 Common configuration:
 
-- `PORT`: server port, default `4177`
-- `AGW_TMUX_SESSION`: tmux server session, default `agw_server`
+- `PORT`: server port, default `4178`
+- `AGW_TMUX_SESSION`: tmux server session, default `honeyrail_server`
 - `AGW_LOG_FILE`: server log path, default `npm_start.log`
 - `AGENT_GATEWAY_CONFIG`: config file path, default `~/.agent-gateway/config.json`
 - `AGENT_GATEWAY_DATA`: SQLite state file, default `~/.agent-gateway/gateway.sqlite`
@@ -158,6 +158,8 @@ The current UI exposes commit, checks, and merge actions directly on worktrees. 
 Tasks remain atomic execution primitives: one agent execution, one worktree, one session, and one verification/merge lifecycle. Run/Step orchestration sits above tasks rather than changing that meaning.
 
 M1 orchestration can run explicit DAGs through `agent-task`, `shell`, `check`, and `approval` executors. Runs and steps persist in SQLite, resume on server restart, and are exposed through REST and MCP.
+
+For a concrete REST payload, see [docs/orchestration-dag-example.md](docs/orchestration-dag-example.md).
 
 ## Interfaces
 
