@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Agent Gateway">
+  <rect width="128" height="128" rx="28" fill="#0f172a"/>
+  <path d="M34 42h60a8 8 0 0 1 8 8v34a8 8 0 0 1-8 8H34a8 8 0 0 1-8-8V50a8 8 0 0 1 8-8Z" fill="#e2e8f0"/>
+  <path d="M43 61l13 10-13 10" fill="none" stroke="#0f172a" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M64 82h24" fill="none" stroke="#0f172a" stroke-width="8" stroke-linecap="round"/>
+  <circle cx="39" cy="38" r="9" fill="#38bdf8"/>
+  <circle cx="89" cy="38" r="9" fill="#22c55e"/>
+</svg>
