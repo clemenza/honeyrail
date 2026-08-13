@@ -291,7 +291,8 @@ export function TaskTable({ tasks, projects }: { tasks: TaskData[]; projects: Pr
               <strong>{task.title}</strong>
               <span>{project?.name || task.projectId}</span>
               <span>{task.agent}</span>
-              <StatusPill tone={task.status?.includes("running") ? "good" : "warn"}>{task.status}</StatusPill>
+              <StatusPill tone={task.status === "failed" ? "bad" : task.status?.includes("running") ? "good" : "warn"}>{task.status}</StatusPill>
+              {task.error ? <small className="record-error" role="alert">{task.error}</small> : null}
             </div>
           );
         })}

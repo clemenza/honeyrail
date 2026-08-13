@@ -8,7 +8,7 @@ import {
   sessionLogPath,
   tmuxName
 } from "./session-helpers.js";
-import { publishTaskFailed, publishTaskStarted } from "./domain-events.js";
+import { publishSessionCreated, publishTaskFailed, publishTaskStarted } from "./domain-events.js";
 import { validate, createTaskBody } from "./validation.js";
 import { makeId } from "./utils.js";
 import type { Session, Worktree } from "./types.js";
@@ -55,6 +55,7 @@ export function taskRoutes(ctx: RouteContext) {
         id: sessionId,
         projectId: project.id,
         worktreeId: worktree.id,
+        taskId: task.id,
         name: title,
         agent,
         model: model || null,
@@ -64,6 +65,7 @@ export function taskRoutes(ctx: RouteContext) {
         logPath,
         status: "running"
       });
+      await publishSessionCreated(ctx, project.id, session.id, agent, tmuxSessionName);
       await publishInitialAgentPrompt({ store, bus: ctx.bus, session, text: task.prompt || title, attachments });
       const updatedTask = await store.updateTask(task.id, {
         worktreeId: worktree.id,

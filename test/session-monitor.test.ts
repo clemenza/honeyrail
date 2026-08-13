@@ -19,6 +19,15 @@ test("inferSessionStatus detects waiting approval and waiting input", () => {
   assert.equal(inferSessionStatus("Queued follow-up inputs are waiting", new Date().toISOString(), 60_000), "waiting_input");
 });
 
+test("inferSessionStatus ignores approval words in older task output while the agent is working", () => {
+  const output = [
+    "Approve the final barrier after reviewing the worktree.",
+    ...Array.from({ length: 20 }, (_, index) => `inspection output ${index + 1}`),
+    "Working (18s - esc to interrupt)"
+  ].join("\n");
+  assert.equal(inferSessionStatus(output, new Date().toISOString(), 60_000), "running");
+});
+
 test("inferSessionStatus marks stale sessions without recent output", () => {
   const old = new Date(Date.now() - 120_000).toISOString();
   assert.equal(inferSessionStatus("working...", old, 1_000), "stale");
@@ -96,6 +105,82 @@ test("reconcileSessions marks related records failed when tmux session disappear
   assert.equal((await store.getWorktree(worktree.id))!.status, "failed");
   assert.equal((await store.listTasks()).find((item) => item.id === task.id)!.status, "failed");
   assert.equal(events.at(-1).payload.status, "failed");
+});
+
+test("reconcileSessions fails a Codex task and prompts for an upgrade when the CLI is too old", async (t) => {
+  const store = await makeStore(t, "agw-monitor-codex-upgrade-");
+  const bus = new EventBus();
+  const events: any[] = [];
+  bus.subscribe((event) => events.push(event));
+  const task = await store.createTask({ projectId: "proj_1", title: "new model task", agent: "codex", status: "agent_running" });
+  const worktree = await store.createWorktree({ projectId: "proj_1", taskId: task.id, path: "/tmp/wt", branch: "codex/new-model", status: "created" });
+  const session = await store.createSession({
+    projectId: "proj_1",
+    taskId: task.id,
+    worktreeId: worktree.id,
+    name: "unsupported model",
+    agent: "codex",
+    tmuxSessionName: "agw_old_codex",
+    cwd: "/tmp/wt",
+    status: "running"
+  });
+  await store.updateTask(task.id, { sessionId: session.id, worktreeId: worktree.id });
+
+  const killed: string[] = [];
+  await reconcileSessions({
+    store,
+    bus,
+    staleMs: 60_000,
+    tmux: {
+      capture: async () => "The 'gpt-5.6-sol' model requires a\nnewer version of Codex. Please upgrade to the latest app or CLI and try\nagain.",
+      killSession: async (name: string) => { killed.push(name); }
+    } as any
+  });
+
+  const expected = "Codex CLI is too old for model gpt-5.6-sol. Upgrade it with `npm install -g @openai/codex@latest`, then start a new task.";
+  assert.deepEqual(killed, ["agw_old_codex"]);
+  assert.equal((await store.getSession(session.id))!.status, "failed");
+  assert.equal((await store.getSession(session.id))!.error, expected);
+  assert.equal((await store.getWorktree(worktree.id))!.status, "failed");
+  assert.equal((await store.listTasks()).find((item) => item.id === task.id)!.status, "failed");
+  assert.equal(events.at(-2).type, "session.status_changed");
+  assert.equal(events.at(-2).payload.code, "codex_cli_upgrade_required");
+  assert.equal(events.at(-1).type, "task.failed");
+  assert.equal(events.at(-1).payload.reason, expected);
+});
+
+test("reconcileSessions completes a linked task when Codex returns to its prompt", async (t) => {
+  const store = await makeStore(t, "agw-monitor-codex-complete-");
+  const bus = new EventBus();
+  const events: any[] = [];
+  bus.subscribe((event) => events.push(event));
+  const task = await store.createTask({ projectId: "proj_1", title: "completed task", agent: "codex", status: "agent_running" });
+  const session = await store.createSession({
+    projectId: "proj_1",
+    taskId: task.id,
+    name: "completed codex task",
+    agent: "codex",
+    tmuxSessionName: "agw_completed_codex",
+    cwd: "/tmp/wt",
+    status: "running"
+  });
+  await store.updateTask(task.id, { sessionId: session.id });
+
+  const killed: string[] = [];
+  await reconcileSessions({
+    store,
+    bus,
+    staleMs: 60_000,
+    tmux: {
+      capture: async () => "Added the requested note.\n\n─ Worked for 1m 29s ─────\n\n› Use /skills to list available skills",
+      killSession: async (name: string) => { killed.push(name); }
+    } as any
+  });
+
+  assert.deepEqual(killed, ["agw_completed_codex"]);
+  assert.equal((await store.getSession(session.id))!.status, "completed");
+  assert.equal((await store.getTask(task.id))!.status, "done");
+  assert.deepEqual(events.slice(-2).map((event) => event.type), ["task.completed", "session.status_changed"]);
 });
 
 test("reconcileSessions auto-answers a known interactive prompt instead of flagging waiting_approval", async (t) => {

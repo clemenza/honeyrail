@@ -6,7 +6,7 @@ Prerequisites:
 
 - HoneyRail is running on the default port `4178`.
 - A project is already registered in HoneyRail.
-- The selected project has check commands configured, or the repository can run the default check command.
+- The repository is a Git worktree. The example uses `git diff --check`, so it does not require dependencies to be installed in the isolated worktree.
 
 Get a project ID:
 
@@ -33,7 +33,7 @@ curl -fsS http://127.0.0.1:4178/api/runs \
       "input": {
         "agent": "codex",
         "title": "Document one missing operator workflow",
-        "prompt": "Add or improve one concise operator-facing documentation note. Keep the change scoped, then stop and report the files changed."
+        "prompt": "Add or improve one concise operator-facing documentation note. Keep the change scoped and report the files changed when complete."
       }
     },
     {
@@ -43,8 +43,7 @@ curl -fsS http://127.0.0.1:4178/api/runs \
       "dependsOn": ["implement"],
       "input": {
         "commands": [
-          "npm run typecheck",
-          "env -u AGENT_GATEWAY_ACCOUNTS -u AGENT_GATEWAY_TOKEN -u AGENT_GATEWAY_SESSION_SECRET npm test"
+          "git diff --check"
         ]
       }
     },

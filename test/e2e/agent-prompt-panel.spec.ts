@@ -22,7 +22,7 @@ const session = {
 
 const sessionHeadingExpect = { timeout: 15_000 };
 
-async function mockGateway(page: Page, output: string, options: { holdInput?: boolean } = {}) {
+async function mockGateway(page: Page, output: string, options: { holdInput?: boolean; sessionOverride?: Partial<typeof session> & { error?: string } } = {}) {
   const inputs: any[] = [];
   const summaries: any[] = [];
   const inputResolvers: Array<() => void> = [];
@@ -38,7 +38,7 @@ async function mockGateway(page: Page, output: string, options: { holdInput?: bo
       contentType: "application/json",
       body: JSON.stringify({
         projects: [project],
-        sessions: [session],
+        sessions: [{ ...session, ...options.sessionOverride }],
         tasks: [],
         worktrees: [],
         events: [
@@ -123,9 +123,10 @@ async function mockGateway(page: Page, output: string, options: { holdInput?: bo
   };
 }
 
-async function mockManagementGateway(page: Page, options: { holdSession?: boolean; holdTask?: boolean } = {}) {
+async function mockManagementGateway(page: Page, options: { holdSession?: boolean; holdTask?: boolean; initialTasks?: any[]; initialWorktrees?: any[] } = {}) {
   const sessions: any[] = [];
-  const tasks: any[] = [];
+  const tasks: any[] = [...(options.initialTasks || [])];
+  const worktrees: any[] = [...(options.initialWorktrees || [])];
   const sessionResolvers: Array<() => void> = [];
   const taskResolvers: Array<() => void> = [];
 
@@ -145,7 +146,7 @@ async function mockManagementGateway(page: Page, options: { holdSession?: boolea
         tasks,
         events: [],
         tmuxSessions: [],
-        worktrees: []
+        worktrees
       })
     });
   });
@@ -315,6 +316,20 @@ test.describe("agent prompt panel removal", () => {
     });
   }
 
+  test("shows an actionable upgrade message when the Codex CLI is too old", async ({ page }) => {
+    const upgradeMessage = "Codex CLI is too old for model gpt-5.6-sol. Upgrade it with `npm install -g @openai/codex@latest`, then start a new task.";
+    await mockGateway(page, "The selected model requires a newer Codex CLI.", {
+      sessionOverride: { status: "failed", error: upgradeMessage }
+    });
+
+    await page.goto("/session/sess_prompt");
+
+    await expect(page.getByRole("heading", { name: "continuous optimization" })).toBeVisible(sessionHeadingExpect);
+    await expect(page.locator(".inline-error")).toContainText("Action required:");
+    await expect(page.locator(".inline-error")).toContainText("npm install -g @openai/codex@latest");
+    await expect(page.getByText("This session is failed. Start a new session before sending prompts.")).toHaveCount(0);
+  });
+
   test("keeps terminal divider lines out of the chat transcript and terminal view", async ({ page }) => {
     await mockGateway(
       page,
@@ -403,6 +418,84 @@ test.describe("agent prompt panel removal", () => {
     expect(gateway.tasks).toHaveLength(1);
     gateway.resolveTask();
     await expect(page.getByRole("button", { name: "Start task" })).toBeEnabled();
+  });
+
+  test("shows an empty sessions message after an empty dashboard finishes loading", async ({ page }) => {
+    await mockManagementGateway(page);
+
+    await page.goto("/?view=sessions");
+
+    await expect(page.getByRole("heading", { name: "Managed sessions" })).toBeVisible(sessionHeadingExpect);
+    await expect(page.getByText("No sessions yet.", { exact: true })).toBeVisible();
+    await expect(page.locator(".sessions-table .skeleton")).toHaveCount(0);
+  });
+
+  test("refreshes the sessions list when a task creates its agent session", async ({ page }) => {
+    let dashboardRequests = 0;
+    await page.route("**/api/health", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ ok: true, tmux: "tmux 3.5", agents: { codex: true, claude: true } })
+      });
+    });
+    await page.route("**/api/dashboard", async (route) => {
+      dashboardRequests += 1;
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          projects: [project],
+          sessions: dashboardRequests > 1 ? [session] : [],
+          tasks: [],
+          events: [],
+          tmuxSessions: [],
+          worktrees: [],
+          runs: []
+        })
+      });
+    });
+    await page.route("**/api/events/stream", async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+        body: `event: session.created\ndata: ${JSON.stringify({ type: "session.created", sessionId: session.id, projectId: project.id, payload: { agent: "codex" } })}\n\n`
+      });
+    });
+
+    await page.goto("/?view=sessions");
+
+    await expect(page.getByText("continuous optimization", { exact: true })).toBeVisible(sessionHeadingExpect);
+    await expect(page.getByText("1 tmux-backed sessions.", { exact: false })).toBeVisible();
+  });
+
+  test("shows the failure reason for failed tasks and worktrees", async ({ page }) => {
+    const failureReason = "Codex CLI is too old for model gpt-5.6-sol. Upgrade it with `npm install -g @openai/codex@latest`, then start a new task.";
+    await mockManagementGateway(page, {
+      initialTasks: [{
+        id: "task_failed",
+        projectId: project.id,
+        worktreeId: "wt_failed",
+        title: "DAG CLI upgrade prompt test",
+        agent: "codex",
+        status: "failed",
+        error: failureReason
+      }],
+      initialWorktrees: [{
+        id: "wt_failed",
+        projectId: project.id,
+        taskId: "task_failed",
+        path: "/tmp/wt-failed",
+        branch: "codex/dag-cli-upgrade",
+        agent: "codex",
+        status: "failed",
+        error: failureReason
+      }]
+    });
+
+    await page.goto("/?view=worktrees");
+
+    await expect(page.getByRole("heading", { name: "Active tasks" })).toBeVisible(sessionHeadingExpect);
+    await expect(page.getByText(failureReason, { exact: true })).toHaveCount(2);
+    await expect(page.locator(".record-error").first()).toContainText("npm install -g @openai/codex@latest");
   });
 
   test("generates and displays a mobile session summary", async ({ page }) => {
