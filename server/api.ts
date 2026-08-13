@@ -22,6 +22,8 @@ import { taskRoutes } from "./task-routes.js";
 import { mcpHttpRoutes } from "./mcp-http-transport.js";
 import type { McpContext } from "./mcp-server.js";
 import { createOAuthSupport } from "./oauth.js";
+import { OrchestrationService } from "./orchestration/service.js";
+import { runRoutes } from "./orchestration/routes.js";
 
 type CreateAppOptions = {
   store: Store;
@@ -41,6 +43,7 @@ type CreateAppOptions = {
   attachmentRoot?: string;
   sessionLogRoot?: string;
   defaultWorkspace?: string;
+  orchestration?: OrchestrationService;
 };
 
 export function createApp({
@@ -60,7 +63,8 @@ export function createApp({
   publicBaseUrl = process.env.AGENT_GATEWAY_PUBLIC_BASE_URL,
   attachmentRoot = resolve(homedir(), ".agent-gateway", "attachments"),
   sessionLogRoot = resolve(homedir(), ".agent-gateway", "sessions"),
-  defaultWorkspace = resolve(homedir(), "Workspace")
+  defaultWorkspace = resolve(homedir(), "Workspace"),
+  orchestration: providedOrchestration
 }: CreateAppOptions) {
   const app = express();
   const auth = providedAuth || createAuthenticator({ token, accounts, sessionSecret });
@@ -78,6 +82,15 @@ export function createApp({
     sessionLogRoot,
     defaultWorkspace
   };
+  const orchestration = providedOrchestration || new OrchestrationService({
+    store,
+    bus,
+    tmux,
+    worktrees,
+    runCommand: run,
+    sessionLogRoot,
+    attachmentRoot
+  });
 
   app.use(cors({ exposedHeaders: ["mcp-session-id", "www-authenticate"] }));
   app.use(express.json({ limit: "60mb" }));
@@ -132,15 +145,16 @@ export function createApp({
 
   // Dashboard
   app.get("/api/dashboard", asyncRoute(async (_req, res) => {
-    const [projects, sessions, tasks, worktreesList, tmuxSessions, events] = await Promise.all([
+    const [projects, sessions, tasks, worktreesList, runs, tmuxSessions, events] = await Promise.all([
       store.listProjects(),
       store.listSessions(),
       store.listTasks(),
       store.listWorktrees(),
+      orchestration.listRuns(),
       tmux.listSessions(),
       store.listEvents(40)
     ]);
-    res.json({ projects, sessions, tasks, worktrees: worktreesList, tmuxSessions, events });
+    res.json({ projects, sessions, tasks, worktrees: worktreesList, runs, tmuxSessions, events });
   }));
 
   // Domain routers
@@ -148,9 +162,10 @@ export function createApp({
   app.use(worktreeRoutes(ctx));
   app.use(sessionRoutes(ctx));
   app.use(taskRoutes(ctx));
+  app.use(runRoutes(orchestration));
 
   // MCP HTTP transport (Streamable HTTP for remote AI agent access)
-  const mcpCtx: McpContext = { store, bus, tmux, worktrees, run, sessionLogRoot, attachmentRoot };
+  const mcpCtx: McpContext = { store, bus, tmux, worktrees, run, sessionLogRoot, attachmentRoot, orchestration };
   app.use(mcpHttpRoutes(mcpCtx));
 
   // SSE stream

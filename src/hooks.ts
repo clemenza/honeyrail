@@ -162,13 +162,32 @@ function applySSEDelta(state: GatewayState, eventType: string, data: SSEPayload)
       return { ...state, tasks: patchList<TaskData>(state.tasks, data.taskId, { status: "failed" }), events: appendEvent(state.events, data) };
     }
 
+    case "run.created":
+    case "run.started":
+    case "run.running":
+    case "run.waiting_input":
+    case "run.waiting_approval":
+    case "run.succeeded":
+    case "run.failed":
+    case "run.cancelled":
+    case "step.ready":
+    case "step.started":
+    case "step.waiting_input":
+    case "step.waiting_approval":
+    case "step.succeeded":
+    case "step.failed":
+    case "step.retrying":
+    case "step.skipped":
+    case "step.cancelled":
+      return { ...state, events: appendEvent(state.events, data) };
+
     default:
       return null;
   }
 }
 
 export function useGatewayData(enabled = true) {
-  const [state, setState] = useState<GatewayState>({ projects: [], sessions: [], tasks: [], worktrees: [], events: [], tmuxSessions: [] });
+  const [state, setState] = useState<GatewayState>({ projects: [], sessions: [], tasks: [], worktrees: [], runs: [], events: [], tmuxSessions: [] });
   const [health, setHealth] = useState<HealthData | null>(null);
   const [error, setError] = useState("");
   const [connectionStatus, setConnectionStatus] = useState("connecting");
@@ -232,6 +251,9 @@ export function useGatewayData(enabled = true) {
     stream.addEventListener("worktree.discarded", incrementalHandler);
     stream.addEventListener("task.started", incrementalHandler);
     stream.addEventListener("task.failed", incrementalHandler);
+    for (const type of ["run.created", "run.started", "run.running", "run.waiting_input", "run.waiting_approval", "run.succeeded", "run.failed", "run.cancelled", "step.ready", "step.started", "step.waiting_input", "step.waiting_approval", "step.succeeded", "step.failed", "step.retrying", "step.skipped", "step.cancelled"]) {
+      stream.addEventListener(type, () => refresh());
+    }
 
     stream.onmessage = (event) => {
       let data: SSEPayload;

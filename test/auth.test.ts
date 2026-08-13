@@ -94,7 +94,7 @@ test("users with console permission can access console APIs after login", async 
   assert.equal(login.status, 200);
   assert.ok(cookie.startsWith("agw_session="));
   assert.equal(response.status, 200);
-  assert.deepEqual(Object.keys(body).sort(), ["events", "projects", "sessions", "tasks", "tmuxSessions", "worktrees"].sort());
+  assert.deepEqual(Object.keys(body).sort(), ["events", "projects", "runs", "sessions", "tasks", "tmuxSessions", "worktrees"].sort());
 });
 
 test("login cookies are not marked secure for direct HTTP access", async (t) => {

@@ -2,7 +2,7 @@
 
 HoneyRail is a local Node.js runtime for verifiable engineering work. The current implementation builds on the Agent Gateway execution/control-plane subsystem: a React frontend, an Express backend, SQLite runtime state, tmux-backed agent execution, and REST/WebSocket/MCP interfaces.
 
-The current system is the execution plane. Future orchestration concepts such as Goal, Recipe, Run, Step, Executor, DAG scheduling, and restart/resume sit above this layer and are not implemented in M0. See [ADR 0001](adr/0001-execution-vs-orchestration-model.md).
+The execution plane remains the Agent Gateway-derived kernel. M1 adds a small orchestration plane above it: persisted Runs, DAG Steps, registry-backed Executors, restart reconciliation, approval barriers, and REST/MCP controls. See [ADR 0001](adr/0001-execution-vs-orchestration-model.md).
 
 ## Runtime Shape
 
@@ -51,6 +51,8 @@ Key route groups:
 `SQLiteStore` stores mutable runtime state in `~/.agent-gateway/gateway.sqlite` by default. It tracks:
 
 - Projects
+- Runs
+- Steps
 - Sessions
 - Tasks
 - Worktrees
@@ -60,6 +62,19 @@ Key route groups:
 The older JSON store remains present for compatibility. On startup, a legacy `gateway.json` can be imported into SQLite once and then renamed to `gateway.json.bak`.
 
 SQLite startup uses explicit sequential schema migrations. Fresh installs migrate to the latest schema, older supported schemas are upgraded in order, and migration failures stop startup instead of silently continuing.
+
+## Orchestration Plane
+
+An orchestration `Run` represents one execution of an explicit multi-step workflow for a project goal. Each `Step` belongs to a run, declares dependencies by step ID, and names a registry-backed executor.
+
+M1 executors are deliberately small:
+
+- `agent-task`: creates and reconnects to the existing Task/Session/Worktree lifecycle.
+- `shell`: runs deterministic shell commands in a configured working directory with bounded output and timeout support.
+- `check`: reuses the existing worktree check implementation.
+- `approval`: blocks until an operator explicitly approves or rejects the step.
+
+The scheduler validates DAGs before creating runs, marks steps ready only after dependencies succeed, skips downstream steps after upstream failure, persists attempts and execution references, and reconciles non-terminal runs on startup. Shell steps that disappear across process restart are marked failed because M1 does not try to reattach arbitrary local processes.
 
 ## Event Bus
 
@@ -113,7 +128,9 @@ Commit and merge actions are explicit API operations. MCP clients can call `prop
 
 ## MCP
 
-The MCP server exposes projects, sessions, tasks, worktrees, checks, merges, and dashboard state. MCP tool names are intentionally stable compatibility identifiers and are not renamed as part of branding work.
+The MCP server exposes projects, sessions, tasks, worktrees, checks, merges, dashboard state, and orchestration runs. MCP tool names are intentionally stable compatibility identifiers and are not renamed as part of branding work.
+
+M1 adds `create_run`, `get_run`, `list_runs`, `cancel_run`, `approve_step`, and `reject_step`.
 
 The internal MCP server name remains `codex-remote-controller` during the HoneyRail bootstrap for client compatibility.
 

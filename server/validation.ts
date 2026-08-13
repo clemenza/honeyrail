@@ -82,6 +82,25 @@ export const createTaskBody = z.object({
   attachments: z.array(imageAttachmentInput).optional()
 });
 
+const stepInput = z.record(z.string(), z.unknown());
+
+export const createRunBody = z.object({
+  projectId: z.string(),
+  goal: z.string().min(1),
+  steps: z.array(z.object({
+    id: z.string().min(1),
+    name: z.string().optional(),
+    executor: z.string().min(1),
+    input: stepInput.optional(),
+    dependsOn: z.array(z.string()).optional(),
+    maxAttempts: z.number().int().positive().optional()
+  })).min(1)
+});
+
+export const rejectStepBody = z.object({
+  reason: z.string().optional()
+});
+
 export function validate(schema: z.ZodSchema) {
   return (req: Request, _res: Response, next: NextFunction) => {
     try {

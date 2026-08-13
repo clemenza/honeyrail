@@ -1,4 +1,4 @@
-export type ViewId = "dashboard" | "projects" | "sessions" | "worktrees" | "approvals";
+export type ViewId = "dashboard" | "projects" | "sessions" | "worktrees" | "runs" | "approvals";
 
 export type ProjectData = {
   id: string;
@@ -45,6 +45,37 @@ export type WorktreeData = {
   status: string;
 };
 
+export type StepData = {
+  id: string;
+  runId: string;
+  name: string;
+  executor: string;
+  input: Record<string, unknown>;
+  dependsOn: string[];
+  status: string;
+  attempt: number;
+  maxAttempts: number;
+  createdAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  executionRef?: Record<string, unknown>;
+  output?: Record<string, unknown>;
+  error?: string;
+};
+
+export type RunData = {
+  id: string;
+  projectId: string;
+  goal: string;
+  status: string;
+  createdAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  cancelledAt?: string;
+  error?: string;
+  steps: StepData[];
+};
+
 export type EventAttachment = {
   id?: string;
   fileName?: string;
@@ -74,6 +105,7 @@ export type GatewayState = {
   sessions: SessionData[];
   tasks: TaskData[];
   worktrees: WorktreeData[];
+  runs: RunData[];
   events: EventData[];
   tmuxSessions: unknown[];
 };

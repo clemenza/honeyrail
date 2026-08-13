@@ -4,6 +4,7 @@ import {
   Braces,
   FolderGit2,
   GitBranch,
+  ListTree,
   LogOut,
   Moon,
   RefreshCw,
@@ -39,6 +40,7 @@ const NAV_ITEMS: Array<[ViewId, LucideIcon, string]> = [
   ["projects", FolderGit2, "Projects"],
   ["sessions", SquareTerminal, "Sessions"],
   ["worktrees", GitBranch, "Worktrees"],
+  ["runs", ListTree, "Runs"],
   ["approvals", Shield, "Approvals"]
 ];
 
@@ -58,6 +60,10 @@ export const VIEW_META: Record<string, { title: string; subtitle: string }> = {
   worktrees: {
     title: "Worktrees",
     subtitle: "isolated task branches for agent runs"
+  },
+  runs: {
+    title: "Runs",
+    subtitle: "orchestrated multi-step engineering workflows"
   },
   approvals: {
     title: "Approvals",

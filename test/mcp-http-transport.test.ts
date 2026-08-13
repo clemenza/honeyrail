@@ -138,12 +138,14 @@ test("POST /api/mcp tools/list returns all registered tools", async (t) => {
   const dataLine = body.split("\n").find((line) => line.startsWith("data: "));
   assert.ok(dataLine, "Expected SSE data line in response");
   const rpcResult = JSON.parse(dataLine.slice(6));
-  assert.ok(rpcResult.result.tools.length >= 17, `Expected at least 17 tools, got ${rpcResult.result.tools.length}`);
+  assert.ok(rpcResult.result.tools.length >= 23, `Expected at least 23 tools, got ${rpcResult.result.tools.length}`);
   const names = rpcResult.result.tools.map((tool: any) => tool.name);
   assert.ok(names.includes("list_projects"));
   assert.ok(names.includes("create_agent_task"));
   assert.ok(names.includes("propose_merge"));
   assert.ok(names.includes("approve_merge"));
+  assert.ok(names.includes("create_run"));
+  assert.ok(names.includes("approve_step"));
 });
 
 test("POST /api/mcp without session ID and non-initialize body returns 400", async (t) => {

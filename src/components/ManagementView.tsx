@@ -7,10 +7,11 @@ import {
   Play,
   RefreshCw,
   Shield,
+  XCircle,
   Trash2
 } from "lucide-react";
 import { api } from "../api.js";
-import type { DiffData, EventData, GatewayState, ProjectData, SessionData, TaskData, WorktreeData, WorktreeItem } from "../types.js";
+import type { DiffData, EventData, GatewayState, ProjectData, RunData, SessionData, TaskData, WorktreeData, WorktreeItem } from "../types.js";
 import { StatusPill } from "./layout.js";
 import { ProjectForm, ProjectList } from "./ProjectPanel.js";
 import { SessionLauncher, TaskComposer, TaskTable } from "./TaskPanel.js";
@@ -218,6 +219,87 @@ function ApprovalQueue({ tasks }: { tasks: TaskData[] }) {
   );
 }
 
+function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: ProjectData[]; refresh: () => Promise<void> }) {
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+
+  const act = async (path: string, label: string) => {
+    setBusy(label);
+    setError("");
+    try {
+      await api(path, { method: "POST", body: JSON.stringify({}) });
+      await refresh();
+    } catch (err: unknown) {
+      setError((err as Error).message);
+    } finally {
+      setBusy("");
+    }
+  };
+
+  return (
+    <section className="panel table-panel">
+      <div className="panel-heading">
+        <div>
+          <h2>Orchestration runs</h2>
+          <p>{runs.length} persisted multi-step workflows</p>
+        </div>
+      </div>
+      {error ? <div className="inline-error">{error}</div> : null}
+      <div className="run-list">
+        {runs.slice().reverse().map((run) => {
+          const project = projects.find((item) => item.id === run.projectId);
+          const terminal = ["succeeded", "failed", "cancelled"].includes(run.status);
+          return (
+            <article className="run-card" key={run.id}>
+              <div className="run-card-header">
+                <div>
+                  <h3>{run.goal}</h3>
+                  <p>{project?.name || run.projectId} · {run.id}</p>
+                </div>
+                <StatusPill tone={run.status === "succeeded" ? "good" : run.status === "failed" ? "bad" : "warn"}>{run.status}</StatusPill>
+              </div>
+              <div className="run-steps">
+                {run.steps.map((step) => (
+                  <div className="run-step" key={step.id}>
+                    <div>
+                      <strong>{step.name}</strong>
+                      <span>{step.executor} · attempt {step.attempt}/{step.maxAttempts}</span>
+                      <small>depends on {step.dependsOn.length ? step.dependsOn.join(", ") : "none"}</small>
+                      {step.error ? <small className="run-step-error">{step.error}</small> : null}
+                    </div>
+                    <div className="run-step-actions">
+                      <StatusPill tone={step.status === "succeeded" ? "good" : step.status === "failed" ? "bad" : step.status === "waiting_approval" ? "warn" : "neutral"}>{step.status}</StatusPill>
+                      {step.executionRef?.sessionId ? (
+                        <a className="secondary-button table-action" href={`#/session/${step.executionRef.sessionId}`}>Session <ArrowRight size={14} /></a>
+                      ) : null}
+                      {step.status === "waiting_approval" ? (
+                        <>
+                          <button type="button" className="secondary-button table-action" disabled={Boolean(busy)} onClick={() => act(`/api/runs/${run.id}/steps/${step.id}/approve`, `approve:${step.id}`)}>
+                            <Shield size={14} /> Approve
+                          </button>
+                          <button type="button" className="secondary-button table-action danger" disabled={Boolean(busy)} onClick={() => act(`/api/runs/${run.id}/steps/${step.id}/reject`, `reject:${step.id}`)}>
+                            <XCircle size={14} /> Reject
+                          </button>
+                        </>
+                      ) : null}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="run-card-footer">
+                <button type="button" className="secondary-button table-action danger" disabled={terminal || Boolean(busy)} onClick={() => act(`/api/runs/${run.id}/cancel`, `cancel:${run.id}`)}>
+                  <Trash2 size={14} /> Cancel run
+                </button>
+              </div>
+            </article>
+          );
+        })}
+        {!runs.length ? <div className="table-empty">No orchestration runs yet.</div> : null}
+      </div>
+    </section>
+  );
+}
+
 function ManagementSummary({ state, onOpenSession, onNavigate }: { state: GatewayState; onOpenSession: (sessionId: string) => void; onNavigate?: (view: string) => void }) {
   const runningSessions = state.sessions.filter((session) => session.status === "running").length;
   const activeTasks = state.tasks.filter((task) => !["done", "failed", "cancelled"].includes(task.status)).length;
@@ -236,6 +318,10 @@ function ManagementSummary({ state, onOpenSession, onNavigate }: { state: Gatewa
       <div className="summary-card" onClick={() => onNavigate?.("worktrees")} role="button" tabIndex={0}>
         <span>Active tasks</span>
         <strong>{activeTasks}</strong>
+      </div>
+      <div className="summary-card" onClick={() => onNavigate?.("runs")} role="button" tabIndex={0}>
+        <span>Runs</span>
+        <strong>{state.runs.length}</strong>
       </div>
       <div className="summary-card summary-card-action">
         <span>Latest session</span>
@@ -344,6 +430,19 @@ export function MainContent({ activeView, state, selectedProject, setSelectedPro
         <div className="primary-column">
           <ApprovalQueue tasks={state.tasks} />
           <TaskTable tasks={state.tasks} projects={state.projects} />
+        </div>
+        <div className="secondary-column">
+          <EventFeed events={state.events} className="event-feed-hide-mobile" />
+        </div>
+      </div>
+    );
+  }
+
+  if (activeView === "runs") {
+    return (
+      <div className="content-grid">
+        <div className="primary-column">
+          <RunsPanel runs={state.runs} projects={state.projects} refresh={refresh} />
         </div>
         <div className="secondary-column">
           <EventFeed events={state.events} className="event-feed-hide-mobile" />

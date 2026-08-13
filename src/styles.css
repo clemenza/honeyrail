@@ -1841,6 +1841,73 @@ textarea:focus {
   white-space: pre-wrap;
 }
 
+.run-list {
+  display: grid;
+  gap: var(--space-md);
+}
+
+.run-card {
+  display: grid;
+  gap: var(--space-md);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: var(--space-md);
+  background: var(--color-panel);
+}
+
+.run-card-header,
+.run-card-footer,
+.run-step,
+.run-step-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.run-card-header,
+.run-step {
+  justify-content: space-between;
+}
+
+.run-card-header h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.run-card-header p,
+.run-step span,
+.run-step small {
+  display: block;
+  margin: 2px 0 0;
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
+.run-steps {
+  display: grid;
+  gap: var(--space-sm);
+}
+
+.run-step {
+  border: 1px solid var(--color-border-light);
+  border-radius: 8px;
+  padding: var(--space-sm);
+  background: var(--color-bg-subtle);
+}
+
+.run-step > div:first-child {
+  min-width: 0;
+}
+
+.run-step-error {
+  color: var(--color-danger) !important;
+}
+
+.run-step-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .table-action {
   min-height: var(--touch-min);
   padding: 7px 10px;

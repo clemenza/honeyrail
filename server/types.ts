@@ -29,6 +29,26 @@ export type TaskStatus =
 
 export type AgentType = "shell" | "codex" | "claude" | "hermes";
 
+export type RunStatus =
+  | "pending"
+  | "running"
+  | "waiting_input"
+  | "waiting_approval"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+export type StepStatus =
+  | "pending"
+  | "ready"
+  | "running"
+  | "waiting_input"
+  | "waiting_approval"
+  | "succeeded"
+  | "failed"
+  | "skipped"
+  | "cancelled";
+
 export type CheckRun = {
   command: string;
   status: "passed" | "failed";
@@ -47,6 +67,36 @@ export type Project = {
   defaultAgent: AgentType;
   testCommands: string[];
   runCommands: string[];
+};
+
+export type Run = {
+  id: string;
+  projectId: string;
+  goal: string;
+  status: RunStatus;
+  createdAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  cancelledAt?: string;
+  error?: string;
+};
+
+export type Step = {
+  id: string;
+  runId: string;
+  name: string;
+  executor: string;
+  input: Record<string, unknown>;
+  dependsOn: string[];
+  status: StepStatus;
+  attempt: number;
+  maxAttempts: number;
+  createdAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  executionRef?: Record<string, unknown>;
+  output?: Record<string, unknown>;
+  error?: string;
 };
 
 export type Session = {
@@ -145,6 +195,15 @@ export interface Store {
   createProject(input: Partial<Project> & Pick<Project, "name" | "repoPath">): Promise<Project>;
   getProject(id: string): Promise<Project | undefined>;
   deleteProject(id: string): Promise<Project | null>;
+
+  listRuns(projectId?: string): Promise<Run[]>;
+  createRun(input: Partial<Run> & Pick<Run, "projectId" | "goal">): Promise<Run>;
+  getRun(id: string): Promise<Run | undefined>;
+  updateRun(id: string, updates: Partial<Run>): Promise<Run | undefined>;
+  createStep(input: Partial<Step> & Pick<Step, "id" | "runId" | "name" | "executor">): Promise<Step>;
+  listSteps(runId: string): Promise<Step[]>;
+  getStep(runId: string, stepId: string): Promise<Step | undefined>;
+  updateStep(runId: string, stepId: string, updates: Partial<Step>): Promise<Step | undefined>;
 
   listSessions(): Promise<Session[]>;
   createSession(input: Partial<Session> & { id?: string }): Promise<Session>;

@@ -15,6 +15,7 @@ import { runCommandSafe } from "./utils.js";
 import { sessionAcceptsInput, startSessionMonitor } from "./session-monitor.js";
 import { readSessionLog, stripAnsi } from "./session-helpers.js";
 import { WorktreeManager } from "./worktrees.js";
+import { OrchestrationService } from "./orchestration/service.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, "..");
@@ -34,6 +35,16 @@ async function main() {
     });
     
     await recoverLegacyTaskWorktrees(store, runCommandSafe);
+    const orchestration = new OrchestrationService({
+        store,
+        bus,
+        tmux,
+        worktrees,
+        runCommand: runCommandSafe,
+        sessionLogRoot: config.sessionLogRoot,
+        attachmentRoot: config.attachmentRoot
+    });
+    await orchestration.recover();
 
     const app = createApp({
         store,
@@ -44,7 +55,8 @@ async function main() {
         auth,
         publicBaseUrl: config.publicBaseUrl,
         attachmentRoot: config.attachmentRoot,
-        sessionLogRoot: config.sessionLogRoot
+        sessionLogRoot: config.sessionLogRoot,
+        orchestration
     });
 
     startSessionMonitor({

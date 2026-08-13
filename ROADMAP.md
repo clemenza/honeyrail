@@ -18,6 +18,7 @@ This roadmap is directional, not a feature promise.
 - Introduce additive `Run`, `Step`, and `Executor` concepts above the existing task/session/worktree primitives.
 - Add DAG scheduling and dependency tracking.
 - Add restart/resume behavior for orchestration runs.
+- Add REST/MCP control surfaces for run creation, inspection, cancellation, approval, and rejection.
 - Keep existing task execution semantics intact.
 
 ## v0.3 / M2: Evidence And Quality
