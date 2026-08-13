@@ -18,6 +18,8 @@ export type GatewayConfig = {
   sessionStaleMs: number;
 };
 
+export const DEFAULT_PORT = 4178;
+
 type RawGatewayConfig = Partial<GatewayConfig> & Record<string, unknown>;
 
 function parseNumber(value: unknown, fallback: number) {
@@ -69,7 +71,7 @@ export async function loadGatewayConfig(): Promise<GatewayConfig> {
   const worktreeRoot = resolve(expandHome(process.env.AGENT_WORKTREE_ROOT || fileConfig.worktreeRoot as string || "~/agent-worktrees") || "");
 
   return {
-    port: parseNumber(process.env.PORT || fileConfig.port, 4177),
+    port: parseNumber(process.env.PORT || fileConfig.port, DEFAULT_PORT),
     dataFile,
     legacyJsonDataFile,
     worktreeRoot,

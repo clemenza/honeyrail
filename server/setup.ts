@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { defaultConfigPath } from "./config.js";
+import { DEFAULT_PORT, defaultConfigPath } from "./config.js";
 
 function hashPassword(password: string) {
   return scryptSync(password, "agent-gateway", 64).toString("hex");
@@ -27,7 +27,7 @@ async function main() {
     const username = defaultValue(await rl.question("Console username [admin]: "), "admin");
     const password = await rl.question("Console password: ");
     if (!password.trim()) throw new Error("Console password is required.");
-    const port = Number(defaultValue(await rl.question("Port [4177]: "), "4177"));
+    const port = Number(defaultValue(await rl.question(`Port [${DEFAULT_PORT}]: `), String(DEFAULT_PORT)));
     const worktreeRoot = expandHome(defaultValue(await rl.question("Worktree root [~/agent-worktrees]: "), "~/agent-worktrees"));
     const dataFile = expandHome(defaultValue(await rl.question("SQLite state file [~/.agent-gateway/gateway.sqlite]: "), "~/.agent-gateway/gateway.sqlite"));
     const legacyJsonDataFile = expandHome(defaultValue(await rl.question("Legacy JSON state file for migration [~/.agent-gateway/gateway.json]: "), "~/.agent-gateway/gateway.json"));

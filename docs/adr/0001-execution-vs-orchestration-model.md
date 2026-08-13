@@ -84,7 +84,7 @@ M0 preserves the Agent Gateway-derived compatibility surfaces:
 - Existing MCP tool names
 - Internal MCP server compatibility identifier `codex-remote-controller`
 - Existing SQLite state semantics
-- tmux compatibility identifiers such as `agw_server`
+- legacy tmux compatibility identifiers such as `agw_server`; current HoneyRail ops scripts default to `honeyrail_server`
 
 These names are compatibility surfaces, not immediate technical debt. Any future rename must be explicit, migrated, and documented.
 

@@ -76,6 +76,8 @@ M1 executors are deliberately small:
 
 The scheduler validates DAGs before creating runs, marks steps ready only after dependencies succeed, skips downstream steps after upstream failure, persists attempts and execution references, and reconciles non-terminal runs on startup. Shell steps that disappear across process restart are marked failed because M1 does not try to reattach arbitrary local processes.
 
+See [orchestration-dag-example.md](orchestration-dag-example.md) for a concrete multi-step REST payload.
+
 ## Event Bus
 
 Domain events are published through `domain-events.ts` and `events.ts`. Events are stored and also emitted to connected UI clients so dashboards update after project, session, task, worktree, checks, commit, merge, and delete changes.
