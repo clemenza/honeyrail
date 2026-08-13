@@ -56,7 +56,7 @@ test("SQLiteStore persists projects, sessions, tasks, worktrees, events, and set
   assert.equal((await store.getTask(task.id))!.title, "fix");
   assert.equal((await store.getWorktree(worktree.id))!.branch, "codex/fix");
   assert.equal((await store.listEvents()).at(-1)!.id, event.id);
-  assert.equal(readSchemaVersion(dbPath), 2);
+  assert.equal(readSchemaVersion(dbPath), 3);
 
   await store.updateTask(task.id, { status: "ready_to_merge" });
   await store.updateWorktree(worktree.id, { status: "committed" });
@@ -77,7 +77,7 @@ test("SQLiteStore schema migrations are idempotent on repeated startup", async (
   const second = new SQLiteStore(dbPath);
   t.after(() => second.close());
 
-  assert.equal(readSchemaVersion(dbPath), 2);
+  assert.equal(readSchemaVersion(dbPath), 3);
   assert.equal((await second.getProject(project.id))!.name, "stable");
   assert.equal((await second.listProjects()).length, 1);
 });
@@ -112,7 +112,7 @@ test("SQLiteStore upgrades v1 records schema to the structured schema without lo
   const store = new SQLiteStore(dbPath);
   t.after(() => store.close());
 
-  assert.equal(readSchemaVersion(dbPath), 2);
+  assert.equal(readSchemaVersion(dbPath), 3);
   assert.equal((await store.getProject("proj_v1"))!.repoPath, "/repo/v1");
   assert.equal((await store.getSession("sess_v1"))!.worktreeId, "wt_v1");
   assert.equal((await store.getTask("task_v1"))!.sessionId, "sess_v1");
@@ -138,6 +138,124 @@ test("SQLiteStore migration failure rolls back partial schema changes and leaves
   assert.throws(() => new SQLiteStore(dbPath), /projects/);
   assert.equal(readSchemaVersion(dbPath), 1);
   assert.equal(tableExists(dbPath, "kv_settings"), false);
+});
+
+test("SQLiteStore upgrades v2 execution schema to v3 orchestration schema and preserves existing state", async (t) => {
+  const tempDir = await tempPath(t);
+  const dbPath = join(tempDir, "gateway.sqlite");
+  inspectDatabase(dbPath, (db) => {
+    db.exec(`
+      CREATE TABLE schema_version (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        version INTEGER NOT NULL
+      );
+      INSERT INTO schema_version (id, version) VALUES (1, 2);
+      CREATE TABLE kv_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+      CREATE TABLE projects (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        repo_path TEXT NOT NULL,
+        default_branch TEXT NOT NULL DEFAULT 'main',
+        default_agent TEXT NOT NULL DEFAULT 'codex',
+        test_commands TEXT NOT NULL DEFAULT '[]',
+        run_commands TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        project_id TEXT,
+        worktree_id TEXT,
+        task_id TEXT,
+        name TEXT NOT NULL DEFAULT '',
+        agent TEXT NOT NULL DEFAULT 'shell',
+        model TEXT,
+        prompt TEXT,
+        tmux_session_name TEXT NOT NULL DEFAULT '',
+        cwd TEXT NOT NULL DEFAULT '',
+        log_path TEXT,
+        status TEXT NOT NULL DEFAULT 'running',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_output_at TEXT,
+        last_health_check_at TEXT,
+        error TEXT,
+        summary TEXT,
+        summary_updated_at TEXT
+      );
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        worktree_id TEXT,
+        session_id TEXT,
+        title TEXT NOT NULL DEFAULT '',
+        prompt TEXT,
+        agent TEXT NOT NULL DEFAULT 'codex',
+        status TEXT NOT NULL DEFAULT 'agent_running',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        failed_at TEXT,
+        committed_at TEXT,
+        cancelled_at TEXT,
+        merged_at TEXT,
+        checked_at TEXT,
+        head_revision TEXT,
+        error TEXT,
+        check_runs TEXT
+      );
+      CREATE TABLE worktrees (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        task_id TEXT,
+        path TEXT NOT NULL DEFAULT '',
+        branch TEXT NOT NULL DEFAULT '',
+        base_branch TEXT NOT NULL DEFAULT '',
+        base_revision TEXT NOT NULL DEFAULT '',
+        title TEXT NOT NULL DEFAULT '',
+        agent TEXT NOT NULL DEFAULT 'codex',
+        status TEXT NOT NULL DEFAULT 'created',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        committed_at TEXT,
+        checked_at TEXT,
+        merged_at TEXT,
+        discarded_at TEXT,
+        failed_at TEXT,
+        head_revision TEXT,
+        error TEXT,
+        check_runs TEXT,
+        commit_data TEXT,
+        merge_data TEXT,
+        discard_data TEXT
+      );
+      CREATE TABLE events (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        project_id TEXT,
+        session_id TEXT,
+        task_id TEXT,
+        payload TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO projects (id, name, repo_path, created_at, updated_at) VALUES ('proj_v2', 'v2', '/repo/v2', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+    `);
+  });
+
+  const store = new SQLiteStore(dbPath);
+  const run = await store.createRun({ projectId: "proj_v2", goal: "persist m1" });
+  await store.createStep({ id: "step_a", runId: run.id, name: "A", executor: "shell", input: { command: "true" }, dependsOn: [], status: "pending" });
+  store.close();
+
+  const reopened = new SQLiteStore(dbPath);
+  t.after(() => reopened.close());
+
+  assert.equal(readSchemaVersion(dbPath), 3);
+  assert.equal((await reopened.getProject("proj_v2"))!.name, "v2");
+  assert.equal((await reopened.getRun(run.id))!.goal, "persist m1");
+  assert.equal((await reopened.getStep(run.id, "step_a"))!.input.command, "true");
 });
 
 test("SQLiteStore migrates legacy gateway.json once and writes a backup", async (t) => {

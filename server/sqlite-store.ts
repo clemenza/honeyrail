@@ -1,12 +1,14 @@
 import { existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { EventInput, GatewayEvent, Project, Session, Store, Task, Worktree } from "./types.js";
+import type { EventInput, GatewayEvent, Project, Run, Session, Step, Store, Task, Worktree } from "./types.js";
 import { makeId } from "./utils.js";
 
 type StoreData = {
   settings: Record<string, unknown>;
   projects: Project[];
+  runs: Run[];
+  steps: Step[];
   sessions: Session[];
   tasks: Task[];
   worktrees: Worktree[];
@@ -16,6 +18,8 @@ type StoreData = {
 const EMPTY_DATA: StoreData = {
   settings: {},
   projects: [],
+  runs: [],
+  steps: [],
   sessions: [],
   tasks: [],
   worktrees: [],
@@ -170,6 +174,43 @@ const STRUCTURED_SCHEMA_SQL = `
   CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
 `;
 
+const ORCHESTRATION_SCHEMA_SQL = `
+  CREATE TABLE IF NOT EXISTS runs (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    goal TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    cancelled_at TEXT,
+    error TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
+  CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
+
+  CREATE TABLE IF NOT EXISTS steps (
+    id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    executor TEXT NOT NULL,
+    input TEXT NOT NULL DEFAULT '{}',
+    depends_on TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    execution_ref TEXT,
+    output TEXT,
+    error TEXT,
+    PRIMARY KEY (run_id, id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_steps_run ON steps(run_id);
+  CREATE INDEX IF NOT EXISTS idx_steps_status ON steps(status);
+`;
+
 type SchemaMigration = {
   version: number;
   name: string;
@@ -186,6 +227,11 @@ const SCHEMA_MIGRATIONS: SchemaMigration[] = [
     version: 2,
     name: "structured-execution-state",
     up: (db) => db.exec(STRUCTURED_SCHEMA_SQL)
+  },
+  {
+    version: 3,
+    name: "orchestration-runs-steps",
+    up: (db) => db.exec(ORCHESTRATION_SCHEMA_SQL)
   }
 ];
 
@@ -317,6 +363,27 @@ export class SQLiteStore implements Store {
     );
   }
 
+  private upsertRunRow(run: Run, createdAt: string) {
+    this.db.prepare(`INSERT OR REPLACE INTO runs (id, project_id, goal, status, created_at, started_at, finished_at, cancelled_at, error)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      run.id, run.projectId, run.goal || "", run.status || "pending", createdAt,
+      run.startedAt ?? null, run.finishedAt ?? null, run.cancelledAt ?? null, run.error ?? null
+    );
+  }
+
+  private upsertStepRow(step: Step, createdAt: string) {
+    this.db.prepare(`INSERT OR REPLACE INTO steps (id, run_id, name, executor, input, depends_on, status, attempt, max_attempts, created_at, started_at, finished_at, execution_ref, output, error)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      step.id, step.runId, step.name || "", step.executor,
+      JSON.stringify(step.input || {}), JSON.stringify(step.dependsOn || []),
+      step.status || "pending", step.attempt ?? 0, step.maxAttempts ?? 1,
+      createdAt, step.startedAt ?? null, step.finishedAt ?? null,
+      step.executionRef ? JSON.stringify(step.executionRef) : null,
+      step.output ? JSON.stringify(step.output) : null,
+      step.error ?? null
+    );
+  }
+
   private upsertSessionRow(s: Session, createdAt: string, updatedAt: string) {
     this.db.prepare(`INSERT OR REPLACE INTO sessions (id, project_id, worktree_id, task_id, name, agent, model, prompt, tmux_session_name, cwd, log_path, status, created_at, updated_at, last_output_at, last_health_check_at, error, summary, summary_updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
@@ -373,6 +440,40 @@ export class SQLiteStore implements Store {
       defaultAgent: (String(row.default_agent || "codex")) as Project["defaultAgent"],
       testCommands: parseJson<string[]>(row.test_commands as string, []),
       runCommands: parseJson<string[]>(row.run_commands as string, [])
+    };
+  }
+
+  private rowToRun(row: Record<string, unknown>): Run {
+    return {
+      id: String(row.id),
+      projectId: String(row.project_id || ""),
+      goal: String(row.goal || ""),
+      status: (String(row.status || "pending")) as Run["status"],
+      createdAt: String(row.created_at || ""),
+      startedAt: row.started_at as string | undefined,
+      finishedAt: row.finished_at as string | undefined,
+      cancelledAt: row.cancelled_at as string | undefined,
+      error: row.error as string | undefined
+    };
+  }
+
+  private rowToStep(row: Record<string, unknown>): Step {
+    return {
+      id: String(row.id),
+      runId: String(row.run_id || ""),
+      name: String(row.name || ""),
+      executor: String(row.executor || ""),
+      input: parseJson<Record<string, unknown>>(row.input as string, {}),
+      dependsOn: parseJson<string[]>(row.depends_on as string, []),
+      status: (String(row.status || "pending")) as Step["status"],
+      attempt: Number(row.attempt || 0),
+      maxAttempts: Number(row.max_attempts || 1),
+      createdAt: String(row.created_at || ""),
+      startedAt: row.started_at as string | undefined,
+      finishedAt: row.finished_at as string | undefined,
+      executionRef: row.execution_ref ? parseJson<Record<string, unknown>>(row.execution_ref as string, {}) : undefined,
+      output: row.output ? parseJson<Record<string, unknown>>(row.output as string, {}) : undefined,
+      error: row.error as string | undefined
     };
   }
 
@@ -551,6 +652,73 @@ export class SQLiteStore implements Store {
     if (!project) return null;
     this.db.prepare("DELETE FROM projects WHERE id = ?").run(id);
     return project;
+  }
+
+  async listRuns(projectId?: string): Promise<Run[]> {
+    const rows = projectId
+      ? this.db.prepare("SELECT * FROM runs WHERE project_id = ? ORDER BY created_at ASC").all(projectId) as Record<string, unknown>[]
+      : this.db.prepare("SELECT * FROM runs ORDER BY created_at ASC").all() as Record<string, unknown>[];
+    return rows.map((row) => this.rowToRun(row));
+  }
+
+  async createRun(input: Partial<Run> & Pick<Run, "projectId" | "goal">): Promise<Run> {
+    const now = nowIso();
+    const run: Run = {
+      ...input,
+      id: input.id || makeId("run"),
+      projectId: input.projectId,
+      goal: input.goal,
+      status: input.status || "pending",
+      createdAt: input.createdAt || now
+    } as Run;
+    this.upsertRunRow(run, run.createdAt);
+    return run;
+  }
+
+  async getRun(id: string): Promise<Run | undefined> {
+    const row = this.db.prepare("SELECT * FROM runs WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    return row ? this.rowToRun(row) : undefined;
+  }
+
+  async updateRun(id: string, updates: Partial<Run>): Promise<Run | undefined> {
+    const run = await this.getRun(id);
+    if (!run) return undefined;
+    const merged = { ...run, ...updates };
+    this.upsertRunRow(merged, run.createdAt);
+    return merged;
+  }
+
+  async createStep(input: Partial<Step> & Pick<Step, "id" | "runId" | "name" | "executor">): Promise<Step> {
+    const now = nowIso();
+    const step: Step = {
+      input: {},
+      dependsOn: [],
+      status: "pending",
+      attempt: 0,
+      maxAttempts: 1,
+      createdAt: now,
+      ...input
+    } as Step;
+    this.upsertStepRow(step, step.createdAt);
+    return step;
+  }
+
+  async listSteps(runId: string): Promise<Step[]> {
+    const rows = this.db.prepare("SELECT * FROM steps WHERE run_id = ? ORDER BY created_at ASC").all(runId) as Record<string, unknown>[];
+    return rows.map((row) => this.rowToStep(row));
+  }
+
+  async getStep(runId: string, stepId: string): Promise<Step | undefined> {
+    const row = this.db.prepare("SELECT * FROM steps WHERE run_id = ? AND id = ?").get(runId, stepId) as Record<string, unknown> | undefined;
+    return row ? this.rowToStep(row) : undefined;
+  }
+
+  async updateStep(runId: string, stepId: string, updates: Partial<Step>): Promise<Step | undefined> {
+    const step = await this.getStep(runId, stepId);
+    if (!step) return undefined;
+    const merged = { ...step, ...updates };
+    this.upsertStepRow(merged, step.createdAt);
+    return merged;
   }
 
   async listSessions(): Promise<Session[]> {

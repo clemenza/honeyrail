@@ -25,6 +25,7 @@ HoneyRail adds a local runtime around those agents so each engineering goal can 
 - Capture check results and session evidence.
 - Review work before merge.
 - Expose workflows through REST, WebSocket, and MCP interfaces.
+- Create explicit multi-step Runs with dependency-ordered Steps and approval barriers.
 - Self-host locally on your own machine or trusted network.
 
 ## Architecture
@@ -154,7 +155,9 @@ Create task
 
 The current UI exposes commit, checks, and merge actions directly on worktrees. MCP clients can use `propose_merge` to preview risk and `approve_merge` to perform the merge after an operator decision.
 
-In v0.1, a task is an atomic execution primitive: one agent execution, one worktree, one session, and one verification/merge lifecycle. Future Run/Step orchestration will sit above tasks rather than changing that meaning.
+Tasks remain atomic execution primitives: one agent execution, one worktree, one session, and one verification/merge lifecycle. Run/Step orchestration sits above tasks rather than changing that meaning.
+
+M1 orchestration can run explicit DAGs through `agent-task`, `shell`, `check`, and `approval` executors. Runs and steps persist in SQLite, resume on server restart, and are exposed through REST and MCP.
 
 ## Interfaces
 

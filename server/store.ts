@@ -1,10 +1,12 @@
 import { readFile, writeFile } from "node:fs/promises";
-import type { EventInput, GatewayEvent, Project, Session, Store, Task, Worktree } from "./types.js";
+import type { EventInput, GatewayEvent, Project, Run, Session, Step, Store, Task, Worktree } from "./types.js";
 import { makeId } from "./utils.js";
 
 type StoreData = {
     settings: Record<string, unknown>;
     projects: Project[];
+    runs: Run[];
+    steps: Step[];
     sessions: Session[];
     tasks: Task[];
     worktrees: Worktree[];
@@ -17,7 +19,7 @@ export class JsonStore implements Store {
 
     constructor(filePath: string) {
         this.filePath = filePath;
-        this.data = { settings: {}, projects: [], sessions: [], tasks: [], worktrees: [], events: [] };
+        this.data = { settings: {}, projects: [], runs: [], steps: [], sessions: [], tasks: [], worktrees: [], events: [] };
         this._load();
     }
 
@@ -27,6 +29,8 @@ export class JsonStore implements Store {
             this.data = {
                 settings: {},
                 projects: [],
+                runs: [],
+                steps: [],
                 sessions: [],
                 tasks: [],
                 worktrees: [],
@@ -75,6 +79,70 @@ export class JsonStore implements Store {
         const [project] = this.data.projects.splice(index, 1);
         await this._save();
         return project;
+    }
+
+    async listRuns(projectId?: string): Promise<Run[]> {
+        const runs = this.data.runs || [];
+        return projectId ? runs.filter((run) => run.projectId === projectId) : runs;
+    }
+
+    async createRun(input: Partial<Run> & Pick<Run, "projectId" | "goal">): Promise<Run> {
+        const run = {
+            id: input.id || makeId("run"),
+            status: "pending",
+            createdAt: new Date().toISOString(),
+            ...input
+        } as Run;
+        this.data.runs = this.data.runs || [];
+        this.data.runs.push(run);
+        await this._save();
+        return run;
+    }
+
+    async getRun(id: string): Promise<Run | undefined> {
+        return (this.data.runs || []).find((run) => run.id === id);
+    }
+
+    async updateRun(id: string, updates: Partial<Run>): Promise<Run | undefined> {
+        const run = await this.getRun(id);
+        if (run) {
+            Object.assign(run, updates);
+            await this._save();
+        }
+        return run;
+    }
+
+    async createStep(input: Partial<Step> & Pick<Step, "id" | "runId" | "name" | "executor">): Promise<Step> {
+        const step = {
+            input: {},
+            dependsOn: [],
+            status: "pending",
+            attempt: 0,
+            maxAttempts: 1,
+            createdAt: new Date().toISOString(),
+            ...input
+        } as Step;
+        this.data.steps = this.data.steps || [];
+        this.data.steps.push(step);
+        await this._save();
+        return step;
+    }
+
+    async listSteps(runId: string): Promise<Step[]> {
+        return (this.data.steps || []).filter((step) => step.runId === runId);
+    }
+
+    async getStep(runId: string, stepId: string): Promise<Step | undefined> {
+        return (this.data.steps || []).find((step) => step.runId === runId && step.id === stepId);
+    }
+
+    async updateStep(runId: string, stepId: string, updates: Partial<Step>): Promise<Step | undefined> {
+        const step = await this.getStep(runId, stepId);
+        if (step) {
+            Object.assign(step, updates);
+            await this._save();
+        }
+        return step;
     }
 
     async listSessions(): Promise<Session[]> {

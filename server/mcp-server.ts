@@ -7,6 +7,7 @@ import type { Store } from "./types.js";
 import type { WorktreeManager } from "./worktrees.js";
 import type { runCommandSafe as RunCommandSafe } from "./utils.js";
 import { makeId } from "./utils.js";
+import type { OrchestrationService } from "./orchestration/service.js";
 import { gitSummary, defaultCheckCommands, mergeCheckRuns, requireWorktreeAndProject } from "./project-helpers.js";
 import {
   errorMessage,
@@ -39,6 +40,7 @@ export type McpContext = {
   run: typeof RunCommandSafe;
   sessionLogRoot: string;
   attachmentRoot: string;
+  orchestration?: OrchestrationService;
 };
 
 function text(value: string) {
@@ -506,6 +508,97 @@ export function createMcpServer(ctx: McpContext): McpServer {
         store.listEvents(40)
       ]);
       return json({ projects, sessions, tasks, worktrees: worktreesList, events });
+    }
+  );
+
+  // ── create_run ────────────────────────────────────────────────
+  server.tool(
+    "create_run",
+    "Create and start an orchestration Run from an explicit Step graph",
+    {
+      projectId: z.string().describe("Project ID"),
+      goal: z.string().describe("Operator goal for this run"),
+      steps: z.array(z.object({
+        id: z.string(),
+        name: z.string().optional(),
+        executor: z.string(),
+        input: z.record(z.string(), z.unknown()).optional(),
+        dependsOn: z.array(z.string()).optional(),
+        maxAttempts: z.number().optional()
+      })).describe("Explicit DAG step definitions")
+    },
+    async ({ projectId, goal, steps }) => {
+      if (!ctx.orchestration) return text("Error: Orchestration service unavailable");
+      return json(await ctx.orchestration.createRun({ projectId, goal, steps }));
+    }
+  );
+
+  // ── list_runs ─────────────────────────────────────────────────
+  server.tool(
+    "list_runs",
+    "List orchestration Runs and their Steps",
+    {
+      projectId: z.string().optional().describe("Filter by project ID")
+    },
+    async ({ projectId }) => {
+      if (!ctx.orchestration) return text("Error: Orchestration service unavailable");
+      return json({ runs: await ctx.orchestration.listRuns(projectId) });
+    }
+  );
+
+  // ── get_run ───────────────────────────────────────────────────
+  server.tool(
+    "get_run",
+    "Get an orchestration Run with Steps",
+    {
+      runId: z.string().describe("Run ID")
+    },
+    async ({ runId }) => {
+      if (!ctx.orchestration) return text("Error: Orchestration service unavailable");
+      const detail = await ctx.orchestration.getRunDetail(runId);
+      return detail ? json(detail) : text("Error: Run not found");
+    }
+  );
+
+  // ── cancel_run ────────────────────────────────────────────────
+  server.tool(
+    "cancel_run",
+    "Cancel an orchestration Run",
+    {
+      runId: z.string().describe("Run ID")
+    },
+    async ({ runId }) => {
+      if (!ctx.orchestration) return text("Error: Orchestration service unavailable");
+      return json({ run: await ctx.orchestration.cancelRun(runId) });
+    }
+  );
+
+  // ── approve_step ──────────────────────────────────────────────
+  server.tool(
+    "approve_step",
+    "Approve a waiting orchestration Step",
+    {
+      runId: z.string().describe("Run ID"),
+      stepId: z.string().describe("Step ID")
+    },
+    async ({ runId, stepId }) => {
+      if (!ctx.orchestration) return text("Error: Orchestration service unavailable");
+      return json(await ctx.orchestration.approveStep(runId, stepId));
+    }
+  );
+
+  // ── reject_step ───────────────────────────────────────────────
+  server.tool(
+    "reject_step",
+    "Reject a waiting orchestration Step",
+    {
+      runId: z.string().describe("Run ID"),
+      stepId: z.string().describe("Step ID"),
+      reason: z.string().optional().describe("Optional rejection reason")
+    },
+    async ({ runId, stepId, reason }) => {
+      if (!ctx.orchestration) return text("Error: Orchestration service unavailable");
+      return json(await ctx.orchestration.rejectStep(runId, stepId, reason));
     }
   );
 

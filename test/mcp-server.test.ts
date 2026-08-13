@@ -9,6 +9,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpServer, type McpContext } from "../server/mcp-server.js";
 import { EventBus } from "../server/events.js";
 import { JsonStore } from "../server/store.js";
+import { OrchestrationService } from "../server/orchestration/service.js";
 
 function stubTmux(overrides: Record<string, Function> = {}) {
   return {
@@ -89,6 +90,15 @@ async function withMcp(t: TestContext, overrides: { tmux?: Record<string, Functi
     sessionLogRoot: join(tempDir, "sessions"),
     attachmentRoot: join(tempDir, "attachments")
   };
+  ctx.orchestration = new OrchestrationService({
+    store,
+    bus,
+    tmux: ctx.tmux,
+    worktrees: ctx.worktrees,
+    runCommand: ctx.run,
+    sessionLogRoot: ctx.sessionLogRoot,
+    attachmentRoot: ctx.attachmentRoot
+  });
 
   const server = createMcpServer(ctx);
   const client = new Client({ name: "test-client", version: "1.0.0" });
@@ -581,6 +591,55 @@ test("get_dashboard returns full gateway state", async (t) => {
   assert.equal(body.projects.length, 1);
 });
 
+test("orchestration MCP tools create, list, get, approve, reject, and cancel runs", async (t) => {
+  const { client, store } = await withMcp(t);
+  const project = await store.createProject({ name: "demo", repoPath: "/repo/demo", defaultBranch: "main", defaultAgent: "shell" });
+
+  const createResult = await client.callTool({
+    name: "create_run",
+    arguments: {
+      projectId: project.id,
+      goal: "mcp approval",
+      steps: [{ id: "approve", executor: "approval" }]
+    }
+  });
+  const created = resultJson(createResult);
+  assert.equal(created.run.status, "waiting_approval");
+
+  const listResult = await client.callTool({ name: "list_runs", arguments: { projectId: project.id } });
+  assert.equal(resultJson(listResult).runs.length, 1);
+
+  const getResult = await client.callTool({ name: "get_run", arguments: { runId: created.run.id } });
+  assert.equal(resultJson(getResult).steps[0].status, "waiting_approval");
+
+  const approveResult = await client.callTool({ name: "approve_step", arguments: { runId: created.run.id, stepId: "approve" } });
+  assert.equal(resultJson(approveResult).run.status, "succeeded");
+
+  const rejectRunResult = await client.callTool({
+    name: "create_run",
+    arguments: {
+      projectId: project.id,
+      goal: "mcp reject",
+      steps: [{ id: "approve", executor: "approval" }]
+    }
+  });
+  const rejectRun = resultJson(rejectRunResult);
+  const rejectResult = await client.callTool({ name: "reject_step", arguments: { runId: rejectRun.run.id, stepId: "approve", reason: "no" } });
+  assert.equal(resultJson(rejectResult).run.status, "failed");
+
+  const cancelRunResult = await client.callTool({
+    name: "create_run",
+    arguments: {
+      projectId: project.id,
+      goal: "mcp cancel",
+      steps: [{ id: "approve", executor: "approval" }]
+    }
+  });
+  const cancelRun = resultJson(cancelRunResult);
+  const cancelResult = await client.callTool({ name: "cancel_run", arguments: { runId: cancelRun.run.id } });
+  assert.equal(resultJson(cancelResult).run.status, "cancelled");
+});
+
 test("list_sessions filters by projectId", async (t) => {
   const { client, store } = await withMcp(t);
   const p1 = await store.createProject({ name: "p1", repoPath: "/p1", defaultBranch: "main", defaultAgent: "shell" });
@@ -618,19 +677,25 @@ test("server advertises all tools via listTools", async (t) => {
   const names = result.tools.map((tool) => tool.name).sort();
   assert.deepEqual(names, [
     "approve_merge",
+    "approve_step",
+    "cancel_run",
     "commit_worktree",
     "create_agent_task",
     "create_project",
+    "create_run",
     "create_session",
     "delete_session",
     "get_dashboard",
+    "get_run",
     "get_session_output",
     "get_task_status",
     "get_worktree_diff",
     "list_projects",
+    "list_runs",
     "list_sessions",
     "list_tasks",
     "propose_merge",
+    "reject_step",
     "run_checks",
     "send_session_input",
     "stop_session"
