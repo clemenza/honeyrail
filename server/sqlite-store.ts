@@ -39,18 +39,28 @@ function normalizeData(input: Partial<StoreData>): StoreData {
   return { ...EMPTY_DATA, ...input };
 }
 
-const SCHEMA_SQL = `
-  PRAGMA journal_mode = WAL;
-  PRAGMA foreign_keys = ON;
-
-  CREATE TABLE IF NOT EXISTS kv_settings (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-  );
-
+const SCHEMA_VERSION_SQL = `
   CREATE TABLE IF NOT EXISTS schema_version (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     version INTEGER NOT NULL
+  );
+`;
+
+const LEGACY_RECORDS_SQL = `
+  CREATE TABLE IF NOT EXISTS records (
+    collection TEXT NOT NULL,
+    id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (collection, id)
+  );
+`;
+
+const STRUCTURED_SCHEMA_SQL = `
+  CREATE TABLE IF NOT EXISTS kv_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS projects (
@@ -160,7 +170,26 @@ const SCHEMA_SQL = `
   CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
 `;
 
-const CURRENT_SCHEMA_VERSION = 2;
+type SchemaMigration = {
+  version: number;
+  name: string;
+  up: (db: DatabaseSync) => void;
+};
+
+const SCHEMA_MIGRATIONS: SchemaMigration[] = [
+  {
+    version: 1,
+    name: "legacy-records-compatibility",
+    up: (db) => db.exec(LEGACY_RECORDS_SQL)
+  },
+  {
+    version: 2,
+    name: "structured-execution-state",
+    up: (db) => db.exec(STRUCTURED_SCHEMA_SQL)
+  }
+];
+
+const CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS.at(-1)!.version;
 
 export class SQLiteStore implements Store {
   private filePath: string;
@@ -193,11 +222,46 @@ export class SQLiteStore implements Store {
   }
 
   private initialize() {
-    this.db.exec(SCHEMA_SQL);
-    const versionRow = this.db.prepare("SELECT version FROM schema_version WHERE id = 1").get() as { version: number } | undefined;
-    if (!versionRow) {
-      this.db.prepare("INSERT INTO schema_version (id, version) VALUES (1, ?)").run(CURRENT_SCHEMA_VERSION);
+    this.db.exec("PRAGMA journal_mode = WAL");
+    this.db.exec("PRAGMA foreign_keys = ON");
+    this.db.exec(SCHEMA_VERSION_SQL);
+
+    this.assertSequentialMigrations();
+    const currentVersion = this.readSchemaVersion();
+    if (currentVersion > CURRENT_SCHEMA_VERSION) {
+      throw new Error(`SQLite schema version ${currentVersion} is newer than supported version ${CURRENT_SCHEMA_VERSION}`);
     }
+
+    for (const migration of SCHEMA_MIGRATIONS) {
+      if (migration.version <= currentVersion) continue;
+      this.runInTransaction(() => {
+        migration.up(this.db);
+        this.setSchemaVersion(migration.version);
+      });
+    }
+  }
+
+  private assertSequentialMigrations() {
+    for (const [index, migration] of SCHEMA_MIGRATIONS.entries()) {
+      const expected = index + 1;
+      if (migration.version !== expected) {
+        throw new Error(`SQLite migration ${migration.name} has version ${migration.version}; expected ${expected}`);
+      }
+    }
+  }
+
+  private readSchemaVersion() {
+    const versionRow = this.db.prepare("SELECT version FROM schema_version WHERE id = 1").get() as { version: number } | undefined;
+    if (!versionRow) return 0;
+    const version = Number(versionRow.version);
+    if (!Number.isInteger(version) || version < 0) {
+      throw new Error(`Invalid SQLite schema version: ${String(versionRow.version)}`);
+    }
+    return version;
+  }
+
+  private setSchemaVersion(version: number) {
+    this.db.prepare("INSERT OR REPLACE INTO schema_version (id, version) VALUES (1, ?)").run(version);
   }
 
   private tableExists(name: string): boolean {

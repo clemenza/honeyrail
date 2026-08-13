@@ -2,6 +2,8 @@
 
 HoneyRail keeps backend-specific behavior in `server/agents/`. The rest of the backend should treat agents as registry-backed adapters, not as scattered string branches.
 
+These adapters belong to the current execution plane. Future orchestration `Executor` concepts should call into or compose this layer rather than replacing adapter registration or task/session/worktree semantics.
+
 ## Contract
 
 The shared interface lives in `server/agents/types.ts`. Each adapter provides:

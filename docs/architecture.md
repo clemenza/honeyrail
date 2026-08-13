@@ -2,6 +2,8 @@
 
 HoneyRail is a local Node.js runtime for verifiable engineering work. The current implementation builds on the Agent Gateway execution/control-plane subsystem: a React frontend, an Express backend, SQLite runtime state, tmux-backed agent execution, and REST/WebSocket/MCP interfaces.
 
+The current system is the execution plane. Future orchestration concepts such as Goal, Recipe, Run, Step, Executor, DAG scheduling, and restart/resume sit above this layer and are not implemented in M0. See [ADR 0001](adr/0001-execution-vs-orchestration-model.md).
+
 ## Runtime Shape
 
 ```text
@@ -57,6 +59,8 @@ Key route groups:
 
 The older JSON store remains present for compatibility. On startup, a legacy `gateway.json` can be imported into SQLite once and then renamed to `gateway.json.bak`.
 
+SQLite startup uses explicit sequential schema migrations. Fresh installs migrate to the latest schema, older supported schemas are upgraded in order, and migration failures stop startup instead of silently continuing.
+
 ## Event Bus
 
 Domain events are published through `domain-events.ts` and `events.ts`. Events are stored and also emitted to connected UI clients so dashboards update after project, session, task, worktree, checks, commit, merge, and delete changes.
@@ -88,7 +92,7 @@ Sessions capture logs under `~/.agent-gateway/sessions` by default. The WebSocke
 
 A project points at a local git repository and defines defaults such as branch, agent, and check commands.
 
-A task is a requested unit of agent work. Worktree-backed task creation:
+A task is an atomic execution primitive for a requested unit of agent work. It is not a workflow node and does not carry parent/child/dependency/DAG semantics in M0. Worktree-backed task creation:
 
 1. Creates a task with `worktree_preparing`.
 2. Creates a git worktree and branch under `AGENT_WORKTREE_ROOT`.
@@ -98,6 +102,8 @@ A task is a requested unit of agent work. Worktree-backed task creation:
 6. Publishes events for UI and MCP observers.
 
 A worktree tracks isolation and verification state, including branch, base revision, status, check runs, commit metadata, merge metadata, and errors.
+
+Future orchestration should create or operate these task/session/worktree primitives from an additive Run/Step/Executor layer rather than overloading `Task`.
 
 ## Checks, Evidence, And Merge
 

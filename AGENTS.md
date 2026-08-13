@@ -44,6 +44,7 @@ environment variables and rerun with them unset as shown above.
 - Initial prompts for Codex/Claude sessions should be passed in the agent startup command, not pasted into the TUI after launch. Pasting the first prompt can leave Codex in `Queued follow-up inputs` without executing the task.
 - If tmux capture reports a missing pane, synchronize the associated session/task/worktree status to `failed`; do not leave the task shown as running.
 - Worktree merge behavior must update both task and worktree status and publish events so the dashboard refreshes.
+- Treat `Task` as an atomic execution primitive tied to one agent/session/worktree lifecycle. Do not add Run/Step/DAG orchestration semantics to `Task` during M0 work.
 
 ## Style
 
