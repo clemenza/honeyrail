@@ -31,7 +31,7 @@ Give it an engineering goal. Get back evidence.
 Positioning:
 
 ```text
-HoneyRail is an open-source runtime for long-horizon, verifiable engineering work. It orchestrates mature coding agents such as Codex and Claude Code together with deterministic tools, environments, evaluators, artifacts, and human approval.
+HoneyRail is an open-source runtime for long-horizon, verifiable engineering work. It will orchestrate mature coding agents such as Codex and Claude Code together with deterministic tools, environments, evaluators, artifacts, and human approval. The current bootstrap preserves the Agent Gateway execution/control-plane subsystem as the v0.1 foundation.
 ```
 
 Core thesis:
@@ -130,3 +130,7 @@ gitleaks git . --redact
 3. Confirm GitHub recognizes the license as Apache-2.0.
 4. Decide whether and when to migrate compatibility identifiers such as `AGENT_GATEWAY_*` and `~/.agent-gateway`.
 5. Tag `v0.1.0` only after validation and release approval.
+
+## M0 Closeout Boundary
+
+M0 freezes the existing `Task` model as an atomic execution primitive tied to session/worktree/check/merge lifecycle state. Future Run/Step orchestration is additive and should not rewrite or overload `Task` with DAG semantics.

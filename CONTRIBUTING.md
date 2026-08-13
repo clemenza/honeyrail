@@ -1,6 +1,6 @@
 # Contributing
 
-HoneyRail is an open-source runtime for long-horizon, verifiable engineering work. Contributions should stay within that scope: goal/task orchestration, project registration, task/session/worktree lifecycle, agent execution boundaries, verification evidence, approval/merge flow, Web/mobile UI, MCP/REST automation, local runtime safety, and documentation.
+HoneyRail is an open-source runtime for long-horizon, verifiable engineering work. Contributions should stay within that scope: project registration, atomic task/session/worktree lifecycle, agent execution boundaries, verification evidence, approval/merge flow, Web/mobile UI, MCP/REST automation, local runtime safety, documentation, and future orchestration layers above the execution runtime.
 
 ## Local Setup
 
@@ -64,6 +64,7 @@ Pull requests should:
 
 - Keep changes scoped to the stated problem.
 - Preserve existing SQLite state, `~/.agent-gateway` runtime data, `AGENT_GATEWAY_*` configuration, REST paths, MCP tool names, and tmux-backed session behavior unless a migration is explicitly required. These are compatibility surfaces inherited from the Agent Gateway subsystem.
+- Preserve `Task` as an atomic execution primitive. Do not add workflow dependency, parent/child, or DAG semantics to `Task`; put future orchestration concepts above it.
 - Add focused tests for lifecycle, project management, auth, ops scripts, or regression-prone behavior.
 - Update README or docs when setup, security posture, public behavior, or supported agents change.
 - Include validation results.

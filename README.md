@@ -2,7 +2,7 @@
 
 Give it an engineering goal. Get back evidence.
 
-HoneyRail is an open-source runtime for long-horizon, verifiable engineering work. It orchestrates mature coding agents such as Codex and Claude Code together with deterministic tools, environments, evaluators, artifacts, and human approval.
+HoneyRail is an open-source runtime for long-horizon, verifiable engineering work. It will orchestrate mature coding agents such as Codex and Claude Code together with deterministic tools, environments, evaluators, artifacts, and human approval. The current v0.1 foundation is the execution/control-plane runtime those orchestration features will build on.
 
 We don't build another coding agent. We harness the best ones.
 
@@ -37,10 +37,10 @@ HoneyRail adds a local runtime around those agents so each engineering goal can 
                       v
                 HoneyRail
         +-----------------------+
-        | Goal/task lifecycle   |
+        | Execution runtime     |
+        | Atomic task lifecycle |
         | Worktree isolation    |
-        | Checks & evidence     |
-        | Approval / merge      |
+        | Checks / approval     |
         | Events & state        |
         +-----------+-----------+
                     |
@@ -50,7 +50,7 @@ HoneyRail adds a local runtime around those agents so each engineering goal can 
         Codex     Claude    Shell/...
 ```
 
-See [docs/architecture.md](docs/architecture.md) for the current implementation.
+See [docs/architecture.md](docs/architecture.md) for the current implementation and [docs/adr/0001-execution-vs-orchestration-model.md](docs/adr/0001-execution-vs-orchestration-model.md) for the M0 architecture boundary.
 
 ## Quick Start
 
@@ -154,6 +154,8 @@ Create task
 
 The current UI exposes commit, checks, and merge actions directly on worktrees. MCP clients can use `propose_merge` to preview risk and `approve_merge` to perform the merge after an operator decision.
 
+In v0.1, a task is an atomic execution primitive: one agent execution, one worktree, one session, and one verification/merge lifecycle. Future Run/Step orchestration will sit above tasks rather than changing that meaning.
+
 ## Interfaces
 
 - Web UI: project registry, task creation, session console, worktree inventory, diffs, checks, commits, and merges.
@@ -219,18 +221,13 @@ Local generated or runtime directories such as `dist/`, `node_modules/`, `output
 
 HoneyRail is pre-1.0 developer tooling. APIs, UI flows, and MCP tool shapes may evolve as the project hardens. Issues and focused pull requests are welcome.
 
-## Roadmap Themes
+## Roadmap
 
-- Declarative job specs
-- Evidence bundles
-- Policy and quality gates
-- GitHub issue and pull request workflows
-- Agent comparison and evaluation
-- Reliability and recovery improvements
+See [ROADMAP.md](ROADMAP.md). Near-term milestones are additive: M1 introduces Run/Step/Executor orchestration above the current execution runtime, while later milestones add evidence, quality gates, environment abstraction, benchmarking, and stable contracts.
 
 ## First Major Milestone: Database Testing Harness
 
-The first major milestone is a future/reference workflow for database testing. This bootstrap does not implement the harness; it establishes the runtime that can later orchestrate it.
+The Database Testing Harness is a future/reference workflow, not a feature implemented in v0.1. This bootstrap establishes the runtime that can later orchestrate it.
 
 ```text
 Goal
