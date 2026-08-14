@@ -1,111 +1,43 @@
-# HoneyRail Bootstrap Readiness
+# Open Source Readiness
 
-Date: 2026-08-13
+Date: 2026-08-14
 
 Repository: `clemenza/honeyrail`
 
-Source snapshot: `clemenza/codex-remote-controller` `origin/main`
+Latest inspected main SHA: `631789922d3bfb29dd434ca725ca9e23e9b8cb7f`
 
-Source main SHA: `43949aa387be3efb1c66258b04ed6eedcb579422`
+HoneyRail is still private until maintainers explicitly approve the public switch. This checklist tracks code, documentation, runtime hygiene, verification, security, and GitHub-side release actions without marking unverified repository settings complete.
 
-## Bootstrap Strategy
+## Repository
 
-HoneyRail starts as a fresh-history repository created from the latest committed source tree of `clemenza/codex-remote-controller`.
+- Package name is `honeyrail`.
+- Package license is `Apache-2.0`.
+- Repository, bugs, and homepage metadata point to `https://github.com/clemenza/honeyrail`.
+- GitHub currently detects the license as Apache-2.0.
+- Repository description is `Open-source runtime for long-horizon, verifiable engineering work.`
+- Default branch is `main`.
+- No open issues or pull requests were present at the latest inspection.
+- GitHub topics are set: `agentic-ai`, `ai-agents`, `coding-agents`, `codex`, `claude-code`, `database-testing`, `postgresql`, `evaluation`, `test-automation`, `developer-tools`, `mcp`, `self-hosted`.
 
-The old repository is preserved as the original Agent Gateway / Codex Remote Controller project history. HoneyRail does not copy the old `.git` directory and does not mirror old commit history.
+## Documentation
 
-## Branding Position
+- README describes the implemented runtime, alpha orchestration primitives, verification data, quality gates, and PostgreSQL Database Testing Harness Alpha.
+- README preserves the positioning: `We don't build another coding agent. We harness the best ones.`
+- README includes the architecture flow from goal through quality gate decision to verified result.
+- `ROADMAP.md` marks M1/M2 and the PostgreSQL harness as alpha implementations while keeping future environment and benchmarking work directional.
+- `docs/database-testing-harness-alpha.md` documents Docker and local-binary PostgreSQL modes, artifacts, evidence, evaluations, quality gate decisions, and limitations.
+- `SECURITY.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, and `LICENSE` are present.
 
-Product name:
+## Runtime Hygiene
 
-```text
-HoneyRail
-```
+- Runtime and generated outputs are ignored: `node_modules/`, `dist/`, `output/`, `test-results/`, `playwright-report/`, `coverage/`, logs, `.omx/`, `.omc/`, `.remember/`, and `.playwright-cli/`.
+- Local config, secrets, and state are ignored: `.env`, `.env.*`, `gateway.json`, `gateway.json.bak`, `attachments/`, `sessions/`, `agent-worktrees/`, `*.sqlite`, `*.sqlite-*`, `*.db`, `*.pem`, `*.key`, `*.p12`, and `*.pfx`.
+- `.env.example` remains allowed if added later.
+- Runtime state under `~/.agent-gateway/` and `~/agent-worktrees/` must not be copied into the repository.
 
-Tagline:
+## Verification
 
-```text
-Give it an engineering goal. Get back evidence.
-```
-
-Positioning:
-
-```text
-HoneyRail is an open-source runtime for long-horizon, verifiable engineering work. It will orchestrate mature coding agents such as Codex and Claude Code together with deterministic tools, environments, evaluators, artifacts, and human approval. The current bootstrap preserves the Agent Gateway execution/control-plane subsystem as the v0.1 foundation.
-```
-
-Core thesis:
-
-```text
-We don't build another coding agent. We harness the best ones.
-```
-
-## Compatibility Identifiers
-
-The Agent Gateway execution/control-plane subsystem remains the current implementation base. The following identifiers are intentionally preserved unless a future migration explicitly changes them:
-
-- `AGENT_GATEWAY_*` environment variables
-- `~/.agent-gateway` runtime paths
-- MCP tool names
-- Internal MCP server name `codex-remote-controller`
-- REST paths
-- SQLite schema/state names
-- legacy tmux session naming conventions such as `agw_server`; current HoneyRail ops scripts default to `honeyrail_server`
-
-## Repository Metadata
-
-Expected package metadata:
-
-```json
-{
-  "name": "honeyrail",
-  "version": "0.1.0",
-  "license": "Apache-2.0"
-}
-```
-
-Repository URLs should point to:
-
-```text
-https://github.com/clemenza/honeyrail
-```
-
-## First Major Milestone: Database Testing Harness
-
-This is a future/reference workflow and is not implemented during bootstrap.
-
-```text
-Goal
-  -> task decomposition
-  -> requirement analysis
-  -> acquire package/build
-  -> provision environment
-  -> generate test plan/cases
-  -> cross review
-  -> generate automation
-  -> execute
-  -> triage/reproduce failures
-  -> issue draft
-  -> test report
-  -> evaluation
-```
-
-## Runtime Artifact Policy
-
-Runtime/generated directories remain ignored and should not be committed:
-
-- `node_modules/`
-- `dist/`
-- `test-results/`
-- `.omx/`
-- `.remember/`
-- `.playwright-cli/`
-- `.omc/`
-- local gateway logs/state
-
-## Validation Checklist
-
-Before publishing or tagging, run:
+Run this clean-clone gate before tagging or making the repository public:
 
 ```sh
 npm ci
@@ -117,20 +49,41 @@ npm run test:e2e
 git diff --check
 ```
 
-Run a full-history secret scan when `gitleaks` is available:
+Required CI on push and pull request should continue to cover:
 
-```sh
-gitleaks git . --redact
-```
+- `npm ci`
+- `npm run typecheck`
+- `env -u AGENT_GATEWAY_ACCOUNTS -u AGENT_GATEWAY_TOKEN -u AGENT_GATEWAY_SESSION_SECRET npm test`
+- `npm run build`
 
-## Remaining Actions Before Public
+The PostgreSQL harness may skip real Docker/local-binary environment tests when PostgreSQL is unavailable. CI must not require Docker image downloads for the default test path.
 
-1. Keep `clemenza/honeyrail` private until maintainers explicitly approve public release.
-2. Enable GitHub private vulnerability reporting before making the repository public.
-3. Confirm GitHub recognizes the license as Apache-2.0.
-4. Decide whether and when to migrate compatibility identifiers such as `AGENT_GATEWAY_*` and `~/.agent-gateway`.
-5. Tag `v0.1.0` only after validation and release approval.
+## Security
 
-## M0 Closeout Boundary
+- Run `npm audit` against the official npm registry before publication.
+- Run a full-history secret scan with `gitleaks git . --redact` when available.
+- Also scan source text for common token, private key, password, and bearer-token patterns.
+- Review Git author identity before publishing. Do not rewrite history automatically; decide explicitly if author names or emails should change.
+- Keep examples free of real credentials, private hostnames, cookies, OAuth secrets, bearer tokens, and database passwords.
+- Treat HoneyRail as privileged local developer tooling: it can launch agents, run shell commands, control tmux, read/write repositories, accept uploads, expose REST/WebSocket/MCP surfaces, and commit or merge code.
 
-M0 freezes the existing `Task` model as an atomic execution primitive tied to session/worktree/check/merge lifecycle state. Future Run/Step orchestration is additive and should not rewrite or overload `Task` with DAG semantics.
+## Public Switch
+
+Latest GitHub API inspection on 2026-08-14:
+
+- Repository visibility is private.
+- Dependabot vulnerability alerts are disabled.
+- Dependabot automated security fixes endpoint returned success, but alerts still need to be enabled before publication.
+- Private vulnerability reporting returned 404 and is not verified as enabled.
+- Secret scanning status was not available in the repository metadata returned to the current token.
+- Repository topics are set.
+
+Do not make the repository public until these GitHub-side items are verified or intentionally accepted:
+
+- Private vulnerability reporting is enabled, or SECURITY.md has an approved public fallback process.
+- Dependabot alerts are enabled.
+- Dependabot security updates are enabled where available.
+- Secret scanning is enabled where available for the plan/repository visibility.
+- Repository topics remain set.
+- Maintainers have approved visibility change from private to public.
+- A final clean-clone release gate has passed on the exact commit being published.

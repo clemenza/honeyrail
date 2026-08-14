@@ -1,6 +1,6 @@
 # Security Policy
 
-HoneyRail is local developer tooling that can launch coding agents, execute shell commands, control tmux sessions, read and write repositories, receive uploaded files, expose remote interfaces, and merge code. Deploy it with the same care you would apply to a privileged local automation service.
+HoneyRail is local developer tooling that can launch coding agents, execute shell commands, control tmux sessions, read and write repositories, receive uploaded files, expose REST/WebSocket/MCP interfaces, commit changes, and merge code. Deploy it with the same care you would apply to a privileged local automation service.
 
 ## Threat Model
 
@@ -26,7 +26,7 @@ Potentially untrusted:
 - Leaked bearer tokens or session secrets.
 - Agent prompt injection through repository content, uploaded files, terminal output, or MCP inputs.
 - Malicious repositories with unsafe scripts, hooks, generated files, or test commands.
-- Unsafe automation around merge and approval flows.
+- Unsafe automation around commit, merge, approval, override, and rejection flows.
 - Path traversal or unsafe file upload handling.
 - Over-privileged MCP clients that can start sessions, send input, run checks, or merge work.
 
@@ -45,7 +45,7 @@ Potentially untrusted:
 
 ## Reporting Vulnerabilities
 
-If GitHub private vulnerability reporting is enabled for this repository, please use the repository's private security advisory workflow. If it is not enabled, open a minimal public issue that says you need to report a vulnerability, but do not include exploit details, secrets, private hostnames, or sensitive logs in the issue.
+Before this repository is made public, maintainers should enable GitHub private vulnerability reporting. Once that is enabled, please use the repository's private security advisory workflow. If it is not enabled, open a minimal public issue that says you need to report a vulnerability, but do not include exploit details, secrets, private hostnames, or sensitive logs in the issue.
 
 Maintainers should enable GitHub private vulnerability reporting before switching the repository to public:
 

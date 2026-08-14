@@ -2,11 +2,13 @@
 
 Give it an engineering goal. Get back evidence.
 
-HoneyRail is an open-source runtime for long-horizon, verifiable engineering work. It will orchestrate mature coding agents such as Codex and Claude Code together with deterministic tools, environments, evaluators, artifacts, and human approval. The current v0.1 foundation is the execution/control-plane runtime those orchestration features will build on.
+HoneyRail is an open-source runtime for long-horizon, verifiable engineering work.
+
+It orchestrates mature coding agents and deterministic tools through persisted DAG workflows, artifacts, evidence, evaluators, quality gates, human approvals, and reproducible engineering harnesses.
 
 We don't build another coding agent. We harness the best ones.
 
-HoneyRail starts from the Agent Gateway execution/control-plane subsystem: isolated git worktrees, tmux-backed agent sessions, task and worktree lifecycle state, project checks, evidence capture, REST/WebSocket/MCP automation, and an explicit human review step before merge.
+HoneyRail starts from the Agent Gateway execution/control-plane subsystem: isolated git worktrees, tmux-backed agent sessions, task and worktree lifecycle state, project checks, evidence capture, REST/WebSocket/MCP automation, and an explicit human review step before merge. Run/Step orchestration, verification records, quality gate decisions, and the PostgreSQL Database Testing Harness Alpha now sit above that execution plane.
 
 ## Why
 
@@ -16,19 +18,22 @@ HoneyRail adds a local runtime around those agents so each engineering goal can 
 
 ## What It Does
 
-- Run multiple coding-agent backends from one local console.
-- Create isolated git worktrees per task.
-- Monitor project, task, session, worktree, and tmux state.
-- Interact from desktop browsers or the mobile/PWA session UI.
-- Inspect diffs, git status, and recent commits.
-- Run configured project checks.
-- Capture check results and session evidence.
-- Review work before merge.
-- Expose workflows through REST, WebSocket, and MCP interfaces.
-- Create explicit multi-step Runs with dependency-ordered Steps and approval barriers.
-- Self-host locally on your own machine or trusted network.
+- Runs persisted `Run` / `Step` DAG workflows above the atomic task/session/worktree lifecycle.
+- Executes workflow steps through `agent-task`, `shell`, `check`, `approval`, and PostgreSQL harness executors.
+- Creates isolated git worktrees per task and monitors project, task, session, worktree, and tmux state.
+- Captures artifacts and evidence from checks, sessions, and harness steps.
+- Runs deterministic evaluators plus async/custom evaluator registry entries.
+- Persists `QualityGateDecision` records for pass, fail, operator override, and operator rejection.
+- Supports human approval, rejection, commit, and merge review flows.
+- Provides a PostgreSQL Database Testing Harness Alpha for Docker or local-binary transaction/restart validation.
+- Exposes inspection and control through the web UI, REST, WebSocket, and MCP interfaces.
+- Self-hosts locally on your own machine or trusted network.
 
 ## Architecture
+
+```text
+Goal -> Run / DAG -> Executors -> Artifacts -> Evidence -> Evaluation -> Quality Gate Decision -> Human override / progression -> Verified result
+```
 
 ```text
                  Web / Mobile
@@ -231,26 +236,24 @@ HoneyRail is pre-1.0 developer tooling. APIs, UI flows, and MCP tool shapes may 
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). Near-term milestones are additive: M1 introduces Run/Step/Executor orchestration above the current execution runtime, while later milestones add evidence, quality gates, environment abstraction, benchmarking, and stable contracts.
+See [ROADMAP.md](ROADMAP.md). M1/M2 orchestration and verification primitives are present as alpha interfaces. The Database Testing Harness is also available as a PostgreSQL Alpha. Later milestones harden environment abstraction, benchmarking, distributed operation, and stable contracts.
 
 ## First Major Milestone: Database Testing Harness
 
-The Database Testing Harness is a future/reference workflow, not a feature implemented in v0.1. This bootstrap establishes the runtime that can later orchestrate it.
+The Database Testing Harness Alpha is implemented for PostgreSQL transaction/restart validation through Docker or local PostgreSQL binaries. It deploys a temporary target, runs deterministic SQL checks, records artifacts and evidence, evaluates DB assertions, writes quality gate decisions, and produces a final Markdown report.
+
+See [docs/database-testing-harness-alpha.md](docs/database-testing-harness-alpha.md) for the current scope, payloads, artifacts, evidence, quality gate behavior, and limitations.
 
 ```text
 Goal
-  -> task decomposition
-  -> requirement analysis
-  -> acquire package/build
-  -> provision environment
-  -> generate test plan/cases
-  -> cross review
-  -> generate automation
-  -> execute
-  -> triage/reproduce failures
-  -> issue draft
-  -> test report
-  -> evaluation
+  -> Run / DAG
+  -> PostgreSQL executor
+  -> temporary Docker or local-binary environment
+  -> deterministic transaction/restart checks
+  -> artifacts and evidence
+  -> db-assertions evaluator
+  -> QualityGateDecision
+  -> final report
 ```
 
 ## License

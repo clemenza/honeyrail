@@ -40,7 +40,7 @@ docker run --rm postgres:16-alpine postgres --version
 The default Docker image is `postgres:16-alpine`. Override it per run with `input.dockerImage`, or process-wide with:
 
 ```sh
-HONEYRAIL_POSTGRES_DOCKER_IMAGE=docker-0.unsee.tech/pgvector/pgvector:pg16
+HONEYRAIL_POSTGRES_DOCKER_IMAGE=<your-postgres-image>
 ```
 
 The optional test suite only runs Docker harness tests when Docker is available and a PostgreSQL image is available locally, or when `HONEYRAIL_POSTGRES_DOCKER_IMAGE` is set. This keeps CI from depending on Docker Hub network pulls.
