@@ -197,7 +197,7 @@ test("POST /api/tasks starts the agent with the task prompt", async (t) => {
   assert.equal(response.status, 201);
   assert.equal(startCall.input.command, "codex 'make the first task prompt respond'");
   assert.equal(tmuxCalls.some((call) => call.method === "sendInput"), false);
-  assert.deepEqual(events.map((event) => event.type), ["session.input_sent", "task.started"]);
+  assert.deepEqual(events.map((event) => event.type), ["session.created", "session.input_sent", "task.started"]);
 });
 
 test("POST /api/tasks starts the agent with task image attachments", async (t) => {
@@ -234,11 +234,11 @@ test("POST /api/tasks starts the agent with task image attachments", async (t) =
   assert.match(startCall.input.command, /^codex '/);
   assert.match(startCall.input.command, /inspect this screenshot Attached file paths:\s+1\. .*\/attachments\/img_[^/]+\.png/);
   assert.equal(tmuxCalls.some((call) => call.method === "sendInput"), false);
-  assert.equal(events[0].type, "session.input_sent");
-  assert.equal(events[0].payload.preview, "inspect this screenshot");
-  assert.equal(events[0].payload.attachments.length, 1);
-  assert.equal(events[0].payload.attachments[0].name, "failure.png");
-  assert.match(events[0].payload.attachments[0].url, /^\/api\/attachments\/img_[^/]+\.png$/);
+  const inputEvent = events.find((event) => event.type === "session.input_sent")!;
+  assert.equal(inputEvent.payload.preview, "inspect this screenshot");
+  assert.equal(inputEvent.payload.attachments.length, 1);
+  assert.equal(inputEvent.payload.attachments[0].name, "failure.png");
+  assert.match(inputEvent.payload.attachments[0].url, /^\/api\/attachments\/img_[^/]+\.png$/);
 });
 
 test("POST /api/tasks rejects unknown persisted project default agents before launching shell", async (t) => {

@@ -114,7 +114,14 @@ function applySSEDelta(state: GatewayState, eventType: string, data: SSEPayload)
       if (!data.sessionId) return null;
       const status = payload.status as string | undefined;
       if (!status) return null;
-      return { ...state, sessions: patchList<SessionData>(state.sessions, data.sessionId, { status }), events: appendEvent(state.events, data) };
+      return {
+        ...state,
+        sessions: patchList<SessionData>(state.sessions, data.sessionId, {
+          status,
+          error: (payload.error || payload.reason) as string | undefined
+        }),
+        events: appendEvent(state.events, data)
+      };
     }
 
     case "session.updated": {
@@ -159,7 +166,28 @@ function applySSEDelta(state: GatewayState, eventType: string, data: SSEPayload)
 
     case "task.failed": {
       if (!data.taskId) return null;
-      return { ...state, tasks: patchList<TaskData>(state.tasks, data.taskId, { status: "failed" }), events: appendEvent(state.events, data) };
+      const error = (payload.error || payload.reason) as string | undefined;
+      const worktreeId = payload.worktreeId as string | undefined;
+      return {
+        ...state,
+        tasks: patchList<TaskData>(state.tasks, data.taskId, {
+          status: "failed",
+          error
+        }),
+        worktrees: worktreeId
+          ? patchList<WorktreeData>(state.worktrees, worktreeId, { status: "failed", error })
+          : state.worktrees,
+        events: appendEvent(state.events, data)
+      };
+    }
+
+    case "task.completed": {
+      if (!data.taskId) return null;
+      return {
+        ...state,
+        tasks: patchList<TaskData>(state.tasks, data.taskId, { status: "done", error: undefined }),
+        events: appendEvent(state.events, data)
+      };
     }
 
     case "run.created":
@@ -191,6 +219,7 @@ export function useGatewayData(enabled = true) {
   const [health, setHealth] = useState<HealthData | null>(null);
   const [error, setError] = useState("");
   const [connectionStatus, setConnectionStatus] = useState("connecting");
+  const [loaded, setLoaded] = useState(false);
 
   const refresh = useCallback(async () => {
     if (!enabled) return;
@@ -201,6 +230,8 @@ export function useGatewayData(enabled = true) {
       setError("");
     } catch (err: unknown) {
       setError((err as Error).message);
+    } finally {
+      setLoaded(true);
     }
   }, [enabled]);
 
@@ -249,8 +280,12 @@ export function useGatewayData(enabled = true) {
     stream.addEventListener("worktree.checks_failed", incrementalHandler);
     stream.addEventListener("worktree.merged", incrementalHandler);
     stream.addEventListener("worktree.discarded", incrementalHandler);
-    stream.addEventListener("task.started", incrementalHandler);
+    stream.addEventListener("task.started", (event) => {
+      incrementalHandler(event);
+      refresh();
+    });
     stream.addEventListener("task.failed", incrementalHandler);
+    stream.addEventListener("task.completed", incrementalHandler);
     for (const type of ["run.created", "run.started", "run.running", "run.waiting_input", "run.waiting_approval", "run.succeeded", "run.failed", "run.cancelled", "step.ready", "step.started", "step.waiting_input", "step.waiting_approval", "step.succeeded", "step.failed", "step.retrying", "step.skipped", "step.cancelled"]) {
       stream.addEventListener(type, () => refresh());
     }
@@ -273,5 +308,5 @@ export function useGatewayData(enabled = true) {
     return () => stream.close();
   }, [enabled]);
 
-  return { state, health, error, connectionStatus, refresh };
+  return { state, health, error, connectionStatus, loaded, refresh };
 }

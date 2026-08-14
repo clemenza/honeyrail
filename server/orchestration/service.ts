@@ -47,6 +47,12 @@ export class OrchestrationService {
     this.sessionLogRoot = runtime.sessionLogRoot;
     this.attachmentRoot = runtime.attachmentRoot;
     this.executors = runtime.executors || createDefaultExecutorRegistry();
+    this.bus.subscribe((event) => {
+      if (!["task.failed", "task.completed"].includes(event.type) || !event.taskId) return;
+      this.scheduleRunsForTask(event.taskId).catch((error) => {
+        console.error(`Failed to reschedule runs for task ${event.taskId}:`, error);
+      });
+    });
   }
 
   executorRegistry() {
@@ -109,6 +115,19 @@ export class OrchestrationService {
       await this.scheduleLoop(runId);
     } finally {
       this.scheduling.delete(runId);
+    }
+  }
+
+  private async scheduleRunsForTask(taskId: string) {
+    const runs = await this.store.listRuns();
+    for (const run of runs.filter((item) => !isRunTerminal(item.status))) {
+      const steps = await this.store.listSteps(run.id);
+      const linkedActiveStep = steps.some((step) =>
+        step.executor === "agent-task" &&
+        step.executionRef?.taskId === taskId &&
+        ["running", "waiting_input", "waiting_approval"].includes(step.status)
+      );
+      if (linkedActiveStep) await this.scheduleRun(run.id);
     }
   }
 

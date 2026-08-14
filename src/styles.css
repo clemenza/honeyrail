@@ -1828,6 +1828,15 @@ textarea:focus {
   align-items: start;
 }
 
+.record-error {
+  grid-column: 1 / -1;
+  color: var(--color-danger);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 .worktree-diff-preview {
   grid-column: 1 / -1;
   max-height: 180px;

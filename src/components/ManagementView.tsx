@@ -37,7 +37,7 @@ function EventFeed({ events, className }: { events: EventData[]; className?: str
   );
 }
 
-function SessionsTable({ sessions, onOpenSession }: { sessions: SessionData[]; onOpenSession: (sessionId: string) => void }) {
+function SessionsTable({ sessions, loading, onOpenSession }: { sessions: SessionData[]; loading: boolean; onOpenSession: (sessionId: string) => void }) {
   return (
     <section className="panel table-panel">
       <div className="panel-heading">
@@ -65,11 +65,13 @@ function SessionsTable({ sessions, onOpenSession }: { sessions: SessionData[]; o
             </button>
           </div>
         ))}
-        {!sessions.length ? (
+        {loading ? (
           <div className="table-empty">
             <div className="skeleton skeleton-card" style={{ marginBottom: 8 }} />
             <div className="skeleton skeleton-text" style={{ width: "40%" }} />
           </div>
+        ) : !sessions.length ? (
+          <div className="table-empty">No sessions yet.</div>
         ) : null}
       </div>
     </section>
@@ -89,7 +91,8 @@ function WorktreeList({ tasks, worktrees = [], onMerged }: { tasks: TaskData[]; 
       taskId: task.id,
       title: task.title,
       agent: task.agent,
-      status: task.status
+      status: task.status,
+      error: task.error
     }));
 
   const runWorktreeAction = async (worktree: WorktreeItem, action: string, label: string, body: Record<string, unknown> = {}) => {
@@ -149,6 +152,7 @@ function WorktreeList({ tasks, worktrees = [], onMerged }: { tasks: TaskData[]; 
         {worktreeItems.slice().reverse().map((worktree) => {
           const task = tasks.find((item) => item.id === worktree.taskId);
           const status = worktree.status || task?.status || "created";
+          const failureReason = worktree.error || task?.error;
           const terminal = ["merged", "discarded", "cancelled"].includes(status);
           const diff = diffs[worktree.id];
           const isExpanded = expandedActions === worktree.id;
@@ -157,7 +161,7 @@ function WorktreeList({ tasks, worktrees = [], onMerged }: { tasks: TaskData[]; 
               <strong className="truncate">{task?.title || worktree.title || worktree.id}</strong>
               <span className="truncate">{worktree.branch || worktree.id}</span>
               <span>{worktree.agent || task?.agent}</span>
-              <StatusPill tone={status === "merged" || status === "checks_passed" || status === "committed" ? "good" : status === "checks_failed" ? "bad" : status === "agent_running" ? "good" : "warn"}>{status}</StatusPill>
+              <StatusPill tone={status === "merged" || status === "checks_passed" || status === "committed" ? "good" : status === "failed" || status === "checks_failed" ? "bad" : status === "agent_running" ? "good" : "warn"}>{status}</StatusPill>
               <div className="worktree-actions">
                 <button type="button" className="secondary-button table-action" onClick={() => showDiff(worktree)} disabled={!worktree.id || busyId === `${worktree.id}:diff`}>
                   <RefreshCw size={15} /> Diff
@@ -178,6 +182,7 @@ function WorktreeList({ tasks, worktrees = [], onMerged }: { tasks: TaskData[]; 
               {diff ? (
                 <pre className="worktree-diff-preview">{diff.diffStat || diff.status || diff.commits || "No diff."}</pre>
               ) : null}
+              {failureReason ? <small className="record-error" role="alert">{failureReason}</small> : null}
             </div>
           );
         })}
@@ -334,9 +339,10 @@ function ManagementSummary({ state, onOpenSession, onNavigate }: { state: Gatewa
   );
 }
 
-export function MainContent({ activeView, state, selectedProject, setSelectedProjectId, refresh, onOpenSession, showFabForm, setShowFabForm }: {
+export function MainContent({ activeView, state, loaded, selectedProject, setSelectedProjectId, refresh, onOpenSession, showFabForm, setShowFabForm }: {
   activeView: string;
   state: GatewayState;
+  loaded: boolean;
   selectedProject: ProjectData | undefined;
   setSelectedProjectId: (id: string) => void;
   refresh: () => Promise<void>;
@@ -378,7 +384,7 @@ export function MainContent({ activeView, state, selectedProject, setSelectedPro
               subtitle="Start a tmux-backed shell, codex, claude, or hermes process."
             />
           ) : null}
-          <SessionsTable sessions={state.sessions} onOpenSession={onOpenSession} />
+          <SessionsTable sessions={state.sessions} loading={!loaded} onOpenSession={onOpenSession} />
         </div>
         <div className="secondary-column">
           <SessionLauncher
@@ -455,7 +461,7 @@ export function MainContent({ activeView, state, selectedProject, setSelectedPro
     <div className="dashboard-layout">
       <ManagementSummary state={state} onOpenSession={onOpenSession} />
       <div className="dashboard-management-grid">
-        <SessionsTable sessions={state.sessions} onOpenSession={onOpenSession} />
+        <SessionsTable sessions={state.sessions} loading={!loaded} onOpenSession={onOpenSession} />
         <TaskTable tasks={state.tasks} projects={state.projects} />
       </div>
       <EventFeed events={state.events} />

@@ -43,6 +43,24 @@ export const codexAdapter: AgentAdapter = {
     return rule ? { label: rule.label, keys: rule.keys } : null;
   },
 
+  findFatalError(output) {
+    const versionError = output.match(/The ['‘’"]([^'‘’"]+)['‘’"] model requires\s+a\s+newer version of Codex\.\s+Please upgrade to the latest app or CLI and try\s+again\./i);
+    if (!versionError) return null;
+    const model = versionError[1];
+    return {
+      code: "codex_cli_upgrade_required",
+      message: `Codex CLI is too old for model ${model}. Upgrade it with \`npm install -g @openai/codex@latest\`, then start a new task.`
+    };
+  },
+
+  hasCompletedTask(output) {
+    const completedAt = output.lastIndexOf("Worked for ");
+    if (completedAt === -1) return false;
+    const workingAt = output.lastIndexOf("Working (");
+    const recentTail = output.split("\n").slice(-12).join("\n");
+    return completedAt > workingAt && /(?:^|\n)›\s+/m.test(recentTail);
+  },
+
   async detectInstallation(run) {
     return detectCli(this, run, "codex");
   }

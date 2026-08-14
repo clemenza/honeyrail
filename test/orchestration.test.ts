@@ -12,7 +12,7 @@ import { AgentTaskExecutor } from "../server/executors/agent-task.js";
 import { CheckExecutor } from "../server/executors/check.js";
 import { ShellExecutor } from "../server/executors/shell.js";
 import type { ExecutionHandle, ExecutionState, Executor, StepExecutionContext } from "../server/executors/types.js";
-import { EventBus } from "../server/events.js";
+import { EventBus, publishEvent } from "../server/events.js";
 import { validateStepGraph } from "../server/orchestration/dag.js";
 import { OrchestrationService } from "../server/orchestration/service.js";
 import { assertStepTransition, deriveRunStatus } from "../server/orchestration/state-machine.js";
@@ -321,6 +321,123 @@ test("AgentTaskExecutor creates one task, links execution refs, and recovery ins
   await restarted.recover();
   assert.equal((await store.listTasks()).length, 1);
   assert.equal((await store.getStep(created.run.id, "agent"))!.status, "succeeded");
+});
+
+test("task.failed immediately fails the linked agent step and run without a restart", async (t) => {
+  const registry = new ExecutorRegistry([new AgentTaskExecutor(), new MemoryExecutor("check")]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-agent-failure-event-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: {
+      startSession: async () => {},
+      killSession: async () => {}
+    } as any,
+    worktrees: {
+      create: async ({ project, title, agent }: any) => ({
+        projectId: project.id,
+        path: join(tempDir, "wt"),
+        branch: `${agent}/${title}`,
+        baseBranch: "main",
+        baseRevision: "base",
+        title,
+        agent
+      })
+    } as any,
+    runCommand: (async () => ({ ok: true, stdout: "", stderr: "" })) as any,
+    sessionLogRoot: join(tempDir, "sessions"),
+    attachmentRoot: join(tempDir, "attachments"),
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "propagate agent failure",
+    steps: [
+      { id: "implement", executor: "agent-task", input: { agent: "codex", prompt: "do work" } },
+      { id: "verify", executor: "check", dependsOn: ["implement"] }
+    ]
+  });
+  const implement = (await store.getStep(created.run.id, "implement"))!;
+  const taskId = String(implement.executionRef?.taskId);
+  const reason = "Codex CLI is too old. Upgrade it, then start a new task.";
+  await store.updateTask(taskId, { status: "failed", failedAt: new Date().toISOString(), error: reason });
+  await publishEvent(store, bus, {
+    type: "task.failed",
+    projectId: project.id,
+    taskId,
+    payload: { reason }
+  });
+
+  for (let attempt = 0; attempt < 50 && (await store.getRun(created.run.id))?.status !== "failed"; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  assert.equal((await store.getRun(created.run.id))!.status, "failed");
+  assert.equal((await store.getStep(created.run.id, "implement"))!.status, "failed");
+  assert.equal((await store.getStep(created.run.id, "implement"))!.error, reason);
+  assert.equal((await store.getStep(created.run.id, "verify"))!.status, "skipped");
+});
+
+test("task.completed immediately advances the linked agent step to approval", async (t) => {
+  const registry = new ExecutorRegistry([new AgentTaskExecutor(), new MemoryExecutor("check"), new ApprovalTestExecutor()]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-agent-completion-event-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: { startSession: async () => {}, killSession: async () => {} } as any,
+    worktrees: {
+      create: async ({ project, title, agent }: any) => ({
+        projectId: project.id,
+        path: join(tempDir, "wt"),
+        branch: `${agent}/${title}`,
+        baseBranch: "main",
+        baseRevision: "base",
+        title,
+        agent
+      })
+    } as any,
+    runCommand: (async () => ({ ok: true, stdout: "", stderr: "" })) as any,
+    sessionLogRoot: join(tempDir, "sessions"),
+    attachmentRoot: join(tempDir, "attachments"),
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "propagate agent completion",
+    steps: [
+      { id: "implement", executor: "agent-task", input: { agent: "codex", prompt: "do work" } },
+      { id: "verify", executor: "check", dependsOn: ["implement"] },
+      { id: "approve", executor: "approval", dependsOn: ["verify"] }
+    ]
+  });
+  const implement = (await store.getStep(created.run.id, "implement"))!;
+  const taskId = String(implement.executionRef?.taskId);
+  await store.updateTask(taskId, { status: "done" });
+  await publishEvent(store, bus, {
+    type: "task.completed",
+    projectId: project.id,
+    taskId,
+    payload: { status: "done" }
+  });
+
+  for (let attempt = 0; attempt < 50 && (await store.getRun(created.run.id))?.status !== "waiting_approval"; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  assert.equal((await store.getStep(created.run.id, "implement"))!.status, "succeeded");
+  assert.equal((await store.getStep(created.run.id, "verify"))!.status, "succeeded");
+  assert.equal((await store.getStep(created.run.id, "approve"))!.status, "waiting_approval");
+  assert.equal((await store.getRun(created.run.id))!.status, "waiting_approval");
 });
 
 test("ShellExecutor captures success, non-zero failure, timeout, and restart disappearance semantics", async (t) => {

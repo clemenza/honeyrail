@@ -10,7 +10,7 @@ export default function App() {
   const auth = useAuth();
   const { theme, toggle: toggleTheme } = useTheme();
   const authorized = !auth.loading && (!auth.enabled || auth.user);
-  const { state, health, error, connectionStatus, refresh } = useGatewayData(Boolean(authorized));
+  const { state, health, error, connectionStatus, loaded, refresh } = useGatewayData(Boolean(authorized));
   const { route, openSession, openManagement } = useRoute();
   const [activeView, setActiveView] = useState(route.kind === "management" ? route.view : "sessions");
   const [selectedProjectId, setSelectedProjectId] = useState("");
@@ -101,6 +101,7 @@ export default function App() {
         <MainContent
           activeView={activeView}
           state={state}
+          loaded={loaded}
           selectedProject={selectedProject}
           setSelectedProjectId={setSelectedProjectId}
           refresh={refresh}

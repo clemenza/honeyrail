@@ -27,6 +27,11 @@ export type InteractivePromptResponse = {
   keys: string[];
 };
 
+export type AgentFatalError = {
+  code: string;
+  message: string;
+};
+
 export type AgentInstallationStatus = {
   id: AgentType;
   displayName: string;
@@ -52,5 +57,7 @@ export interface AgentAdapter {
   buildLaunchCommand(input?: AgentLaunchInput): string;
   formatInput(input: AgentInputContext): string;
   findInteractivePromptResponse?(output: string): InteractivePromptResponse | null;
+  findFatalError?(output: string): AgentFatalError | null;
+  hasCompletedTask?(output: string): boolean;
   detectInstallation?(run: AgentCommandRunner): Promise<AgentInstallationStatus>;
 }

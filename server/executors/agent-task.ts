@@ -1,5 +1,5 @@
 import { getAgentAdapter } from "../agents/registry.js";
-import { publishTaskFailed, publishTaskStarted } from "../domain-events.js";
+import { publishSessionCreated, publishTaskFailed, publishTaskStarted } from "../domain-events.js";
 import {
   errorMessage,
   publishInitialAgentPrompt,
@@ -70,6 +70,7 @@ export class AgentTaskExecutor implements Executor {
         logPath,
         status: "running"
       });
+      await publishSessionCreated(ctx, ctx.project.id, session.id, agent, tmuxSessionName);
       await publishInitialAgentPrompt({ store: ctx.store, bus: ctx.bus, session, text: prompt });
       const updatedTask = await ctx.store.updateTask(task.id, {
         worktreeId: worktree.id,

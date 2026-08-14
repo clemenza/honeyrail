@@ -397,7 +397,11 @@ export function ChatWorkspace({ sessions, events, selectedSessionId, setSelected
           </div>
         </div>
 
-      {selected && !selectedIsRunning && selected.status !== "completed" ? (
+      {selected?.error ? (
+        <div className="inline-error" style={{ margin: "0 16px" }}>
+          <strong>Action required:</strong> {selected.error}
+        </div>
+      ) : selected && !selectedIsRunning && selected.status !== "completed" ? (
         <div className="inline-warning" style={{ margin: "0 16px" }}>
           This session is {selected.status}. Start a new session before sending prompts.
         </div>

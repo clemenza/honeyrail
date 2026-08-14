@@ -21,6 +21,7 @@ export type SessionData = {
   cwd: string;
   status: string;
   createdAt: string;
+  error?: string;
   summary?: { text: string; model: string; generatedAt: string } | null;
 };
 
@@ -32,6 +33,7 @@ export type TaskData = {
   title: string;
   agent: string;
   status: string;
+  error?: string;
 };
 
 export type WorktreeData = {
@@ -43,6 +45,7 @@ export type WorktreeData = {
   title?: string;
   agent?: string;
   status: string;
+  error?: string;
 };
 
 export type StepData = {
@@ -162,4 +165,5 @@ export type WorktreeItem = {
   branch?: string;
   path?: string;
   projectId?: string;
+  error?: string;
 };

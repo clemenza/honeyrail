@@ -16,13 +16,9 @@ type SessionMonitorOptions = {
 
 const TERMINAL_STATUSES = new Set<string>(["failed", "killed", "completed", "merged", "cancelled"]);
 const WAITING_APPROVAL_PATTERNS = [
-  /\bapprove\b/i,
-  /\ballow\b/i,
-  /\bpermission\b/i,
-  /do you want to continue/i,
-  /waiting for .*approval/i,
-  /requires approval/i,
-  /confirm/i
+  /do you want to (?:continue|proceed)/i,
+  /waiting for (?:operator )?approval/i,
+  /requires (?:operator )?approval/i
 ];
 const WAITING_INPUT_PATTERNS = [
   /queued follow-up inputs/i,
@@ -45,8 +41,12 @@ export function sessionAcceptsInput(status: unknown) {
 }
 
 export function inferSessionStatus(output: string, lastOutputAt: unknown, staleMs: number): SessionStatus {
-  if (WAITING_APPROVAL_PATTERNS.some((pattern) => pattern.test(output))) return "waiting_approval";
-  if (WAITING_INPUT_PATTERNS.some((pattern) => pattern.test(output))) return "waiting_input";
+  // tmux capture includes scrollback from the whole interaction. Only inspect
+  // the recent tail so words in prompts, docs, or completed commands do not
+  // make an actively working agent look like it is waiting for approval.
+  const recentOutput = output.split("\n").slice(-20).join("\n");
+  if (WAITING_APPROVAL_PATTERNS.some((pattern) => pattern.test(recentOutput))) return "waiting_approval";
+  if (WAITING_INPUT_PATTERNS.some((pattern) => pattern.test(recentOutput))) return "waiting_input";
   if (elapsedMs(lastOutputAt) > staleMs) return "stale";
   return "running";
 }
@@ -120,6 +120,85 @@ export async function reconcileSessions({ store, bus, tmux, staleMs }: Omit<Sess
       const capturedAt = nowIso();
 
       const adapter = getAgentAdapter(session.agent);
+      const fatalError = adapter.findFatalError?.(output) || null;
+      if (fatalError) {
+        try {
+          await tmux.killSession(session.tmuxSessionName);
+        } catch {
+          // The CLI may have already exited after printing the fatal error.
+        }
+        await store.updateSession(session.id, {
+          status: "failed",
+          error: fatalError.message,
+          lastHealthCheckAt: capturedAt,
+          lastOutputAt: capturedAt
+        });
+        forgetLogSize(session.logPath);
+        forgetAutoResponseAttempts(session.id);
+        const task = await markRelatedRecordsFailed(store, session, fatalError.message, capturedAt);
+        await publishEvent(store, bus, {
+          type: "session.status_changed",
+          projectId: session.projectId ?? undefined,
+          sessionId: session.id,
+          taskId: task?.id,
+          payload: {
+            status: "failed",
+            previousStatus: session.status,
+            error: fatalError.message,
+            reason: fatalError.message,
+            code: fatalError.code
+          }
+        });
+        if (task) {
+          await publishEvent(store, bus, {
+            type: "task.failed",
+            projectId: task.projectId,
+            sessionId: session.id,
+            taskId: task.id,
+            payload: {
+              reason: fatalError.message,
+              error: fatalError.message,
+              worktreeId: task.worktreeId,
+              code: fatalError.code
+            }
+          });
+        }
+        continue;
+      }
+      if (session.taskId && adapter.hasCompletedTask?.(output)) {
+        try {
+          await tmux.killSession(session.tmuxSessionName);
+        } catch {
+          // The CLI may have exited after completing the task.
+        }
+        await store.updateSession(session.id, {
+          status: "completed",
+          lastHealthCheckAt: capturedAt,
+          lastOutputAt: capturedAt,
+          error: undefined
+        });
+        forgetLogSize(session.logPath);
+        forgetAutoResponseAttempts(session.id);
+        const task = await store.getTask(session.taskId);
+        if (task && task.status === "agent_running") {
+          await store.updateTask(task.id, { status: "done", error: undefined });
+          await publishEvent(store, bus, {
+            type: "task.completed",
+            projectId: task.projectId,
+            sessionId: session.id,
+            taskId: task.id,
+            payload: { status: "done", worktreeId: task.worktreeId }
+          });
+        }
+        await publishEvent(store, bus, {
+          type: "session.status_changed",
+          projectId: session.projectId ?? undefined,
+          sessionId: session.id,
+          taskId: session.taskId,
+          payload: { status: "completed", previousStatus: session.status }
+        });
+        continue;
+      }
       const promptResponse = adapter.findInteractivePromptResponse?.(output) || null;
       if (promptResponse) {
         const attemptsByLabel = autoResponseAttempts.get(session.id) ?? new Map<string, number>();

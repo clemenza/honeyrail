@@ -47,6 +47,13 @@ const CODEX_TRUST_DIALOG = `
   Press enter to continue
 `;
 
+const CODEX_CLI_TOO_OLD = `
+■ {"type":"error","status":400,"error":
+{"type":"invalid_request_error","message":"The 'gpt-5.6-sol' model requires a
+newer version of Codex. Please upgrade to the latest app or CLI and try
+again."}}
+`;
+
 test("detects the claude workspace trust dialog and answers with 1+Enter", () => {
   const result = getAgentAdapter("claude").findInteractivePromptResponse?.(CLAUDE_TRUST_DIALOG);
   assert.deepEqual(result, { label: "claude_trust_folder", keys: ["1", "Enter"] });
@@ -76,4 +83,23 @@ test("does not match a normal ready prompt after a dialog has been dismissed", (
 test("prompt rules are scoped to the owning adapter", () => {
   assert.equal(getAgentAdapter("claude").findInteractivePromptResponse?.(CODEX_TRUST_DIALOG), null);
   assert.equal(getAgentAdapter("codex").findInteractivePromptResponse?.(CLAUDE_TRUST_DIALOG), null);
+});
+
+test("detects when the Codex CLI is too old for the selected model", () => {
+  const result = getAgentAdapter("codex").findFatalError?.(CODEX_CLI_TOO_OLD);
+  assert.deepEqual(result, {
+    code: "codex_cli_upgrade_required",
+    message: "Codex CLI is too old for model gpt-5.6-sol. Upgrade it with `npm install -g @openai/codex@latest`, then start a new task."
+  });
+});
+
+test("does not classify ordinary Codex output as a fatal error", () => {
+  assert.equal(getAgentAdapter("codex").findFatalError?.("Working on the requested changes."), null);
+});
+
+test("detects a completed Codex task only after the final response returns to the prompt", () => {
+  const completed = "Added the requested note.\n\n─ Worked for 1m 29s ─────────\n\n› Use /skills to list available skills";
+  const stillWorking = `${completed}\n\n• Working (2s - esc to interrupt)`;
+  assert.equal(getAgentAdapter("codex").hasCompletedTask?.(completed), true);
+  assert.equal(getAgentAdapter("codex").hasCompletedTask?.(stillWorking), false);
 });
