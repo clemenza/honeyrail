@@ -159,7 +159,9 @@ Tasks remain atomic execution primitives: one agent execution, one worktree, one
 
 M1 orchestration can run explicit DAGs through `agent-task`, `shell`, `check`, and `approval` executors. Runs and steps persist in SQLite, resume on server restart, and are exposed through REST and MCP.
 
-For a concrete REST payload, see [docs/orchestration-dag-example.md](docs/orchestration-dag-example.md).
+M2 adds first-class verification data above execution status. A step can now emit artifacts, record evidence, run deterministic evaluators, and apply a quality gate before downstream steps proceed. Execution success and verification success are intentionally separate.
+
+For concrete REST payloads, see [docs/orchestration-dag-example.md](docs/orchestration-dag-example.md).
 
 ## Interfaces
 

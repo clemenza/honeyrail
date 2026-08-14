@@ -207,6 +207,12 @@ function applySSEDelta(state: GatewayState, eventType: string, data: SSEPayload)
     case "step.retrying":
     case "step.skipped":
     case "step.cancelled":
+    case "artifact.created":
+    case "evidence.recorded":
+    case "evaluation.completed":
+    case "quality_gate.passed":
+    case "quality_gate.failed":
+    case "quality_gate.waiting_approval":
       return { ...state, events: appendEvent(state.events, data) };
 
     default:
@@ -286,7 +292,7 @@ export function useGatewayData(enabled = true) {
     });
     stream.addEventListener("task.failed", incrementalHandler);
     stream.addEventListener("task.completed", incrementalHandler);
-    for (const type of ["run.created", "run.started", "run.running", "run.waiting_input", "run.waiting_approval", "run.succeeded", "run.failed", "run.cancelled", "step.ready", "step.started", "step.waiting_input", "step.waiting_approval", "step.succeeded", "step.failed", "step.retrying", "step.skipped", "step.cancelled"]) {
+    for (const type of ["run.created", "run.started", "run.running", "run.waiting_input", "run.waiting_approval", "run.succeeded", "run.failed", "run.cancelled", "step.ready", "step.started", "step.waiting_input", "step.waiting_approval", "step.succeeded", "step.failed", "step.retrying", "step.skipped", "step.cancelled", "artifact.created", "evidence.recorded", "evaluation.completed", "quality_gate.passed", "quality_gate.failed", "quality_gate.waiting_approval"]) {
       stream.addEventListener(type, () => refresh());
     }
 

@@ -58,12 +58,71 @@ export type StepData = {
   status: string;
   attempt: number;
   maxAttempts: number;
+  qualityGate?: {
+    evaluators: Array<Record<string, unknown>>;
+    onFail?: string;
+  };
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;
   executionRef?: Record<string, unknown>;
   output?: Record<string, unknown>;
   error?: string;
+  verification?: VerificationData;
+};
+
+export type ArtifactData = {
+  id: string;
+  runId: string;
+  stepId?: string;
+  kind: string;
+  name: string;
+  uri?: string;
+  path?: string;
+  mediaType?: string;
+  metadata?: Record<string, unknown>;
+  createdAt: string;
+};
+
+export type EvidenceData = {
+  id: string;
+  runId: string;
+  stepId?: string;
+  kind: string;
+  claim?: string;
+  value?: unknown;
+  source?: string;
+  artifactIds?: string[];
+  metadata?: Record<string, unknown>;
+  createdAt: string;
+};
+
+export type EvaluationData = {
+  id: string;
+  runId: string;
+  stepId?: string;
+  evaluator: string;
+  status: string;
+  score?: number;
+  threshold?: number;
+  reason?: string;
+  evidenceIds?: string[];
+  artifactIds?: string[];
+  metadata?: Record<string, unknown>;
+  createdAt: string;
+};
+
+export type VerificationData = {
+  artifacts: number;
+  evidence: number;
+  evaluations: {
+    passed: number;
+    failed: number;
+    error: number;
+  };
+  artifactItems?: ArtifactData[];
+  evidenceItems?: EvidenceData[];
+  evaluationItems?: EvaluationData[];
 };
 
 export type RunData = {
@@ -77,6 +136,7 @@ export type RunData = {
   cancelledAt?: string;
   error?: string;
   steps: StepData[];
+  verification?: VerificationData;
 };
 
 export type EventAttachment = {

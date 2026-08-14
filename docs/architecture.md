@@ -78,6 +78,39 @@ The scheduler validates DAGs before creating runs, marks steps ready only after 
 
 See [orchestration-dag-example.md](orchestration-dag-example.md) for a concrete multi-step REST payload.
 
+## Evidence And Quality
+
+M2 keeps verification data separate from execution state:
+
+- `Artifact`: durable output or reference produced by a run or step, such as a log, file, directory, JSON document, or text result.
+- `Evidence`: an observed fact or measurement, such as a command, status, exit code, duration, pass count, or extracted claim. Evidence may reference artifacts.
+- `Evaluation`: deterministic rule output that says whether evidence, artifacts, or step output satisfies a criterion.
+
+`step.status === "succeeded"` only means execution succeeded. A step can additionally declare a `qualityGate`:
+
+```json
+{
+  "qualityGate": {
+    "evaluators": [
+      { "type": "check" },
+      { "type": "boolean", "source": "output.ok" },
+      { "type": "numeric-threshold", "source": "check.exitCode", "operator": "<=", "threshold": 0 }
+    ],
+    "onFail": "fail"
+  }
+}
+```
+
+Supported M2 evaluators are deterministic:
+
+- `boolean`: compares a resolved source to an expected boolean, defaulting to `true`.
+- `numeric-threshold`: compares a numeric source with `>`, `>=`, `<`, `<=`, `==`, or `!=`.
+- `check`: requires all `check.command` evidence for the step to have passed with exit code `0`.
+
+Quality gates are deliberately small. Passing gates allow downstream scheduling. Failed gates either fail the step or put it into the existing `waiting_approval` flow when `onFail` is `wait_approval`.
+
+The first evidence producer is the `check` executor. Each command run registers a log artifact metadata record and a `check.command` evidence record with command, status, exit code, and duration.
+
 ## Event Bus
 
 Domain events are published through `domain-events.ts` and `events.ts`. Events are stored and also emitted to connected UI clients so dashboards update after project, session, task, worktree, checks, commit, merge, and delete changes.
@@ -133,6 +166,13 @@ Commit and merge actions are explicit API operations. MCP clients can call `prop
 The MCP server exposes projects, sessions, tasks, worktrees, checks, merges, dashboard state, and orchestration runs. MCP tool names are intentionally stable compatibility identifiers and are not renamed as part of branding work.
 
 M1 adds `create_run`, `get_run`, `list_runs`, `cancel_run`, `approve_step`, and `reject_step`.
+
+M2 run inspection includes verification summaries. REST additionally exposes:
+
+- `GET /api/runs/:runId/artifacts`
+- `GET /api/runs/:runId/evidence`
+- `GET /api/runs/:runId/evaluations`
+- `GET /api/artifacts/:artifactId`
 
 The internal MCP server name remains `codex-remote-controller` during the HoneyRail bootstrap for client compatibility.
 

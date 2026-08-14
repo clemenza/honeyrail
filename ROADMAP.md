@@ -27,6 +27,7 @@ This roadmap is directional, not a feature promise.
 - Add evaluator integration points.
 - Add quality gates that can block or approve progression.
 - Make verification outputs easier to compare across runs.
+- Keep deterministic, inspectable evaluation separate from executor success.
 
 ## v0.4 / M3/M4: Environments And Database Testing Harness Alpha
 

@@ -1,6 +1,6 @@
 # Orchestration DAG Example
 
-This example creates a real M1 Run through the REST API. It uses the existing Task/Session/Worktree lifecycle as the first step, then reuses the produced `worktreeId` in the check step, and finally blocks for operator approval.
+This example creates a real M2 Run through the REST API. It uses the existing Task/Session/Worktree lifecycle as the first step, then reuses the produced `worktreeId` in the check step, evaluates the check evidence, applies a quality gate, and finally blocks for operator approval.
 
 Prerequisites:
 
@@ -45,6 +45,12 @@ curl -fsS http://127.0.0.1:4178/api/runs \
         "commands": [
           "git diff --check"
         ]
+      },
+      "qualityGate": {
+        "evaluators": [
+          { "type": "check" }
+        ],
+        "onFail": "fail"
       }
     },
     {
@@ -60,11 +66,26 @@ JSON
 
 The `verify` step does not need an explicit `worktreeId`. When `implement` succeeds, its executor output includes `worktreeId`; the scheduler copies dependency output into downstream step input when a key is not already set.
 
+The `verify` step demonstrates the M2 verification loop:
+
+- the `check` executor emits a log Artifact for `git diff --check`
+- it records `check.command` Evidence with command status, exit code, and duration
+- the `check` evaluator persists an Evaluation
+- the quality gate lets `operator_approval` proceed only when the Evaluation passes
+
 Inspect the Run:
 
 ```sh
 RUN_ID="<run id from create response>"
 curl -fsS "http://127.0.0.1:4178/api/runs/$RUN_ID" | jq
+```
+
+Inspect M2 verification data:
+
+```sh
+curl -fsS "http://127.0.0.1:4178/api/runs/$RUN_ID/artifacts?stepId=verify" | jq
+curl -fsS "http://127.0.0.1:4178/api/runs/$RUN_ID/evidence?stepId=verify" | jq
+curl -fsS "http://127.0.0.1:4178/api/runs/$RUN_ID/evaluations?stepId=verify" | jq
 ```
 
 Approve the final barrier after reviewing the worktree and check output:

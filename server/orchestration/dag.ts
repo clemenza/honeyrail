@@ -1,4 +1,4 @@
-import type { Step } from "../types.js";
+import type { QualityGate, Step } from "../types.js";
 
 export type StepDefinition = {
   id: string;
@@ -7,6 +7,7 @@ export type StepDefinition = {
   input?: Record<string, unknown>;
   dependsOn?: string[];
   maxAttempts?: number;
+  qualityGate?: QualityGate;
 };
 
 export type ExecutorLookup = {

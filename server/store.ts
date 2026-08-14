@@ -1,5 +1,5 @@
 import { readFile, writeFile } from "node:fs/promises";
-import type { EventInput, GatewayEvent, Project, Run, Session, Step, Store, Task, Worktree } from "./types.js";
+import type { Artifact, Evaluation, EventInput, Evidence, GatewayEvent, Project, Run, Session, Step, Store, Task, Worktree } from "./types.js";
 import { makeId } from "./utils.js";
 
 type StoreData = {
@@ -7,6 +7,9 @@ type StoreData = {
     projects: Project[];
     runs: Run[];
     steps: Step[];
+    artifacts: Artifact[];
+    evidence: Evidence[];
+    evaluations: Evaluation[];
     sessions: Session[];
     tasks: Task[];
     worktrees: Worktree[];
@@ -19,7 +22,7 @@ export class JsonStore implements Store {
 
     constructor(filePath: string) {
         this.filePath = filePath;
-        this.data = { settings: {}, projects: [], runs: [], steps: [], sessions: [], tasks: [], worktrees: [], events: [] };
+        this.data = { settings: {}, projects: [], runs: [], steps: [], artifacts: [], evidence: [], evaluations: [], sessions: [], tasks: [], worktrees: [], events: [] };
         this._load();
     }
 
@@ -31,6 +34,9 @@ export class JsonStore implements Store {
                 projects: [],
                 runs: [],
                 steps: [],
+                artifacts: [],
+                evidence: [],
+                evaluations: [],
                 sessions: [],
                 tasks: [],
                 worktrees: [],
@@ -143,6 +149,49 @@ export class JsonStore implements Store {
             await this._save();
         }
         return step;
+    }
+
+    async createArtifact(input: Partial<Artifact> & Pick<Artifact, "runId" | "kind" | "name">): Promise<Artifact> {
+        const artifact = { id: input.id || makeId("art"), createdAt: new Date().toISOString(), ...input } as Artifact;
+        this.data.artifacts = this.data.artifacts || [];
+        this.data.artifacts.push(artifact);
+        await this._save();
+        return artifact;
+    }
+
+    async listArtifacts(runId: string, stepId?: string): Promise<Artifact[]> {
+        const artifacts = (this.data.artifacts || []).filter((artifact) => artifact.runId === runId);
+        return stepId ? artifacts.filter((artifact) => artifact.stepId === stepId) : artifacts;
+    }
+
+    async getArtifact(id: string): Promise<Artifact | undefined> {
+        return (this.data.artifacts || []).find((artifact) => artifact.id === id);
+    }
+
+    async createEvidence(input: Partial<Evidence> & Pick<Evidence, "runId" | "kind">): Promise<Evidence> {
+        const evidence = { id: input.id || makeId("evd"), createdAt: new Date().toISOString(), ...input } as Evidence;
+        this.data.evidence = this.data.evidence || [];
+        this.data.evidence.push(evidence);
+        await this._save();
+        return evidence;
+    }
+
+    async listEvidence(runId: string, stepId?: string): Promise<Evidence[]> {
+        const evidence = (this.data.evidence || []).filter((item) => item.runId === runId);
+        return stepId ? evidence.filter((item) => item.stepId === stepId) : evidence;
+    }
+
+    async createEvaluation(input: Partial<Evaluation> & Pick<Evaluation, "runId" | "evaluator" | "status">): Promise<Evaluation> {
+        const evaluation = { id: input.id || makeId("eval"), createdAt: new Date().toISOString(), ...input } as Evaluation;
+        this.data.evaluations = this.data.evaluations || [];
+        this.data.evaluations.push(evaluation);
+        await this._save();
+        return evaluation;
+    }
+
+    async listEvaluations(runId: string, stepId?: string): Promise<Evaluation[]> {
+        const evaluations = (this.data.evaluations || []).filter((item) => item.runId === runId);
+        return stepId ? evaluations.filter((item) => item.stepId === stepId) : evaluations;
     }
 
     async listSessions(): Promise<Session[]> {

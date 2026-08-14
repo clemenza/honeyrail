@@ -1,8 +1,9 @@
 import type { EventBus } from "../events.js";
+import { createDefaultEvaluatorRegistry, type EvaluatorRegistry } from "../evaluators/registry.js";
 import { createDefaultExecutorRegistry } from "../executors/index.js";
 import type { ExecutorRegistry } from "../executors/registry.js";
 import type { ExecutionState, StepExecutionContext } from "../executors/types.js";
-import type { Project, Run, Step, Store } from "../types.js";
+import type { Artifact, Evaluation, Evidence, Project, Run, Step, Store, VerificationSummary } from "../types.js";
 import type { TmuxManager } from "../tmux.js";
 import type { runCommandSafe } from "../utils.js";
 import type { WorktreeManager } from "../worktrees.js";
@@ -19,6 +20,7 @@ export type OrchestrationRuntime = {
   sessionLogRoot: string;
   attachmentRoot: string;
   executors?: ExecutorRegistry;
+  evaluators?: EvaluatorRegistry;
 };
 
 export type CreateRunInput = {
@@ -36,6 +38,7 @@ export class OrchestrationService {
   private sessionLogRoot: string;
   private attachmentRoot: string;
   private executors: ExecutorRegistry;
+  private evaluators: EvaluatorRegistry;
   private scheduling = new Set<string>();
 
   constructor(runtime: OrchestrationRuntime) {
@@ -47,6 +50,7 @@ export class OrchestrationService {
     this.sessionLogRoot = runtime.sessionLogRoot;
     this.attachmentRoot = runtime.attachmentRoot;
     this.executors = runtime.executors || createDefaultExecutorRegistry();
+    this.evaluators = runtime.evaluators || createDefaultEvaluatorRegistry();
     this.bus.subscribe((event) => {
       if (!["task.failed", "task.completed"].includes(event.type) || !event.taskId) return;
       this.scheduleRunsForTask(event.taskId).catch((error) => {
@@ -82,7 +86,8 @@ export class OrchestrationService {
         input: definition.input || {},
         dependsOn: definition.dependsOn || [],
         maxAttempts: definition.maxAttempts || 1,
-        status: "pending"
+        status: "pending",
+        qualityGate: definition.qualityGate
       }));
     }
     await publishRunEvent(this.eventContext(), "run.created", run, { stepCount: steps.length });
@@ -90,15 +95,74 @@ export class OrchestrationService {
     return { run: (await this.store.getRun(run.id)) || run, steps: await this.store.listSteps(run.id) };
   }
 
-  async getRunDetail(runId: string): Promise<{ run: Run; steps: Step[] } | null> {
+  async getRunDetail(runId: string): Promise<{ run: Run & { verification: VerificationSummary }; steps: Array<Step & { verification: VerificationSummary & { artifactItems: Artifact[]; evidenceItems: Evidence[]; evaluationItems: Evaluation[] } }> } | null> {
     const run = await this.store.getRun(runId);
     if (!run) return null;
-    return { run, steps: await this.store.listSteps(run.id) };
+    return this.enrichRun(run);
   }
 
-  async listRuns(projectId?: string): Promise<Array<Run & { steps: Step[] }>> {
+  async listRuns(projectId?: string): Promise<Array<Run & { steps: Array<Step & { verification: VerificationSummary & { artifactItems: Artifact[]; evidenceItems: Evidence[]; evaluationItems: Evaluation[] } }>; verification: VerificationSummary }>> {
     const runs = await this.store.listRuns(projectId);
-    return Promise.all(runs.map(async (run) => ({ ...run, steps: await this.store.listSteps(run.id) })));
+    const details = await Promise.all(runs.map((run) => this.enrichRun(run)));
+    return details.map((detail) => ({ ...detail.run, steps: detail.steps }));
+  }
+
+  async listArtifacts(runId: string, stepId?: string) {
+    return this.store.listArtifacts(runId, stepId);
+  }
+
+  async getArtifact(artifactId: string) {
+    return this.store.getArtifact(artifactId);
+  }
+
+  async listEvidence(runId: string, stepId?: string) {
+    return this.store.listEvidence(runId, stepId);
+  }
+
+  async listEvaluations(runId: string, stepId?: string) {
+    return this.store.listEvaluations(runId, stepId);
+  }
+
+  private async enrichRun(run: Run) {
+    const steps = await this.store.listSteps(run.id);
+    const [artifacts, evidence, evaluations] = await Promise.all([
+      this.store.listArtifacts(run.id),
+      this.store.listEvidence(run.id),
+      this.store.listEvaluations(run.id)
+    ]);
+    const stepDetails = steps.map((step) => {
+      const artifactItems = artifacts.filter((item) => item.stepId === step.id);
+      const evidenceItems = evidence.filter((item) => item.stepId === step.id);
+      const evaluationItems = evaluations.filter((item) => item.stepId === step.id);
+      return {
+        ...step,
+        verification: {
+          ...this.verificationSummary(artifactItems, evidenceItems, evaluationItems),
+          artifactItems,
+          evidenceItems,
+          evaluationItems
+        }
+      };
+    });
+    return {
+      run: {
+        ...run,
+        verification: this.verificationSummary(artifacts, evidence, evaluations)
+      },
+      steps: stepDetails
+    };
+  }
+
+  private verificationSummary(artifacts: Artifact[], evidence: Evidence[], evaluations: Evaluation[]): VerificationSummary {
+    return {
+      artifacts: artifacts.length,
+      evidence: evidence.length,
+      evaluations: {
+        passed: evaluations.filter((item) => item.status === "passed").length,
+        failed: evaluations.filter((item) => item.status === "failed").length,
+        error: evaluations.filter((item) => item.status === "error").length
+      }
+    };
   }
 
   async recover() {
@@ -166,6 +230,7 @@ export class OrchestrationService {
   private async inspectActiveSteps(run: Run, project: Project, steps: Step[]) {
     let changed = false;
     for (const step of steps.filter((item) => item.status === "running" || item.status === "waiting_input" || item.status === "waiting_approval")) {
+      if (this.isQualityGateWaiting(step)) continue;
       if (!step.executionRef && step.executor !== "approval") continue;
       const executor = this.executors.get(step.executor);
       const state = await executor.inspect(this.context(project, run, step), step.executionRef || {});
@@ -181,6 +246,10 @@ export class OrchestrationService {
       changed = true;
     }
     return changed;
+  }
+
+  private isQualityGateWaiting(step: Step) {
+    return step.status === "waiting_approval" && (step.output?.qualityGate as { status?: string } | undefined)?.status === "waiting_approval";
   }
 
   private async skipBlockedSteps(run: Run, steps: Step[]) {
@@ -243,6 +312,8 @@ export class OrchestrationService {
   private async completeStepFromState(run: Run, step: Step, state: ExecutionState) {
     const finishedAt = new Date().toISOString();
     if (state.status === "succeeded") {
+      const gateResult = await this.applyQualityGate(run, step, state);
+      if (gateResult === "waiting_approval" || gateResult === "failed") return;
       const updated = await transitionStep(this.store, step, {
         status: "succeeded",
         finishedAt,
@@ -264,6 +335,75 @@ export class OrchestrationService {
       return;
     }
     await this.handleStepFailure(run, step, state.error || "Step failed", state.output);
+  }
+
+  private async applyQualityGate(run: Run, step: Step, state: ExecutionState): Promise<"passed" | "failed" | "waiting_approval"> {
+    const gate = step.qualityGate;
+    if (!gate?.evaluators?.length) return "passed";
+    const [evidence, artifacts] = await Promise.all([
+      this.store.listEvidence(run.id, step.id),
+      this.store.listArtifacts(run.id, step.id)
+    ]);
+    const evaluations: Evaluation[] = [];
+    for (const definition of gate.evaluators) {
+      let evaluationInput: Partial<Evaluation> & Pick<Evaluation, "runId" | "evaluator" | "status">;
+      try {
+        const result = this.evaluators.get(definition.type).evaluate({
+          definition,
+          step,
+          output: state.output,
+          evidence,
+          artifacts
+        });
+        evaluationInput = { ...result, runId: run.id, stepId: step.id };
+      } catch (error) {
+        evaluationInput = {
+          runId: run.id,
+          stepId: step.id,
+          evaluator: definition.id || definition.type,
+          status: "error",
+          reason: (error as Error).message || "Evaluator error",
+          evidenceIds: evidence.map((item) => item.id),
+          artifactIds: artifacts.map((item) => item.id),
+          metadata: { type: definition.type, source: definition.source }
+        };
+      }
+      const evaluation = await this.store.createEvaluation(evaluationInput);
+      evaluations.push(evaluation);
+      await publishStepEvent(this.eventContext(), "evaluation.completed", run, step, {
+        evaluationId: evaluation.id,
+        evaluator: evaluation.evaluator,
+        evaluationStatus: evaluation.status,
+        reason: evaluation.reason
+      });
+    }
+
+    const passed = evaluations.every((evaluation) => evaluation.status === "passed");
+    if (passed) {
+      await publishStepEvent(this.eventContext(), "quality_gate.passed", run, step, { evaluations: evaluations.map((item) => item.id) });
+      return "passed";
+    }
+    const reason = evaluations.find((evaluation) => evaluation.status !== "passed")?.reason || "Quality gate failed";
+    if (gate.onFail === "wait_approval") {
+      const updated = await transitionStep(this.store, step, {
+        status: "waiting_approval",
+        output: {
+          ...(state.output || {}),
+          qualityGate: { status: "waiting_approval", reason, evaluations: evaluations.map((item) => item.id) }
+        },
+        executionRef: state.executionRef || step.executionRef,
+        error: reason
+      });
+      await publishStepEvent(this.eventContext(), "quality_gate.waiting_approval", run, updated, { reason });
+      await publishStepEvent(this.eventContext(), "step.waiting_approval", run, updated);
+      return "waiting_approval";
+    }
+    await publishStepEvent(this.eventContext(), "quality_gate.failed", run, step, { reason });
+    await this.handleStepFailure(run, step, reason, {
+      ...(state.output || {}),
+      qualityGate: { status: "failed", reason, evaluations: evaluations.map((item) => item.id) }
+    });
+    return "failed";
   }
 
   private async handleStepFailure(run: Run, step: Step, error: string, output?: Record<string, unknown>) {
@@ -295,7 +435,8 @@ export class OrchestrationService {
     const updated = await transitionStep(this.store, step, {
       status: "succeeded",
       finishedAt: new Date().toISOString(),
-      output: { approved: true, approvedAt: new Date().toISOString() }
+      output: { ...(step.output || {}), approved: true, approvedAt: new Date().toISOString() },
+      error: undefined
     });
     await publishStepEvent(this.eventContext(), "step.succeeded", run, updated, { approved: true });
     await this.scheduleRun(run.id);
@@ -309,7 +450,7 @@ export class OrchestrationService {
     const updated = await transitionStep(this.store, step, {
       status: "failed",
       finishedAt: new Date().toISOString(),
-      output: { approved: false },
+      output: { ...(step.output || {}), approved: false },
       error: reason
     });
     await publishStepEvent(this.eventContext(), "step.failed", run, updated, { rejected: true, error: reason });
