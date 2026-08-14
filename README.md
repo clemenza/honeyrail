@@ -136,6 +136,7 @@ Common configuration:
 - `AGENT_GATEWAY_PUBLIC_BASE_URL`: public origin used for OAuth/MCP metadata behind a proxy
 - `AGENT_HEALTH_INTERVAL_MS`: session health check interval, default `15000`
 - `AGENT_SESSION_STALE_MS`: stale-session threshold, default `1800000`
+- `AGENT_ORCHESTRATION_POLL_INTERVAL_MS`: interval for re-scheduling non-terminal orchestration runs (needed for executors like `shell` that complete a detached background process), default `3000`
 
 The `AGENT_GATEWAY_*`, `~/.agent-gateway`, REST, MCP, SQLite, and tmux identifiers are compatibility surfaces inherited from the Agent Gateway subsystem. They are intentionally not renamed during the HoneyRail bootstrap.
 

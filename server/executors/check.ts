@@ -92,8 +92,15 @@ export class CheckExecutor implements Executor {
   }
 
   async inspect(_ctx: StepExecutionContext, handle: ExecutionHandle): Promise<ExecutionState> {
-    const ok = Boolean(handle.ok);
-    const output = { worktreeId: handle.worktreeId, checkRuns: handle.checkRuns };
-    return ok ? { status: "succeeded", output } : { status: "failed", output, error: "Checks failed" };
+    // Execution succeeding only means the checks ran without an
+    // infrastructure error (see CheckExecutor.start, which throws for
+    // missing worktrees/commands). Whether the *commands* passed is a fact
+    // for the quality gate to judge, not the executor - otherwise a failing
+    // check command fails the step before its qualityGate (including
+    // onFail: "wait_approval") ever runs. OrchestrationService applies a
+    // default check-type gate for "check" steps that don't declare one, so
+    // this does not change the observed default behavior.
+    const output = { worktreeId: handle.worktreeId, checkRuns: handle.checkRuns, ok: Boolean(handle.ok) };
+    return { status: "succeeded", output };
   }
 }

@@ -29,7 +29,8 @@ function config(root: string): GatewayConfig {
     sessionSecret: null,
     publicBaseUrl: null,
     healthCheckIntervalMs: 15000,
-    sessionStaleMs: 1800000
+    sessionStaleMs: 1800000,
+    orchestrationPollIntervalMs: 3000
   };
 }
 

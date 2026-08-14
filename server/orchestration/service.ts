@@ -3,7 +3,7 @@ import { createDefaultEvaluatorRegistry, type EvaluatorRegistry } from "../evalu
 import { createDefaultExecutorRegistry } from "../executors/index.js";
 import type { ExecutorRegistry } from "../executors/registry.js";
 import type { ExecutionState, StepExecutionContext } from "../executors/types.js";
-import type { Artifact, Evaluation, Evidence, Project, Run, Step, Store, VerificationSummary } from "../types.js";
+import type { Artifact, Evaluation, Evidence, Project, QualityGate, Run, Step, Store, VerificationSummary } from "../types.js";
 import type { TmuxManager } from "../tmux.js";
 import type { runCommandSafe } from "../utils.js";
 import type { WorktreeManager } from "../worktrees.js";
@@ -166,10 +166,48 @@ export class OrchestrationService {
   }
 
   async recover() {
+    await this.scheduleNonTerminalRuns();
+  }
+
+  private async scheduleNonTerminalRuns() {
     const runs = await this.store.listRuns();
     for (const run of runs.filter((item) => !isRunTerminal(item.status))) {
       await this.scheduleRun(run.id);
     }
+  }
+
+  /**
+   * Some executors (e.g. `shell`) complete a detached background process and
+   * have no event that re-invokes the scheduler for their run. Without a
+   * poller those steps stay "running" forever even after the underlying
+   * work finishes. This mirrors session-monitor.ts's polling pattern.
+   */
+  startPolling(intervalMs: number): () => void {
+    let stopped = false;
+    let running = false;
+    let rerunRequested = false;
+    const tick = () => {
+      if (stopped) return;
+      if (running) {
+        rerunRequested = true;
+        return;
+      }
+      running = true;
+      this.scheduleNonTerminalRuns()
+        .catch((error) => console.error("Orchestration poller failed:", error))
+        .finally(() => {
+          running = false;
+          if (rerunRequested && !stopped) {
+            rerunRequested = false;
+            tick();
+          }
+        });
+    };
+    const timer = setInterval(tick, intervalMs);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
   }
 
   async scheduleRun(runId: string): Promise<void> {
@@ -337,8 +375,18 @@ export class OrchestrationService {
     await this.handleStepFailure(run, step, state.error || "Step failed", state.output);
   }
 
+  private defaultQualityGate(step: Step): QualityGate | undefined {
+    // "check" steps historically failed outright whenever a command failed
+    // (see CheckExecutor.inspect). That executor now always reports
+    // "succeeded" and defers pass/fail to the quality gate instead, so a
+    // check step without an explicit gate gets this default to preserve
+    // that observed behavior instead of silently succeeding on failed checks.
+    if (step.executor === "check") return { evaluators: [{ type: "check" }], onFail: "fail" };
+    return undefined;
+  }
+
   private async applyQualityGate(run: Run, step: Step, state: ExecutionState): Promise<"passed" | "failed" | "waiting_approval"> {
-    const gate = step.qualityGate;
+    const gate = step.qualityGate || this.defaultQualityGate(step);
     if (!gate?.evaluators?.length) return "passed";
     const [evidence, artifacts] = await Promise.all([
       this.store.listEvidence(run.id, step.id),

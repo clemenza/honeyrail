@@ -16,6 +16,7 @@ export type GatewayConfig = {
   publicBaseUrl?: string | null;
   healthCheckIntervalMs: number;
   sessionStaleMs: number;
+  orchestrationPollIntervalMs: number;
 };
 
 export const DEFAULT_PORT = 4178;
@@ -82,7 +83,8 @@ export async function loadGatewayConfig(): Promise<GatewayConfig> {
     sessionSecret: nonEmpty(process.env.AGENT_GATEWAY_SESSION_SECRET) || fileConfig.sessionSecret as string || null,
     publicBaseUrl: nonEmpty(process.env.AGENT_GATEWAY_PUBLIC_BASE_URL) || fileConfig.publicBaseUrl as string || null,
     healthCheckIntervalMs: parseNumber(process.env.AGENT_HEALTH_INTERVAL_MS || fileConfig.healthCheckIntervalMs, 15000),
-    sessionStaleMs: parseNumber(process.env.AGENT_SESSION_STALE_MS || fileConfig.sessionStaleMs, 1000 * 60 * 30)
+    sessionStaleMs: parseNumber(process.env.AGENT_SESSION_STALE_MS || fileConfig.sessionStaleMs, 1000 * 60 * 30),
+    orchestrationPollIntervalMs: parseNumber(process.env.AGENT_ORCHESTRATION_POLL_INTERVAL_MS || fileConfig.orchestrationPollIntervalMs, 3000)
   };
 }
 
