@@ -25,6 +25,10 @@ import type { Project, Worktree } from "../server/types.js";
 async function initGitRepo(path: string) {
   await mkdir(path, { recursive: true });
   await runCommandSafe("git", ["init"], { cwd: path });
+  // git's default initial branch name depends on the runner's git version/
+  // config (e.g. differs between local dev and CI); pin it explicitly,
+  // matching ensureNewProjectRepo's own `git checkout -B <branch>` pattern.
+  await runCommandSafe("git", ["checkout", "-B", "main"], { cwd: path });
   await runCommandSafe("git", ["config", "user.email", "e2e@example.com"], { cwd: path });
   await runCommandSafe("git", ["config", "user.name", "E2E"], { cwd: path });
   await writeFile(join(path, "README.md"), "# e2e fixture\n");
