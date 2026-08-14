@@ -239,6 +239,25 @@ function evaluationLabel(step: RunData["steps"][number]) {
   return "PASS";
 }
 
+function latestGateDecision(step: RunData["steps"][number]) {
+  return step.verification?.gateDecisionItems?.at(-1);
+}
+
+function gateDecisionTone(step: RunData["steps"][number]) {
+  const decision = latestGateDecision(step);
+  if (!decision) return "neutral";
+  if (decision.status === "passed") return "good";
+  if (decision.status === "overridden") return "warn";
+  return "bad";
+}
+
+function gateDecisionLabel(step: RunData["steps"][number]) {
+  const decision = latestGateDecision(step);
+  if (!decision) return "no gate decision";
+  if (decision.status === "overridden") return "OVERRIDDEN";
+  return decision.status.toUpperCase();
+}
+
 function compactJson(value: unknown) {
   if (value === undefined || value === null) return "";
   if (typeof value === "string") return value;
@@ -299,9 +318,11 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
                       <div className="run-verification">
                         <span>Artifacts {step.verification?.artifacts || 0}</span>
                         <span>Evidence {step.verification?.evidence || 0}</span>
+                        {step.verification?.latestAttempt ? <span>Latest attempt {step.verification.latestAttempt}</span> : null}
                         <StatusPill tone={evaluationTone(step)}>{evaluationLabel(step)}</StatusPill>
+                        <StatusPill tone={gateDecisionTone(step)}>{gateDecisionLabel(step)}</StatusPill>
                       </div>
-                      {step.verification && (step.verification.artifactItems?.length || step.verification.evidenceItems?.length || step.verification.evaluationItems?.length) ? (
+                      {step.verification && (step.verification.artifactItems?.length || step.verification.evidenceItems?.length || step.verification.evaluationItems?.length || step.verification.gateDecisionItems?.length) ? (
                         <details className="run-verification-detail">
                           <summary>Verification detail</summary>
                           {step.verification.artifactItems?.map((artifact) => (
@@ -320,9 +341,16 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
                           ))}
                           {step.verification.evaluationItems?.map((evaluation) => (
                             <div className="run-verification-item" key={evaluation.id}>
-                              <strong>{evaluation.evaluator}: {evaluation.status}</strong>
+                              <strong>{evaluation.evaluator}: {evaluation.status}{evaluation.attempt ? ` · attempt ${evaluation.attempt}` : ""}</strong>
                               {evaluation.reason ? <small>{evaluation.reason}</small> : null}
                               <code>{compactJson({ score: evaluation.score, threshold: evaluation.threshold, metadata: evaluation.metadata })}</code>
+                            </div>
+                          ))}
+                          {step.verification.gateDecisionItems?.map((decision) => (
+                            <div className="run-verification-item" key={decision.id}>
+                              <strong>gate: {decision.status}{decision.attempt ? ` · attempt ${decision.attempt}` : ""}</strong>
+                              <small>{decision.decidedBy}{decision.reason ? ` · ${decision.reason}` : ""}</small>
+                              <code>{compactJson({ evaluationIds: decision.evaluationIds })}</code>
                             </div>
                           ))}
                         </details>

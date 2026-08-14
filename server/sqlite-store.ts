@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { Artifact, Evaluation, EventInput, Evidence, GatewayEvent, Project, Run, Session, Step, Store, Task, Worktree } from "./types.js";
+import type { Artifact, Evaluation, EventInput, Evidence, GatewayEvent, Project, QualityGateDecision, Run, Session, Step, Store, Task, Worktree } from "./types.js";
 import { makeId } from "./utils.js";
 
 type StoreData = {
@@ -12,6 +12,7 @@ type StoreData = {
   artifacts: Artifact[];
   evidence: Evidence[];
   evaluations: Evaluation[];
+  qualityGateDecisions: QualityGateDecision[];
   sessions: Session[];
   tasks: Task[];
   worktrees: Worktree[];
@@ -26,6 +27,7 @@ const EMPTY_DATA: StoreData = {
   artifacts: [],
   evidence: [],
   evaluations: [],
+  qualityGateDecisions: [],
   sessions: [],
   tasks: [],
   worktrees: [],
@@ -54,6 +56,28 @@ const SCHEMA_VERSION_SQL = `
     id INTEGER PRIMARY KEY CHECK (id = 1),
     version INTEGER NOT NULL
   );
+`;
+
+const GATE_DECISION_SCHEMA_SQL = `
+  ALTER TABLE artifacts ADD COLUMN attempt INTEGER;
+  ALTER TABLE evidence ADD COLUMN attempt INTEGER;
+  ALTER TABLE evaluations ADD COLUMN attempt INTEGER;
+
+  CREATE TABLE IF NOT EXISTS quality_gate_decisions (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    step_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    evaluation_ids TEXT NOT NULL DEFAULT '[]',
+    reason TEXT,
+    decided_by TEXT NOT NULL DEFAULT 'system',
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_quality_gate_decisions_run ON quality_gate_decisions(run_id);
+  CREATE INDEX IF NOT EXISTS idx_quality_gate_decisions_step ON quality_gate_decisions(step_id);
+  CREATE INDEX IF NOT EXISTS idx_quality_gate_decisions_attempt ON quality_gate_decisions(attempt);
+  CREATE INDEX IF NOT EXISTS idx_quality_gate_decisions_created ON quality_gate_decisions(created_at);
 `;
 
 const LEGACY_RECORDS_SQL = `
@@ -298,6 +322,11 @@ const SCHEMA_MIGRATIONS: SchemaMigration[] = [
     version: 4,
     name: "verification-artifacts-evidence-evaluations",
     up: (db) => db.exec(VERIFICATION_SCHEMA_SQL)
+  },
+  {
+    version: 5,
+    name: "attempt-aware-verification-and-gate-decisions",
+    up: (db) => db.exec(GATE_DECISION_SCHEMA_SQL)
   }
 ];
 
@@ -452,9 +481,9 @@ export class SQLiteStore implements Store {
   }
 
   private upsertArtifactRow(artifact: Artifact) {
-    this.db.prepare(`INSERT OR REPLACE INTO artifacts (id, run_id, step_id, kind, name, uri, path, media_type, metadata, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      artifact.id, artifact.runId, artifact.stepId ?? null, artifact.kind, artifact.name || "",
+    this.db.prepare(`INSERT OR REPLACE INTO artifacts (id, run_id, step_id, attempt, kind, name, uri, path, media_type, metadata, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      artifact.id, artifact.runId, artifact.stepId ?? null, artifact.attempt ?? null, artifact.kind, artifact.name || "",
       artifact.uri ?? null, artifact.path ?? null, artifact.mediaType ?? null,
       artifact.metadata ? JSON.stringify(artifact.metadata) : null,
       artifact.createdAt
@@ -462,9 +491,9 @@ export class SQLiteStore implements Store {
   }
 
   private upsertEvidenceRow(evidence: Evidence) {
-    this.db.prepare(`INSERT OR REPLACE INTO evidence (id, run_id, step_id, kind, claim, value, source, artifact_ids, metadata, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      evidence.id, evidence.runId, evidence.stepId ?? null, evidence.kind, evidence.claim ?? null,
+    this.db.prepare(`INSERT OR REPLACE INTO evidence (id, run_id, step_id, attempt, kind, claim, value, source, artifact_ids, metadata, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      evidence.id, evidence.runId, evidence.stepId ?? null, evidence.attempt ?? null, evidence.kind, evidence.claim ?? null,
       evidence.value !== undefined ? JSON.stringify(evidence.value) : null,
       evidence.source ?? null, JSON.stringify(evidence.artifactIds || []),
       evidence.metadata ? JSON.stringify(evidence.metadata) : null,
@@ -473,13 +502,22 @@ export class SQLiteStore implements Store {
   }
 
   private upsertEvaluationRow(evaluation: Evaluation) {
-    this.db.prepare(`INSERT OR REPLACE INTO evaluations (id, run_id, step_id, evaluator, status, score, threshold, reason, evidence_ids, artifact_ids, metadata, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      evaluation.id, evaluation.runId, evaluation.stepId ?? null, evaluation.evaluator, evaluation.status,
+    this.db.prepare(`INSERT OR REPLACE INTO evaluations (id, run_id, step_id, attempt, evaluator, status, score, threshold, reason, evidence_ids, artifact_ids, metadata, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      evaluation.id, evaluation.runId, evaluation.stepId ?? null, evaluation.attempt ?? null, evaluation.evaluator, evaluation.status,
       evaluation.score ?? null, evaluation.threshold ?? null, evaluation.reason ?? null,
       JSON.stringify(evaluation.evidenceIds || []), JSON.stringify(evaluation.artifactIds || []),
       evaluation.metadata ? JSON.stringify(evaluation.metadata) : null,
       evaluation.createdAt
+    );
+  }
+
+  private upsertQualityGateDecisionRow(decision: QualityGateDecision) {
+    this.db.prepare(`INSERT OR REPLACE INTO quality_gate_decisions (id, run_id, step_id, attempt, status, evaluation_ids, reason, decided_by, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      decision.id, decision.runId, decision.stepId, decision.attempt, decision.status,
+      JSON.stringify(decision.evaluationIds || []), decision.reason ?? null, decision.decidedBy,
+      decision.createdAt
     );
   }
 
@@ -582,6 +620,7 @@ export class SQLiteStore implements Store {
       id: String(row.id),
       runId: String(row.run_id || ""),
       stepId: row.step_id as string | undefined,
+      attempt: row.attempt === null || row.attempt === undefined ? undefined : Number(row.attempt),
       kind: String(row.kind || "text") as Artifact["kind"],
       name: String(row.name || ""),
       uri: row.uri as string | undefined,
@@ -597,6 +636,7 @@ export class SQLiteStore implements Store {
       id: String(row.id),
       runId: String(row.run_id || ""),
       stepId: row.step_id as string | undefined,
+      attempt: row.attempt === null || row.attempt === undefined ? undefined : Number(row.attempt),
       kind: String(row.kind || ""),
       claim: row.claim as string | undefined,
       value: row.value ? parseJson<unknown>(row.value as string, undefined) : undefined,
@@ -612,6 +652,7 @@ export class SQLiteStore implements Store {
       id: String(row.id),
       runId: String(row.run_id || ""),
       stepId: row.step_id as string | undefined,
+      attempt: row.attempt === null || row.attempt === undefined ? undefined : Number(row.attempt),
       evaluator: String(row.evaluator || ""),
       status: String(row.status || "error") as Evaluation["status"],
       score: row.score === null || row.score === undefined ? undefined : Number(row.score),
@@ -620,6 +661,20 @@ export class SQLiteStore implements Store {
       evidenceIds: parseJson<string[]>(row.evidence_ids as string, []),
       artifactIds: parseJson<string[]>(row.artifact_ids as string, []),
       metadata: row.metadata ? parseJson<Record<string, unknown>>(row.metadata as string, {}) : undefined,
+      createdAt: String(row.created_at || "")
+    };
+  }
+
+  private rowToQualityGateDecision(row: Record<string, unknown>): QualityGateDecision {
+    return {
+      id: String(row.id),
+      runId: String(row.run_id || ""),
+      stepId: String(row.step_id || ""),
+      attempt: Number(row.attempt || 0),
+      status: String(row.status || "failed") as QualityGateDecision["status"],
+      evaluationIds: parseJson<string[]>(row.evaluation_ids as string, []),
+      reason: row.reason as string | undefined,
+      decidedBy: String(row.decided_by || "system") as QualityGateDecision["decidedBy"],
       createdAt: String(row.created_at || "")
     };
   }
@@ -925,6 +980,23 @@ export class SQLiteStore implements Store {
       ? this.db.prepare("SELECT * FROM evaluations WHERE run_id = ? AND step_id = ? ORDER BY created_at ASC").all(runId, stepId) as Record<string, unknown>[]
       : this.db.prepare("SELECT * FROM evaluations WHERE run_id = ? ORDER BY created_at ASC").all(runId) as Record<string, unknown>[];
     return rows.map((row) => this.rowToEvaluation(row));
+  }
+
+  async createQualityGateDecision(input: Partial<QualityGateDecision> & Pick<QualityGateDecision, "runId" | "stepId" | "attempt" | "status" | "evaluationIds" | "decidedBy">): Promise<QualityGateDecision> {
+    const decision: QualityGateDecision = {
+      id: input.id || makeId("qgd"),
+      createdAt: input.createdAt || nowIso(),
+      ...input
+    } as QualityGateDecision;
+    this.upsertQualityGateDecisionRow(decision);
+    return decision;
+  }
+
+  async listQualityGateDecisions(runId: string, stepId?: string): Promise<QualityGateDecision[]> {
+    const rows = stepId
+      ? this.db.prepare("SELECT * FROM quality_gate_decisions WHERE run_id = ? AND step_id = ? ORDER BY created_at ASC").all(runId, stepId) as Record<string, unknown>[]
+      : this.db.prepare("SELECT * FROM quality_gate_decisions WHERE run_id = ? ORDER BY created_at ASC").all(runId) as Record<string, unknown>[];
+    return rows.map((row) => this.rowToQualityGateDecision(row));
   }
 
   async listSessions(): Promise<Session[]> {

@@ -12,7 +12,7 @@ export type EvaluatorResult = Omit<Evaluation, "id" | "runId" | "stepId" | "crea
 
 export interface Evaluator {
   type: string;
-  evaluate(input: EvaluatorInput): EvaluatorResult;
+  evaluate(input: EvaluatorInput): Promise<EvaluatorResult> | EvaluatorResult;
 }
 
 export class EvaluatorRegistry {
@@ -153,10 +153,34 @@ export class CheckEvaluator implements Evaluator {
   }
 }
 
+export class DbAssertionsEvaluator implements Evaluator {
+  type = "db-assertions";
+
+  evaluate(input: EvaluatorInput): EvaluatorResult {
+    const assertions = input.evidence.filter((item) => item.kind === "db.assertion" && (item.attempt === undefined || item.attempt === input.step.attempt));
+    const passedCount = assertions.filter((item) => nestedValue(item.value, "passed") === true).length;
+    const passed = assertions.length > 0 && passedCount === assertions.length;
+    const failed = assertions.find((item) => nestedValue(item.value, "passed") !== true);
+    return {
+      evaluator: input.definition.id || this.type,
+      status: passed ? "passed" : "failed",
+      score: passedCount,
+      threshold: assertions.length,
+      reason: passed
+        ? `All database assertions passed (${passedCount}/${assertions.length})`
+        : failed?.claim || `Database assertions failed (${passedCount}/${assertions.length})`,
+      evidenceIds: evidenceIds(assertions),
+      artifactIds: artifactIds(input.artifacts),
+      metadata: { type: this.type, assertionCount: assertions.length }
+    };
+  }
+}
+
 export function createDefaultEvaluatorRegistry() {
   return new EvaluatorRegistry([
     new BooleanEvaluator(),
     new NumericThresholdEvaluator(),
-    new CheckEvaluator()
+    new CheckEvaluator(),
+    new DbAssertionsEvaluator()
   ]);
 }

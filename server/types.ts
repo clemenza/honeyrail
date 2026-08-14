@@ -65,6 +65,7 @@ export type Artifact = {
   id: string;
   runId: string;
   stepId?: string;
+  attempt?: number;
   kind: ArtifactKind;
   name: string;
   uri?: string;
@@ -78,6 +79,7 @@ export type Evidence = {
   id: string;
   runId: string;
   stepId?: string;
+  attempt?: number;
   kind: string;
   claim?: string;
   value?: unknown;
@@ -93,6 +95,7 @@ export type Evaluation = {
   id: string;
   runId: string;
   stepId?: string;
+  attempt?: number;
   evaluator: string;
   status: EvaluationStatus;
   score?: number;
@@ -108,7 +111,7 @@ export type EvaluationOperator = "==" | "!=" | ">" | ">=" | "<" | "<=";
 
 export type EvaluatorDefinition = {
   id?: string;
-  type: "boolean" | "numeric-threshold" | "check";
+  type: string;
   source?: string;
   expected?: boolean | string | number;
   operator?: EvaluationOperator;
@@ -121,9 +124,24 @@ export type QualityGate = {
   onFail?: "fail" | "wait_approval";
 };
 
+export type QualityGateDecisionStatus = "passed" | "failed" | "overridden";
+
+export type QualityGateDecision = {
+  id: string;
+  runId: string;
+  stepId: string;
+  attempt: number;
+  status: QualityGateDecisionStatus;
+  evaluationIds: string[];
+  reason?: string;
+  decidedBy: "system" | "operator";
+  createdAt: string;
+};
+
 export type VerificationSummary = {
   artifacts: number;
   evidence: number;
+  latestAttempt?: number;
   evaluations: {
     passed: number;
     failed: number;
@@ -285,6 +303,8 @@ export interface Store {
   listEvidence(runId: string, stepId?: string): Promise<Evidence[]>;
   createEvaluation(input: Partial<Evaluation> & Pick<Evaluation, "runId" | "evaluator" | "status">): Promise<Evaluation>;
   listEvaluations(runId: string, stepId?: string): Promise<Evaluation[]>;
+  createQualityGateDecision(input: Partial<QualityGateDecision> & Pick<QualityGateDecision, "runId" | "stepId" | "attempt" | "status" | "evaluationIds" | "decidedBy">): Promise<QualityGateDecision>;
+  listQualityGateDecisions(runId: string, stepId?: string): Promise<QualityGateDecision[]>;
 
   listSessions(): Promise<Session[]>;
   createSession(input: Partial<Session> & { id?: string }): Promise<Session>;

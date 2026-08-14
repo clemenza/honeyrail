@@ -1,5 +1,5 @@
 import { readFile, writeFile } from "node:fs/promises";
-import type { Artifact, Evaluation, EventInput, Evidence, GatewayEvent, Project, Run, Session, Step, Store, Task, Worktree } from "./types.js";
+import type { Artifact, Evaluation, EventInput, Evidence, GatewayEvent, Project, QualityGateDecision, Run, Session, Step, Store, Task, Worktree } from "./types.js";
 import { makeId } from "./utils.js";
 
 type StoreData = {
@@ -10,6 +10,7 @@ type StoreData = {
     artifacts: Artifact[];
     evidence: Evidence[];
     evaluations: Evaluation[];
+    qualityGateDecisions: QualityGateDecision[];
     sessions: Session[];
     tasks: Task[];
     worktrees: Worktree[];
@@ -22,7 +23,7 @@ export class JsonStore implements Store {
 
     constructor(filePath: string) {
         this.filePath = filePath;
-        this.data = { settings: {}, projects: [], runs: [], steps: [], artifacts: [], evidence: [], evaluations: [], sessions: [], tasks: [], worktrees: [], events: [] };
+        this.data = { settings: {}, projects: [], runs: [], steps: [], artifacts: [], evidence: [], evaluations: [], qualityGateDecisions: [], sessions: [], tasks: [], worktrees: [], events: [] };
         this._load();
     }
 
@@ -37,6 +38,7 @@ export class JsonStore implements Store {
                 artifacts: [],
                 evidence: [],
                 evaluations: [],
+                qualityGateDecisions: [],
                 sessions: [],
                 tasks: [],
                 worktrees: [],
@@ -192,6 +194,19 @@ export class JsonStore implements Store {
     async listEvaluations(runId: string, stepId?: string): Promise<Evaluation[]> {
         const evaluations = (this.data.evaluations || []).filter((item) => item.runId === runId);
         return stepId ? evaluations.filter((item) => item.stepId === stepId) : evaluations;
+    }
+
+    async createQualityGateDecision(input: Partial<QualityGateDecision> & Pick<QualityGateDecision, "runId" | "stepId" | "attempt" | "status" | "evaluationIds" | "decidedBy">): Promise<QualityGateDecision> {
+        const decision = { id: input.id || makeId("qgd"), createdAt: new Date().toISOString(), reason: undefined, ...input } as QualityGateDecision;
+        this.data.qualityGateDecisions = this.data.qualityGateDecisions || [];
+        this.data.qualityGateDecisions.push(decision);
+        await this._save();
+        return decision;
+    }
+
+    async listQualityGateDecisions(runId: string, stepId?: string): Promise<QualityGateDecision[]> {
+        const decisions = (this.data.qualityGateDecisions || []).filter((item) => item.runId === runId);
+        return stepId ? decisions.filter((item) => item.stepId === stepId) : decisions;
     }
 
     async listSessions(): Promise<Session[]> {

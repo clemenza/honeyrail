@@ -85,7 +85,7 @@ export const createTaskBody = z.object({
 const stepInput = z.record(z.string(), z.unknown());
 const evaluatorBody = z.object({
   id: z.string().optional(),
-  type: z.enum(["boolean", "numeric-threshold", "check"]),
+  type: z.string().min(1),
   source: z.string().optional(),
   expected: z.union([z.boolean(), z.string(), z.number()]).optional(),
   operator: z.enum(["==", "!=", ">", ">=", "<", "<="]).optional(),
