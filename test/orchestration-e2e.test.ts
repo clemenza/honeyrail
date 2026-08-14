@@ -191,6 +191,50 @@ test("service.startPolling() advances a shell step to completion via pure REST p
   assert.equal(detail.steps[0].output.stdout.trim(), "done");
 });
 
+test("issue #3 regression: an approval step followed by a shell step converges to succeeded via the poller after approval, with no other scheduling trigger", async (t) => {
+  // Exact reproduction from https://github.com/clemenza/honeyrail/issues/3:
+  // approve a "gate" step, then a dependent "after" shell step starts but
+  // (pre-fix) never got re-inspected once its background process finished,
+  // since approveStep()'s own scheduleRun() call only advances the run up
+  // to starting "after" - nothing further ever re-invoked the scheduler for
+  // it. This is the same root cause as issue #7, fixed by
+  // OrchestrationService.startPolling().
+  const { baseUrl, project, service } = await withE2EServer(t);
+  const stopPolling = service.startPolling(50);
+  t.after(() => stopPolling());
+
+  const createRes = await fetch(`${baseUrl}/api/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      projectId: project.id,
+      goal: "approval then shell",
+      steps: [
+        { id: "gate", executor: "approval" },
+        { id: "after", executor: "shell", dependsOn: ["gate"], input: { command: "printf after-restart" } }
+      ]
+    })
+  });
+  const created = await createRes.json();
+  assert.equal(created.run.status, "waiting_approval");
+
+  const approveRes = await fetch(`${baseUrl}/api/runs/${created.run.id}/steps/gate/approve`, { method: "POST" });
+  assert.equal(approveRes.status, 200);
+
+  // Converge to a terminal run state via pure REST polling - no manual
+  // scheduleRun() call, relying entirely on the background poller, within
+  // the 15s bound mentioned in the issue (usually well under 1s here).
+  const deadline = Date.now() + 15000;
+  let detail = await getRun(baseUrl, created.run.id);
+  while (Date.now() < deadline && detail.run.status === "running") {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    detail = await getRun(baseUrl, created.run.id);
+  }
+  assert.equal(detail.run.status, "succeeded");
+  assert.equal(detail.steps.find((s: any) => s.id === "after").status, "succeeded");
+  assert.equal(detail.steps.find((s: any) => s.id === "after").output.stdout, "after-restart");
+});
+
 test("simple linear DAG: shell prepare -> check verify -> approval gate, with real artifact/evidence generation", async (t) => {
   const { baseUrl, store, service, worktrees, project } = await withE2EServer(t);
   const worktree = await createFixtureWorktree(worktrees, store, project, "simple-dag");
