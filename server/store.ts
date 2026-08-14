@@ -1,4 +1,5 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import type { Artifact, Evaluation, EventInput, Evidence, GatewayEvent, Project, QualityGateDecision, Run, Session, Step, Store, Task, Worktree } from "./types.js";
 import { makeId } from "./utils.js";
 
@@ -27,9 +28,9 @@ export class JsonStore implements Store {
         this._load();
     }
 
-    async _load() {
+    _load() {
         try {
-            const content = await readFile(this.filePath, "utf-8");
+            const content = readFileSync(this.filePath, "utf-8");
             this.data = {
                 settings: {},
                 projects: [],

@@ -15,24 +15,26 @@ This roadmap is directional, not a feature promise.
 
 ## v0.2 / M1: Orchestration Core
 
-- Introduce additive `Run`, `Step`, and `Executor` concepts above the existing task/session/worktree primitives.
-- Add DAG scheduling and dependency tracking.
-- Add restart/resume behavior for orchestration runs.
-- Add REST/MCP control surfaces for run creation, inspection, cancellation, approval, and rejection.
+- Status: implemented as alpha.
+- Additive `Run`, `Step`, and `Executor` concepts sit above the existing task/session/worktree primitives.
+- DAG scheduling, dependency tracking, and restart/resume behavior are present.
+- REST/MCP control surfaces exist for run creation, inspection, cancellation, approval, and rejection.
 - Keep existing task execution semantics intact.
 
 ## v0.3 / M2: Evidence And Quality
 
-- Introduce artifact and evidence contracts.
-- Add evaluator integration points.
-- Add quality gates that can block or approve progression.
-- Make verification outputs easier to compare across runs.
+- Status: implemented as alpha.
+- Artifact and evidence contracts are present.
+- Deterministic evaluators and async/custom evaluator registry support are present.
+- Quality gates can block, pass, request approval, record operator override, or record operator rejection.
+- Verification outputs are queryable across runs.
 - Keep deterministic, inspectable evaluation separate from executor success.
 
 ## v0.4 / M3/M4: Environments And Database Testing Harness Alpha
 
-- Add an environment abstraction for repeatable execution contexts.
-- Build an alpha Database Testing Harness workflow on top of orchestration, evidence, and environment primitives.
+- Status: PostgreSQL harness implemented as alpha; broader environment abstraction remains directional.
+- Build repeatable execution contexts for more targets.
+- Harden the PostgreSQL Database Testing Harness Alpha on top of orchestration, evidence, and quality gate primitives.
 - Keep database-specific harness logic outside the M0 execution kernel.
 
 ## v0.5: Benchmarking And Agent Evaluation
