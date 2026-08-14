@@ -224,6 +224,31 @@ function ApprovalQueue({ tasks }: { tasks: TaskData[] }) {
   );
 }
 
+function evaluationTone(step: RunData["steps"][number]) {
+  const evaluations = step.verification?.evaluations;
+  if (!evaluations || evaluations.passed + evaluations.failed + evaluations.error === 0) return "neutral";
+  if (evaluations.error || evaluations.failed) return "bad";
+  return "good";
+}
+
+function evaluationLabel(step: RunData["steps"][number]) {
+  const evaluations = step.verification?.evaluations;
+  if (!evaluations || evaluations.passed + evaluations.failed + evaluations.error === 0) return "not evaluated";
+  if (evaluations.error) return "ERROR";
+  if (evaluations.failed) return "FAIL";
+  return "PASS";
+}
+
+function compactJson(value: unknown) {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
 function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: ProjectData[]; refresh: () => Promise<void> }) {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -271,6 +296,37 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
                       <span>{step.executor} · attempt {step.attempt}/{step.maxAttempts}</span>
                       <small>depends on {step.dependsOn.length ? step.dependsOn.join(", ") : "none"}</small>
                       {step.error ? <small className="run-step-error">{step.error}</small> : null}
+                      <div className="run-verification">
+                        <span>Artifacts {step.verification?.artifacts || 0}</span>
+                        <span>Evidence {step.verification?.evidence || 0}</span>
+                        <StatusPill tone={evaluationTone(step)}>{evaluationLabel(step)}</StatusPill>
+                      </div>
+                      {step.verification && (step.verification.artifactItems?.length || step.verification.evidenceItems?.length || step.verification.evaluationItems?.length) ? (
+                        <details className="run-verification-detail">
+                          <summary>Verification detail</summary>
+                          {step.verification.artifactItems?.map((artifact) => (
+                            <div className="run-verification-item" key={artifact.id}>
+                              <strong>{artifact.kind}: {artifact.name}</strong>
+                              <small>{artifact.uri || artifact.path || artifact.id}</small>
+                              {artifact.metadata ? <code>{compactJson(artifact.metadata)}</code> : null}
+                            </div>
+                          ))}
+                          {step.verification.evidenceItems?.map((evidence) => (
+                            <div className="run-verification-item" key={evidence.id}>
+                              <strong>{evidence.kind}</strong>
+                              {evidence.claim ? <small>{evidence.claim}</small> : null}
+                              {evidence.value !== undefined ? <code>{compactJson(evidence.value)}</code> : null}
+                            </div>
+                          ))}
+                          {step.verification.evaluationItems?.map((evaluation) => (
+                            <div className="run-verification-item" key={evaluation.id}>
+                              <strong>{evaluation.evaluator}: {evaluation.status}</strong>
+                              {evaluation.reason ? <small>{evaluation.reason}</small> : null}
+                              <code>{compactJson({ score: evaluation.score, threshold: evaluation.threshold, metadata: evaluation.metadata })}</code>
+                            </div>
+                          ))}
+                        </details>
+                      ) : null}
                     </div>
                     <div className="run-step-actions">
                       <StatusPill tone={step.status === "succeeded" ? "good" : step.status === "failed" ? "bad" : step.status === "waiting_approval" ? "warn" : "neutral"}>{step.status}</StatusPill>

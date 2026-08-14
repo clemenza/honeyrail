@@ -27,6 +27,27 @@ export function runRoutes(orchestration: OrchestrationService) {
     res.json(detail);
   }));
 
+  router.get("/api/runs/:runId/artifacts", asyncRoute(async (req, res) => {
+    const stepId = typeof req.query.stepId === "string" ? req.query.stepId : undefined;
+    res.json({ artifacts: await orchestration.listArtifacts(String(req.params.runId), stepId) });
+  }));
+
+  router.get("/api/runs/:runId/evidence", asyncRoute(async (req, res) => {
+    const stepId = typeof req.query.stepId === "string" ? req.query.stepId : undefined;
+    res.json({ evidence: await orchestration.listEvidence(String(req.params.runId), stepId) });
+  }));
+
+  router.get("/api/runs/:runId/evaluations", asyncRoute(async (req, res) => {
+    const stepId = typeof req.query.stepId === "string" ? req.query.stepId : undefined;
+    res.json({ evaluations: await orchestration.listEvaluations(String(req.params.runId), stepId) });
+  }));
+
+  router.get("/api/artifacts/:artifactId", asyncRoute(async (req, res) => {
+    const artifact = await orchestration.getArtifact(String(req.params.artifactId));
+    if (!artifact) return res.status(404).json({ error: "Artifact not found" });
+    res.json({ artifact });
+  }));
+
   router.post("/api/runs/:runId/cancel", asyncRoute(async (req, res) => {
     res.json({ run: await orchestration.cancelRun(String(req.params.runId)) });
   }));

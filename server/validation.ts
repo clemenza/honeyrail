@@ -83,6 +83,20 @@ export const createTaskBody = z.object({
 });
 
 const stepInput = z.record(z.string(), z.unknown());
+const evaluatorBody = z.object({
+  id: z.string().optional(),
+  type: z.enum(["boolean", "numeric-threshold", "check"]),
+  source: z.string().optional(),
+  expected: z.union([z.boolean(), z.string(), z.number()]).optional(),
+  operator: z.enum(["==", "!=", ">", ">=", "<", "<="]).optional(),
+  threshold: z.number().optional(),
+  reason: z.string().optional()
+});
+
+const qualityGateBody = z.object({
+  evaluators: z.array(evaluatorBody).min(1),
+  onFail: z.enum(["fail", "wait_approval"]).optional()
+});
 
 export const createRunBody = z.object({
   projectId: z.string(),
@@ -93,7 +107,8 @@ export const createRunBody = z.object({
     executor: z.string().min(1),
     input: stepInput.optional(),
     dependsOn: z.array(z.string()).optional(),
-    maxAttempts: z.number().int().positive().optional()
+    maxAttempts: z.number().int().positive().optional(),
+    qualityGate: qualityGateBody.optional()
   })).min(1)
 });
 

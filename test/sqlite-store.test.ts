@@ -56,7 +56,7 @@ test("SQLiteStore persists projects, sessions, tasks, worktrees, events, and set
   assert.equal((await store.getTask(task.id))!.title, "fix");
   assert.equal((await store.getWorktree(worktree.id))!.branch, "codex/fix");
   assert.equal((await store.listEvents()).at(-1)!.id, event.id);
-  assert.equal(readSchemaVersion(dbPath), 3);
+  assert.equal(readSchemaVersion(dbPath), 4);
 
   await store.updateTask(task.id, { status: "ready_to_merge" });
   await store.updateWorktree(worktree.id, { status: "committed" });
@@ -77,7 +77,7 @@ test("SQLiteStore schema migrations are idempotent on repeated startup", async (
   const second = new SQLiteStore(dbPath);
   t.after(() => second.close());
 
-  assert.equal(readSchemaVersion(dbPath), 3);
+  assert.equal(readSchemaVersion(dbPath), 4);
   assert.equal((await second.getProject(project.id))!.name, "stable");
   assert.equal((await second.listProjects()).length, 1);
 });
@@ -112,7 +112,7 @@ test("SQLiteStore upgrades v1 records schema to the structured schema without lo
   const store = new SQLiteStore(dbPath);
   t.after(() => store.close());
 
-  assert.equal(readSchemaVersion(dbPath), 3);
+  assert.equal(readSchemaVersion(dbPath), 4);
   assert.equal((await store.getProject("proj_v1"))!.repoPath, "/repo/v1");
   assert.equal((await store.getSession("sess_v1"))!.worktreeId, "wt_v1");
   assert.equal((await store.getTask("task_v1"))!.sessionId, "sess_v1");
@@ -140,7 +140,7 @@ test("SQLiteStore migration failure rolls back partial schema changes and leaves
   assert.equal(tableExists(dbPath, "kv_settings"), false);
 });
 
-test("SQLiteStore upgrades v2 execution schema to v3 orchestration schema and preserves existing state", async (t) => {
+test("SQLiteStore upgrades v2 execution schema to v4 orchestration and verification schema and preserves existing state", async (t) => {
   const tempDir = await tempPath(t);
   const dbPath = join(tempDir, "gateway.sqlite");
   inspectDatabase(dbPath, (db) => {
@@ -246,16 +246,23 @@ test("SQLiteStore upgrades v2 execution schema to v3 orchestration schema and pr
 
   const store = new SQLiteStore(dbPath);
   const run = await store.createRun({ projectId: "proj_v2", goal: "persist m1" });
-  await store.createStep({ id: "step_a", runId: run.id, name: "A", executor: "shell", input: { command: "true" }, dependsOn: [], status: "pending" });
+  await store.createStep({ id: "step_a", runId: run.id, name: "A", executor: "shell", input: { command: "true" }, dependsOn: [], status: "pending", qualityGate: { evaluators: [{ type: "boolean", source: "output.ok" }] } });
+  const artifact = await store.createArtifact({ runId: run.id, stepId: "step_a", kind: "log", name: "check.log", metadata: { command: "true" } });
+  const evidence = await store.createEvidence({ runId: run.id, stepId: "step_a", kind: "check.command", claim: "true passed", artifactIds: [artifact.id], value: { exitCode: 0 } });
+  await store.createEvaluation({ runId: run.id, stepId: "step_a", evaluator: "check", status: "passed", evidenceIds: [evidence.id], artifactIds: [artifact.id], reason: "ok" });
   store.close();
 
   const reopened = new SQLiteStore(dbPath);
   t.after(() => reopened.close());
 
-  assert.equal(readSchemaVersion(dbPath), 3);
+  assert.equal(readSchemaVersion(dbPath), 4);
   assert.equal((await reopened.getProject("proj_v2"))!.name, "v2");
   assert.equal((await reopened.getRun(run.id))!.goal, "persist m1");
   assert.equal((await reopened.getStep(run.id, "step_a"))!.input.command, "true");
+  assert.equal((await reopened.getStep(run.id, "step_a"))!.qualityGate?.evaluators[0].type, "boolean");
+  assert.equal((await reopened.listArtifacts(run.id, "step_a"))[0].metadata?.command, "true");
+  assert.equal((await reopened.listEvidence(run.id, "step_a"))[0].artifactIds?.[0], artifact.id);
+  assert.equal((await reopened.listEvaluations(run.id, "step_a"))[0].status, "passed");
 });
 
 test("SQLiteStore migrates legacy gateway.json once and writes a backup", async (t) => {

@@ -1,5 +1,16 @@
 import { defaultCheckCommands, mergeCheckRuns } from "../project-helpers.js";
+import { publishEvent } from "../events.js";
 import type { ExecutionHandle, ExecutionState, Executor, StepExecutionContext } from "./types.js";
+
+function durationMs(startedAt: string, finishedAt: string) {
+  const started = Date.parse(startedAt);
+  const finished = Date.parse(finishedAt);
+  return Number.isFinite(started) && Number.isFinite(finished) ? Math.max(0, finished - started) : undefined;
+}
+
+function preview(value: string, max = 4000) {
+  return value.length > max ? value.slice(value.length - max) : value;
+}
 
 export class CheckExecutor implements Executor {
   type = "check";
@@ -27,7 +38,57 @@ export class CheckExecutor implements Executor {
         checkRuns: mergeCheckRuns(existingTask?.checkRuns, result.runs)
       });
     }
-    return { worktreeId, ok: result.ok, checkRuns: result.runs };
+    const artifactIds: string[] = [];
+    const evidenceIds: string[] = [];
+    for (const [index, run] of result.runs.entries()) {
+      const artifact = await ctx.store.createArtifact({
+        runId: ctx.runId,
+        stepId: ctx.step.id,
+        kind: "log",
+        name: `check-${index + 1}.log`,
+        uri: `honeyrail://runs/${ctx.runId}/steps/${ctx.step.id}/checks/${index + 1}`,
+        mediaType: "text/plain",
+        metadata: {
+          command: run.command,
+          status: run.status,
+          exitCode: run.exitCode ?? (run.status === "passed" ? 0 : 1),
+          stdoutPreview: preview(run.stdout || ""),
+          stderrPreview: preview(run.stderr || "")
+        }
+      });
+      artifactIds.push(artifact.id);
+      await publishEvent(ctx.store, ctx.bus, {
+        type: "artifact.created",
+        projectId: ctx.project.id,
+        payload: { runId: ctx.runId, stepId: ctx.step.id, artifactId: artifact.id, kind: artifact.kind, name: artifact.name }
+      });
+      const exitCode = run.exitCode ?? (run.status === "passed" ? 0 : 1);
+      const evidence = await ctx.store.createEvidence({
+        runId: ctx.runId,
+        stepId: ctx.step.id,
+        kind: "check.command",
+        claim: `Command \`${run.command}\` ${run.status}`,
+        source: "check",
+        artifactIds: [artifact.id],
+        value: {
+          command: run.command,
+          status: run.status,
+          exitCode,
+          durationMs: durationMs(run.startedAt, run.finishedAt)
+        },
+        metadata: {
+          startedAt: run.startedAt,
+          finishedAt: run.finishedAt
+        }
+      });
+      evidenceIds.push(evidence.id);
+      await publishEvent(ctx.store, ctx.bus, {
+        type: "evidence.recorded",
+        projectId: ctx.project.id,
+        payload: { runId: ctx.runId, stepId: ctx.step.id, evidenceId: evidence.id, kind: evidence.kind, claim: evidence.claim }
+      });
+    }
+    return { worktreeId, ok: result.ok, checkRuns: result.runs, artifactIds, evidenceIds };
   }
 
   async inspect(_ctx: StepExecutionContext, handle: ExecutionHandle): Promise<ExecutionState> {

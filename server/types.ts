@@ -59,6 +59,78 @@ export type CheckRun = {
   finishedAt: string;
 };
 
+export type ArtifactKind = "file" | "directory" | "text" | "json" | "log";
+
+export type Artifact = {
+  id: string;
+  runId: string;
+  stepId?: string;
+  kind: ArtifactKind;
+  name: string;
+  uri?: string;
+  path?: string;
+  mediaType?: string;
+  metadata?: Record<string, unknown>;
+  createdAt: string;
+};
+
+export type Evidence = {
+  id: string;
+  runId: string;
+  stepId?: string;
+  kind: string;
+  claim?: string;
+  value?: unknown;
+  source?: string;
+  artifactIds?: string[];
+  metadata?: Record<string, unknown>;
+  createdAt: string;
+};
+
+export type EvaluationStatus = "passed" | "failed" | "error";
+
+export type Evaluation = {
+  id: string;
+  runId: string;
+  stepId?: string;
+  evaluator: string;
+  status: EvaluationStatus;
+  score?: number;
+  threshold?: number;
+  reason?: string;
+  evidenceIds?: string[];
+  artifactIds?: string[];
+  metadata?: Record<string, unknown>;
+  createdAt: string;
+};
+
+export type EvaluationOperator = "==" | "!=" | ">" | ">=" | "<" | "<=";
+
+export type EvaluatorDefinition = {
+  id?: string;
+  type: "boolean" | "numeric-threshold" | "check";
+  source?: string;
+  expected?: boolean | string | number;
+  operator?: EvaluationOperator;
+  threshold?: number;
+  reason?: string;
+};
+
+export type QualityGate = {
+  evaluators: EvaluatorDefinition[];
+  onFail?: "fail" | "wait_approval";
+};
+
+export type VerificationSummary = {
+  artifacts: number;
+  evidence: number;
+  evaluations: {
+    passed: number;
+    failed: number;
+    error: number;
+  };
+};
+
 export type Project = {
   id: string;
   name: string;
@@ -91,6 +163,7 @@ export type Step = {
   status: StepStatus;
   attempt: number;
   maxAttempts: number;
+  qualityGate?: QualityGate;
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;
@@ -204,6 +277,14 @@ export interface Store {
   listSteps(runId: string): Promise<Step[]>;
   getStep(runId: string, stepId: string): Promise<Step | undefined>;
   updateStep(runId: string, stepId: string, updates: Partial<Step>): Promise<Step | undefined>;
+
+  createArtifact(input: Partial<Artifact> & Pick<Artifact, "runId" | "kind" | "name">): Promise<Artifact>;
+  listArtifacts(runId: string, stepId?: string): Promise<Artifact[]>;
+  getArtifact(id: string): Promise<Artifact | undefined>;
+  createEvidence(input: Partial<Evidence> & Pick<Evidence, "runId" | "kind">): Promise<Evidence>;
+  listEvidence(runId: string, stepId?: string): Promise<Evidence[]>;
+  createEvaluation(input: Partial<Evaluation> & Pick<Evaluation, "runId" | "evaluator" | "status">): Promise<Evaluation>;
+  listEvaluations(runId: string, stepId?: string): Promise<Evaluation[]>;
 
   listSessions(): Promise<Session[]>;
   createSession(input: Partial<Session> & { id?: string }): Promise<Session>;

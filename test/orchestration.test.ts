@@ -168,6 +168,87 @@ test("bounded retry retries failures without rerunning successful steps", async 
   assert.equal(flaky.starts, 2);
 });
 
+test("quality gate pass allows downstream scheduling and records evaluation", async (t) => {
+  const ok = new MemoryExecutor("ok", [{ status: "succeeded", output: { ok: true } }, { status: "succeeded", output: { downstream: true } }]);
+  const registry = new ExecutorRegistry([ok]);
+  const { store, service, project, events } = await withService(t, registry);
+
+  const result = await service.createRun({
+    projectId: project.id,
+    goal: "gate pass",
+    steps: [
+      { id: "a", executor: "ok", qualityGate: { evaluators: [{ type: "boolean", source: "output.ok" }] } },
+      { id: "b", executor: "ok", dependsOn: ["a"] }
+    ]
+  });
+
+  assert.equal(result.run.status, "succeeded");
+  assert.equal((await store.getStep(result.run.id, "b"))!.status, "succeeded");
+  assert.equal((await store.listEvaluations(result.run.id, "a"))[0].status, "passed");
+  assert.equal(events.some((event) => event.type === "quality_gate.passed"), true);
+});
+
+test("quality gate fail blocks downstream scheduling", async (t) => {
+  const ok = new MemoryExecutor("ok", [{ status: "succeeded", output: { ok: false } }]);
+  const registry = new ExecutorRegistry([ok]);
+  const { store, service, project } = await withService(t, registry);
+
+  const result = await service.createRun({
+    projectId: project.id,
+    goal: "gate fail",
+    steps: [
+      { id: "a", executor: "ok", qualityGate: { evaluators: [{ type: "boolean", source: "output.ok" }] } },
+      { id: "b", executor: "ok", dependsOn: ["a"] }
+    ]
+  });
+
+  assert.equal(result.run.status, "failed");
+  assert.equal((await store.getStep(result.run.id, "a"))!.status, "failed");
+  assert.equal((await store.getStep(result.run.id, "b"))!.status, "skipped");
+  assert.equal((await store.listEvaluations(result.run.id, "a"))[0].status, "failed");
+});
+
+test("quality gate wait_approval uses existing approval flow", async (t) => {
+  const ok = new MemoryExecutor("ok", [{ status: "succeeded", output: { score: 0.5 } }, { status: "succeeded", output: { downstream: true } }]);
+  const registry = new ExecutorRegistry([ok]);
+  const { store, service, project } = await withService(t, registry);
+
+  const result = await service.createRun({
+    projectId: project.id,
+    goal: "gate approval",
+    steps: [
+      { id: "a", executor: "ok", qualityGate: { evaluators: [{ type: "numeric-threshold", source: "output.score", operator: ">=", threshold: 1 }], onFail: "wait_approval" } },
+      { id: "b", executor: "ok", dependsOn: ["a"] }
+    ]
+  });
+
+  assert.equal(result.run.status, "waiting_approval");
+  assert.equal((await store.getStep(result.run.id, "a"))!.status, "waiting_approval");
+  assert.equal((await store.getStep(result.run.id, "b"))!.status, "pending");
+  assert.equal((await store.listEvaluations(result.run.id, "a"))[0].status, "failed");
+
+  await service.approveStep(result.run.id, "a");
+  assert.equal((await store.getStep(result.run.id, "b"))!.status, "succeeded");
+  assert.equal((await store.getRun(result.run.id))!.status, "succeeded");
+});
+
+test("evaluator input errors are recorded as evaluation errors and fail the gate", async (t) => {
+  const ok = new MemoryExecutor("ok", [{ status: "succeeded", output: {} }]);
+  const registry = new ExecutorRegistry([ok]);
+  const { store, service, project } = await withService(t, registry);
+
+  const result = await service.createRun({
+    projectId: project.id,
+    goal: "gate error",
+    steps: [{ id: "a", executor: "ok", qualityGate: { evaluators: [{ type: "numeric-threshold", source: "output.missing", operator: ">=", threshold: 1 }] } }]
+  });
+
+  assert.equal(result.run.status, "failed");
+  const evaluation = (await store.listEvaluations(result.run.id, "a"))[0];
+  assert.equal(evaluation.status, "error");
+  assert.match(String(evaluation.reason), /finite/);
+});
+
 test("approval survives recovery and continues only after explicit approval", async (t) => {
   const approval = new ApprovalTestExecutor();
   const ok = new MemoryExecutor("ok");
@@ -500,6 +581,15 @@ test("CheckExecutor reuses worktree check flow and updates linked task/worktree 
   assert.equal(state.status, "succeeded");
   assert.equal((await store.getWorktree(worktree.id))!.status, "checks_passed");
   assert.equal((await store.getTask(task.id))!.status, "ready_to_merge");
+  const artifacts = await store.listArtifacts("run_check", "check");
+  const evidence = await store.listEvidence("run_check", "check");
+  assert.equal(artifacts.length, 1);
+  assert.equal(artifacts[0].kind, "log");
+  assert.equal(artifacts[0].metadata?.command, "npm test");
+  assert.equal(evidence.length, 1);
+  assert.equal(evidence[0].kind, "check.command");
+  assert.equal((evidence[0].value as any).exitCode, 0);
+  assert.deepEqual(evidence[0].artifactIds, [artifacts[0].id]);
 });
 
 async function withHttpServer(t: TestContext) {
@@ -534,11 +624,11 @@ async function withHttpServer(t: TestContext) {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(tempDir, { recursive: true, force: true });
   });
-  return { baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, project };
+  return { baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, project, store };
 }
 
 test("REST API creates, gets, approves, rejects, cancels, and validates runs", async (t) => {
-  const { baseUrl, project } = await withHttpServer(t);
+  const { baseUrl, project, store } = await withHttpServer(t);
   const invalid = await fetch(`${baseUrl}/api/runs`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -557,7 +647,17 @@ test("REST API creates, gets, approves, rejects, cancels, and validates runs", a
 
   const getRes = await fetch(`${baseUrl}/api/runs/${created.run.id}`);
   assert.equal(getRes.status, 200);
-  assert.equal((await getRes.json()).steps[0].status, "waiting_approval");
+  const getBody = await getRes.json();
+  assert.equal(getBody.steps[0].status, "waiting_approval");
+  assert.equal(getBody.run.verification.artifacts, 0);
+
+  const artifact = await store.createArtifact({ runId: created.run.id, stepId: "approve", kind: "json", name: "result.json", metadata: { ok: true } });
+  const evidence = await store.createEvidence({ runId: created.run.id, stepId: "approve", kind: "manual.fact", claim: "operator inspected result", artifactIds: [artifact.id], value: { ok: true } });
+  await store.createEvaluation({ runId: created.run.id, stepId: "approve", evaluator: "boolean", status: "passed", evidenceIds: [evidence.id], artifactIds: [artifact.id], reason: "ok" });
+  assert.equal((await (await fetch(`${baseUrl}/api/runs/${created.run.id}/artifacts?stepId=approve`)).json()).artifacts[0].id, artifact.id);
+  assert.equal((await (await fetch(`${baseUrl}/api/artifacts/${artifact.id}`)).json()).artifact.metadata.ok, true);
+  assert.equal((await (await fetch(`${baseUrl}/api/runs/${created.run.id}/evidence?stepId=approve`)).json()).evidence[0].claim, "operator inspected result");
+  assert.equal((await (await fetch(`${baseUrl}/api/runs/${created.run.id}/evaluations?stepId=approve`)).json()).evaluations[0].status, "passed");
 
   const approveRes = await fetch(`${baseUrl}/api/runs/${created.run.id}/steps/approve/approve`, { method: "POST" });
   assert.equal(approveRes.status, 200);

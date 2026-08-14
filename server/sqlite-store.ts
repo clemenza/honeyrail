@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { EventInput, GatewayEvent, Project, Run, Session, Step, Store, Task, Worktree } from "./types.js";
+import type { Artifact, Evaluation, EventInput, Evidence, GatewayEvent, Project, Run, Session, Step, Store, Task, Worktree } from "./types.js";
 import { makeId } from "./utils.js";
 
 type StoreData = {
@@ -9,6 +9,9 @@ type StoreData = {
   projects: Project[];
   runs: Run[];
   steps: Step[];
+  artifacts: Artifact[];
+  evidence: Evidence[];
+  evaluations: Evaluation[];
   sessions: Session[];
   tasks: Task[];
   worktrees: Worktree[];
@@ -20,6 +23,9 @@ const EMPTY_DATA: StoreData = {
   projects: [],
   runs: [],
   steps: [],
+  artifacts: [],
+  evidence: [],
+  evaluations: [],
   sessions: [],
   tasks: [],
   worktrees: [],
@@ -211,6 +217,61 @@ const ORCHESTRATION_SCHEMA_SQL = `
   CREATE INDEX IF NOT EXISTS idx_steps_status ON steps(status);
 `;
 
+const VERIFICATION_SCHEMA_SQL = `
+  ALTER TABLE steps ADD COLUMN quality_gate TEXT;
+
+  CREATE TABLE IF NOT EXISTS artifacts (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    step_id TEXT,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    uri TEXT,
+    path TEXT,
+    media_type TEXT,
+    metadata TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts(run_id);
+  CREATE INDEX IF NOT EXISTS idx_artifacts_step ON artifacts(step_id);
+  CREATE INDEX IF NOT EXISTS idx_artifacts_created ON artifacts(created_at);
+
+  CREATE TABLE IF NOT EXISTS evidence (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    step_id TEXT,
+    kind TEXT NOT NULL,
+    claim TEXT,
+    value TEXT,
+    source TEXT,
+    artifact_ids TEXT NOT NULL DEFAULT '[]',
+    metadata TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_evidence_run ON evidence(run_id);
+  CREATE INDEX IF NOT EXISTS idx_evidence_step ON evidence(step_id);
+  CREATE INDEX IF NOT EXISTS idx_evidence_created ON evidence(created_at);
+
+  CREATE TABLE IF NOT EXISTS evaluations (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    step_id TEXT,
+    evaluator TEXT NOT NULL,
+    status TEXT NOT NULL,
+    score REAL,
+    threshold REAL,
+    reason TEXT,
+    evidence_ids TEXT NOT NULL DEFAULT '[]',
+    artifact_ids TEXT NOT NULL DEFAULT '[]',
+    metadata TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_evaluations_run ON evaluations(run_id);
+  CREATE INDEX IF NOT EXISTS idx_evaluations_step ON evaluations(step_id);
+  CREATE INDEX IF NOT EXISTS idx_evaluations_status ON evaluations(status);
+  CREATE INDEX IF NOT EXISTS idx_evaluations_created ON evaluations(created_at);
+`;
+
 type SchemaMigration = {
   version: number;
   name: string;
@@ -232,6 +293,11 @@ const SCHEMA_MIGRATIONS: SchemaMigration[] = [
     version: 3,
     name: "orchestration-runs-steps",
     up: (db) => db.exec(ORCHESTRATION_SCHEMA_SQL)
+  },
+  {
+    version: 4,
+    name: "verification-artifacts-evidence-evaluations",
+    up: (db) => db.exec(VERIFICATION_SCHEMA_SQL)
   }
 ];
 
@@ -372,15 +438,48 @@ export class SQLiteStore implements Store {
   }
 
   private upsertStepRow(step: Step, createdAt: string) {
-    this.db.prepare(`INSERT OR REPLACE INTO steps (id, run_id, name, executor, input, depends_on, status, attempt, max_attempts, created_at, started_at, finished_at, execution_ref, output, error)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    this.db.prepare(`INSERT OR REPLACE INTO steps (id, run_id, name, executor, input, depends_on, status, attempt, max_attempts, created_at, started_at, finished_at, execution_ref, output, error, quality_gate)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       step.id, step.runId, step.name || "", step.executor,
       JSON.stringify(step.input || {}), JSON.stringify(step.dependsOn || []),
       step.status || "pending", step.attempt ?? 0, step.maxAttempts ?? 1,
       createdAt, step.startedAt ?? null, step.finishedAt ?? null,
       step.executionRef ? JSON.stringify(step.executionRef) : null,
       step.output ? JSON.stringify(step.output) : null,
-      step.error ?? null
+      step.error ?? null,
+      step.qualityGate ? JSON.stringify(step.qualityGate) : null
+    );
+  }
+
+  private upsertArtifactRow(artifact: Artifact) {
+    this.db.prepare(`INSERT OR REPLACE INTO artifacts (id, run_id, step_id, kind, name, uri, path, media_type, metadata, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      artifact.id, artifact.runId, artifact.stepId ?? null, artifact.kind, artifact.name || "",
+      artifact.uri ?? null, artifact.path ?? null, artifact.mediaType ?? null,
+      artifact.metadata ? JSON.stringify(artifact.metadata) : null,
+      artifact.createdAt
+    );
+  }
+
+  private upsertEvidenceRow(evidence: Evidence) {
+    this.db.prepare(`INSERT OR REPLACE INTO evidence (id, run_id, step_id, kind, claim, value, source, artifact_ids, metadata, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      evidence.id, evidence.runId, evidence.stepId ?? null, evidence.kind, evidence.claim ?? null,
+      evidence.value !== undefined ? JSON.stringify(evidence.value) : null,
+      evidence.source ?? null, JSON.stringify(evidence.artifactIds || []),
+      evidence.metadata ? JSON.stringify(evidence.metadata) : null,
+      evidence.createdAt
+    );
+  }
+
+  private upsertEvaluationRow(evaluation: Evaluation) {
+    this.db.prepare(`INSERT OR REPLACE INTO evaluations (id, run_id, step_id, evaluator, status, score, threshold, reason, evidence_ids, artifact_ids, metadata, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      evaluation.id, evaluation.runId, evaluation.stepId ?? null, evaluation.evaluator, evaluation.status,
+      evaluation.score ?? null, evaluation.threshold ?? null, evaluation.reason ?? null,
+      JSON.stringify(evaluation.evidenceIds || []), JSON.stringify(evaluation.artifactIds || []),
+      evaluation.metadata ? JSON.stringify(evaluation.metadata) : null,
+      evaluation.createdAt
     );
   }
 
@@ -473,7 +572,55 @@ export class SQLiteStore implements Store {
       finishedAt: row.finished_at as string | undefined,
       executionRef: row.execution_ref ? parseJson<Record<string, unknown>>(row.execution_ref as string, {}) : undefined,
       output: row.output ? parseJson<Record<string, unknown>>(row.output as string, {}) : undefined,
+      qualityGate: row.quality_gate ? parseJson<Step["qualityGate"]>(row.quality_gate as string, undefined) : undefined,
       error: row.error as string | undefined
+    };
+  }
+
+  private rowToArtifact(row: Record<string, unknown>): Artifact {
+    return {
+      id: String(row.id),
+      runId: String(row.run_id || ""),
+      stepId: row.step_id as string | undefined,
+      kind: String(row.kind || "text") as Artifact["kind"],
+      name: String(row.name || ""),
+      uri: row.uri as string | undefined,
+      path: row.path as string | undefined,
+      mediaType: row.media_type as string | undefined,
+      metadata: row.metadata ? parseJson<Record<string, unknown>>(row.metadata as string, {}) : undefined,
+      createdAt: String(row.created_at || "")
+    };
+  }
+
+  private rowToEvidence(row: Record<string, unknown>): Evidence {
+    return {
+      id: String(row.id),
+      runId: String(row.run_id || ""),
+      stepId: row.step_id as string | undefined,
+      kind: String(row.kind || ""),
+      claim: row.claim as string | undefined,
+      value: row.value ? parseJson<unknown>(row.value as string, undefined) : undefined,
+      source: row.source as string | undefined,
+      artifactIds: parseJson<string[]>(row.artifact_ids as string, []),
+      metadata: row.metadata ? parseJson<Record<string, unknown>>(row.metadata as string, {}) : undefined,
+      createdAt: String(row.created_at || "")
+    };
+  }
+
+  private rowToEvaluation(row: Record<string, unknown>): Evaluation {
+    return {
+      id: String(row.id),
+      runId: String(row.run_id || ""),
+      stepId: row.step_id as string | undefined,
+      evaluator: String(row.evaluator || ""),
+      status: String(row.status || "error") as Evaluation["status"],
+      score: row.score === null || row.score === undefined ? undefined : Number(row.score),
+      threshold: row.threshold === null || row.threshold === undefined ? undefined : Number(row.threshold),
+      reason: row.reason as string | undefined,
+      evidenceIds: parseJson<string[]>(row.evidence_ids as string, []),
+      artifactIds: parseJson<string[]>(row.artifact_ids as string, []),
+      metadata: row.metadata ? parseJson<Record<string, unknown>>(row.metadata as string, {}) : undefined,
+      createdAt: String(row.created_at || "")
     };
   }
 
@@ -719,6 +866,65 @@ export class SQLiteStore implements Store {
     const merged = { ...step, ...updates };
     this.upsertStepRow(merged, step.createdAt);
     return merged;
+  }
+
+  async createArtifact(input: Partial<Artifact> & Pick<Artifact, "runId" | "kind" | "name">): Promise<Artifact> {
+    const artifact: Artifact = {
+      id: input.id || makeId("art"),
+      createdAt: input.createdAt || nowIso(),
+      ...input
+    } as Artifact;
+    this.upsertArtifactRow(artifact);
+    return artifact;
+  }
+
+  async listArtifacts(runId: string, stepId?: string): Promise<Artifact[]> {
+    const rows = stepId
+      ? this.db.prepare("SELECT * FROM artifacts WHERE run_id = ? AND step_id = ? ORDER BY created_at ASC").all(runId, stepId) as Record<string, unknown>[]
+      : this.db.prepare("SELECT * FROM artifacts WHERE run_id = ? ORDER BY created_at ASC").all(runId) as Record<string, unknown>[];
+    return rows.map((row) => this.rowToArtifact(row));
+  }
+
+  async getArtifact(id: string): Promise<Artifact | undefined> {
+    const row = this.db.prepare("SELECT * FROM artifacts WHERE id = ?").get(id) as Record<string, unknown> | undefined;
+    return row ? this.rowToArtifact(row) : undefined;
+  }
+
+  async createEvidence(input: Partial<Evidence> & Pick<Evidence, "runId" | "kind">): Promise<Evidence> {
+    const evidence: Evidence = {
+      id: input.id || makeId("evd"),
+      createdAt: input.createdAt || nowIso(),
+      artifactIds: [],
+      ...input
+    } as Evidence;
+    this.upsertEvidenceRow(evidence);
+    return evidence;
+  }
+
+  async listEvidence(runId: string, stepId?: string): Promise<Evidence[]> {
+    const rows = stepId
+      ? this.db.prepare("SELECT * FROM evidence WHERE run_id = ? AND step_id = ? ORDER BY created_at ASC").all(runId, stepId) as Record<string, unknown>[]
+      : this.db.prepare("SELECT * FROM evidence WHERE run_id = ? ORDER BY created_at ASC").all(runId) as Record<string, unknown>[];
+    return rows.map((row) => this.rowToEvidence(row));
+  }
+
+  async createEvaluation(input: Partial<Evaluation> & Pick<Evaluation, "runId" | "evaluator" | "status">): Promise<Evaluation> {
+    const evaluation: Evaluation = {
+      id: input.id || makeId("eval"),
+      createdAt: input.createdAt || nowIso(),
+      evidenceIds: [],
+      artifactIds: [],
+      ...input
+    } as Evaluation;
+    this.upsertEvaluationRow(evaluation);
+    return evaluation;
+  }
+
+  async listEvaluations(runId: string, stepId?: string): Promise<Evaluation[]> {
+    const rows = stepId
+      ? this.db.prepare("SELECT * FROM evaluations WHERE run_id = ? AND step_id = ? ORDER BY created_at ASC").all(runId, stepId) as Record<string, unknown>[]
+      : this.db.prepare("SELECT * FROM evaluations WHERE run_id = ? ORDER BY created_at ASC").all(runId) as Record<string, unknown>[];
+    return rows.map((row) => this.rowToEvaluation(row));
   }
 
   async listSessions(): Promise<Session[]> {

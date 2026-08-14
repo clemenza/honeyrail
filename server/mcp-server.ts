@@ -524,7 +524,19 @@ export function createMcpServer(ctx: McpContext): McpServer {
         executor: z.string(),
         input: z.record(z.string(), z.unknown()).optional(),
         dependsOn: z.array(z.string()).optional(),
-        maxAttempts: z.number().optional()
+        maxAttempts: z.number().optional(),
+        qualityGate: z.object({
+          evaluators: z.array(z.object({
+            id: z.string().optional(),
+            type: z.enum(["boolean", "numeric-threshold", "check"]),
+            source: z.string().optional(),
+            expected: z.union([z.boolean(), z.string(), z.number()]).optional(),
+            operator: z.enum(["==", "!=", ">", ">=", "<", "<="]).optional(),
+            threshold: z.number().optional(),
+            reason: z.string().optional()
+          })),
+          onFail: z.enum(["fail", "wait_approval"]).optional()
+        }).optional()
       })).describe("Explicit DAG step definitions")
     },
     async ({ projectId, goal, steps }) => {
