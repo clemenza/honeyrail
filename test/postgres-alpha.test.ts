@@ -29,14 +29,13 @@ async function hasDocker() {
   return result.ok && Boolean(result.stdout.trim());
 }
 
-async function dockerImage() {
+async function dockerHarnessImage() {
   if (process.env.HONEYRAIL_POSTGRES_DOCKER_IMAGE) return process.env.HONEYRAIL_POSTGRES_DOCKER_IMAGE;
   const images = await runCommandSafe("docker", ["images", "--format", "{{.Repository}}:{{.Tag}}"]);
   const available = images.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   return available.find((image) => image === "postgres:16-alpine")
     || available.find((image) => image.includes("pgvector") && image.includes("pg16"))
-    || available.find((image) => image.includes("postgres"))
-    || "postgres:16-alpine";
+    || available.find((image) => image.includes("postgres"));
 }
 
 async function withPostgresHarness(t: TestContext) {
@@ -87,8 +86,12 @@ test("optional PostgreSQL alpha Docker passing scenario persists DB artifacts, e
     t.skip("Docker daemon is not available");
     return;
   }
+  const image = await dockerHarnessImage();
+  if (!image) {
+    t.skip("Docker PostgreSQL image is not available locally");
+    return;
+  }
   const { store, service, project } = await withPostgresHarness(t);
-  const image = await dockerImage();
 
   const result = await service.createRun({
     projectId: project.id,
@@ -123,8 +126,12 @@ test("optional PostgreSQL alpha Docker failing scenario waits for approval, over
     t.skip("Docker daemon is not available");
     return;
   }
+  const image = await dockerHarnessImage();
+  if (!image) {
+    t.skip("Docker PostgreSQL image is not available locally");
+    return;
+  }
   const { store, service, project } = await withPostgresHarness(t);
-  const image = await dockerImage();
 
   const overrideRun = await service.createRun({
     projectId: project.id,

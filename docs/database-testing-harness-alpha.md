@@ -43,6 +43,8 @@ The default Docker image is `postgres:16-alpine`. Override it per run with `inpu
 HONEYRAIL_POSTGRES_DOCKER_IMAGE=docker-0.unsee.tech/pgvector/pgvector:pg16
 ```
 
+The optional test suite only runs Docker harness tests when Docker is available and a PostgreSQL image is available locally, or when `HONEYRAIL_POSTGRES_DOCKER_IMAGE` is set. This keeps CI from depending on Docker Hub network pulls.
+
 Local PostgreSQL binaries are supported as a fallback when `executionMode` is `local-binaries` or Docker is unavailable in `auto` mode:
 
 ```sh
@@ -221,7 +223,7 @@ Run the always-on tests:
 env -u AGENT_GATEWAY_ACCOUNTS -u AGENT_GATEWAY_TOKEN -u AGENT_GATEWAY_SESSION_SECRET npm test
 ```
 
-`test/postgres-alpha.test.ts` runs a real Docker PostgreSQL instance when Docker is available. It also probes local PostgreSQL binaries and skips that fallback probe when they are not runnable.
+`test/postgres-alpha.test.ts` runs a real Docker PostgreSQL instance when Docker and a PostgreSQL image are available. It also probes local PostgreSQL binaries and skips that fallback probe when they are not runnable.
 
 ## Known Limitations
 
