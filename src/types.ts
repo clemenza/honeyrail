@@ -75,6 +75,7 @@ export type ArtifactData = {
   id: string;
   runId: string;
   stepId?: string;
+  attempt?: number;
   kind: string;
   name: string;
   uri?: string;
@@ -88,6 +89,7 @@ export type EvidenceData = {
   id: string;
   runId: string;
   stepId?: string;
+  attempt?: number;
   kind: string;
   claim?: string;
   value?: unknown;
@@ -101,6 +103,7 @@ export type EvaluationData = {
   id: string;
   runId: string;
   stepId?: string;
+  attempt?: number;
   evaluator: string;
   status: string;
   score?: number;
@@ -112,9 +115,22 @@ export type EvaluationData = {
   createdAt: string;
 };
 
+export type QualityGateDecisionData = {
+  id: string;
+  runId: string;
+  stepId: string;
+  attempt: number;
+  status: string;
+  evaluationIds: string[];
+  reason?: string;
+  decidedBy: string;
+  createdAt: string;
+};
+
 export type VerificationData = {
   artifacts: number;
   evidence: number;
+  latestAttempt?: number;
   evaluations: {
     passed: number;
     failed: number;
@@ -123,6 +139,7 @@ export type VerificationData = {
   artifactItems?: ArtifactData[];
   evidenceItems?: EvidenceData[];
   evaluationItems?: EvaluationData[];
+  gateDecisionItems?: QualityGateDecisionData[];
 };
 
 export type RunData = {
@@ -137,6 +154,7 @@ export type RunData = {
   error?: string;
   steps: StepData[];
   verification?: VerificationData;
+  gateDecisions?: QualityGateDecisionData[];
 };
 
 export type EventAttachment = {

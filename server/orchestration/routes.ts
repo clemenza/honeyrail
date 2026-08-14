@@ -42,6 +42,11 @@ export function runRoutes(orchestration: OrchestrationService) {
     res.json({ evaluations: await orchestration.listEvaluations(String(req.params.runId), stepId) });
   }));
 
+  router.get("/api/runs/:runId/gate-decisions", asyncRoute(async (req, res) => {
+    const stepId = typeof req.query.stepId === "string" ? req.query.stepId : undefined;
+    res.json({ gateDecisions: await orchestration.listQualityGateDecisions(String(req.params.runId), stepId) });
+  }));
+
   router.get("/api/artifacts/:artifactId", asyncRoute(async (req, res) => {
     const artifact = await orchestration.getArtifact(String(req.params.artifactId));
     if (!artifact) return res.status(404).json({ error: "Artifact not found" });

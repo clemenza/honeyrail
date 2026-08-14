@@ -12,6 +12,7 @@ import { AgentTaskExecutor } from "../server/executors/agent-task.js";
 import { CheckExecutor } from "../server/executors/check.js";
 import { ShellExecutor } from "../server/executors/shell.js";
 import type { ExecutionHandle, ExecutionState, Executor, StepExecutionContext } from "../server/executors/types.js";
+import { EvaluatorRegistry, type Evaluator, type EvaluatorInput, type EvaluatorResult } from "../server/evaluators/registry.js";
 import { EventBus, publishEvent } from "../server/events.js";
 import { validateStepGraph } from "../server/orchestration/dag.js";
 import { OrchestrationService } from "../server/orchestration/service.js";
@@ -65,6 +66,21 @@ class RestartCompletesExecutor implements Executor {
   }
 }
 
+class AsyncPassEvaluator implements Evaluator {
+  type = "async-pass";
+
+  async evaluate(input: EvaluatorInput): Promise<EvaluatorResult> {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    return {
+      evaluator: input.definition.id || this.type,
+      status: "passed",
+      score: 1,
+      threshold: 1,
+      reason: "async evaluator passed"
+    };
+  }
+}
+
 async function waitForTerminalShell(executor: ShellExecutor, ctx: StepExecutionContext, handle: ExecutionHandle) {
   let state: ExecutionState = { status: "running" };
   for (let i = 0; i < 100; i += 1) {
@@ -75,7 +91,7 @@ async function waitForTerminalShell(executor: ShellExecutor, ctx: StepExecutionC
   return state;
 }
 
-async function withService(t: TestContext, registry?: ExecutorRegistry) {
+async function withService(t: TestContext, registry?: ExecutorRegistry, evaluators?: EvaluatorRegistry) {
   const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-orchestration-"));
   const store = new JsonStore(join(tempDir, "store.json"));
   const bus = new EventBus();
@@ -89,7 +105,8 @@ async function withService(t: TestContext, registry?: ExecutorRegistry) {
     runCommand: (async () => ({ ok: true, stdout: "", stderr: "" })) as any,
     sessionLogRoot: join(tempDir, "sessions"),
     attachmentRoot: join(tempDir, "attachments"),
-    executors: registry
+    executors: registry,
+    evaluators
   });
   const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: ["npm test"], runCommands: [] });
   t.after(async () => rm(tempDir, { recursive: true, force: true }));
@@ -230,6 +247,90 @@ test("quality gate wait_approval uses existing approval flow", async (t) => {
   await service.approveStep(result.run.id, "a");
   assert.equal((await store.getStep(result.run.id, "b"))!.status, "succeeded");
   assert.equal((await store.getRun(result.run.id))!.status, "succeeded");
+});
+
+test("quality gate evaluations are attempt-aware and summaries use the latest attempt", async (t) => {
+  const flaky = new MemoryExecutor("flaky", [
+    { status: "succeeded", output: { ok: false } },
+    { status: "succeeded", output: { ok: true } }
+  ]);
+  const registry = new ExecutorRegistry([flaky]);
+  const { store, service, project } = await withService(t, registry);
+
+  const result = await service.createRun({
+    projectId: project.id,
+    goal: "attempt-aware gate",
+    steps: [{ id: "verify", executor: "flaky", maxAttempts: 2, qualityGate: { evaluators: [{ type: "boolean", source: "output.ok" }] } }]
+  });
+
+  assert.equal(result.run.status, "succeeded");
+  const evaluations = await store.listEvaluations(result.run.id, "verify");
+  assert.equal(evaluations.length, 2);
+  assert.deepEqual(evaluations.map((item) => [item.attempt, item.status]), [[1, "failed"], [2, "passed"]]);
+  const detail = await service.getRunDetail(result.run.id);
+  assert.equal(detail!.steps[0].verification.latestAttempt, 2);
+  assert.deepEqual(detail!.steps[0].verification.evaluations, { passed: 1, failed: 0, error: 0 });
+});
+
+test("quality gate decisions persist pass, fail, operator override, and operator rejection", async (t) => {
+  const ok = new MemoryExecutor("ok", [
+    { status: "succeeded", output: { ok: true } },
+    { status: "succeeded", output: { ok: false } },
+    { status: "succeeded", output: { ok: false } }
+  ]);
+  const registry = new ExecutorRegistry([ok]);
+  const { store, service, project } = await withService(t, registry);
+
+  const passed = await service.createRun({
+    projectId: project.id,
+    goal: "decision pass",
+    steps: [{ id: "verify", executor: "ok", qualityGate: { evaluators: [{ type: "boolean", source: "output.ok" }] } }]
+  });
+  assert.equal((await store.listQualityGateDecisions(passed.run.id, "verify"))[0].status, "passed");
+
+  const override = await service.createRun({
+    projectId: project.id,
+    goal: "decision override",
+    steps: [{ id: "verify", executor: "ok", qualityGate: { evaluators: [{ type: "boolean", source: "output.ok" }], onFail: "wait_approval" } }]
+  });
+  assert.equal(override.run.status, "waiting_approval");
+  await service.approveStep(override.run.id, "verify");
+  const overrideDecisions = await store.listQualityGateDecisions(override.run.id, "verify");
+  assert.deepEqual(overrideDecisions.map((item) => [item.status, item.decidedBy]), [["failed", "system"], ["overridden", "operator"]]);
+
+  const rejected = await service.createRun({
+    projectId: project.id,
+    goal: "decision reject",
+    steps: [{ id: "verify", executor: "ok", qualityGate: { evaluators: [{ type: "boolean", source: "output.ok" }], onFail: "wait_approval" } }]
+  });
+  await service.rejectStep(rejected.run.id, "verify", "operator rejected");
+  const rejectedDecisions = await store.listQualityGateDecisions(rejected.run.id, "verify");
+  assert.deepEqual(rejectedDecisions.map((item) => [item.status, item.decidedBy]), [["failed", "system"], ["failed", "operator"]]);
+  assert.equal((await store.getRun(rejected.run.id))!.status, "failed");
+});
+
+test("async registered evaluators work and unknown evaluator types are rejected by the registry-backed service validation", async (t) => {
+  const ok = new MemoryExecutor("ok");
+  const executors = new ExecutorRegistry([ok]);
+  const evaluators = new EvaluatorRegistry([new AsyncPassEvaluator()]);
+  const { store, service, project } = await withService(t, executors, evaluators);
+
+  const result = await service.createRun({
+    projectId: project.id,
+    goal: "async evaluator",
+    steps: [{ id: "verify", executor: "ok", qualityGate: { evaluators: [{ type: "async-pass" }] } }]
+  });
+  assert.equal(result.run.status, "succeeded");
+  assert.equal((await store.listEvaluations(result.run.id, "verify"))[0].reason, "async evaluator passed");
+
+  await assert.rejects(
+    () => service.createRun({
+      projectId: project.id,
+      goal: "unknown evaluator",
+      steps: [{ id: "bad", executor: "ok", qualityGate: { evaluators: [{ type: "missing-evaluator" }] } }]
+    }),
+    /Unknown evaluator type: missing-evaluator/
+  );
 });
 
 test("evaluator input errors are recorded as evaluation errors and fail the gate", async (t) => {
@@ -599,7 +700,7 @@ test("CheckExecutor reuses worktree check flow and updates linked task/worktree 
   assert.deepEqual(evidence[0].artifactIds, [artifacts[0].id]);
 });
 
-async function withHttpServer(t: TestContext) {
+async function withHttpServer(t: TestContext, evaluators?: EvaluatorRegistry) {
   const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-runs-api-"));
   const store = new JsonStore(join(tempDir, "store.json"));
   const bus = new EventBus();
@@ -611,7 +712,8 @@ async function withHttpServer(t: TestContext) {
     runCommand: (async () => ({ ok: true, stdout: "", stderr: "" })) as any,
     sessionLogRoot: "",
     attachmentRoot: "",
-    executors: new ExecutorRegistry([new MemoryExecutor("ok"), new ApprovalTestExecutor()])
+    executors: new ExecutorRegistry([new MemoryExecutor("ok"), new ApprovalTestExecutor()]),
+    evaluators
   });
   const app = createApp({
     store,
@@ -693,4 +795,33 @@ test("REST API creates, gets, approves, rejects, cancels, and validates runs", a
   });
   assert.equal(rejectRes.status, 200);
   assert.equal((await rejectRes.json()).run.status, "failed");
+});
+
+test("REST run creation accepts registered custom evaluator types and rejects unknown evaluator types", async (t) => {
+  const evaluators = new EvaluatorRegistry([new AsyncPassEvaluator()]);
+  const { baseUrl, project } = await withHttpServer(t, evaluators);
+
+  const custom = await fetch(`${baseUrl}/api/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      projectId: project.id,
+      goal: "custom evaluator over REST",
+      steps: [{ id: "verify", executor: "ok", qualityGate: { evaluators: [{ type: "async-pass" }] } }]
+    })
+  });
+  assert.equal(custom.status, 201);
+  assert.equal((await custom.json()).run.status, "succeeded");
+
+  const unknown = await fetch(`${baseUrl}/api/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      projectId: project.id,
+      goal: "unknown evaluator over REST",
+      steps: [{ id: "verify", executor: "ok", qualityGate: { evaluators: [{ type: "missing-evaluator" }] } }]
+    })
+  });
+  assert.equal(unknown.status, 400);
+  assert.match(((await unknown.json()) as { error: string }).error, /Unknown evaluator type: missing-evaluator/);
 });
