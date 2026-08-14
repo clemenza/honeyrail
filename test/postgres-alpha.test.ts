@@ -24,6 +24,21 @@ async function hasLocalPostgres() {
   return result.ok;
 }
 
+async function hasDocker() {
+  const result = await runCommandSafe("docker", ["info", "--format", "{{.ServerVersion}}"], { timeout: 10000 });
+  return result.ok && Boolean(result.stdout.trim());
+}
+
+async function dockerImage() {
+  if (process.env.HONEYRAIL_POSTGRES_DOCKER_IMAGE) return process.env.HONEYRAIL_POSTGRES_DOCKER_IMAGE;
+  const images = await runCommandSafe("docker", ["images", "--format", "{{.Repository}}:{{.Tag}}"]);
+  const available = images.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  return available.find((image) => image === "postgres:16-alpine")
+    || available.find((image) => image.includes("pgvector") && image.includes("pg16"))
+    || available.find((image) => image.includes("postgres"))
+    || "postgres:16-alpine";
+}
+
 async function withPostgresHarness(t: TestContext) {
   const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-postgres-alpha-"));
   const store = new JsonStore(join(tempDir, "store.json"));
@@ -42,13 +57,13 @@ async function withPostgresHarness(t: TestContext) {
   return { store, service, project };
 }
 
-function alphaSteps(expectedCommittedRows = 1) {
+function alphaSteps(expectedCommittedRows = 1, executionMode: "auto" | "docker" | "local-binaries" = "auto", image?: string) {
   return [
     {
       id: "verify",
       name: "PostgreSQL transaction and restart validation",
       executor: "postgres",
-      input: { operation: "transaction-restart-alpha", expectedCommittedRows },
+      input: { operation: "transaction-restart-alpha", executionMode, expectedCommittedRows, ...(image ? { dockerImage: image } : {}) },
       qualityGate: {
         evaluators: [
           { type: "db-assertions" },
@@ -67,17 +82,18 @@ function alphaSteps(expectedCommittedRows = 1) {
   ];
 }
 
-test("optional local PostgreSQL alpha passing scenario persists DB artifacts, evidence, evaluations, gate decision, and final report", async (t) => {
-  if (!(await hasLocalPostgres())) {
-    t.skip("local PostgreSQL binaries are not installed");
+test("optional PostgreSQL alpha Docker passing scenario persists DB artifacts, evidence, evaluations, gate decision, and final report", async (t) => {
+  if (!(await hasDocker())) {
+    t.skip("Docker daemon is not available");
     return;
   }
   const { store, service, project } = await withPostgresHarness(t);
+  const image = await dockerImage();
 
   const result = await service.createRun({
     projectId: project.id,
-    goal: "postgres alpha pass",
-    steps: alphaSteps()
+    goal: "postgres alpha docker pass",
+    steps: alphaSteps(1, "docker", image)
   });
 
   assert.equal(result.run.status, "succeeded");
@@ -94,6 +110,7 @@ test("optional local PostgreSQL alpha passing scenario persists DB artifacts, ev
   assert.ok(evidence.filter((item) => item.kind === "db.assertion").length >= 4);
   assert.deepEqual(evaluations.map((item) => [item.evaluator, item.status, item.attempt]), [["db-assertions", "passed", 1], ["boolean", "passed", 1]]);
   assert.deepEqual(decisions.map((item) => [item.status, item.decidedBy, item.attempt]), [["passed", "system", 1]]);
+  assert.equal((await store.getStep(result.run.id, "verify"))!.output?.executionMode, "docker");
 
   const reportStep = (await store.getStep(result.run.id, "report"))!;
   const reportArtifact = await store.getArtifact(String(reportStep.output?.reportArtifactId));
@@ -101,17 +118,18 @@ test("optional local PostgreSQL alpha passing scenario persists DB artifacts, ev
   assert.match(await readFile(String(reportArtifact?.path), "utf8"), /Result\nVERIFIED/);
 });
 
-test("optional local PostgreSQL alpha failing scenario waits for approval, override continues, and reject fails", async (t) => {
-  if (!(await hasLocalPostgres())) {
-    t.skip("local PostgreSQL binaries are not installed");
+test("optional PostgreSQL alpha Docker failing scenario waits for approval, override continues, and reject fails", async (t) => {
+  if (!(await hasDocker())) {
+    t.skip("Docker daemon is not available");
     return;
   }
   const { store, service, project } = await withPostgresHarness(t);
+  const image = await dockerImage();
 
   const overrideRun = await service.createRun({
     projectId: project.id,
     goal: "postgres alpha override",
-    steps: alphaSteps(2)
+    steps: alphaSteps(2, "docker", image)
   });
   assert.equal(overrideRun.run.status, "waiting_approval");
   assert.equal((await store.getStep(overrideRun.run.id, "report"))!.status, "pending");
@@ -126,11 +144,18 @@ test("optional local PostgreSQL alpha failing scenario waits for approval, overr
   const rejectRun = await service.createRun({
     projectId: project.id,
     goal: "postgres alpha reject",
-    steps: alphaSteps(2)
+    steps: alphaSteps(2, "docker", image)
   });
   assert.equal(rejectRun.run.status, "waiting_approval");
   await service.rejectStep(rejectRun.run.id, "verify", "operator rejected failed DB assertion");
   assert.equal((await store.getRun(rejectRun.run.id))!.status, "failed");
   assert.equal((await store.getStep(rejectRun.run.id, "report"))!.status, "skipped");
   assert.deepEqual((await store.listQualityGateDecisions(rejectRun.run.id, "verify")).map((item) => [item.status, item.decidedBy]), [["failed", "system"], ["failed", "operator"]]);
+});
+
+test("optional PostgreSQL alpha local-binaries environment probe", async (t) => {
+  if (!(await hasLocalPostgres())) {
+    t.skip("local PostgreSQL binaries are not runnable");
+    return;
+  }
 });

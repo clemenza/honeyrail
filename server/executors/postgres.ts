@@ -14,6 +14,8 @@ type QueryObservation = {
   rowCount: number;
 };
 
+type ExecutionMode = "auto" | "docker" | "local-binaries";
+
 async function allocatePort() {
   const server = createServer();
   await new Promise<void>((resolve, reject) => {
@@ -97,12 +99,27 @@ async function commandPath(ctx: StepExecutionContext, name: string) {
   return path;
 }
 
+async function commandAvailable(ctx: StepExecutionContext, name: string) {
+  const result = await ctx.runCommand("sh", ["-lc", `command -v ${name} >/dev/null`], { timeout: 5000 });
+  return result.ok;
+}
+
 async function runRequired(ctx: StepExecutionContext, cmd: string, args: string[], cwd: string, timeout = 30000) {
   const result = await ctx.runCommand(cmd, args, { cwd, timeout, maxBuffer: 1024 * 1024 * 8 });
   if (!result.ok) {
     throw new Error(`${cmd} ${args.join(" ")} failed: ${result.stderr || result.stdout || result.code}`);
   }
   return result;
+}
+
+async function runDockerRequired(ctx: StepExecutionContext, args: string[], cwd: string, timeout = 30000) {
+  return runRequired(ctx, "docker", args, cwd, timeout);
+}
+
+async function dockerAvailable(ctx: StepExecutionContext) {
+  if (!(await commandAvailable(ctx, "docker"))) return false;
+  const result = await ctx.runCommand("docker", ["info", "--format", "{{.ServerVersion}}"], { timeout: 10000 });
+  return result.ok && Boolean(result.stdout.trim());
 }
 
 async function runPsql(ctx: StepExecutionContext, cwd: string, port: number, sql: string) {
@@ -114,6 +131,26 @@ async function runPsql(ctx: StepExecutionContext, cwd: string, port: number, sql
     "127.0.0.1",
     "-p",
     String(port),
+    "-U",
+    "postgres",
+    "-d",
+    "postgres",
+    "-t",
+    "-A",
+    "-c",
+    sql
+  ], cwd);
+  return result.stdout.trim();
+}
+
+async function runDockerPsql(ctx: StepExecutionContext, cwd: string, containerName: string, sql: string) {
+  const result = await runDockerRequired(ctx, [
+    "exec",
+    containerName,
+    "psql",
+    "-X",
+    "-v",
+    "ON_ERROR_STOP=1",
     "-U",
     "postgres",
     "-d",
@@ -154,13 +191,53 @@ async function waitReady(ctx: StepExecutionContext, cwd: string, port: number) {
   throw new Error(`PostgreSQL did not become ready: ${lastError}`);
 }
 
+async function waitDockerReady(ctx: StepExecutionContext, cwd: string, containerName: string) {
+  const started = Date.now();
+  let lastError = "";
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    const result = await ctx.runCommand("docker", [
+      "exec",
+      containerName,
+      "psql",
+      "-X",
+      "-U",
+      "postgres",
+      "-d",
+      "postgres",
+      "-t",
+      "-A",
+      "-c",
+      "SELECT 1;"
+    ], { cwd, timeout: 5000 });
+    if (result.ok && result.stdout.trim() === "1") {
+      return { ready: true, latencyMs: Date.now() - started };
+    }
+    lastError = result.stderr || result.stdout;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(`Docker PostgreSQL did not become ready: ${lastError}`);
+}
+
 async function readScalar(ctx: StepExecutionContext, cwd: string, port: number, sql: string): Promise<number> {
   const value = await runPsql(ctx, cwd, port, sql);
   return Number(value);
 }
 
+async function readDockerScalar(ctx: StepExecutionContext, cwd: string, containerName: string, sql: string): Promise<number> {
+  const value = await runDockerPsql(ctx, cwd, containerName, sql);
+  return Number(value);
+}
+
 async function stopPostgres(ctx: StepExecutionContext, cwd: string, dataDir: string) {
   await ctx.runCommand("pg_ctl", ["-D", dataDir, "stop", "-m", "fast", "-w"], { cwd, timeout: 30000 });
+}
+
+async function removeDockerContainer(ctx: StepExecutionContext, cwd: string, containerName: string) {
+  await ctx.runCommand("docker", ["rm", "-f", containerName], { cwd, timeout: 30000 });
+}
+
+function dockerContainerName(runId: string, stepId: string, attempt: number) {
+  return `honeyrail-${runId}-${stepId}-${attempt}`.replace(/[^a-zA-Z0-9_.-]/g, "-").slice(0, 120);
 }
 
 export class PostgresExecutor implements Executor {
@@ -182,6 +259,20 @@ export class PostgresExecutor implements Executor {
   }
 
   private async runTransactionRestartScenario(ctx: StepExecutionContext): Promise<ExecutionHandle> {
+    const requestedMode = String(ctx.step.input.executionMode || "auto") as ExecutionMode;
+    if (!["auto", "docker", "local-binaries"].includes(requestedMode)) {
+      throw new Error(`Unsupported postgres executionMode: ${requestedMode}`);
+    }
+    if (requestedMode === "docker" || (requestedMode === "auto" && await dockerAvailable(ctx))) {
+      return this.runDockerTransactionRestartScenario(ctx);
+    }
+    if (requestedMode === "auto" || requestedMode === "local-binaries") {
+      return this.runLocalTransactionRestartScenario(ctx);
+    }
+    throw new Error(`Unsupported postgres executionMode: ${requestedMode}`);
+  }
+
+  private async runLocalTransactionRestartScenario(ctx: StepExecutionContext): Promise<ExecutionHandle> {
     const attemptDir = join(ctx.attachmentRoot, "runs", ctx.runId, ctx.step.id, `attempt-${ctx.step.attempt}`);
     const dataDir = join(attemptDir, "pgdata");
     const socketDir = join(attemptDir, "socket");
@@ -335,6 +426,177 @@ export class PostgresExecutor implements Executor {
     }
   }
 
+  private async runDockerTransactionRestartScenario(ctx: StepExecutionContext): Promise<ExecutionHandle> {
+    const attemptDir = join(ctx.attachmentRoot, "runs", ctx.runId, ctx.step.id, `attempt-${ctx.step.attempt}`);
+    await mkdir(attemptDir, { recursive: true });
+    const port = await allocatePort();
+    const logPath = join(attemptDir, "postgres.log");
+    const expectedCommittedRows = Number(ctx.step.input.expectedCommittedRows ?? 1);
+    const expectedRolledBackRows = Number(ctx.step.input.expectedRolledBackRows ?? 0);
+    const expectedTotalRows = Number(ctx.step.input.expectedTotalRows ?? 1);
+    const image = String(ctx.step.input.dockerImage || process.env.HONEYRAIL_POSTGRES_DOCKER_IMAGE || "postgres:16-alpine");
+    const containerName = dockerContainerName(ctx.runId, ctx.step.id, ctx.step.attempt);
+    const dockerVersion = (await runDockerRequired(ctx, ["info", "--format", "{{.ServerVersion}}"], attemptDir, 10000)).stdout.trim();
+
+    const setupSql = [
+      "DROP TABLE IF EXISTS honeyrail_alpha_transactions;",
+      "CREATE TABLE honeyrail_alpha_transactions (id integer PRIMARY KEY, label text NOT NULL);",
+      "BEGIN;",
+      "INSERT INTO honeyrail_alpha_transactions VALUES (1, 'committed');",
+      "COMMIT;",
+      "BEGIN;",
+      "INSERT INTO honeyrail_alpha_transactions VALUES (2, 'rolled_back');",
+      "ROLLBACK;"
+    ].join("\n");
+    const verificationSql = [
+      "SELECT count(*)::int FROM honeyrail_alpha_transactions WHERE label = 'committed';",
+      "SELECT count(*)::int FROM honeyrail_alpha_transactions WHERE label = 'rolled_back';",
+      "SELECT count(*)::int FROM honeyrail_alpha_transactions;"
+    ].join("\n");
+
+    let removed = false;
+    try {
+      await removeDockerContainer(ctx, attemptDir, containerName);
+      const runResult = await runDockerRequired(ctx, [
+        "run",
+        "-d",
+        "--name",
+        containerName,
+        "-e",
+        "POSTGRES_HOST_AUTH_METHOD=trust",
+        "-p",
+        `127.0.0.1:${port}:5432`,
+        image
+      ], attemptDir, 120000);
+      const containerId = runResult.stdout.trim();
+      const initialReady = await waitDockerReady(ctx, attemptDir, containerName);
+      await createEvidence(ctx, {
+        kind: "db.server.ready",
+        claim: "Docker PostgreSQL accepted connections before schema setup",
+        value: initialReady,
+        metadata: artifactMetadata("initial-readiness", { executionMode: "docker", image, containerName, containerId, port })
+      });
+
+      const version = await runDockerPsql(ctx, attemptDir, containerName, "SELECT version();");
+      const envArtifact = await createFileArtifact(ctx, attemptDir, "environment.json", json({
+        database: "postgresql",
+        version,
+        platform: platform(),
+        executionMode: "docker",
+        image,
+        containerName,
+        containerId,
+        dockerVersion,
+        port,
+        scenario: SCENARIO,
+        runId: ctx.runId
+      }), "json", "application/json", "environment", { version, executionMode: "docker", image, containerName, dockerVersion, port });
+      const setupArtifact = await createFileArtifact(ctx, attemptDir, "setup.sql", `${setupSql}\n`, "text", "application/sql", "setup");
+      const verificationArtifact = await createFileArtifact(ctx, attemptDir, "verification.sql", `${verificationSql}\n`, "text", "application/sql", "verify-before-restart");
+
+      await runDockerPsql(ctx, attemptDir, containerName, setupSql);
+      const before = await this.collectDockerQueries(ctx, attemptDir, containerName, verificationArtifact.id);
+
+      const restartStarted = Date.now();
+      await runDockerRequired(ctx, ["restart", containerName], attemptDir, 60000);
+      const restartedReady = await waitDockerReady(ctx, attemptDir, containerName);
+      const restartDurationMs = Date.now() - restartStarted;
+      await createEvidence(ctx, {
+        kind: "db.restart",
+        claim: "Docker PostgreSQL restarted and became ready",
+        value: { passed: restartedReady.ready, durationMs: restartDurationMs },
+        metadata: artifactMetadata("restart", { executionMode: "docker", image, containerName, port })
+      });
+      await createEvidence(ctx, {
+        kind: "db.server.ready",
+        claim: "Docker PostgreSQL accepted connections after restart",
+        value: restartedReady,
+        metadata: artifactMetadata("post-restart-readiness", { executionMode: "docker", image, containerName, port })
+      });
+
+      const after = await this.collectDockerQueries(ctx, attemptDir, containerName, verificationArtifact.id, "after restart");
+      const actual = {
+        committedRows: Number(after[0].rows[0]?.[0] ?? 0),
+        rolledBackRows: Number(after[1].rows[0]?.[0] ?? 0),
+        totalRows: Number(after[2].rows[0]?.[0] ?? 0)
+      };
+      const assertions = [
+        { claim: "Committed rows persisted after restart", expected: expectedCommittedRows, actual: actual.committedRows },
+        { claim: "Rolled-back rows remain absent after restart", expected: expectedRolledBackRows, actual: actual.rolledBackRows },
+        { claim: "Total row count matches expectation after restart", expected: expectedTotalRows, actual: actual.totalRows },
+        { claim: "PostgreSQL became ready after restart", expected: true, actual: restartedReady.ready }
+      ];
+      const assertionEvidenceIds: string[] = [];
+      for (const assertion of assertions) {
+        const evidence = await createEvidence(ctx, {
+          kind: "db.assertion",
+          claim: assertion.claim,
+          value: { passed: assertion.actual === assertion.expected, expected: assertion.expected, actual: assertion.actual },
+          artifactIds: [verificationArtifact.id],
+          metadata: artifactMetadata("assertion", { executionMode: "docker", image, containerName })
+        });
+        assertionEvidenceIds.push(evidence.id);
+      }
+
+      const queryResults = { beforeRestart: before, afterRestart: after, assertions };
+      const queryArtifact = await createFileArtifact(ctx, attemptDir, "query-results.json", json(queryResults), "json", "application/json", "query-results", { assertionEvidenceIds, executionMode: "docker" });
+      const summary = {
+        scenario: SCENARIO,
+        database: "postgresql",
+        version,
+        executionMode: "docker",
+        image,
+        containerName,
+        ready: restartedReady.ready,
+        assertions,
+        artifacts: [envArtifact.id, setupArtifact.id, verificationArtifact.id, queryArtifact.id]
+      };
+      await createFileArtifact(ctx, attemptDir, "test-summary.json", json(summary), "json", "application/json", "summary", { executionMode: "docker" });
+      const logs = (await runDockerRequired(ctx, ["logs", containerName], attemptDir, 30000)).stdout;
+      await writeFile(logPath, logs);
+      const logArtifact = await ctx.store.createArtifact({
+        runId: ctx.runId,
+        stepId: ctx.step.id,
+        attempt: ctx.step.attempt,
+        kind: "log",
+        name: "postgres.log",
+        path: logPath,
+        uri: `honeyrail://runs/${ctx.runId}/steps/${ctx.step.id}/attempts/${ctx.step.attempt}/postgres.log`,
+        mediaType: "text/plain",
+        metadata: artifactMetadata("postgres-log", { executionMode: "docker", image, containerName, port })
+      });
+      await publishArtifact(ctx, logArtifact);
+      await createEvidence(ctx, {
+        kind: "db.process.health",
+        claim: "Docker PostgreSQL process completed scenario before cleanup",
+        value: { alive: true, exitCode: null },
+        artifactIds: [logArtifact.id],
+        metadata: artifactMetadata("process-health", { executionMode: "docker", image, containerName })
+      });
+
+      await removeDockerContainer(ctx, attemptDir, containerName);
+      removed = true;
+
+      return {
+        status: "succeeded",
+        output: {
+          scenario: SCENARIO,
+          executionMode: "docker",
+          dockerImage: image,
+          containerName,
+          databaseReady: restartedReady.ready,
+          databaseVersion: version,
+          port,
+          assertionEvidenceIds,
+          expected: { expectedCommittedRows, expectedRolledBackRows, expectedTotalRows },
+          actual
+        }
+      };
+    } finally {
+      if (!removed) await removeDockerContainer(ctx, attemptDir, containerName);
+    }
+  }
+
   private async collectQueries(ctx: StepExecutionContext, cwd: string, port: number, artifactId: string, suffix = "before restart"): Promise<QueryObservation[]> {
     const queries = [
       "SELECT count(*)::int FROM honeyrail_alpha_transactions WHERE label = 'committed';",
@@ -357,6 +619,28 @@ export class PostgresExecutor implements Executor {
     return observations;
   }
 
+  private async collectDockerQueries(ctx: StepExecutionContext, cwd: string, containerName: string, artifactId: string, suffix = "before restart"): Promise<QueryObservation[]> {
+    const queries = [
+      "SELECT count(*)::int FROM honeyrail_alpha_transactions WHERE label = 'committed';",
+      "SELECT count(*)::int FROM honeyrail_alpha_transactions WHERE label = 'rolled_back';",
+      "SELECT count(*)::int FROM honeyrail_alpha_transactions;"
+    ];
+    const observations: QueryObservation[] = [];
+    for (const sql of queries) {
+      const value = await readDockerScalar(ctx, cwd, containerName, sql);
+      const observation = { sql, rows: [[value]], rowCount: 1 };
+      observations.push(observation);
+      await createEvidence(ctx, {
+        kind: "db.query.result",
+        claim: `${sql} ${suffix}`,
+        value: observation,
+        artifactIds: [artifactId],
+        metadata: artifactMetadata("query-result", { executionMode: "docker", containerName })
+      });
+    }
+    return observations;
+  }
+
   private async generateReport(ctx: StepExecutionContext): Promise<ExecutionHandle> {
     const sourceStepId = String(ctx.step.input.sourceStepId || ctx.step.dependsOn[0] || "").trim();
     if (!sourceStepId) throw new Error("Postgres report operation requires input.sourceStepId or one dependency");
@@ -372,6 +656,7 @@ export class PostgresExecutor implements Executor {
     const latestDecision = decisions.at(-1);
     const assertions = evidence.filter((item) => item.kind === "db.assertion");
     const version = String(sourceStep?.output?.databaseVersion || "unknown");
+    const executionMode = String(sourceStep?.output?.executionMode || "local-binaries");
     const finalStatus = latestDecision?.status === "passed"
       ? "VERIFIED"
       : latestDecision?.status === "overridden"
@@ -382,7 +667,7 @@ export class PostgresExecutor implements Executor {
       "",
       "## Environment",
       `- PostgreSQL: ${version}`,
-      "- Execution mode: local-binaries",
+      `- Execution mode: ${executionMode}`,
       `- Run: ${ctx.runId}`,
       `- Scenario: ${SCENARIO}`,
       "",
