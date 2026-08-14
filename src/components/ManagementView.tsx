@@ -15,6 +15,7 @@ import type { DiffData, EventData, GatewayState, ProjectData, RunData, SessionDa
 import { StatusPill } from "./layout.js";
 import { ProjectForm, ProjectList } from "./ProjectPanel.js";
 import { SessionLauncher, TaskComposer, TaskTable } from "./TaskPanel.js";
+import { VerificationDrawer } from "./VerificationDrawer.js";
 
 function EventFeed({ events, className }: { events: EventData[]; className?: string }) {
   return (
@@ -271,6 +272,7 @@ function compactJson(value: unknown) {
 function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: ProjectData[]; refresh: () => Promise<void> }) {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const [drawer, setDrawer] = useState<{ runId: string; stepId: string; kind: "artifact" | "evidence" } | null>(null);
 
   const act = async (path: string, label: string) => {
     setBusy(label);
@@ -284,6 +286,8 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
       setBusy("");
     }
   };
+
+  const drawerStep = drawer ? runs.find((run) => run.id === drawer.runId)?.steps.find((step) => step.id === drawer.stepId) : undefined;
 
   return (
     <section className="panel table-panel">
@@ -316,8 +320,22 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
                       <small>depends on {step.dependsOn.length ? step.dependsOn.join(", ") : "none"}</small>
                       {step.error ? <small className="run-step-error">{step.error}</small> : null}
                       <div className="run-verification">
-                        <span>Artifacts {step.verification?.artifacts || 0}</span>
-                        <span>Evidence {step.verification?.evidence || 0}</span>
+                        <button
+                          type="button"
+                          className="verification-count-button"
+                          disabled={!step.verification?.artifacts}
+                          onClick={() => setDrawer({ runId: run.id, stepId: step.id, kind: "artifact" })}
+                        >
+                          Artifacts {step.verification?.artifacts || 0}
+                        </button>
+                        <button
+                          type="button"
+                          className="verification-count-button"
+                          disabled={!step.verification?.evidence}
+                          onClick={() => setDrawer({ runId: run.id, stepId: step.id, kind: "evidence" })}
+                        >
+                          Evidence {step.verification?.evidence || 0}
+                        </button>
                         {step.verification?.latestAttempt ? <span>Latest attempt {step.verification.latestAttempt}</span> : null}
                         <StatusPill tone={evaluationTone(step)}>{evaluationLabel(step)}</StatusPill>
                         <StatusPill tone={gateDecisionTone(step)}>{gateDecisionLabel(step)}</StatusPill>
@@ -385,6 +403,9 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
         })}
         {!runs.length ? <div className="table-empty">No orchestration runs yet.</div> : null}
       </div>
+      {drawer && drawerStep ? (
+        <VerificationDrawer step={drawerStep} initialKind={drawer.kind} onClose={() => setDrawer(null)} />
+      ) : null}
     </section>
   );
 }

@@ -1,9 +1,14 @@
 import { Router } from "express";
+import { createReadStream } from "node:fs";
+import { stat } from "node:fs/promises";
+import { resolve, sep } from "node:path";
 import { validate, createRunBody, rejectStepBody } from "../validation.js";
 import { asyncRoute, httpError } from "../route-context.js";
 import type { OrchestrationService } from "./service.js";
 
-export function runRoutes(orchestration: OrchestrationService) {
+const MAX_ARTIFACT_CONTENT_BYTES = 2 * 1024 * 1024;
+
+export function runRoutes(orchestration: OrchestrationService, attachmentRoot: string) {
   const router = Router();
 
   router.post("/api/runs", validate(createRunBody), asyncRoute(async (req, res) => {
@@ -51,6 +56,37 @@ export function runRoutes(orchestration: OrchestrationService) {
     const artifact = await orchestration.getArtifact(String(req.params.artifactId));
     if (!artifact) return res.status(404).json({ error: "Artifact not found" });
     res.json({ artifact });
+  }));
+
+  router.get("/api/artifacts/:artifactId/content", asyncRoute(async (req, res) => {
+    const artifact = await orchestration.getArtifact(String(req.params.artifactId));
+    if (!artifact) return res.status(404).json({ error: "Artifact not found" });
+    if (!artifact.path) return res.status(404).json({ error: "Artifact has no file content" });
+
+    const resolvedRoot = resolve(attachmentRoot);
+    const resolvedPath = resolve(artifact.path);
+    const withinRoot = resolvedPath === resolvedRoot || resolvedPath.startsWith(resolvedRoot + sep);
+    if (!withinRoot) return res.status(404).json({ error: "Artifact not found" });
+
+    let stats;
+    try {
+      stats = await stat(resolvedPath);
+    } catch {
+      return res.status(404).json({ error: "Artifact file not found on disk" });
+    }
+    if (!stats.isFile()) return res.status(404).json({ error: "Artifact file not found on disk" });
+
+    const truncated = stats.size > MAX_ARTIFACT_CONTENT_BYTES;
+    res.setHeader("Content-Type", artifact.mediaType || "application/octet-stream");
+    res.setHeader("X-Artifact-Size", String(stats.size));
+    res.setHeader("X-Artifact-Truncated", truncated ? "true" : "false");
+
+    const stream = createReadStream(resolvedPath, truncated ? { start: 0, end: MAX_ARTIFACT_CONTENT_BYTES - 1 } : undefined);
+    stream.on("error", () => {
+      if (!res.headersSent) res.status(500);
+      res.end();
+    });
+    stream.pipe(res);
   }));
 
   router.post("/api/runs/:runId/cancel", asyncRoute(async (req, res) => {

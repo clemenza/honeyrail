@@ -1966,6 +1966,322 @@ textarea:focus {
   white-space: nowrap;
 }
 
+/* ─── Verification drawer (artifact/evidence browser) ─── */
+.verification-count-button {
+  border: 1px solid var(--color-border-light);
+  border-radius: 6px;
+  padding: 3px 8px;
+  background: var(--color-panel);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  transition: border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.verification-count-button:hover:not(:disabled) {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+.verification-count-button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.verification-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  justify-content: flex-end;
+  background: var(--color-backdrop);
+  animation: fadeIn var(--transition-fast) both;
+}
+
+.verification-drawer {
+  display: flex;
+  flex-direction: column;
+  width: min(520px, 100%);
+  height: 100%;
+  border-left: 1px solid var(--color-border);
+  background: var(--color-bg-elevated);
+  animation: slideInRight var(--transition-normal) both;
+}
+
+@keyframes slideInRight {
+  from {
+    transform: translateX(24px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+.verification-drawer-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+  padding: var(--space-lg);
+}
+
+.verification-drawer-header h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.verification-drawer-header p {
+  margin: 2px 0 0;
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
+.verification-drawer-tabs {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  border-bottom: 1px solid var(--color-border);
+  padding: var(--space-sm) var(--space-lg);
+}
+
+.verification-drawer-tabs button {
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  padding: 6px 12px;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.verification-drawer-tabs button.active {
+  border-color: var(--color-primary);
+  background: var(--color-primary-lighter);
+  color: var(--color-primary);
+}
+
+.verification-drawer-tabs select {
+  margin-left: auto;
+  border: 1px solid var(--color-border-input);
+  border-radius: var(--radius-sm);
+  padding: 5px 8px;
+  background: var(--color-bg-elevated);
+  color: var(--color-text);
+  font-size: 12px;
+}
+
+.verification-drawer-body {
+  flex: 1;
+  overflow: auto;
+  padding: var(--space-lg);
+}
+
+.verification-list {
+  display: grid;
+  gap: var(--space-sm);
+}
+
+.verification-list-row {
+  display: grid;
+  gap: 2px;
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+  padding: var(--space-sm) var(--space-md);
+  background: var(--color-bg-subtle);
+  text-align: left;
+  transition: border-color var(--transition-fast);
+}
+
+.verification-list-row:hover {
+  border-color: var(--color-primary);
+}
+
+.verification-list-row strong {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.verification-list-row small {
+  color: var(--color-text-muted);
+  font-size: 11px;
+}
+
+.verification-list-row time {
+  margin-top: 4px;
+  color: var(--color-text-muted);
+  font-size: 11px;
+}
+
+.verification-content {
+  display: grid;
+  gap: var(--space-md);
+}
+
+.verification-content-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-sm);
+}
+
+.verification-content-header strong {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+
+.verification-content-header small {
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
+.verification-content-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+}
+
+.drawer-back {
+  border: 0;
+  background: transparent;
+  color: var(--color-text-secondary);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.drawer-back:hover {
+  color: var(--color-primary);
+}
+
+.verification-claim {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+}
+
+.verification-loading {
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
+.verification-binary-fallback {
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+  padding: var(--space-md);
+  background: var(--color-bg-subtle);
+  color: var(--color-text-secondary);
+  font-size: 13px;
+}
+
+.verification-linked-artifacts h4 {
+  margin: 0 0 var(--space-sm);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.content-pre {
+  overflow: auto;
+  max-height: 60vh;
+  margin: 0;
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+  padding: var(--space-sm) 0;
+  background: var(--color-bg-subtle);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.content-line {
+  display: flex;
+  padding: 0 var(--space-sm);
+}
+
+.content-line-number {
+  flex: 0 0 auto;
+  margin-right: var(--space-sm);
+  min-width: 2.5em;
+  color: var(--color-text-muted);
+  text-align: right;
+  user-select: none;
+}
+
+.content-line-text {
+  flex: 1;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.json-pre {
+  padding: var(--space-sm) var(--space-md);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.json-key {
+  color: var(--color-primary);
+}
+
+.json-string {
+  color: var(--color-success);
+}
+
+.json-number,
+.json-boolean {
+  color: var(--color-warn);
+}
+
+.json-null {
+  color: var(--color-text-muted);
+}
+
+.markdown-content {
+  display: grid;
+  gap: var(--space-sm);
+  color: var(--color-text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.markdown-content h3,
+.markdown-content h4,
+.markdown-content h5,
+.markdown-content h6 {
+  margin: var(--space-sm) 0 0;
+  color: var(--color-text);
+}
+
+.markdown-content p {
+  margin: 0;
+}
+
+.markdown-content ul {
+  margin: 0;
+  padding-left: 1.4em;
+}
+
+.markdown-content code {
+  border-radius: 4px;
+  padding: 1px 4px;
+  background: var(--color-bg-subtle);
+  font-size: 12px;
+}
+
+@media (max-width: 640px) {
+  .verification-drawer {
+    width: 100%;
+  }
+}
+
 .event-row {
   display: flex;
   justify-content: space-between;

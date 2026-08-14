@@ -92,7 +92,7 @@ export function createApp({
     attachmentRoot
   });
 
-  app.use(cors({ exposedHeaders: ["mcp-session-id", "www-authenticate"] }));
+  app.use(cors({ exposedHeaders: ["mcp-session-id", "www-authenticate", "x-artifact-size", "x-artifact-truncated"] }));
   app.use(express.json({ limit: "60mb" }));
   auth.routes(app);
   const oauth = createOAuthSupport({ auth, publicBaseUrl });
@@ -162,7 +162,7 @@ export function createApp({
   app.use(worktreeRoutes(ctx));
   app.use(sessionRoutes(ctx));
   app.use(taskRoutes(ctx));
-  app.use(runRoutes(orchestration));
+  app.use(runRoutes(orchestration, attachmentRoot));
 
   // MCP HTTP transport (Streamable HTTP for remote AI agent access)
   const mcpCtx: McpContext = { store, bus, tmux, worktrees, run, sessionLogRoot, attachmentRoot, orchestration };
