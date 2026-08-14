@@ -103,3 +103,54 @@ test("detects a completed Codex task only after the final response returns to th
   assert.equal(getAgentAdapter("codex").hasCompletedTask?.(completed), true);
   assert.equal(getAgentAdapter("codex").hasCompletedTask?.(stillWorking), false);
 });
+
+// Captured verbatim from a real `claude` CLI session (v2.1.227) driven
+// through honeyrail's agent-task executor.
+const CLAUDE_JUST_STARTED = `❯ Create a file named done.txt in the repository root containing exactly the
+  text: hello from claude. Then stop, do not ask any follow-up questions.
+
+✳ Beboppin'…
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  branch:main
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents`;
+
+const CLAUDE_MID_WORK = `❯ Write a detailed 400-word essay about lighthouses to essay.txt, thinking
+  carefully. Then stop, do not ask follow-up questions.
+
+✢ Moseying… (9s · ↓ 233 tokens)
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  branch:main
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents`;
+
+const CLAUDE_COMPLETED = `⏺ File created at repository root with the exact content "hello from claude".
+
+✻ Brewed for 6s
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  branch:claude/write-done-marker-20260814-112137
+  [OMC#4.6.7] | 5h:[###-----]38%(3h48m) wk:[--------]4%(1d8h) | thinking | se…
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents`;
+
+test("detects a completed Claude task only after the final response returns to the prompt", () => {
+  assert.equal(getAgentAdapter("claude").hasCompletedTask?.(CLAUDE_COMPLETED), true);
+  assert.equal(getAgentAdapter("claude").hasCompletedTask?.(CLAUDE_JUST_STARTED), false);
+  assert.equal(getAgentAdapter("claude").hasCompletedTask?.(CLAUDE_MID_WORK), false);
+});
+
+test("Claude completion detection uses the most recent status line, not a stale one from an earlier turn", () => {
+  const secondTurnStillWorking = `${CLAUDE_COMPLETED}\n\n❯ do one more thing\n\n✢ Pondering… (3s · ↓ 40 tokens)\n\n────\n❯\n────`;
+  assert.equal(getAgentAdapter("claude").hasCompletedTask?.(secondTurnStillWorking), false);
+});
+
+test("does not classify ordinary Claude output that merely mentions a duration as completed", () => {
+  const chatter = "⏺ Keepers historically worked for long hours in harsh coastal conditions.\n\n✢ Moseying… (9s · ↓ 233 tokens)\n\n❯";
+  assert.equal(getAgentAdapter("claude").hasCompletedTask?.(chatter), false);
+});
