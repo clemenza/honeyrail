@@ -102,13 +102,13 @@ async function getRun(baseUrl: string, runId: string) {
 }
 
 /**
- * Production has no background poller for detached-completion executors
- * (see the dedicated gap test below): nothing re-invokes the scheduler for
- * a `shell` step once it starts, unless another step's approve/reject call
- * happens to touch the same run. This harness calls scheduleRun() directly
- * (the in-process service instance) to advance the run the way a future
- * poller would, so the rest of this suite can validate downstream DAG,
- * evidence, and quality-gate behavior instead of being blocked by that gap.
+ * Production now advances detached-completion executors (like `shell`) via
+ * OrchestrationService.startPolling() (wired in server/index.ts) - see the
+ * dedicated tests below for both the poller-off baseline and the fix. This
+ * harness calls scheduleRun() directly (the in-process service instance)
+ * instead of starting a real poller, so the rest of this suite can
+ * validate downstream DAG, evidence, and quality-gate behavior on its own
+ * schedule rather than waiting on interval-based polling.
  */
 async function pollRun(
   service: OrchestrationService,
@@ -128,14 +128,18 @@ async function pollRun(
   throw new Error(`pollRun timed out waiting for predicate. Last run status=${last?.run?.status}, steps=${JSON.stringify(last?.steps?.map((s: any) => [s.id, s.status]))}`);
 }
 
-test("GAP: a shell step never advances without an external reschedule trigger (pure REST client, no manual scheduleRun)", async (t) => {
+test("without an explicit poller, a shell step does not advance on its own (pure REST client, no manual scheduleRun)", async (t) => {
+  // OrchestrationService.startPolling() is what fixes this in production
+  // (wired in server/index.ts); it is intentionally opt-in rather than
+  // automatic in the constructor, so this test documents the baseline
+  // behavior when nothing has enabled it. See the next test for the fix.
   const { baseUrl, project } = await withE2EServer(t);
   const createRes = await fetch(`${baseUrl}/api/runs`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       projectId: project.id,
-      goal: "gap probe",
+      goal: "no poller probe",
       steps: [{ id: "a", executor: "shell", input: { command: "sleep 0.2 && echo done" } }]
     })
   });
@@ -146,10 +150,41 @@ test("GAP: a shell step never advances without an external reschedule trigger (p
   await new Promise((resolve) => setTimeout(resolve, 1500));
   // ...then poll purely via REST GET, exactly as an external client would.
   // No scheduleRun trigger exists on this path (no approve/reject/cancel
-  // call, no agent-task event) so the step/run must still read "running".
+  // call, no agent-task event, no poller) so the step/run must still read
+  // "running".
   const stillRunning = await getRun(baseUrl, created.run.id);
-  assert.equal(stillRunning.steps[0].status, "running", "documents current gap: shell step should have completed by now but nothing repolled it");
+  assert.equal(stillRunning.steps[0].status, "running", "shell step finished in the background but nothing repolled it");
   assert.equal(stillRunning.run.status, "running");
+});
+
+test("service.startPolling() advances a shell step to completion via pure REST polling (no manual scheduleRun)", async (t) => {
+  const { baseUrl, project, service } = await withE2EServer(t);
+  const stopPolling = service.startPolling(50);
+  t.after(() => stopPolling());
+
+  const createRes = await fetch(`${baseUrl}/api/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      projectId: project.id,
+      goal: "poller probe",
+      steps: [{ id: "a", executor: "shell", input: { command: "sleep 0.2 && echo done" } }]
+    })
+  });
+  const created = await createRes.json();
+  assert.equal(created.steps[0].status, "running");
+
+  // Poll purely via REST GET - no manual scheduleRun() call, no approve/
+  // reject/cancel, relying entirely on the background poller.
+  const deadline = Date.now() + 5000;
+  let detail = created;
+  while (Date.now() < deadline && detail.run.status !== "succeeded") {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    detail = await getRun(baseUrl, created.run.id);
+  }
+  assert.equal(detail.run.status, "succeeded");
+  assert.equal(detail.steps[0].status, "succeeded");
+  assert.equal(detail.steps[0].output.stdout.trim(), "done");
 });
 
 test("simple linear DAG: shell prepare -> check verify -> approval gate, with real artifact/evidence generation", async (t) => {
@@ -196,11 +231,16 @@ test("simple linear DAG: shell prepare -> check verify -> approval gate, with re
   assert.equal(directArtifact.artifact.id, artifacts[1].id);
   assert.equal(directArtifact.artifact.metadata.command, "grep -q hello note.txt");
 
-  // No quality gate was declared on "verify", so zero evaluations exist for it.
+  // No qualityGate was declared on "verify", so the service applies its
+  // default check-type gate; both commands passed, so it's a single
+  // passing evaluation covering both check.command evidence records.
   const evalRes = await fetch(`${baseUrl}/api/runs/${created.run.id}/evaluations?stepId=verify`);
-  assert.equal((await evalRes.json()).evaluations.length, 0);
+  const evaluations = (await evalRes.json()).evaluations;
+  assert.equal(evaluations.length, 1);
+  assert.equal(evaluations[0].status, "passed");
   assert.equal(waiting.run.verification.artifacts, 2);
   assert.equal(waiting.run.verification.evidence, 2);
+  assert.equal(waiting.run.verification.evaluations.passed, 1);
 
   // Real worktree/store state was updated by the real CheckExecutor.
   assert.equal((await store.getWorktree(worktree.id))!.status, "checks_passed");
@@ -259,26 +299,24 @@ test("branched (diamond) DAG: two parallel quality-gated check branches join int
   assert.equal(done.run.verification.evaluations.passed, 2);
 });
 
-test("GAP: a failing check command fails the step at execution time and bypasses its quality gate entirely", async (t) => {
-  // CheckExecutor.inspect() ties execution status directly to whether every
-  // check command passed (result.ok). OrchestrationService only calls
-  // applyQualityGate() when the execution state is "succeeded"
-  // (completeStepFromState). So for a `check` step, any failing command
-  // fails the step immediately with a generic "Checks failed" error -
-  // the qualityGate (including onFail: "wait_approval", meant to let an
-  // operator override a failing gate) is never reached, and zero
-  // Evaluation records are created. This also means the `check` evaluator
-  // type can never itself observe/report a "failed" status: by the time it
-  // would run, the executor has already guaranteed every command passed.
+test("a failing check command reaches its quality gate: onFail=wait_approval lets an operator override it", async (t) => {
+  // Regression test for the fixed gap: CheckExecutor.inspect() used to tie
+  // execution status directly to whether every check command passed, which
+  // meant a failing command failed the step before its qualityGate (and
+  // onFail: "wait_approval" in particular) ever ran. CheckExecutor now
+  // always reports "succeeded" (the checks ran without an infrastructure
+  // error) and lets the quality gate - explicit, or the service's implicit
+  // default `{ evaluators: [{ type: "check" }], onFail: "fail" }` for
+  // check steps with none declared - decide pass/fail.
   const { baseUrl, store, service, worktrees, project } = await withE2EServer(t);
-  const worktree = await createFixtureWorktree(worktrees, store, project, "gate-unreachable-dag");
+  const worktree = await createFixtureWorktree(worktrees, store, project, "gate-reachable-dag");
 
   const createRes = await fetch(`${baseUrl}/api/runs`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       projectId: project.id,
-      goal: "gate unreachable on command failure",
+      goal: "gate reachable on command failure",
       steps: [
         {
           id: "verify",
@@ -286,6 +324,47 @@ test("GAP: a failing check command fails the step at execution time and bypasses
           input: { worktreeId: worktree.id, commands: ["exit 1"] },
           qualityGate: { evaluators: [{ type: "check" }], onFail: "wait_approval" }
         },
+        { id: "after", executor: "shell", dependsOn: ["verify"], input: { command: "echo unblocked" } }
+      ]
+    })
+  });
+  const created = await createRes.json();
+
+  const waiting = await pollRun(service, baseUrl, created.run.id, (detail) => detail.run.status === "waiting_approval");
+  const statuses = Object.fromEntries(waiting.steps.map((s: any) => [s.id, s.status]));
+  assert.deepEqual(statuses, { verify: "waiting_approval", after: "pending" });
+
+  const evalRes = await (await fetch(`${baseUrl}/api/runs/${created.run.id}/evaluations?stepId=verify`)).json();
+  assert.equal(evalRes.evaluations.length, 1);
+  assert.equal(evalRes.evaluations[0].status, "failed");
+  assert.match(evalRes.evaluations[0].reason, /One or more check commands failed/);
+
+  // Evidence/artifacts for the failing command were recorded and are
+  // linked to the (now real) evaluation.
+  const evidence = (await (await fetch(`${baseUrl}/api/runs/${created.run.id}/evidence?stepId=verify`)).json()).evidence;
+  assert.equal(evidence.length, 1);
+  assert.deepEqual(evalRes.evaluations[0].evidenceIds, [evidence[0].id]);
+  assert.equal((await store.getWorktree(worktree.id))!.status, "checks_failed");
+
+  const approveRes = await fetch(`${baseUrl}/api/runs/${created.run.id}/steps/verify/approve`, { method: "POST" });
+  assert.equal(approveRes.status, 200);
+  const done = await pollRun(service, baseUrl, created.run.id, (detail) => detail.run.status === "succeeded" || detail.run.status === "failed");
+  assert.equal(done.run.status, "succeeded");
+  assert.equal(done.steps.find((s: any) => s.id === "after").status, "succeeded");
+});
+
+test("a check step with no declared qualityGate still fails on a failing command (implicit default check gate)", async (t) => {
+  const { baseUrl, store, service, worktrees, project } = await withE2EServer(t);
+  const worktree = await createFixtureWorktree(worktrees, store, project, "gate-default-dag");
+
+  const createRes = await fetch(`${baseUrl}/api/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      projectId: project.id,
+      goal: "default gate preserves prior no-gate behavior",
+      steps: [
+        { id: "verify", executor: "check", input: { worktreeId: worktree.id, commands: ["exit 1"] } },
         { id: "after", executor: "shell", dependsOn: ["verify"], input: { command: "echo should-not-run" } }
       ]
     })
@@ -294,15 +373,11 @@ test("GAP: a failing check command fails the step at execution time and bypasses
 
   const done = await pollRun(service, baseUrl, created.run.id, (detail) => detail.run.status === "failed");
   const statuses = Object.fromEntries(done.steps.map((s: any) => [s.id, s.status]));
-  assert.deepEqual(statuses, { verify: "failed", after: "skipped" }, "onFail:wait_approval was configured but the run failed outright");
-  assert.equal(done.steps.find((s: any) => s.id === "verify").error, "Checks failed", "generic executor error, not the quality-gate reason");
+  assert.deepEqual(statuses, { verify: "failed", after: "skipped" });
 
   const evalRes = await (await fetch(`${baseUrl}/api/runs/${created.run.id}/evaluations?stepId=verify`)).json();
-  assert.equal(evalRes.evaluations.length, 0, "no Evaluation record was ever created for the configured quality gate");
-
-  // Evidence/artifacts for the failing command are still recorded correctly -
-  // only the quality-gate layer is bypassed.
-  assert.equal((await (await fetch(`${baseUrl}/api/runs/${created.run.id}/evidence?stepId=verify`)).json()).evidence.length, 1);
+  assert.equal(evalRes.evaluations.length, 1, "the implicit default check gate still produces an Evaluation record");
+  assert.equal(evalRes.evaluations[0].status, "failed");
   assert.equal((await store.getWorktree(worktree.id))!.status, "checks_failed");
 });
 
@@ -476,17 +551,14 @@ test("check quality gate cross-links evidence and artifact ids on the evaluation
   assert.equal(done.steps[0].status, "succeeded");
 });
 
-test("GAP: WorktreeManager.runChecks leaves CheckRun.exitCode undefined on success, unlike the normalized Evidence.value.exitCode", async (t) => {
-  // CheckExecutor.start() normalizes exitCode when building check.command
-  // Evidence (`run.exitCode ?? (status === "passed" ? 0 : 1)`), but the raw
-  // `checkRuns` array attached to the step's own `output` (and to the
-  // worktree/task checkRuns) is not normalized: runCommandSafe only sets
-  // `code` on the error path, so a passing command's CheckRun.exitCode is
-  // `undefined`. A quality-gate evaluator reading `output.checkRuns.N.exitCode`
-  // directly (a natural-looking source path) will get `Number(undefined)` =
-  // NaN, which numeric-threshold treats as a hard evaluator *error*, failing
-  // the gate for a command that actually passed. The correct/safe source
-  // path is `check.exitCode` (reads the normalized Evidence value).
+test("WorktreeManager.runChecks normalizes CheckRun.exitCode to 0 on success, so raw output.checkRuns[i].exitCode is usable", async (t) => {
+  // Regression test for the fixed gap: runCommandSafe only set `code` on
+  // the failure path, so a passing command's raw CheckRun.exitCode used to
+  // be `undefined`, and a numeric-threshold gate reading
+  // `output.checkRuns.0.exitCode` directly would see Number(undefined) =
+  // NaN and error out even though the check passed. runChecks now
+  // normalizes exitCode to 0/1 based on status, matching the already
+  // normalized `check.exitCode` evidence path.
   const { baseUrl, service, worktrees, store, project } = await withE2EServer(t);
   const worktree = await createFixtureWorktree(worktrees, store, project, "raw-exitcode-dag");
 
@@ -495,7 +567,7 @@ test("GAP: WorktreeManager.runChecks leaves CheckRun.exitCode undefined on succe
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       projectId: project.id,
-      goal: "raw exitCode inconsistency",
+      goal: "raw exitCode is normalized",
       steps: [
         {
           id: "verify",
@@ -509,9 +581,9 @@ test("GAP: WorktreeManager.runChecks leaves CheckRun.exitCode undefined on succe
   const created = await createRes.json();
   const done = await pollRun(service, baseUrl, created.run.id, (detail) => detail.run.status === "succeeded" || detail.run.status === "failed");
 
-  assert.equal(done.run.status, "failed", "the underlying check command actually passed, but the gate errors out on NaN");
+  assert.equal(done.run.status, "succeeded");
   const evalRes = await (await fetch(`${baseUrl}/api/runs/${created.run.id}/evaluations?stepId=verify`)).json();
-  assert.equal(evalRes.evaluations[0].status, "error");
-  assert.match(evalRes.evaluations[0].reason, /finite/);
-  assert.equal((await store.getWorktree(worktree.id))!.status, "checks_passed", "worktree state correctly shows the check passed, contradicting the gate's error-driven failure");
+  assert.equal(evalRes.evaluations[0].status, "passed");
+  assert.equal(evalRes.evaluations[0].score, 0);
+  assert.equal((await store.getWorktree(worktree.id))!.status, "checks_passed");
 });

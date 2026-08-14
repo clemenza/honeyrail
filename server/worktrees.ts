@@ -107,7 +107,7 @@ export class WorktreeManager {
             runs.push({
                 command,
                 status: result.ok ? "passed" : "failed",
-                exitCode: result.code,
+                exitCode: result.code ?? (result.ok ? 0 : 1),
                 stdout: result.stdout,
                 stderr: result.stderr,
                 startedAt,

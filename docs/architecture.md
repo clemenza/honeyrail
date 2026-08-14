@@ -111,6 +111,8 @@ Quality gates are deliberately small. Passing gates allow downstream scheduling.
 
 The first evidence producer is the `check` executor. Each command run registers a log artifact metadata record and a `check.command` evidence record with command, status, exit code, and duration.
 
+The `check` executor's own execution status only reflects whether the commands ran (an infrastructure-level concern); it does not fail just because a command exited non-zero. Whether the checks passed is decided by the quality gate instead, so a `check` step's `qualityGate` (including `onFail: "wait_approval"`) is always reached, even when every command fails. A `check` step declared without an explicit `qualityGate` gets an implicit default of `{ evaluators: [{ type: "check" }], onFail: "fail" }`, so it still fails the step (and downstream steps) on a failing command by default.
+
 ## Event Bus
 
 Domain events are published through `domain-events.ts` and `events.ts`. Events are stored and also emitted to connected UI clients so dashboards update after project, session, task, worktree, checks, commit, merge, and delete changes.

@@ -319,7 +319,11 @@ test("recovery does not duplicate running agent task steps and schedules success
 test("required M1 demonstration workflow composes agent, shell, agent, check, and approval steps", async (t) => {
   const agent = new MemoryExecutor("agent-task", [{ status: "succeeded", output: { worktreeId: "wt_a" } }, { status: "succeeded", output: { worktreeId: "wt_c" } }]);
   const shell = new MemoryExecutor("shell");
-  const check = new MemoryExecutor("check");
+  // Named "verify" (not "check") so it doesn't pick up the real "check"
+  // executor's implicit default quality gate, which expects check.command
+  // evidence this mock never produces; this test only exercises generic
+  // DAG scheduling mechanics.
+  const check = new MemoryExecutor("verify");
   const approval = new ApprovalTestExecutor();
   const registry = new ExecutorRegistry([agent, shell, check, approval]);
   const { service, project } = await withService(t, registry);
@@ -331,7 +335,7 @@ test("required M1 demonstration workflow composes agent, shell, agent, check, an
       { id: "a", name: "Agent A", executor: "agent-task" },
       { id: "b", name: "Shell B", executor: "shell", dependsOn: ["a"] },
       { id: "c", name: "Agent C", executor: "agent-task", dependsOn: ["b"] },
-      { id: "d", name: "Check D", executor: "check", dependsOn: ["c"] },
+      { id: "d", name: "Check D", executor: "verify", dependsOn: ["c"] },
       { id: "e", name: "Approval E", executor: "approval", dependsOn: ["d"] }
     ]
   });
@@ -465,7 +469,10 @@ test("task.failed immediately fails the linked agent step and run without a rest
 });
 
 test("task.completed immediately advances the linked agent step to approval", async (t) => {
-  const registry = new ExecutorRegistry([new AgentTaskExecutor(), new MemoryExecutor("check"), new ApprovalTestExecutor()]);
+  // Named "verify" (not "check") - see comment on the demonstration workflow
+  // test above for why this mock must not collide with the real "check"
+  // executor's implicit default quality gate.
+  const registry = new ExecutorRegistry([new AgentTaskExecutor(), new MemoryExecutor("verify"), new ApprovalTestExecutor()]);
   const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-agent-completion-event-"));
   const store = new JsonStore(join(tempDir, "store.json"));
   const bus = new EventBus();
@@ -497,7 +504,7 @@ test("task.completed immediately advances the linked agent step to approval", as
     goal: "propagate agent completion",
     steps: [
       { id: "implement", executor: "agent-task", input: { agent: "codex", prompt: "do work" } },
-      { id: "verify", executor: "check", dependsOn: ["implement"] },
+      { id: "verify", executor: "verify", dependsOn: ["implement"] },
       { id: "approve", executor: "approval", dependsOn: ["verify"] }
     ]
   });

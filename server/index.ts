@@ -45,6 +45,7 @@ async function main() {
         attachmentRoot: config.attachmentRoot
     });
     await orchestration.recover();
+    orchestration.startPolling(config.orchestrationPollIntervalMs);
 
     const app = createApp({
         store,
