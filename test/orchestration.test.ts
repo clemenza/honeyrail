@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test, type TestContext } from "node:test";
@@ -733,7 +733,7 @@ async function withHttpServer(t: TestContext, evaluators?: EvaluatorRegistry) {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(tempDir, { recursive: true, force: true });
   });
-  return { baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, project, store };
+  return { baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, project, store, attachmentRoot: join(tempDir, "attachments") };
 }
 
 test("REST API creates, gets, approves, rejects, cancels, and validates runs", async (t) => {
@@ -824,4 +824,94 @@ test("REST run creation accepts registered custom evaluator types and rejects un
   });
   assert.equal(unknown.status, 400);
   assert.match(((await unknown.json()) as { error: string }).error, /Unknown evaluator type: missing-evaluator/);
+});
+
+test("GET /api/artifacts/:id/content streams real file content with the artifact's mediaType", async (t) => {
+  const { baseUrl, project, store, attachmentRoot } = await withHttpServer(t);
+  const created = await store.createRun({ projectId: project.id, goal: "content", status: "succeeded" });
+  const dir = join(attachmentRoot, "runs", created.id, "verify", "attempt-1");
+  await mkdir(dir, { recursive: true });
+  const filePath = join(dir, "final-report.md");
+  await writeFile(filePath, "# Report\n\n- ok\n");
+  const artifact = await store.createArtifact({
+    runId: created.id,
+    stepId: "verify",
+    kind: "text",
+    name: "final-report.md",
+    path: filePath,
+    mediaType: "text/markdown"
+  });
+
+  const res = await fetch(`${baseUrl}/api/artifacts/${artifact.id}/content`);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("content-type"), "text/markdown");
+  assert.equal(res.headers.get("x-artifact-truncated"), "false");
+  assert.equal(await res.text(), "# Report\n\n- ok\n");
+});
+
+test("GET /api/artifacts/:id/content returns 404 for an unknown artifact id", async (t) => {
+  const { baseUrl } = await withHttpServer(t);
+  const res = await fetch(`${baseUrl}/api/artifacts/missing/content`);
+  assert.equal(res.status, 404);
+});
+
+test("GET /api/artifacts/:id/content returns 404 for an artifact with no file path", async (t) => {
+  const { baseUrl, project, store } = await withHttpServer(t);
+  const created = await store.createRun({ projectId: project.id, goal: "no path", status: "succeeded" });
+  const artifact = await store.createArtifact({
+    runId: created.id,
+    stepId: "verify",
+    kind: "log",
+    name: "check-1.log",
+    mediaType: "text/plain",
+    metadata: { stdoutPreview: "ok" }
+  });
+
+  const res = await fetch(`${baseUrl}/api/artifacts/${artifact.id}/content`);
+  assert.equal(res.status, 404);
+  assert.match(((await res.json()) as { error: string }).error, /no file content/i);
+});
+
+test("GET /api/artifacts/:id/content rejects an artifact path outside attachmentRoot", async (t) => {
+  const { baseUrl, project, store } = await withHttpServer(t);
+  const created = await store.createRun({ projectId: project.id, goal: "escape", status: "succeeded" });
+  const outsideDir = await mkdtemp(join(tmpdir(), "honeyrail-outside-"));
+  t.after(async () => rm(outsideDir, { recursive: true, force: true }));
+  const outsidePath = join(outsideDir, "secret.txt");
+  await writeFile(outsidePath, "should not be servable");
+  const artifact = await store.createArtifact({
+    runId: created.id,
+    stepId: "verify",
+    kind: "text",
+    name: "secret.txt",
+    path: outsidePath,
+    mediaType: "text/plain"
+  });
+
+  const res = await fetch(`${baseUrl}/api/artifacts/${artifact.id}/content`);
+  assert.equal(res.status, 404);
+});
+
+test("GET /api/artifacts/:id/content truncates files larger than the size cap and reports it", async (t) => {
+  const { baseUrl, project, store, attachmentRoot } = await withHttpServer(t);
+  const created = await store.createRun({ projectId: project.id, goal: "truncate", status: "succeeded" });
+  const dir = join(attachmentRoot, "runs", created.id, "verify", "attempt-1");
+  await mkdir(dir, { recursive: true });
+  const filePath = join(dir, "big.log");
+  const MAX_ARTIFACT_CONTENT_BYTES = 2 * 1024 * 1024;
+  await writeFile(filePath, "a".repeat(MAX_ARTIFACT_CONTENT_BYTES + 1024));
+  const artifact = await store.createArtifact({
+    runId: created.id,
+    stepId: "verify",
+    kind: "log",
+    name: "big.log",
+    path: filePath,
+    mediaType: "text/plain"
+  });
+
+  const res = await fetch(`${baseUrl}/api/artifacts/${artifact.id}/content`);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("x-artifact-truncated"), "true");
+  const body = await res.text();
+  assert.equal(body.length, MAX_ARTIFACT_CONTENT_BYTES);
 });

@@ -15,6 +15,7 @@ import type { DiffData, EventData, GatewayState, ProjectData, RunData, SessionDa
 import { StatusPill } from "./layout.js";
 import { ProjectForm, ProjectList } from "./ProjectPanel.js";
 import { SessionLauncher, TaskComposer, TaskTable } from "./TaskPanel.js";
+import { VerificationDrawer } from "./VerificationDrawer.js";
 
 function EventFeed({ events, className }: { events: EventData[]; className?: string }) {
   return (
@@ -258,19 +259,10 @@ function gateDecisionLabel(step: RunData["steps"][number]) {
   return decision.status.toUpperCase();
 }
 
-function compactJson(value: unknown) {
-  if (value === undefined || value === null) return "";
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
-
 function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: ProjectData[]; refresh: () => Promise<void> }) {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const [drawer, setDrawer] = useState<{ runId: string; stepId: string; kind: "artifact" | "evidence" } | null>(null);
 
   const act = async (path: string, label: string) => {
     setBusy(label);
@@ -284,6 +276,8 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
       setBusy("");
     }
   };
+
+  const drawerStep = drawer ? runs.find((run) => run.id === drawer.runId)?.steps.find((step) => step.id === drawer.stepId) : undefined;
 
   return (
     <section className="panel table-panel">
@@ -316,45 +310,26 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
                       <small>depends on {step.dependsOn.length ? step.dependsOn.join(", ") : "none"}</small>
                       {step.error ? <small className="run-step-error">{step.error}</small> : null}
                       <div className="run-verification">
-                        <span>Artifacts {step.verification?.artifacts || 0}</span>
-                        <span>Evidence {step.verification?.evidence || 0}</span>
+                        <button
+                          type="button"
+                          className="verification-count-button"
+                          disabled={!step.verification?.artifacts}
+                          onClick={() => setDrawer({ runId: run.id, stepId: step.id, kind: "artifact" })}
+                        >
+                          Artifacts {step.verification?.artifacts || 0}
+                        </button>
+                        <button
+                          type="button"
+                          className="verification-count-button"
+                          disabled={!step.verification?.evidence}
+                          onClick={() => setDrawer({ runId: run.id, stepId: step.id, kind: "evidence" })}
+                        >
+                          Evidence {step.verification?.evidence || 0}
+                        </button>
                         {step.verification?.latestAttempt ? <span>Latest attempt {step.verification.latestAttempt}</span> : null}
                         <StatusPill tone={evaluationTone(step)}>{evaluationLabel(step)}</StatusPill>
                         <StatusPill tone={gateDecisionTone(step)}>{gateDecisionLabel(step)}</StatusPill>
                       </div>
-                      {step.verification && (step.verification.artifactItems?.length || step.verification.evidenceItems?.length || step.verification.evaluationItems?.length || step.verification.gateDecisionItems?.length) ? (
-                        <details className="run-verification-detail">
-                          <summary>Verification detail</summary>
-                          {step.verification.artifactItems?.map((artifact) => (
-                            <div className="run-verification-item" key={artifact.id}>
-                              <strong>{artifact.kind}: {artifact.name}</strong>
-                              <small>{artifact.uri || artifact.path || artifact.id}</small>
-                              {artifact.metadata ? <code>{compactJson(artifact.metadata)}</code> : null}
-                            </div>
-                          ))}
-                          {step.verification.evidenceItems?.map((evidence) => (
-                            <div className="run-verification-item" key={evidence.id}>
-                              <strong>{evidence.kind}</strong>
-                              {evidence.claim ? <small>{evidence.claim}</small> : null}
-                              {evidence.value !== undefined ? <code>{compactJson(evidence.value)}</code> : null}
-                            </div>
-                          ))}
-                          {step.verification.evaluationItems?.map((evaluation) => (
-                            <div className="run-verification-item" key={evaluation.id}>
-                              <strong>{evaluation.evaluator}: {evaluation.status}{evaluation.attempt ? ` · attempt ${evaluation.attempt}` : ""}</strong>
-                              {evaluation.reason ? <small>{evaluation.reason}</small> : null}
-                              <code>{compactJson({ score: evaluation.score, threshold: evaluation.threshold, metadata: evaluation.metadata })}</code>
-                            </div>
-                          ))}
-                          {step.verification.gateDecisionItems?.map((decision) => (
-                            <div className="run-verification-item" key={decision.id}>
-                              <strong>gate: {decision.status}{decision.attempt ? ` · attempt ${decision.attempt}` : ""}</strong>
-                              <small>{decision.decidedBy}{decision.reason ? ` · ${decision.reason}` : ""}</small>
-                              <code>{compactJson({ evaluationIds: decision.evaluationIds })}</code>
-                            </div>
-                          ))}
-                        </details>
-                      ) : null}
                     </div>
                     <div className="run-step-actions">
                       <StatusPill tone={step.status === "succeeded" ? "good" : step.status === "failed" ? "bad" : step.status === "waiting_approval" ? "warn" : "neutral"}>{step.status}</StatusPill>
@@ -385,6 +360,9 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
         })}
         {!runs.length ? <div className="table-empty">No orchestration runs yet.</div> : null}
       </div>
+      {drawer && drawerStep ? (
+        <VerificationDrawer step={drawerStep} initialKind={drawer.kind} onClose={() => setDrawer(null)} />
+      ) : null}
     </section>
   );
 }
