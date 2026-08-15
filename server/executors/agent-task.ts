@@ -4,6 +4,7 @@ import {
   errorMessage,
   publishInitialAgentPrompt,
   sessionLogPath,
+  stripAnsi,
   tmuxName
 } from "../session-helpers.js";
 import type { AgentType, Session, Task, Worktree } from "../types.js";
@@ -15,7 +16,18 @@ function stringInput(value: unknown, fallback = "") {
   return text || fallback;
 }
 
-function taskStateToExecution(task: Task | undefined): ExecutionState {
+const QUESTION_TAIL_LINES = 20;
+
+async function captureQuestion(ctx: StepExecutionContext, session: Session): Promise<string> {
+  try {
+    const output = await ctx.tmux.capture(session.tmuxSessionName, 40);
+    return stripAnsi(output).trim().split("\n").slice(-QUESTION_TAIL_LINES).join("\n");
+  } catch {
+    return "";
+  }
+}
+
+async function taskStateToExecution(ctx: StepExecutionContext, task: Task | undefined): Promise<ExecutionState> {
   if (!task) return { status: "failed", error: "Linked task disappeared" };
   if (task.status === "failed" || task.status === "cancelled") {
     return { status: task.status === "cancelled" ? "cancelled" : "failed", error: task.error };
@@ -23,7 +35,15 @@ function taskStateToExecution(task: Task | undefined): ExecutionState {
   if (task.status === "done" || task.status === "merged" || task.status === "ready_to_merge") {
     return { status: "succeeded", output: { taskStatus: task.status, taskId: task.id, worktreeId: task.worktreeId, sessionId: task.sessionId } };
   }
-  return { status: "running", output: { taskStatus: task.status, taskId: task.id, worktreeId: task.worktreeId, sessionId: task.sessionId } };
+  const baseOutput = { taskStatus: task.status, taskId: task.id, worktreeId: task.worktreeId, sessionId: task.sessionId };
+  if (task.status === "agent_running" && task.sessionId) {
+    const session = await ctx.store.getSession(task.sessionId);
+    if (session?.status === "waiting_input" || session?.status === "waiting_approval") {
+      const question = await captureQuestion(ctx, session);
+      return { status: session.status, output: { ...baseOutput, question } };
+    }
+  }
+  return { status: "running", output: baseOutput };
 }
 
 export class AgentTaskExecutor implements Executor {
@@ -104,7 +124,7 @@ export class AgentTaskExecutor implements Executor {
   async inspect(ctx: StepExecutionContext, handle: ExecutionHandle): Promise<ExecutionState> {
     const taskId = String(handle.taskId || "");
     const task = taskId ? await ctx.store.getTask(taskId) : undefined;
-    return taskStateToExecution(task);
+    return taskStateToExecution(ctx, task);
   }
 
   async cancel(ctx: StepExecutionContext, handle: ExecutionHandle): Promise<void> {

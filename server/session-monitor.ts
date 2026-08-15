@@ -24,7 +24,13 @@ const WAITING_INPUT_PATTERNS = [
   /queued follow-up inputs/i,
   /waiting for input/i,
   /send a message/i,
-  /press enter/i
+  /press enter/i,
+  // Claude Code's AskUserQuestion menu and similar interactive pickers
+  // (e.g. loaded via a user-level skill like superpowers:brainstorming).
+  /enter to select\s*[·•]\s*[↑↓]/i,
+  /^\s*[❯>]\s*1\.\s+\S[\s\S]*?\n\s*2\.\s/m,
+  /chat about this/i,
+  /type something\.?\s*$/mi
 ];
 
 function nowIso() {

@@ -33,6 +33,21 @@ test("inferSessionStatus marks stale sessions without recent output", () => {
   assert.equal(inferSessionStatus("working...", old, 1_000), "stale");
 });
 
+test("inferSessionStatus detects Claude Code's AskUserQuestion menu", () => {
+  const output = [
+    "What kind of todo list app do you want?",
+    "",
+    "❯ 1. Simple CLI todo list",
+    "  2. Web app with React",
+    "  3. Mobile app with React Native",
+    "  4. Desktop app with Electron",
+    "  5. Chat about this",
+    "",
+    "Enter to select · ↑/↓ to navigate · Esc to cancel"
+  ].join("\n");
+  assert.equal(inferSessionStatus(output, new Date().toISOString(), 60_000), "waiting_input");
+});
+
 test("sessionAcceptsInput keeps waiting and stale sessions interactive", () => {
   assert.equal(sessionAcceptsInput("running"), true);
   assert.equal(sessionAcceptsInput("waiting_approval"), true);

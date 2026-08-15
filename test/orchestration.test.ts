@@ -509,6 +509,39 @@ test("AgentTaskExecutor creates one task, links execution refs, and recovery ins
   assert.equal((await store.getStep(created.run.id, "agent"))!.status, "succeeded");
 });
 
+test("AgentTaskExecutor.inspect() maps a waiting_input session onto the step state", async () => {
+  const executor = new AgentTaskExecutor();
+  const task = { id: "task_1", status: "agent_running", sessionId: "sess_1", worktreeId: "wt_1" };
+  const session = { id: "sess_1", status: "waiting_input", tmuxSessionName: "honeyrail_test" };
+  const store = {
+    getTask: async (id: string) => (id === task.id ? task : undefined),
+    getSession: async (id: string) => (id === session.id ? session : undefined)
+  } as any;
+  const ctx = {
+    store,
+    tmux: { capture: async () => "What kind of app? 1. CLI 2. Web\nEnter to select · ↑/↓ to navigate" } as any
+  } as StepExecutionContext;
+
+  const state = await executor.inspect(ctx, { taskId: task.id });
+  assert.equal(state.status, "waiting_input");
+  assert.equal(state.output?.taskId, task.id);
+  assert.match(String(state.output?.question), /CLI/);
+});
+
+test("AgentTaskExecutor.inspect() maps a waiting_approval session onto the step state", async () => {
+  const executor = new AgentTaskExecutor();
+  const task = { id: "task_2", status: "agent_running", sessionId: "sess_2", worktreeId: "wt_2" };
+  const session = { id: "sess_2", status: "waiting_approval", tmuxSessionName: "honeyrail_test" };
+  const store = {
+    getTask: async () => task,
+    getSession: async () => session
+  } as any;
+  const ctx = { store, tmux: { capture: async () => "Do you want to continue?" } as any } as StepExecutionContext;
+
+  const state = await executor.inspect(ctx, { taskId: task.id });
+  assert.equal(state.status, "waiting_approval");
+});
+
 test("task.failed immediately fails the linked agent step and run without a restart", async (t) => {
   const registry = new ExecutorRegistry([new AgentTaskExecutor(), new MemoryExecutor("check")]);
   const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-agent-failure-event-"));
