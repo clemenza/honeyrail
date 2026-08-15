@@ -41,6 +41,17 @@ const qualityGateSchema = z.object({
   onFail: z.string().optional()
 });
 
+// Like qualityGate.onFail above, each field is a plain string/number-or-string
+// so a recipe author can template it (e.g. "{{ onBlockedAction }}"); the
+// strict enums are enforced once materializeRecipe's output is re-validated
+// by createRunBody in the routes layer.
+const onBlockedSchema = z.object({
+  action: z.string().optional(),
+  timeoutMs: z.union([z.number(), z.string()]).optional(),
+  onTimeout: z.string().optional(),
+  maxAutoAnswers: z.union([z.number(), z.string()]).optional()
+});
+
 const recipeParameterSchema = z.object({
   key: z.string().min(1),
   label: z.string().min(1),
@@ -57,7 +68,8 @@ const recipeStepTemplateSchema = z.object({
   input: z.record(z.string(), z.unknown()).optional(),
   dependsOn: z.array(z.string()).optional(),
   maxAttempts: z.number().int().positive().optional(),
-  qualityGate: qualityGateSchema.optional()
+  qualityGate: qualityGateSchema.optional(),
+  onBlocked: onBlockedSchema.optional()
 });
 
 const recipeSchema = z.object({
@@ -208,6 +220,9 @@ export function materializeRecipe(
     if (step.input) step.input = templateSubstitute(step.input, resolved, declaredKeys) as Record<string, unknown>;
     if (step.qualityGate) {
       step.qualityGate = templateSubstitute(step.qualityGate, resolved, declaredKeys) as NonNullable<RecipeStepTemplate["qualityGate"]>;
+    }
+    if (step.onBlocked) {
+      step.onBlocked = templateSubstitute(step.onBlocked, resolved, declaredKeys) as NonNullable<RecipeStepTemplate["onBlocked"]>;
     }
   }
 

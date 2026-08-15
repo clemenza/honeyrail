@@ -1,4 +1,4 @@
-import type { QualityGate } from "../types.js";
+import type { OnBlockedPolicy, QualityGate } from "../types.js";
 
 export type RecipeParameterType = "string" | "number" | "boolean" | "enum";
 
@@ -19,6 +19,7 @@ export type RecipeStepTemplate = {
   dependsOn?: string[];
   maxAttempts?: number;
   qualityGate?: QualityGate;
+  onBlocked?: OnBlockedPolicy;
 };
 
 export type Recipe = {

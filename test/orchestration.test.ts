@@ -52,6 +52,46 @@ class ApprovalTestExecutor implements Executor {
   }
 }
 
+class AlwaysWaitingExecutor implements Executor {
+  type: string;
+  waitStatus: "waiting_input" | "waiting_approval";
+  question: string;
+  starts = 0;
+
+  constructor(type: string, waitStatus: "waiting_input" | "waiting_approval" = "waiting_input", question = "which option?") {
+    this.type = type;
+    this.waitStatus = waitStatus;
+    this.question = question;
+  }
+
+  async start(): Promise<ExecutionHandle> {
+    this.starts += 1;
+    return { sessionId: "sess_always_waiting" };
+  }
+
+  async inspect(): Promise<ExecutionState> {
+    return { status: this.waitStatus, output: { question: this.question, sessionId: "sess_always_waiting" } };
+  }
+}
+
+class StaysRunningExecutor implements Executor {
+  type: string;
+  sessionId: string;
+
+  constructor(type: string, sessionId: string) {
+    this.type = type;
+    this.sessionId = sessionId;
+  }
+
+  async start(): Promise<ExecutionHandle> {
+    return { sessionId: this.sessionId };
+  }
+
+  async inspect(): Promise<ExecutionState> {
+    return { status: "running" };
+  }
+}
+
 class RestartCompletesExecutor implements Executor {
   type = "agent";
   starts = 0;
@@ -540,6 +580,187 @@ test("AgentTaskExecutor.inspect() maps a waiting_approval session onto the step 
 
   const state = await executor.inspect(ctx, { taskId: task.id });
   assert.equal(state.status, "waiting_approval");
+});
+
+test("onBlocked action 'fail' immediately fails a blocked step and skips its dependents", async (t) => {
+  const registry = new ExecutorRegistry([new AlwaysWaitingExecutor("agent-task"), new MemoryExecutor("check")]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-blocked-fail-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const events: any[] = [];
+  bus.subscribe((event) => events.push(event));
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: {} as any,
+    worktrees: {} as any,
+    runCommand: runCommandSafe,
+    sessionLogRoot: "",
+    attachmentRoot: "",
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "blocked-fail",
+    steps: [
+      { id: "ask", executor: "agent-task", input: { prompt: "do work" }, onBlocked: { action: "fail" } },
+      { id: "after", executor: "check", dependsOn: ["ask"] }
+    ]
+  });
+
+  const askStep = (await store.getStep(created.run.id, "ask"))!;
+  assert.equal(askStep.status, "failed");
+  assert.match(askStep.error || "", /Agent requested clarification: which option\?/);
+  const afterStep = (await store.getStep(created.run.id, "after"))!;
+  assert.equal(afterStep.status, "skipped");
+  assert.ok(events.some((event) => event.type === "step.blocked"));
+});
+
+test("onBlocked wait_approval times out and fails once timeoutMs elapses", async (t) => {
+  const registry = new ExecutorRegistry([new AlwaysWaitingExecutor("agent-task", "waiting_approval", "should I proceed?")]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-blocked-timeout-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: {} as any,
+    worktrees: {} as any,
+    runCommand: runCommandSafe,
+    sessionLogRoot: "",
+    attachmentRoot: "",
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "blocked-timeout",
+    steps: [{ id: "ask", executor: "agent-task", input: { prompt: "do work" }, onBlocked: { action: "wait_approval", timeoutMs: 30, onTimeout: "fail" } }]
+  });
+  let step = (await store.getStep(created.run.id, "ask"))!;
+  assert.equal(step.status, "waiting_approval");
+  assert.ok(step.blockedSince);
+
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  await service.scheduleRun(created.run.id);
+  step = (await store.getStep(created.run.id, "ask"))!;
+  assert.equal(step.status, "failed");
+  assert.match(step.error || "", /timed out/);
+});
+
+test("a blocked step retried under maxAttempts gets an enriched prompt telling it not to ask again", async (t) => {
+  const registry = new ExecutorRegistry([new AlwaysWaitingExecutor("agent-task", "waiting_input", "which framework?")]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-blocked-retry-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: {} as any,
+    worktrees: {} as any,
+    runCommand: runCommandSafe,
+    sessionLogRoot: "",
+    attachmentRoot: "",
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "blocked-retry",
+    steps: [{ id: "ask", executor: "agent-task", input: { prompt: "build the app" }, maxAttempts: 2, onBlocked: { action: "fail" } }]
+  });
+
+  const step = (await store.getStep(created.run.id, "ask"))!;
+  assert.equal(step.status, "failed");
+  assert.equal(step.attempt, 2);
+  assert.equal(step.input.prompt, "build the app");
+  assert.match(String(step.input.effectivePrompt), /^build the app\n\nPrevious attempt stopped to ask: "which framework\?"/);
+});
+
+test("the stall watchdog blocks a running step with no fresh session output and times it out", async (t) => {
+  const registry = new ExecutorRegistry([new StaysRunningExecutor("agent-task", "sess_stall")]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-stalled-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const events: any[] = [];
+  bus.subscribe((event) => events.push(event));
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: {} as any,
+    worktrees: {} as any,
+    runCommand: runCommandSafe,
+    sessionLogRoot: "",
+    attachmentRoot: "",
+    executors: registry,
+    stalledThresholdMs: 10
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+  await store.createSession({
+    id: "sess_stall",
+    projectId: project.id,
+    name: "stall",
+    agent: "shell",
+    tmuxSessionName: "honeyrail_stall",
+    cwd: "/tmp",
+    status: "running",
+    lastOutputAt: new Date(Date.now() - 1000).toISOString()
+  });
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "stalled",
+    steps: [{ id: "ask", executor: "agent-task", input: {}, onBlocked: { timeoutMs: 30, onTimeout: "fail" } }]
+  });
+  let step = (await store.getStep(created.run.id, "ask"))!;
+  assert.equal(step.status, "waiting_input");
+  assert.ok(step.blockedSince);
+  assert.ok(events.some((event) => event.type === "step.stalled"));
+
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  await service.scheduleRun(created.run.id);
+  step = (await store.getStep(created.run.id, "ask"))!;
+  assert.equal(step.status, "failed");
+  assert.match(step.error || "", /timed out/i);
+});
+
+test("dedicated approval executor steps are not subject to the onBlocked timeout policy", async (t) => {
+  const registry = new ExecutorRegistry([new ApprovalTestExecutor()]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-approval-untimed-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: {} as any,
+    worktrees: {} as any,
+    runCommand: runCommandSafe,
+    sessionLogRoot: "",
+    attachmentRoot: "",
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "approval-untimed",
+    steps: [{ id: "approve", executor: "approval", onBlocked: { timeoutMs: 30, onTimeout: "fail" } }]
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  await service.scheduleRun(created.run.id);
+  const step = (await store.getStep(created.run.id, "approve"))!;
+  assert.equal(step.status, "waiting_approval");
+  assert.equal(step.blockedSince, undefined);
 });
 
 test("task.failed immediately fails the linked agent step and run without a restart", async (t) => {

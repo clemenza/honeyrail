@@ -53,7 +53,11 @@ export class AgentTaskExecutor implements Executor {
     const agent = stringInput(ctx.step.input.agent, ctx.project.defaultAgent || "codex") as AgentType;
     const adapter = getAgentAdapter(agent);
     const title = stringInput(ctx.step.input.title, ctx.step.name || "Agent task");
-    const prompt = stringInput(ctx.step.input.prompt, title);
+    // A retry after the agent stopped to ask a clarifying question runs with
+    // an enriched prompt (see enrichRetryInput in orchestration/service.ts)
+    // telling it not to ask again; the original prompt is kept in step.input
+    // untouched so the UI can still show it.
+    const prompt = stringInput(ctx.step.input.effectivePrompt) || stringInput(ctx.step.input.prompt, title);
     const model = stringInput(ctx.step.input.model);
     const task = await ctx.store.createTask({
       projectId: ctx.project.id,

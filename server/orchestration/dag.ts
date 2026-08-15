@@ -1,4 +1,4 @@
-import type { QualityGate, Step } from "../types.js";
+import type { OnBlockedPolicy, QualityGate, Step } from "../types.js";
 
 export type StepDefinition = {
   id: string;
@@ -8,6 +8,7 @@ export type StepDefinition = {
   dependsOn?: string[];
   maxAttempts?: number;
   qualityGate?: QualityGate;
+  onBlocked?: OnBlockedPolicy;
 };
 
 export type ExecutorLookup = {
