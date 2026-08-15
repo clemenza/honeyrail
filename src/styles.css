@@ -1940,21 +1940,6 @@ textarea:focus {
   font-size: 12px;
 }
 
-.run-verification-item {
-  display: grid;
-  gap: 3px;
-  margin-top: 8px;
-  border-left: 2px solid var(--color-border);
-  padding-left: 8px;
-}
-
-.run-verification-item code {
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
-  color: var(--color-text-secondary);
-  font-size: 11px;
-}
-
 .run-step-actions {
   flex-wrap: wrap;
   justify-content: flex-end;

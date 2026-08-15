@@ -259,16 +259,6 @@ function gateDecisionLabel(step: RunData["steps"][number]) {
   return decision.status.toUpperCase();
 }
 
-function compactJson(value: unknown) {
-  if (value === undefined || value === null) return "";
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
-
 function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: ProjectData[]; refresh: () => Promise<void> }) {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -340,39 +330,6 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
                         <StatusPill tone={evaluationTone(step)}>{evaluationLabel(step)}</StatusPill>
                         <StatusPill tone={gateDecisionTone(step)}>{gateDecisionLabel(step)}</StatusPill>
                       </div>
-                      {step.verification && (step.verification.artifactItems?.length || step.verification.evidenceItems?.length || step.verification.evaluationItems?.length || step.verification.gateDecisionItems?.length) ? (
-                        <details className="run-verification-detail">
-                          <summary>Verification detail</summary>
-                          {step.verification.artifactItems?.map((artifact) => (
-                            <div className="run-verification-item" key={artifact.id}>
-                              <strong>{artifact.kind}: {artifact.name}</strong>
-                              <small>{artifact.uri || artifact.path || artifact.id}</small>
-                              {artifact.metadata ? <code>{compactJson(artifact.metadata)}</code> : null}
-                            </div>
-                          ))}
-                          {step.verification.evidenceItems?.map((evidence) => (
-                            <div className="run-verification-item" key={evidence.id}>
-                              <strong>{evidence.kind}</strong>
-                              {evidence.claim ? <small>{evidence.claim}</small> : null}
-                              {evidence.value !== undefined ? <code>{compactJson(evidence.value)}</code> : null}
-                            </div>
-                          ))}
-                          {step.verification.evaluationItems?.map((evaluation) => (
-                            <div className="run-verification-item" key={evaluation.id}>
-                              <strong>{evaluation.evaluator}: {evaluation.status}{evaluation.attempt ? ` · attempt ${evaluation.attempt}` : ""}</strong>
-                              {evaluation.reason ? <small>{evaluation.reason}</small> : null}
-                              <code>{compactJson({ score: evaluation.score, threshold: evaluation.threshold, metadata: evaluation.metadata })}</code>
-                            </div>
-                          ))}
-                          {step.verification.gateDecisionItems?.map((decision) => (
-                            <div className="run-verification-item" key={decision.id}>
-                              <strong>gate: {decision.status}{decision.attempt ? ` · attempt ${decision.attempt}` : ""}</strong>
-                              <small>{decision.decidedBy}{decision.reason ? ` · ${decision.reason}` : ""}</small>
-                              <code>{compactJson({ evaluationIds: decision.evaluationIds })}</code>
-                            </div>
-                          ))}
-                        </details>
-                      ) : null}
                     </div>
                     <div className="run-step-actions">
                       <StatusPill tone={step.status === "succeeded" ? "good" : step.status === "failed" ? "bad" : step.status === "waiting_approval" ? "warn" : "neutral"}>{step.status}</StatusPill>
