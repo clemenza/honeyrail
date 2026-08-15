@@ -15,7 +15,7 @@ import type { DiffData, EventData, GatewayState, ProjectData, RunData, SessionDa
 import { StatusPill } from "./layout.js";
 import { ProjectForm, ProjectList } from "./ProjectPanel.js";
 import { RecipeWizard } from "./RecipeWizard.js";
-import { StepCard } from "./StepCard.js";
+import { isAgentBlocked, StepCard } from "./StepCard.js";
 import { SessionLauncher, TaskComposer, TaskTable } from "./TaskPanel.js";
 import { VerificationDrawer } from "./VerificationDrawer.js";
 
@@ -233,11 +233,11 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
   const [drawer, setDrawer] = useState<{ runId: string; stepId: string; kind: "artifact" | "evidence" } | null>(null);
   const [showWizard, setShowWizard] = useState(false);
 
-  const act = async (path: string, label: string) => {
+  const act = async (path: string, label: string, body: Record<string, unknown> = {}) => {
     setBusy(label);
     setError("");
     try {
-      await api(path, { method: "POST", body: JSON.stringify({}) });
+      await api(path, { method: "POST", body: JSON.stringify(body) });
       await refresh();
     } catch (err: unknown) {
       setError((err as Error).message);
@@ -264,6 +264,7 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
         {runs.slice().reverse().map((run) => {
           const project = projects.find((item) => item.id === run.projectId);
           const terminal = ["succeeded", "failed", "cancelled"].includes(run.status);
+          const hasBlockedStep = run.steps.some((step) => isAgentBlocked(step));
           return (
             <article className="run-card" key={run.id}>
               <div className="run-card-header">
@@ -271,7 +272,10 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
                   <h3>{run.goal}</h3>
                   <p>{project?.name || run.projectId} · {run.id}</p>
                 </div>
-                <StatusPill tone={run.status === "succeeded" ? "good" : run.status === "failed" ? "bad" : "warn"}>{run.status}</StatusPill>
+                <div className="run-card-header-badges">
+                  {hasBlockedStep ? <StatusPill tone="warn">blocked</StatusPill> : null}
+                  <StatusPill tone={run.status === "succeeded" ? "good" : run.status === "failed" ? "bad" : "warn"}>{run.status}</StatusPill>
+                </div>
               </div>
               <div className="run-steps">
                 {run.steps.map((step) => (
@@ -283,6 +287,7 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
                     onOpenDrawer={(stepId, kind) => setDrawer({ runId: run.id, stepId, kind })}
                     onApprove={(stepId) => act(`/api/runs/${run.id}/steps/${stepId}/approve`, `approve:${stepId}`)}
                     onReject={(stepId) => act(`/api/runs/${run.id}/steps/${stepId}/reject`, `reject:${stepId}`)}
+                    onAnswer={(stepId, text) => act(`/api/runs/${run.id}/steps/${stepId}/answer`, `answer:${stepId}`, { text })}
                   />
                 ))}
               </div>

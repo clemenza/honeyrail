@@ -1945,6 +1945,56 @@ textarea:focus {
   justify-content: flex-end;
 }
 
+.run-card-header-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.run-step-blocked {
+  margin-top: 8px;
+  padding: var(--space-sm);
+  border: 1px solid var(--color-warn-border);
+  border-radius: 8px;
+  background: var(--color-bg-subtle);
+}
+
+.run-step-blocked-question {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.run-step-blocked-countdown {
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
+.run-step-blocked-text {
+  margin: 8px 0 0;
+  padding: 8px;
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--color-border-light);
+  border-radius: 6px;
+  background: var(--color-panel);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.run-step-blocked-answer {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.run-step-blocked-answer input {
+  flex: 1;
+  min-width: 0;
+}
+
 .table-action {
   min-height: var(--touch-min);
   padding: 7px 10px;

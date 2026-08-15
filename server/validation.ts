@@ -124,6 +124,10 @@ export const rejectStepBody = z.object({
   reason: z.string().optional()
 });
 
+export const answerStepBody = z.object({
+  text: z.string().min(1)
+});
+
 export const recipeRunBody = z.object({
   projectId: z.string().min(1),
   goal: z.string().optional(),

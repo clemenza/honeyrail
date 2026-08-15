@@ -3,10 +3,12 @@ import { createDefaultEvaluatorRegistry, type EvaluatorRegistry } from "../evalu
 import { createDefaultExecutorRegistry } from "../executors/index.js";
 import type { ExecutorRegistry } from "../executors/registry.js";
 import type { ExecutionState, StepExecutionContext } from "../executors/types.js";
+import type { SessionSummaryClient } from "../session-helpers.js";
 import type { Artifact, Evaluation, Evidence, OnBlockedPolicy, Project, QualityGate, QualityGateDecision, ResolvedOnBlockedPolicy, Run, Step, Store, VerificationSummary } from "../types.js";
 import type { TmuxManager } from "../tmux.js";
 import type { runCommandSafe } from "../utils.js";
 import type { WorktreeManager } from "../worktrees.js";
+import { generateAutoAnswer } from "./auto-answer.js";
 import { blockedStepsAfterFailure, readySteps, type StepDefinition, validateStepGraph } from "./dag.js";
 import { publishRunEvent, publishStepEvent } from "./events.js";
 import { deriveRunStatus, isRunTerminal, isStepTerminal, transitionRun, transitionStep } from "./state-machine.js";
@@ -31,6 +33,9 @@ export type OrchestrationRuntime = {
   evaluators?: EvaluatorRegistry;
   /** How long a running agent-task step can go without new session output before it's treated as stalled/blocked. Default 20 minutes. */
   stalledThresholdMs?: number;
+  /** LLM client used to answer blocked steps under onBlocked action/onTimeout "auto_answer". Auto-answering is a no-op (falls through to onTimeout) when omitted. */
+  autoAnswerClient?: SessionSummaryClient;
+  autoAnswerModel?: string;
 };
 
 const DEFAULT_ON_BLOCKED: ResolvedOnBlockedPolicy = {
@@ -59,6 +64,8 @@ export class OrchestrationService {
   private executors: ExecutorRegistry;
   private evaluators: EvaluatorRegistry;
   private stalledThresholdMs: number;
+  private autoAnswerClient?: SessionSummaryClient;
+  private autoAnswerModel: string;
   private scheduling = new Set<string>();
 
   constructor(runtime: OrchestrationRuntime) {
@@ -72,6 +79,8 @@ export class OrchestrationService {
     this.executors = runtime.executors || createDefaultExecutorRegistry();
     this.evaluators = runtime.evaluators || createDefaultEvaluatorRegistry();
     this.stalledThresholdMs = runtime.stalledThresholdMs ?? DEFAULT_STALLED_THRESHOLD_MS;
+    this.autoAnswerClient = runtime.autoAnswerClient;
+    this.autoAnswerModel = runtime.autoAnswerModel || "deepseek-v4-flash";
     this.bus.subscribe((event) => {
       if (!["task.failed", "task.completed"].includes(event.type) || !event.taskId) return;
       this.scheduleRunsForTask(event.taskId).catch((error) => {
@@ -441,12 +450,54 @@ export class OrchestrationService {
   }
 
   /**
-   * Overridden by the auto-answer flow; the default implementation reports
-   * no configured auto-answer provider so blocked steps fall through to
-   * their onBlocked.onTimeout handling.
+   * Asks the configured LLM to answer on the operator's behalf and, if it
+   * produces one, types it into the blocked step's session. Returns false
+   * (never throws) whenever auto-answering isn't possible — no client
+   * configured, no linked session, the attempt cap was hit, or the LLM call
+   * itself failed — so callers fall through to the onBlocked.onTimeout
+   * handling.
    */
-  protected async tryAutoAnswer(_run: Run, _project: Project, _step: Step, _question: string, _policy: ResolvedOnBlockedPolicy): Promise<boolean> {
-    return false;
+  private async tryAutoAnswer(run: Run, project: Project, step: Step, question: string, policy: ResolvedOnBlockedPolicy): Promise<boolean> {
+    if (!this.autoAnswerClient || !question) return false;
+    const attempts = await this.countAutoAnswerAttempts(run.id, step.id, step.attempt);
+    if (attempts >= policy.maxAutoAnswers) return false;
+
+    const answer = await generateAutoAnswer({
+      client: this.autoAnswerClient,
+      model: this.autoAnswerModel,
+      question,
+      prompt: String(step.input?.prompt ?? ""),
+      projectName: project.name,
+      goal: run.goal
+    });
+    if (!answer) return false;
+
+    const sessionId = (step.executionRef?.sessionId ?? step.output?.sessionId) as string | undefined;
+    const session = sessionId ? await this.store.getSession(sessionId) : undefined;
+    if (!session) return false;
+    try {
+      await this.tmux.sendInput(session.tmuxSessionName, answer);
+    } catch {
+      return false;
+    }
+
+    await this.store.createEvidence({
+      runId: run.id,
+      stepId: step.id,
+      attempt: step.attempt,
+      kind: "auto_answer",
+      claim: question,
+      value: answer,
+      source: "auto-answer"
+    });
+    await publishStepEvent(this.eventContext(), "step.auto_answered", run, step, { question, answer, attempt: attempts + 1 });
+    await this.markStepUnblocked(run, step);
+    return true;
+  }
+
+  private async countAutoAnswerAttempts(runId: string, stepId: string, attempt: number): Promise<number> {
+    const evidence = await this.store.listEvidence(runId, stepId);
+    return evidence.filter((item) => item.kind === "auto_answer" && item.attempt === attempt).length;
   }
 
   /**
@@ -771,6 +822,37 @@ export class OrchestrationService {
       error: reason
     });
     await publishStepEvent(this.eventContext(), "step.failed", run, updated, { rejected: true, error: reason });
+    await this.scheduleRun(run.id);
+    return { run: (await this.store.getRun(run.id)) || run, step: updated };
+  }
+
+  /**
+   * Answers a step blocked on an agent clarification prompt without opening
+   * its tmux session: types the operator's (or an LLM's, via the REST
+   * caller) text into the session and clears the block so the next poll
+   * picks the step back up. Distinct from approveStep/rejectStep, which
+   * resolve the dedicated "approval" executor and quality-gate waits.
+   */
+  async answerStep(runId: string, stepId: string, text: string): Promise<{ run: Run; step: Step }> {
+    const run = await this.requireRun(runId);
+    const step = await this.requireStep(run.id, stepId);
+    if (step.executor === "approval") throw new Error("Use approve/reject for a dedicated approval step");
+    if (this.isQualityGateWaiting(step)) throw new Error("Use approve/reject for a quality-gate wait_approval step");
+    if (step.status !== "waiting_input" && step.status !== "waiting_approval") {
+      throw new Error(`Step is not waiting for input: ${step.status}`);
+    }
+    const sessionId = (step.executionRef?.sessionId ?? step.output?.sessionId) as string | undefined;
+    const session = sessionId ? await this.store.getSession(sessionId) : undefined;
+    if (!session) throw new Error("Blocked step has no linked session to answer");
+
+    await this.tmux.sendInput(session.tmuxSessionName, text);
+    const updated = await transitionStep(this.store, step, {
+      status: "running",
+      blockedSince: undefined,
+      output: this.withoutStalledMarker(step.output)
+    });
+    await publishStepEvent(this.eventContext(), "step.answered", run, updated, { text });
+    await publishStepEvent(this.eventContext(), "step.running", run, updated);
     await this.scheduleRun(run.id);
     return { run: (await this.store.getRun(run.id)) || run, step: updated };
   }

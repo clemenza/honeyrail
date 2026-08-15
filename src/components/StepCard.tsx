@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import { ArrowRight, Shield, XCircle } from "lucide-react";
 import type { StepData } from "../types.js";
 import { StatusPill } from "./layout.js";
@@ -39,14 +39,91 @@ function gateDecisionLabel(step: StepLike) {
   return decision.status.toUpperCase();
 }
 
-export function StepCard({ step, runId, onApprove, onReject, onOpenDrawer, busy }: {
+function isQualityGateWaiting(step: StepLike) {
+  const gate = step.output?.qualityGate as { status?: string } | undefined;
+  return step.status === "waiting_approval" && gate?.status === "waiting_approval";
+}
+
+// A step is "agent-blocked" when it's the agent itself asking a clarifying
+// question (onBlocked policy territory), as opposed to a dedicated human
+// "approval" step or a quality-gate wait_approval — both of those keep using
+// the existing Approve/Reject flow below.
+export function isAgentBlocked(step: StepLike) {
+  return (step.status === "waiting_input" || step.status === "waiting_approval") &&
+    step.executor !== "approval" &&
+    !isQualityGateWaiting(step);
+}
+
+const DEFAULT_ON_BLOCKED_TIMEOUT_MS = 30 * 60_000;
+
+function formatCountdown(ms: number) {
+  if (ms <= 0) return "any moment";
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
+function BlockedCountdown({ blockedSince, timeoutMs }: { blockedSince?: string; timeoutMs: number }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  if (!blockedSince) return null;
+  const deadline = new Date(blockedSince).getTime() + timeoutMs;
+  return <small className="run-step-blocked-countdown">times out in {formatCountdown(deadline - now)}</small>;
+}
+
+function BlockedStepPanel({ step, onAnswer, busy }: { step: StepLike; onAnswer?: (stepId: string, text: string) => void; busy?: boolean }) {
+  const [text, setText] = useState("");
+  const question = String(step.output?.question || "").trim();
+  const questionTail = question.split("\n").slice(-20).join("\n");
+  const timeoutMs = step.onBlocked?.timeoutMs ?? DEFAULT_ON_BLOCKED_TIMEOUT_MS;
+
+  const submit = () => {
+    const value = text.trim();
+    if (!value) return;
+    onAnswer?.(step.id, value);
+    setText("");
+  };
+
+  return (
+    <div className="run-step-blocked">
+      <div className="run-step-blocked-question">
+        <StatusPill tone="warn">blocked</StatusPill>
+        <BlockedCountdown blockedSince={step.blockedSince} timeoutMs={timeoutMs} />
+      </div>
+      {questionTail ? <pre className="run-step-blocked-text">{questionTail}</pre> : null}
+      <div className="run-step-blocked-answer">
+        <input
+          type="text"
+          placeholder="Type an answer to send to the agent…"
+          value={text}
+          disabled={Boolean(busy)}
+          onChange={(event) => setText(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") submit();
+          }}
+        />
+        <button type="button" className="secondary-button table-action" disabled={Boolean(busy) || !text.trim()} onClick={submit}>
+          Answer
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export function StepCard({ step, runId, onApprove, onReject, onAnswer, onOpenDrawer, busy }: {
   step: StepLike;
   runId?: string;
   onApprove?: (stepId: string) => void;
   onReject?: (stepId: string) => void;
+  onAnswer?: (stepId: string, text: string) => void;
   onOpenDrawer?: (stepId: string, kind: "artifact" | "evidence") => void;
   busy?: boolean;
 }) {
+  const blocked = isAgentBlocked(step);
   return (
     <div className="run-step">
       <div>
@@ -75,14 +152,15 @@ export function StepCard({ step, runId, onApprove, onReject, onOpenDrawer, busy 
           <StatusPill tone={evaluationTone(step)}>{evaluationLabel(step)}</StatusPill>
           <StatusPill tone={gateDecisionTone(step)}>{gateDecisionLabel(step)}</StatusPill>
         </div>
+        {blocked ? <BlockedStepPanel step={step} onAnswer={onAnswer} busy={busy} /> : null}
       </div>
       {runId && step.status ? (
         <div className="run-step-actions">
-          <StatusPill tone={step.status === "succeeded" ? "good" : step.status === "failed" ? "bad" : step.status === "waiting_approval" ? "warn" : "neutral"}>{step.status}</StatusPill>
+          <StatusPill tone={step.status === "succeeded" ? "good" : step.status === "failed" ? "bad" : step.status === "waiting_approval" || blocked ? "warn" : "neutral"}>{step.status}</StatusPill>
           {step.executionRef?.sessionId ? (
             <a className="secondary-button table-action" href={`#/session/${step.executionRef.sessionId}`}>Session <ArrowRight size={14} /></a>
           ) : null}
-          {step.status === "waiting_approval" ? (
+          {step.status === "waiting_approval" && !blocked ? (
             <>
               <button type="button" className="secondary-button table-action" disabled={Boolean(busy)} onClick={() => onApprove?.(step.id)}>
                 <Shield size={14} /> Approve

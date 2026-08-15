@@ -74,6 +74,28 @@ class AlwaysWaitingExecutor implements Executor {
   }
 }
 
+class ToggleWaitingExecutor implements Executor {
+  type: string;
+  waiting = true;
+  question: string;
+  sessionId: string;
+
+  constructor(type: string, sessionId: string, question = "which framework?") {
+    this.type = type;
+    this.sessionId = sessionId;
+    this.question = question;
+  }
+
+  async start(): Promise<ExecutionHandle> {
+    return { sessionId: this.sessionId };
+  }
+
+  async inspect(): Promise<ExecutionState> {
+    if (this.waiting) return { status: "waiting_input", output: { question: this.question, sessionId: this.sessionId } };
+    return { status: "running" };
+  }
+}
+
 class StaysRunningExecutor implements Executor {
   type: string;
   sessionId: string;
@@ -763,6 +785,147 @@ test("dedicated approval executor steps are not subject to the onBlocked timeout
   assert.equal(step.blockedSince, undefined);
 });
 
+test("answerStep sends the operator's text into the blocked session and unblocks the step", async (t) => {
+  const executor = new ToggleWaitingExecutor("agent-task", "sess_toggle");
+  const registry = new ExecutorRegistry([executor]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-answer-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const sentInputs: Array<{ target: string; text: string }> = [];
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: { sendInput: async (target: string, text: string) => { sentInputs.push({ target, text }); } } as any,
+    worktrees: {} as any,
+    runCommand: runCommandSafe,
+    sessionLogRoot: "",
+    attachmentRoot: "",
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+  await store.createSession({ id: "sess_toggle", projectId: project.id, name: "ask", agent: "codex", tmuxSessionName: "honeyrail_ask", cwd: "/tmp", status: "waiting_input" });
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "answer",
+    steps: [{ id: "ask", executor: "agent-task", input: { prompt: "build the app" }, onBlocked: { timeoutMs: 60_000 } }]
+  });
+  let step = (await store.getStep(created.run.id, "ask"))!;
+  assert.equal(step.status, "waiting_input");
+  assert.ok(step.blockedSince);
+
+  // Simulate the underlying agent having resolved the question by the time
+  // the answer is delivered, so the poll triggered by answerStep observes
+  // "running" instead of asking again.
+  executor.waiting = false;
+  const result = await service.answerStep(created.run.id, "ask", "use React");
+
+  assert.deepEqual(sentInputs, [{ target: "honeyrail_ask", text: "use React" }]);
+  assert.equal(result.step.status, "running");
+  assert.equal(result.step.blockedSince, undefined);
+
+  step = (await store.getStep(created.run.id, "ask"))!;
+  assert.equal(step.status, "running");
+});
+
+test("answerStep rejects a step that isn't waiting for input", async (t) => {
+  const registry = new ExecutorRegistry([new MemoryExecutor("ok")]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-answer-invalid-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: {} as any,
+    worktrees: {} as any,
+    runCommand: runCommandSafe,
+    sessionLogRoot: "",
+    attachmentRoot: "",
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+
+  const created = await service.createRun({ projectId: project.id, goal: "answer-invalid", steps: [{ id: "ok", executor: "ok" }] });
+  await assert.rejects(() => service.answerStep(created.run.id, "ok", "text"), /not waiting for input/);
+});
+
+test("onBlocked auto_answer calls the configured LLM, types its answer, records evidence, and caps retries", async (t) => {
+  const registry = new ExecutorRegistry([new AlwaysWaitingExecutor("agent-task", "waiting_input", "which framework?")]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-auto-answer-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const sentInputs: Array<{ target: string; text: string }> = [];
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: { sendInput: async (target: string, text: string) => { sentInputs.push({ target, text }); } } as any,
+    worktrees: {} as any,
+    runCommand: runCommandSafe,
+    sessionLogRoot: "",
+    attachmentRoot: "",
+    executors: registry,
+    autoAnswerClient: { summarize: async () => "React" },
+    autoAnswerModel: "test-model"
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+  await store.createSession({ id: "sess_always_waiting", projectId: project.id, name: "ask", agent: "codex", tmuxSessionName: "honeyrail_ask", cwd: "/tmp", status: "waiting_input" });
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "auto-answer",
+    steps: [{ id: "ask", executor: "agent-task", input: { prompt: "build the app" }, onBlocked: { action: "auto_answer", maxAutoAnswers: 1, timeoutMs: 60_000 } }]
+  });
+
+  assert.equal(sentInputs.length, 1);
+  assert.deepEqual(sentInputs[0], { target: "honeyrail_ask", text: "React" });
+
+  const evidence = await store.listEvidence(created.run.id, "ask");
+  const autoAnswerEvidence = evidence.filter((item) => item.kind === "auto_answer");
+  assert.equal(autoAnswerEvidence.length, 1);
+  assert.equal(autoAnswerEvidence[0].claim, "which framework?");
+  assert.equal(autoAnswerEvidence[0].value, "React");
+
+  // AlwaysWaitingExecutor keeps asking, so once the single allowed
+  // auto-answer is spent the step stays blocked instead of looping forever.
+  const step = (await store.getStep(created.run.id, "ask"))!;
+  assert.equal(step.status, "waiting_input");
+  assert.ok(step.blockedSince);
+});
+
+test("onBlocked auto_answer falls through to onTimeout when no client is configured", async (t) => {
+  const registry = new ExecutorRegistry([new AlwaysWaitingExecutor("agent-task", "waiting_input", "which framework?")]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-auto-answer-unconfigured-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: {} as any,
+    worktrees: {} as any,
+    runCommand: runCommandSafe,
+    sessionLogRoot: "",
+    attachmentRoot: "",
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "auto-answer-unconfigured",
+    steps: [{ id: "ask", executor: "agent-task", input: { prompt: "build" }, onBlocked: { action: "auto_answer", timeoutMs: 30, onTimeout: "fail" } }]
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  await service.scheduleRun(created.run.id);
+  const step = (await store.getStep(created.run.id, "ask"))!;
+  assert.equal(step.status, "failed");
+  assert.match(step.error || "", /timed out/);
+});
+
 test("task.failed immediately fails the linked agent step and run without a restart", async (t) => {
   const registry = new ExecutorRegistry([new AgentTaskExecutor(), new MemoryExecutor("check")]);
   const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-agent-failure-event-"));
@@ -1049,6 +1212,70 @@ test("REST API creates, gets, approves, rejects, cancels, and validates runs", a
   });
   assert.equal(rejectRes.status, 200);
   assert.equal((await rejectRes.json()).run.status, "failed");
+});
+
+test("REST POST /api/runs/:runId/steps/:stepId/answer sends input and unblocks a waiting step", async (t) => {
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-answer-rest-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const executor = new ToggleWaitingExecutor("agent-task", "sess_rest_answer");
+  const sentInputs: Array<{ target: string; text: string }> = [];
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: { sendInput: async (target: string, text: string) => { sentInputs.push({ target, text }); } } as any,
+    worktrees: {} as any,
+    runCommand: (async () => ({ ok: true, stdout: "", stderr: "" })) as any,
+    sessionLogRoot: "",
+    attachmentRoot: "",
+    executors: new ExecutorRegistry([executor])
+  });
+  const app = createApp({
+    store,
+    bus,
+    tmux: { listSessions: async () => [] } as any,
+    worktrees: {} as any,
+    run: (async () => ({ ok: true, stdout: "", stderr: "" })) as any,
+    token: null,
+    attachmentRoot: join(tempDir, "attachments"),
+    sessionLogRoot: join(tempDir, "sessions"),
+    orchestration: service
+  });
+  const server = createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  t.after(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(tempDir, { recursive: true, force: true });
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  await store.createSession({ id: "sess_rest_answer", projectId: project.id, name: "ask", agent: "codex", tmuxSessionName: "honeyrail_rest_ask", cwd: "/tmp", status: "waiting_input" });
+
+  const createRes = await fetch(`${baseUrl}/api/runs`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ projectId: project.id, goal: "answer over REST", steps: [{ id: "ask", executor: "agent-task", input: { prompt: "build" } }] })
+  });
+  const created = await createRes.json();
+  assert.equal(created.steps[0].status, "waiting_input");
+
+  const emptyAnswer = await fetch(`${baseUrl}/api/runs/${created.run.id}/steps/ask/answer`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "" })
+  });
+  assert.equal(emptyAnswer.status, 400);
+
+  executor.waiting = false;
+  const answerRes = await fetch(`${baseUrl}/api/runs/${created.run.id}/steps/ask/answer`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "use React" })
+  });
+  assert.equal(answerRes.status, 200);
+  const answerBody = await answerRes.json();
+  assert.equal(answerBody.step.status, "running");
+  assert.deepEqual(sentInputs, [{ target: "honeyrail_rest_ask", text: "use React" }]);
 });
 
 test("REST run creation accepts registered custom evaluator types and rejects unknown evaluator types", async (t) => {
