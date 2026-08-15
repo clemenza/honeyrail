@@ -14,7 +14,7 @@ test("ops start builds assets before launching the tmux server", async () => {
   assert.ok(alreadyRunningIndex > -1, "start.sh should keep the existing-service fast path");
   assert.ok(buildIndex > -1, "start.sh should build before starting the server");
   assert.ok(launchIndex > -1, "start.sh should launch the tmux server");
-  assert.equal(script.includes('SESSION_NAME="${AGW_TMUX_SESSION:-honeyrail_server}"'), true);
+  assert.equal(script.includes('SESSION_NAME="${HONEYRAIL_TMUX_SESSION:-${AGW_TMUX_SESSION:-honeyrail_server}}"'), true);
   assert.equal(script.includes('SESSION_NAME="${AGW_TMUX_SESSION:-agw_server}"'), false);
   assert.ok(alreadyRunningIndex < buildIndex, "existing running services should not be rebuilt by start.sh");
   assert.ok(buildIndex < launchIndex, "fresh starts should build before launching tmux");

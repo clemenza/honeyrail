@@ -27,7 +27,7 @@ export class TmuxManager {
     // Use a per-call named buffer (instead of the global tmux buffer) so
     // concurrent sendInput calls across sessions can never clobber one
     // another's payload between the set-buffer/paste-buffer/send-keys steps.
-    const bufferName = makeId("agw_input");
+    const bufferName = makeId("honeyrail_input");
     // "--" marks end-of-options so text beginning with "-" (e.g. a line
     // starting with a bullet dash) isn't parsed by tmux as a flag.
     await this.run("tmux", ["set-buffer", "-b", bufferName, "--", text]);

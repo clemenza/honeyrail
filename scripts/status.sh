@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SESSION_NAME="${AGW_TMUX_SESSION:-honeyrail_server}"
+SESSION_NAME="${HONEYRAIL_TMUX_SESSION:-${AGW_TMUX_SESSION:-honeyrail_server}}"
 PORT="${PORT:-4178}"
-LOG_FILE="${AGW_LOG_FILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/npm_start.log}"
+LOG_FILE="${HONEYRAIL_LOG_FILE:-${AGW_LOG_FILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/npm_start.log}}"
 TMUX_BIN="${TMUX_BIN:-$(command -v tmux || true)}"
 
 if [[ -z "$TMUX_BIN" && -x /usr/local/bin/tmux ]]; then

@@ -4,7 +4,7 @@ import { dirname, resolve } from "node:path";
 import { homedir } from "node:os";
 import { listAgentAdapters } from "./agents/registry.js";
 import type { AgentCommandRunner, AgentInstallationStatus } from "./agents/types.js";
-import { defaultConfigPath, loadGatewayConfig, type GatewayConfig } from "./config.js";
+import { collectNamingDeprecations, defaultConfigPath, loadGatewayConfig, type GatewayConfig } from "./config.js";
 import { runCommandSafe, type SafeCommandOutput } from "./utils.js";
 
 export type DoctorCoreCheck = {
@@ -27,6 +27,11 @@ export type DoctorSecurityCheck = {
   detail: string;
 };
 
+export type DoctorNamingCheck = {
+  scheme: "current" | "legacy" | "mixed";
+  deprecations: { old: string; new: string }[];
+};
+
 export type DoctorReport = {
   ready: boolean;
   stableAgentsAvailable: number;
@@ -34,6 +39,7 @@ export type DoctorReport = {
   agents: AgentInstallationStatus[];
   runtime: DoctorRuntimeCheck[];
   security: DoctorSecurityCheck[];
+  naming: DoctorNamingCheck;
 };
 
 type DoctorOptions = {
@@ -162,10 +168,16 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
     }
   ];
 
+  const deprecations = collectNamingDeprecations(env);
+  const naming: DoctorNamingCheck = {
+    scheme: deprecations.length === 0 ? "current" : "legacy",
+    deprecations
+  };
+
   const stableAgentsAvailable = agents.filter((agent) => agent.available && agent.stability === "stable").length;
   const ready = core.every((check) => check.ok) && runtime.every((check) => check.ok);
 
-  return { ready, stableAgentsAvailable, core, agents, runtime, security };
+  return { ready, stableAgentsAvailable, core, agents, runtime, security, naming };
 }
 
 function mark(ok: boolean) {
@@ -193,6 +205,10 @@ export function formatDoctorReport(report: DoctorReport) {
     "",
     "Security",
     ...report.security.map((check) => `  ${mark(check.ok)} ${check.label.padEnd(16)} ${check.detail}`),
+    "",
+    "Naming",
+    `  ${mark(report.naming.deprecations.length === 0)} scheme           ${report.naming.scheme}`,
+    ...report.naming.deprecations.map((d) => `  ! ${d.old} -> ${d.new}`),
     "",
     `Result: ${report.ready ? "READY" : "NOT READY"} (${report.stableAgentsAvailable} stable agent backends available)`
   ].join("\n");

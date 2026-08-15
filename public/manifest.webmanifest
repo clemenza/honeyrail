@@ -1,6 +1,6 @@
 {
-  "name": "Agent Gateway",
-  "short_name": "AgentGW",
+  "name": "HoneyRail",
+  "short_name": "HoneyRail",
   "description": "Self-hosted control plane for coding agents.",
   "start_url": "/",
   "scope": "/",

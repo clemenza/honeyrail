@@ -1,4 +1,4 @@
-const CACHE_NAME = "agent-gateway-shell-v1";
+const CACHE_NAME = "honeyrail-shell-v1";
 const SHELL_ASSETS = ["/", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (event) => {

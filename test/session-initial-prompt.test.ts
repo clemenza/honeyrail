@@ -91,7 +91,7 @@ test("POST /api/sessions starts agent sessions with the initial prompt", async (
   assert.equal(tmuxCalls[0].input.name, "agw_initial");
   assert.equal(tmuxCalls[0].input.cwd, "/repo/demo");
   assert.equal(tmuxCalls[0].input.command, "codex 'respond to the first prompt'");
-  assert.match(tmuxCalls[0].input.logPath, /\.agent-gateway\/sessions\/sess_.*\.log$/);
+  assert.match(tmuxCalls[0].input.logPath, /\.honeyrail\/sessions\/sess_.*\.log$/);
   assert.deepEqual(events.map((event) => event.type), ["session.created", "session.input_sent"]);
 });
 

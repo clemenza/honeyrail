@@ -24,20 +24,20 @@ The primary security assumption is a trusted authenticated operator on a trusted
 
 The Express server binds to `0.0.0.0` by default. Production mode requires authentication, but authentication is not a substitute for network-level protection. Prefer private bind/network placement, VPN, Tailscale, or an authenticated reverse proxy.
 
-`AGENT_GATEWAY_PUBLIC_BASE_URL` controls OAuth/MCP metadata when the gateway is behind a proxy. Configure it carefully so MCP clients receive the expected issuer and resource URLs.
+`HONEYRAIL_PUBLIC_BASE_URL` controls OAuth/MCP metadata when the gateway is behind a proxy. Configure it carefully so MCP clients receive the expected issuer and resource URLs.
 
 ## Filesystem Boundary
 
 Runtime state defaults:
 
-- Config: `~/.agent-gateway/config.json`
-- SQLite: `~/.agent-gateway/gateway.sqlite`
-- Legacy JSON import source: `~/.agent-gateway/gateway.json`
-- Attachments: `~/.agent-gateway/attachments`
-- Session logs: `~/.agent-gateway/sessions`
+- Config: `~/.honeyrail/config.json`
+- SQLite: `~/.honeyrail/gateway.sqlite`
+- Legacy JSON import source: `~/.honeyrail/gateway.json`
+- Attachments: `~/.honeyrail/attachments`
+- Session logs: `~/.honeyrail/sessions`
 - Worktrees: `~/agent-worktrees`
 
-These paths and the `AGENT_GATEWAY_*` environment variables are compatibility identifiers inherited from the Agent Gateway subsystem. They are intentionally preserved during the HoneyRail bootstrap.
+Old `AGENT_GATEWAY_*` / `AGW_*` / `~/.agent-gateway` names still work with a deprecation warning and will be removed no earlier than v0.4.
 
 The repository should not contain those runtime files. `.gitignore` covers common local outputs, runtime directories, logs, SQLite files, attachments, reports, and package-manager auth files.
 

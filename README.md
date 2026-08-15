@@ -122,28 +122,28 @@ npm run ops:stop
 Production mode refuses to start unless account or bearer-token authentication is configured:
 
 ```sh
-export AGENT_GATEWAY_ACCOUNTS='[{"username":"you@example.com","password":"change-me","permissions":["console"]}]'
-export AGENT_GATEWAY_SESSION_SECRET='replace-with-a-long-random-secret'
+export HONEYRAIL_ACCOUNTS='[{"username":"you@example.com","password":"change-me","permissions":["console"]}]'
+export HONEYRAIL_SESSION_SECRET='replace-with-a-long-random-secret'
 ```
 
 Common configuration:
 
 - `PORT`: server port, default `4178`
-- `AGW_TMUX_SESSION`: tmux server session, default `honeyrail_server`
-- `AGW_LOG_FILE`: server log path, default `npm_start.log`
-- `AGENT_GATEWAY_CONFIG`: config file path, default `~/.agent-gateway/config.json`
-- `AGENT_GATEWAY_DATA`: SQLite state file, default `~/.agent-gateway/gateway.sqlite`
-- `AGENT_GATEWAY_LEGACY_JSON_DATA`: legacy JSON state file to migrate on first SQLite startup, default `~/.agent-gateway/gateway.json`
-- `AGENT_WORKTREE_ROOT`: task worktree root, default `~/agent-worktrees`
-- `AGENT_ATTACHMENT_ROOT`: uploaded attachment root, default `~/.agent-gateway/attachments`
-- `AGENT_SESSION_LOG_ROOT`: per-session transcript root, default `~/.agent-gateway/sessions`
-- `AGENT_GATEWAY_TOKEN`: optional bearer token for API clients
-- `AGENT_GATEWAY_PUBLIC_BASE_URL`: public origin used for OAuth/MCP metadata behind a proxy
-- `AGENT_HEALTH_INTERVAL_MS`: session health check interval, default `15000`
-- `AGENT_SESSION_STALE_MS`: stale-session threshold, default `1800000`
-- `AGENT_ORCHESTRATION_POLL_INTERVAL_MS`: interval for re-scheduling non-terminal orchestration runs (needed for executors like `shell` that complete a detached background process), default `3000`
+- `HONEYRAIL_TMUX_SESSION`: tmux server session, default `honeyrail_server`
+- `HONEYRAIL_LOG_FILE`: server log path, default `npm_start.log`
+- `HONEYRAIL_CONFIG`: config file path, default `~/.honeyrail/config.json`
+- `HONEYRAIL_DATA`: SQLite state file, default `~/.honeyrail/gateway.sqlite`
+- `HONEYRAIL_LEGACY_JSON_DATA`: legacy JSON state file to migrate on first SQLite startup, default `~/.honeyrail/gateway.json`
+- `HONEYRAIL_WORKTREE_ROOT`: task worktree root, default `~/agent-worktrees`
+- `HONEYRAIL_ATTACHMENT_ROOT`: uploaded attachment root, default `~/.honeyrail/attachments`
+- `HONEYRAIL_SESSION_LOG_ROOT`: per-session transcript root, default `~/.honeyrail/sessions`
+- `HONEYRAIL_TOKEN`: optional bearer token for API clients
+- `HONEYRAIL_PUBLIC_BASE_URL`: public origin used for OAuth/MCP metadata behind a proxy
+- `HONEYRAIL_HEALTH_INTERVAL_MS`: session health check interval, default `15000`
+- `HONEYRAIL_SESSION_STALE_MS`: stale-session threshold, default `1800000`
+- `HONEYRAIL_ORCHESTRATION_POLL_INTERVAL_MS`: interval for re-scheduling non-terminal orchestration runs (needed for executors like `shell` that complete a detached background process), default `3000`
 
-The `AGENT_GATEWAY_*`, `~/.agent-gateway`, REST, MCP, SQLite, and tmux identifiers are compatibility surfaces inherited from the Agent Gateway subsystem. They are intentionally not renamed during the HoneyRail bootstrap.
+Deprecated names: the old `AGENT_GATEWAY_*` / `AGW_*` / `~/.agent-gateway` names still work with a startup warning and will be removed no earlier than v0.4. Run `npm run doctor` to check which naming scheme is active.
 
 ## Example Workflow
 
@@ -212,20 +212,20 @@ Common verification commands:
 npm run dev
 npm run doctor
 npm run typecheck
-env -u AGENT_GATEWAY_ACCOUNTS -u AGENT_GATEWAY_TOKEN -u AGENT_GATEWAY_SESSION_SECRET npm test
+env -u HONEYRAIL_ACCOUNTS -u HONEYRAIL_TOKEN -u HONEYRAIL_SESSION_SECRET npm test
 npm run build
 npm run test:e2e
 ```
 
-The test command is usually run with gateway auth environment variables unset so tests that intentionally create unauthenticated local apps are not affected by the operator's shell environment.
+The test command is usually run with auth environment variables unset so tests that intentionally create unauthenticated local apps are not affected by the operator's shell environment.
 
 Runtime data is stored outside source control:
 
-- `~/.agent-gateway/config.json`
-- `~/.agent-gateway/gateway.sqlite`
-- `~/.agent-gateway/gateway.json.bak` after first legacy JSON migration, when applicable
-- `~/.agent-gateway/attachments/`
-- `~/.agent-gateway/sessions/`
+- `~/.honeyrail/config.json`
+- `~/.honeyrail/gateway.sqlite`
+- `~/.honeyrail/gateway.json.bak` after first legacy JSON migration, when applicable
+- `~/.honeyrail/attachments/`
+- `~/.honeyrail/sessions/`
 - `~/agent-worktrees/`
 
 Local generated or runtime directories such as `dist/`, `node_modules/`, `output/`, `test-results/`, `.omx/`, `.remember/`, `.playwright-cli/`, and `.omc/` should not be committed.

@@ -341,7 +341,7 @@ ${hiddenInputs(hidden)}
     if (!auth.accountsEnabled) {
       const page = htmlPage(
         "OAuth unavailable",
-        "<h1>OAuth unavailable</h1><p class=\"error\">Gateway account auth is required for OAuth. Configure AGENT_GATEWAY_ACCOUNTS before connecting from ChatGPT.</p>",
+        "<h1>OAuth unavailable</h1><p class=\"error\">Gateway account auth is required for OAuth. Configure HONEYRAIL_ACCOUNTS before connecting from ChatGPT.</p>",
         400
       );
       res.status(page.status).type("html").send(page.html);

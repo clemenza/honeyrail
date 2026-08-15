@@ -220,7 +220,7 @@ Report step: skipped
 Run the always-on tests:
 
 ```sh
-env -u AGENT_GATEWAY_ACCOUNTS -u AGENT_GATEWAY_TOKEN -u AGENT_GATEWAY_SESSION_SECRET npm test
+env -u HONEYRAIL_ACCOUNTS -u HONEYRAIL_TOKEN -u HONEYRAIL_SESSION_SECRET npm test
 ```
 
 `test/postgres-alpha.test.ts` runs a real Docker PostgreSQL instance when Docker and a PostgreSQL image are available. It also probes local PostgreSQL binaries and skips that fallback probe when they are not runnable.

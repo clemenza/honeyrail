@@ -19,13 +19,13 @@ type AuthUser = {
   permissions: string[];
 };
 
-const COOKIE_NAME = "agw_session";
+const COOKIE_NAME = "honeyrail_session";
 const SESSION_TTL_MS = 1000 * 60 * 60 * 12;
 const DEFAULT_PERMISSIONS = ["console"];
 
 function parseAccounts(input: Account[] | string | null | undefined): Account[] {
   if (Array.isArray(input)) return input;
-  const raw = String(input || process.env.AGENT_GATEWAY_ACCOUNTS || "").trim();
+  const raw = String(input || process.env.HONEYRAIL_ACCOUNTS || process.env.AGENT_GATEWAY_ACCOUNTS || "").trim();
   if (!raw) return [];
   if (raw.startsWith("[") || raw.startsWith("{")) {
     const parsed = JSON.parse(raw);
@@ -59,6 +59,7 @@ function safeEqual(left: string, right: string) {
 }
 
 function hashPassword(password: string) {
+  // Salt is a fixed crypto value, not a brand name — changing it would invalidate all stored password hashes.
   return scryptSync(password, "agent-gateway", 64).toString("hex");
 }
 
@@ -124,7 +125,7 @@ function getHeader(req: Request, name: string) {
 export function createAuthenticator({ accounts: rawAccounts, sessionSecret, token }: AuthOptions = {}) {
   const accounts = normalizeAccounts(rawAccounts);
   const accountByName = new Map(accounts.map((account) => [account.username, account]));
-  const secret = sessionSecret || process.env.AGENT_GATEWAY_SESSION_SECRET || randomBytes(32).toString("hex");
+  const secret = sessionSecret || process.env.HONEYRAIL_SESSION_SECRET || process.env.AGENT_GATEWAY_SESSION_SECRET || randomBytes(32).toString("hex");
   const enabled = Boolean(token || accounts.length);
 
   const authenticate = (req: Request): AuthUser | null => {
