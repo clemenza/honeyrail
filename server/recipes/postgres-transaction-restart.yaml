@@ -1,0 +1,45 @@
+id: postgres-transaction-restart
+name: PostgreSQL transaction + restart validation
+description: >
+  Validates commit/rollback correctness and restart recovery for a
+  PostgreSQL target using the postgres executor's alpha scenario.
+category: database-verification
+parameters:
+  - key: dockerImage
+    label: Docker image
+    type: string
+    default: postgres:16-alpine
+    required: false
+  - key: expectedCommittedRows
+    label: Expected committed rows
+    type: number
+    default: 1
+    required: false
+  - key: onFail
+    label: On quality gate failure
+    type: enum
+    options: [wait_approval, fail]
+    default: wait_approval
+steps:
+  - id: verify
+    name: PostgreSQL transaction and restart validation
+    executor: postgres
+    input:
+      operation: transaction-restart-alpha
+      executionMode: docker
+      dockerImage: "{{ dockerImage }}"
+      expectedCommittedRows: "{{ expectedCommittedRows }}"
+    qualityGate:
+      evaluators:
+        - type: db-assertions
+        - type: boolean
+          source: output.databaseReady
+          expected: true
+      onFail: "{{ onFail }}"
+  - id: report
+    name: Generate DB alpha report
+    executor: postgres
+    dependsOn: [verify]
+    input:
+      operation: report
+      sourceStepId: verify

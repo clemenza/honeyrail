@@ -116,6 +116,12 @@ export const rejectStepBody = z.object({
   reason: z.string().optional()
 });
 
+export const recipeRunBody = z.object({
+  projectId: z.string().min(1),
+  goal: z.string().optional(),
+  parameters: z.record(z.string(), z.unknown()).optional()
+});
+
 export function validate(schema: z.ZodSchema) {
   return (req: Request, _res: Response, next: NextFunction) => {
     try {
