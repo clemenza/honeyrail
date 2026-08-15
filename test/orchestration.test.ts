@@ -571,6 +571,64 @@ test("AgentTaskExecutor creates one task, links execution refs, and recovery ins
   assert.equal((await store.getStep(created.run.id, "agent"))!.status, "succeeded");
 });
 
+test("AgentTaskExecutor.start() defaults to unattended and prepends the UNATTENDED_PREAMBLE, opting out via interaction: 'interactive'", async (t) => {
+  const registry = new ExecutorRegistry([new AgentTaskExecutor()]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-agent-unattended-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const startedCommands: string[] = [];
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: {
+      listSessions: async () => [],
+      startSession: async ({ command }: any) => { startedCommands.push(command); },
+      killSession: async () => {},
+      capture: async () => "",
+      sendInput: async () => {}
+    } as any,
+    worktrees: {
+      create: async ({ project, title, agent }: any) => ({
+        projectId: project.id,
+        path: join(tempDir, "wt"),
+        branch: `${agent}/${title}`,
+        baseBranch: "main",
+        baseRevision: "base",
+        title,
+        agent
+      })
+    } as any,
+    runCommand: (async () => ({ ok: true, stdout: "", stderr: "" })) as any,
+    sessionLogRoot: join(tempDir, "sessions"),
+    attachmentRoot: join(tempDir, "attachments"),
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+
+  await service.createRun({
+    projectId: project.id,
+    goal: "unattended-default",
+    steps: [{ id: "auto", executor: "agent-task", input: { agent: "codex", prompt: "implement the feature" } }]
+  });
+  await service.createRun({
+    projectId: project.id,
+    goal: "unattended-opt-out",
+    steps: [{ id: "manual", executor: "agent-task", input: { agent: "codex", prompt: "implement the feature", interaction: "interactive" } }]
+  });
+
+  assert.equal(startedCommands.length, 2);
+  assert.match(startedCommands[0], /--full-auto/);
+  assert.ok(startedCommands[0].includes("You are running unattended"));
+  assert.ok(startedCommands[0].includes("implement the feature"));
+
+  assert.doesNotMatch(startedCommands[1], /--full-auto/);
+  assert.ok(!startedCommands[1].includes("You are running unattended"));
+
+  const autoTask = (await store.listTasks()).find((task) => task.title === "auto");
+  assert.equal(autoTask?.prompt, "implement the feature");
+});
+
 test("AgentTaskExecutor.inspect() maps a waiting_input session onto the step state", async () => {
   const executor = new AgentTaskExecutor();
   const task = { id: "task_1", status: "agent_running", sessionId: "sess_1", worktreeId: "wt_1" };

@@ -1,4 +1,5 @@
 import { stat } from "node:fs/promises";
+import { findBlockedReason } from "./agents/common.js";
 import { getAgentAdapter } from "./agents/registry.js";
 import type { EventBus } from "./events.js";
 import { publishEvent } from "./events.js";
@@ -126,7 +127,13 @@ export async function reconcileSessions({ store, bus, tmux, staleMs }: Omit<Sess
       const capturedAt = nowIso();
 
       const adapter = getAgentAdapter(session.agent);
-      const fatalError = adapter.findFatalError?.(output) || null;
+      // A structured "BLOCKED: <reason>" line (see UNATTENDED_PREAMBLE) is
+      // an unattended agent's clean way of saying it's genuinely stuck; it's
+      // handled identically to an adapter-detected fatal error below rather
+      // than left to hang or misread as a waiting_input/waiting_approval
+      // prompt nobody set up to answer.
+      const blockedReason = findBlockedReason(output);
+      const fatalError = adapter.findFatalError?.(output) || (blockedReason ? { code: "agent_blocked", message: blockedReason.message } : null);
       if (fatalError) {
         try {
           await tmux.killSession(session.tmuxSessionName);

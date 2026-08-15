@@ -72,6 +72,28 @@ test("loadRecipesFromDirectory loads the shipped recipes without throwing", asyn
   assert.deepEqual(ids, ["implement-check-gate-approve", "postgres-transaction-restart"]);
 });
 
+test("shipped implement-check-gate-approve recipe wires interaction/onBlocked defaults and overrides", async () => {
+  const registry = await loadRecipesFromDirectory(shippedRecipesDir);
+  const recipe = registry.get("implement-check-gate-approve")!;
+
+  const defaulted = materializeRecipe(recipe, { projectId: "proj_1", parameters: { title: "t", prompt: "p" } });
+  const implementStep = defaulted.steps.find((step) => step.id === "implement")!;
+  assert.equal(implementStep.input?.interaction, "autonomous");
+  assert.equal(implementStep.input?.model, "");
+  assert.equal(implementStep.onBlocked?.action, "wait_approval");
+  assert.equal(implementStep.onBlocked?.timeoutMs, 1_800_000);
+
+  const overridden = materializeRecipe(recipe, {
+    projectId: "proj_1",
+    parameters: { title: "t", prompt: "p", interaction: "interactive", onBlocked: "fail", blockedTimeoutMinutes: 5, model: "gpt-5-codex" }
+  });
+  const overriddenStep = overridden.steps.find((step) => step.id === "implement")!;
+  assert.equal(overriddenStep.input?.interaction, "interactive");
+  assert.equal(overriddenStep.input?.model, "gpt-5-codex");
+  assert.equal(overriddenStep.onBlocked?.action, "fail");
+  assert.equal(overriddenStep.onBlocked?.timeoutMs, 300_000);
+});
+
 test("RecipeRegistry.list() omits steps", () => {
   const registry = new RecipeRegistry([demoRecipe]);
   const [summary] = registry.list();
@@ -113,6 +135,34 @@ test("materializeRecipe rejects an enum value outside options", () => {
     () => materializeRecipe(demoRecipe, { projectId: "proj_1", parameters: { message: "hi", mode: "turbo" } }),
     (error: unknown) => error instanceof RecipeValidationError && /mode/.test(error.message)
   );
+});
+
+test("materializeRecipe rejects empty string and boolean values for a number parameter instead of silently coercing to 0/1", () => {
+  // Note: an explicit `null` falls back to the parameter's default via `??`
+  // before it ever reaches coerceParameterValue, so it isn't exercised here
+  // — only values that actually reach the number branch are.
+  for (const bad of ["", true, false]) {
+    assert.throws(
+      () => materializeRecipe(demoRecipe, { projectId: "proj_1", parameters: { message: "hi", count: bad } }),
+      (error: unknown) => error instanceof RecipeValidationError && /count/.test(error.message)
+    );
+  }
+});
+
+test("a number parameter's multiplier converts a user-friendly unit into what the step field expects", () => {
+  const minutesRecipe: Recipe = {
+    id: "minutes-demo",
+    name: "Minutes demo",
+    parameters: [
+      { key: "timeoutMinutes", label: "Timeout (minutes)", type: "number", default: 30, multiplier: 60_000 }
+    ],
+    steps: [{ id: "a", executor: "ok", input: { timeoutMs: "{{ timeoutMinutes }}" } }]
+  };
+  const materialized = materializeRecipe(minutesRecipe, { projectId: "proj_1", parameters: {} });
+  assert.equal((materialized.steps[0].input as Record<string, unknown>).timeoutMs, 1_800_000);
+
+  const overridden = materializeRecipe(minutesRecipe, { projectId: "proj_1", parameters: { timeoutMinutes: 5 } });
+  assert.equal((overridden.steps[0].input as Record<string, unknown>).timeoutMs, 300_000);
 });
 
 test("materializeRecipe does not double-process a parameter value that looks like a template", () => {

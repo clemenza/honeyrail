@@ -58,7 +58,8 @@ const recipeParameterSchema = z.object({
   type: z.enum(["string", "number", "boolean", "enum"]),
   default: z.unknown().optional(),
   required: z.boolean().optional(),
-  options: z.array(z.string()).optional()
+  options: z.array(z.string()).optional(),
+  multiplier: z.number().positive().optional()
 });
 
 const recipeStepTemplateSchema = z.object({
@@ -138,6 +139,13 @@ function coerceParameterValue(param: RecipeParameter, raw: unknown, issues: { pa
       return raw;
     }
     case "number": {
+      // Number("") === 0 and Number(null) === 0 are both finite, and
+      // Number(true/false) === 1/0, so each would otherwise pass silently
+      // as a valid number instead of the missing/wrong-type value it is.
+      if (raw === "" || raw === null || typeof raw === "boolean") {
+        issues.push({ path, message: "Must be a finite number" });
+        return undefined;
+      }
       const num = Number(raw);
       if (!Number.isFinite(num)) {
         issues.push({ path, message: "Must be a finite number" });
@@ -210,7 +218,12 @@ export function materializeRecipe(
       continue;
     }
     const value = coerceParameterValue(param, raw, issues);
-    if (value !== undefined) resolved.set(param.key, { type: param.type, value });
+    if (value === undefined) continue;
+    // A numeric parameter can declare a multiplier so it can be entered in a
+    // user-friendly unit (e.g. "Timeout (minutes)") while the template
+    // resolves it into the unit a step field actually expects (ms).
+    const finalValue = param.type === "number" && param.multiplier ? (value as number) * param.multiplier : value;
+    resolved.set(param.key, { type: param.type, value: finalValue });
   }
 
   if (issues.length) throw new RecipeValidationError(issues);

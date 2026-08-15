@@ -1,3 +1,4 @@
+import { withUnattendedPreamble } from "../agents/common.js";
 import { getAgentAdapter } from "../agents/registry.js";
 import { publishSessionCreated, publishTaskFailed, publishTaskStarted } from "../domain-events.js";
 import {
@@ -59,6 +60,12 @@ export class AgentTaskExecutor implements Executor {
     // untouched so the UI can still show it.
     const prompt = stringInput(ctx.step.input.effectivePrompt) || stringInput(ctx.step.input.prompt, title);
     const model = stringInput(ctx.step.input.model);
+    // agent-task steps are always run-launched, so "autonomous" (no
+    // clarifying questions) is the default; a step can opt into
+    // "interactive" explicitly if it truly needs a human at the terminal.
+    const interaction = ctx.step.input.interaction === "interactive" ? "interactive" : "autonomous";
+    const unattended = interaction === "autonomous";
+    const launchPrompt = unattended ? withUnattendedPreamble(prompt) : prompt;
     const task = await ctx.store.createTask({
       projectId: ctx.project.id,
       title,
@@ -77,7 +84,7 @@ export class AgentTaskExecutor implements Executor {
       await ctx.tmux.startSession({
         name: tmuxSessionName,
         cwd: worktree.path,
-        command: adapter.buildLaunchCommand({ prompt, model }),
+        command: adapter.buildLaunchCommand({ prompt: launchPrompt, model, unattended }),
         logPath
       });
       session = await ctx.store.createSession({

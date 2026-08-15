@@ -33,7 +33,8 @@ export const codexAdapter: AgentAdapter = {
   buildLaunchCommand(input = {}) {
     const prompt = normalizedPrompt(input.prompt);
     const modelArg = modelFlag("--model", input.model);
-    return prompt ? `codex${modelArg} ${quoteShellArg(prompt)}` : `codex${modelArg}`;
+    const autoArg = input.unattended ? " --full-auto" : "";
+    return prompt ? `codex${modelArg}${autoArg} ${quoteShellArg(prompt)}` : `codex${modelArg}${autoArg}`;
   },
 
   formatInput: formatGenericInput,

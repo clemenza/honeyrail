@@ -122,6 +122,44 @@ test("reconcileSessions marks related records failed when tmux session disappear
   assert.equal(events.at(-1).payload.status, "failed");
 });
 
+test("reconcileSessions fails a task cleanly on a structured BLOCKED: stop from an unattended agent", async (t) => {
+  const store = await makeStore(t, "agw-monitor-blocked-");
+  const bus = new EventBus();
+  const events: any[] = [];
+  bus.subscribe((event) => events.push(event));
+  const task = await store.createTask({ projectId: "proj_1", title: "unattended task", agent: "codex", status: "agent_running" });
+  const worktree = await store.createWorktree({ projectId: "proj_1", taskId: task.id, path: "/tmp/wt", branch: "codex/unattended", status: "created" });
+  const session = await store.createSession({
+    projectId: "proj_1",
+    taskId: task.id,
+    worktreeId: worktree.id,
+    name: "unattended",
+    agent: "codex",
+    tmuxSessionName: "agw_blocked",
+    cwd: "/tmp/wt",
+    status: "running"
+  });
+  await store.updateTask(task.id, { sessionId: session.id, worktreeId: worktree.id });
+
+  const killed: string[] = [];
+  await reconcileSessions({
+    store,
+    bus,
+    staleMs: 60_000,
+    tmux: {
+      capture: async () => "doing work...\nBLOCKED: the target database is unreachable from this sandbox",
+      killSession: async (name: string) => { killed.push(name); }
+    } as any
+  });
+
+  assert.deepEqual(killed, ["agw_blocked"]);
+  assert.equal((await store.getSession(session.id))!.status, "failed");
+  assert.equal((await store.getSession(session.id))!.error, "the target database is unreachable from this sandbox");
+  assert.equal((await store.listTasks()).find((item) => item.id === task.id)!.status, "failed");
+  assert.equal(events.at(-1).type, "task.failed");
+  assert.equal(events.at(-1).payload.code, "agent_blocked");
+});
+
 test("reconcileSessions fails a Codex task and prompts for an upgrade when the CLI is too old", async (t) => {
   const store = await makeStore(t, "agw-monitor-codex-upgrade-");
   const bus = new EventBus();

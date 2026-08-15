@@ -15,6 +15,8 @@ export type AgentCapabilities = {
 export type AgentLaunchInput = {
   prompt?: string;
   model?: string | null;
+  /** True for run-launched (unattended) steps so the adapter can avoid loading interactive-only surfaces (e.g. Claude Code's user-level skills). */
+  unattended?: boolean;
 };
 
 export type AgentInputContext = {

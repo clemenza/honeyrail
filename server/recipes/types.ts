@@ -9,6 +9,8 @@ export type RecipeParameter = {
   default?: unknown;
   required?: boolean;
   options?: string[];
+  /** For type "number": multiplies the resolved value before templating, so a user-friendly unit (e.g. minutes) can resolve into what a step field actually expects (e.g. ms). */
+  multiplier?: number;
 };
 
 export type RecipeStepTemplate = {
