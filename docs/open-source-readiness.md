@@ -33,7 +33,7 @@ HoneyRail is still private until maintainers explicitly approve the public switc
 - Runtime and generated outputs are ignored: `node_modules/`, `dist/`, `output/`, `test-results/`, `playwright-report/`, `coverage/`, logs, `.omx/`, `.omc/`, `.remember/`, and `.playwright-cli/`.
 - Local config, secrets, and state are ignored: `.env`, `.env.*`, `gateway.json`, `gateway.json.bak`, `attachments/`, `sessions/`, `agent-worktrees/`, `*.sqlite`, `*.sqlite-*`, `*.db`, `*.pem`, `*.key`, `*.p12`, and `*.pfx`.
 - `.env.example` remains allowed if added later.
-- Runtime state under `~/.agent-gateway/` and `~/agent-worktrees/` must not be copied into the repository.
+- Runtime state under `~/.honeyrail/` and `~/agent-worktrees/` must not be copied into the repository.
 
 ## Verification
 
@@ -43,7 +43,7 @@ Run this clean-clone gate before tagging or making the repository public:
 npm ci
 npm run doctor
 npm run typecheck
-env -u AGENT_GATEWAY_ACCOUNTS -u AGENT_GATEWAY_TOKEN -u AGENT_GATEWAY_SESSION_SECRET npm test
+env -u HONEYRAIL_ACCOUNTS -u HONEYRAIL_TOKEN -u HONEYRAIL_SESSION_SECRET npm test
 npm run build
 npm run test:e2e
 git diff --check
@@ -53,7 +53,7 @@ Required CI on push and pull request should continue to cover:
 
 - `npm ci`
 - `npm run typecheck`
-- `env -u AGENT_GATEWAY_ACCOUNTS -u AGENT_GATEWAY_TOKEN -u AGENT_GATEWAY_SESSION_SECRET npm test`
+- `env -u HONEYRAIL_ACCOUNTS -u HONEYRAIL_TOKEN -u HONEYRAIL_SESSION_SECRET npm test`
 - `npm run build`
 
 The PostgreSQL harness may skip real Docker/local-binary environment tests when PostgreSQL is unavailable. CI must not require Docker image downloads for the default test path.

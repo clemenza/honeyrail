@@ -76,17 +76,15 @@ Keeping those separate avoids destabilizing existing behavior, preserves current
 
 ## Compatibility Surfaces
 
-M0 preserves the Agent Gateway-derived compatibility surfaces:
+M0 preserved the Agent Gateway-derived compatibility surfaces. As of v0.2, these have been renamed:
 
-- `AGENT_GATEWAY_*` environment variables
-- `~/.agent-gateway` runtime paths
+- `HONEYRAIL_*` environment variables (old `AGENT_GATEWAY_*` / `AGW_*` names still accepted with a deprecation warning, removed no earlier than v0.4)
+- `~/.honeyrail` runtime paths (old `~/.agent-gateway` auto-migrated on first run)
 - Existing REST routes
 - Existing MCP tool names
 - Internal MCP server compatibility identifier `codex-remote-controller`
 - Existing SQLite state semantics
-- legacy tmux compatibility identifiers such as `agw_server`; current HoneyRail ops scripts default to `honeyrail_server`
-
-These names are compatibility surfaces, not immediate technical debt. Any future rename must be explicit, migrated, and documented.
+- HoneyRail ops scripts default tmux session name `honeyrail_server`
 
 ## Consequences
 

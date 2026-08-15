@@ -23,20 +23,20 @@ Before claiming backend/frontend behavior is fixed, run the smallest relevant se
 
 ```sh
 npm run typecheck
-env -u AGENT_GATEWAY_ACCOUNTS -u AGENT_GATEWAY_TOKEN -u AGENT_GATEWAY_SESSION_SECRET npm test
+env -u HONEYRAIL_ACCOUNTS -u HONEYRAIL_TOKEN -u HONEYRAIL_SESSION_SECRET npm test
 npm run build
 ```
 
 Run `npm run test:e2e` for browser-visible workflow or layout changes.
 
-If `npm test` unexpectedly returns 401s, check for inherited `AGENT_GATEWAY_*`
+If `npm test` unexpectedly returns 401s, check for inherited `HONEYRAIL_*`
 environment variables and rerun with them unset as shown above.
 
 ## Runtime State And Git Hygiene
 
 - Do not commit runtime or generated directories: `node_modules/`, `dist/`, `output/`, `test-results/`, `.omx/`, `.remember/`, `.playwright-cli/`, `.omc/`.
 - Do not commit local logs such as `npm_start.log`, `npm_dev.log`, or `*.log`.
-- Treat `~/.agent-gateway/gateway.json`, `~/.agent-gateway/attachments/`, and `~/agent-worktrees/` as live operator state.
+- Treat `~/.honeyrail/gateway.json`, `~/.honeyrail/attachments/`, and `~/agent-worktrees/` as live operator state.
 - A dirty worktree may contain user/runtime state. Do not revert or delete files you did not create unless explicitly asked.
 
 ## Agent And Worktree Behavior

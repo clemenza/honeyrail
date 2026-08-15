@@ -92,7 +92,7 @@ test("users with console permission can access console APIs after login", async 
   const body = await readJson(response);
 
   assert.equal(login.status, 200);
-  assert.ok(cookie.startsWith("agw_session="));
+  assert.ok(cookie.startsWith("honeyrail_session="));
   assert.equal(response.status, 200);
   assert.deepEqual(Object.keys(body).sort(), ["events", "projects", "runs", "sessions", "tasks", "tmuxSessions", "worktrees"].sort());
 });
@@ -111,7 +111,7 @@ test("login cookies are not marked secure for direct HTTP access", async (t) => 
   const cookie = response.headers.get("set-cookie") || "";
 
   assert.equal(response.status, 200);
-  assert.match(cookie, /agw_session=/);
+  assert.match(cookie, /honeyrail_session=/);
   assert.doesNotMatch(cookie, /;\s*Secure/i);
 });
 

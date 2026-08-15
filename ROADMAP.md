@@ -20,7 +20,7 @@ Goal: make the shipped runtime usable by people outside the core team. No new co
 
 - Built-in recipe templates: named, reusable workflow definitions (for example implement → check → gate → approve, and migration-safety verification) selectable from the UI and API, so operators do not hand-write DAG JSON.
 - One-line startup path (for example `npx honeyrail`) alongside the clone-based flow.
-- Rename compatibility surfaces from `AGENT_GATEWAY_*` / `~/.agent-gateway` to `HONEYRAIL_*` equivalents with an automatic, documented migration. This is the last low-cost window for the rename.
+- Rename compatibility surfaces from `AGENT_GATEWAY_*` / `~/.agent-gateway` to `HONEYRAIL_*` / `~/.honeyrail` equivalents with automatic migration. Done — old names still work with a startup warning and will be removed no earlier than v0.4.
 - Platform documentation: macOS/Linux support, Windows via WSL.
 - Quickstart hardening based on real first-run reports.
 

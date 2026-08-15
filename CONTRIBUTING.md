@@ -39,12 +39,12 @@ Use the smallest relevant check while developing, then run the full stack before
 ```sh
 npm run doctor
 npm run typecheck
-env -u AGENT_GATEWAY_ACCOUNTS -u AGENT_GATEWAY_TOKEN -u AGENT_GATEWAY_SESSION_SECRET npm test
+env -u HONEYRAIL_ACCOUNTS -u HONEYRAIL_TOKEN -u HONEYRAIL_SESSION_SECRET npm test
 npm run build
 npm run test:e2e
 ```
 
-Unset gateway auth environment variables for tests unless the test specifically covers inherited auth configuration.
+Unset auth environment variables for tests unless the test specifically covers inherited auth configuration.
 
 ## Issues
 
@@ -63,7 +63,7 @@ Do not include real API keys, bearer tokens, cookies, private repository data, o
 Pull requests should:
 
 - Keep changes scoped to the stated problem.
-- Preserve existing SQLite state, `~/.agent-gateway` runtime data, `AGENT_GATEWAY_*` configuration, REST paths, MCP tool names, and tmux-backed session behavior unless a migration is explicitly required. These are compatibility surfaces inherited from the Agent Gateway subsystem.
+- Preserve existing SQLite state, `~/.honeyrail` runtime data, `HONEYRAIL_*` configuration, REST paths, MCP tool names, and tmux-backed session behavior unless a migration is explicitly required.
 - Preserve `Task` as an atomic execution primitive. Do not add workflow dependency, parent/child, or DAG semantics to `Task`; put future orchestration concepts above it.
 - Add focused tests for lifecycle, project management, auth, ops scripts, or regression-prone behavior.
 - Update README or docs when setup, security posture, public behavior, or supported agents change.

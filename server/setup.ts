@@ -7,6 +7,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { DEFAULT_PORT, defaultConfigPath } from "./config.js";
 
 function hashPassword(password: string) {
+  // Salt is a fixed crypto value, not a brand name — changing it would invalidate all stored password hashes.
   return scryptSync(password, "agent-gateway", 64).toString("hex");
 }
 
@@ -29,10 +30,10 @@ async function main() {
     if (!password.trim()) throw new Error("Console password is required.");
     const port = Number(defaultValue(await rl.question(`Port [${DEFAULT_PORT}]: `), String(DEFAULT_PORT)));
     const worktreeRoot = expandHome(defaultValue(await rl.question("Worktree root [~/agent-worktrees]: "), "~/agent-worktrees"));
-    const dataFile = expandHome(defaultValue(await rl.question("SQLite state file [~/.agent-gateway/gateway.sqlite]: "), "~/.agent-gateway/gateway.sqlite"));
-    const legacyJsonDataFile = expandHome(defaultValue(await rl.question("Legacy JSON state file for migration [~/.agent-gateway/gateway.json]: "), "~/.agent-gateway/gateway.json"));
-    const attachmentRoot = expandHome(defaultValue(await rl.question("Attachment root [~/.agent-gateway/attachments]: "), "~/.agent-gateway/attachments"));
-    const sessionLogRoot = expandHome(defaultValue(await rl.question("Session log root [~/.agent-gateway/sessions]: "), "~/.agent-gateway/sessions"));
+    const dataFile = expandHome(defaultValue(await rl.question("SQLite state file [~/.honeyrail/gateway.sqlite]: "), "~/.honeyrail/gateway.sqlite"));
+    const legacyJsonDataFile = expandHome(defaultValue(await rl.question("Legacy JSON state file for migration [~/.honeyrail/gateway.json]: "), "~/.honeyrail/gateway.json"));
+    const attachmentRoot = expandHome(defaultValue(await rl.question("Attachment root [~/.honeyrail/attachments]: "), "~/.honeyrail/attachments"));
+    const sessionLogRoot = expandHome(defaultValue(await rl.question("Session log root [~/.honeyrail/sessions]: "), "~/.honeyrail/sessions"));
     const publicBaseUrl = (await rl.question("Public base URL, optional: ")).trim() || null;
 
     const config = {

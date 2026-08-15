@@ -48,7 +48,7 @@ Key route groups:
 
 ## SQLite Store
 
-`SQLiteStore` stores mutable runtime state in `~/.agent-gateway/gateway.sqlite` by default. It tracks:
+`SQLiteStore` stores mutable runtime state in `~/.honeyrail/gateway.sqlite` by default. It tracks:
 
 - Projects
 - Runs
@@ -138,7 +138,7 @@ Each adapter owns the behavior that varies by backend:
 
 Routes, MCP tools, task creation, session restart, session monitoring, and health checks resolve adapters through the registry. Unknown backend identifiers fail clearly instead of falling back to shell.
 
-Sessions capture logs under `~/.agent-gateway/sessions` by default. The WebSocket terminal endpoint streams tmux/session output to the frontend.
+Sessions capture logs under `~/.honeyrail/sessions` by default. The WebSocket terminal endpoint streams tmux/session output to the frontend.
 
 ## Project, Task, Session, And Worktree Entities
 
@@ -147,7 +147,7 @@ A project points at a local git repository and defines defaults such as branch, 
 A task is an atomic execution primitive for a requested unit of agent work. It is not a workflow node and does not carry parent/child/dependency/DAG semantics in M0. Worktree-backed task creation:
 
 1. Creates a task with `worktree_preparing`.
-2. Creates a git worktree and branch under `AGENT_WORKTREE_ROOT`.
+2. Creates a git worktree and branch under `HONEYRAIL_WORKTREE_ROOT`.
 3. Starts the selected agent in tmux from that worktree.
 4. Creates a session bound to the task/worktree.
 5. Updates the task to `agent_running`.

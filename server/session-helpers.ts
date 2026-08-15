@@ -88,7 +88,7 @@ export async function readSessionLog(path: unknown) {
 
 export function tmuxName(prefix: string, name: string) {
   const suffix = slugify(name).replaceAll("-", "_").slice(0, 36);
-  return `agw_${prefix}_${Date.now().toString(36)}_${suffix}`;
+  return `honeyrail_${prefix}_${Date.now().toString(36)}_${suffix}`;
 }
 
 export async function restartSessionWithModel({ store, bus, tmux, session, model, sessionLogRoot }: {

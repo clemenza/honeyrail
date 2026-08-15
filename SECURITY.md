@@ -34,7 +34,7 @@ Potentially untrusted:
 
 - Bind privately when possible and avoid direct public exposure.
 - Prefer a private network, VPN, Tailscale, or authenticated reverse proxy / zero-trust gateway.
-- Use strong unique account passwords, bearer tokens, and `AGENT_GATEWAY_SESSION_SECRET` values.
+- Use strong unique account passwords, bearer tokens, and `HONEYRAIL_SESSION_SECRET` values.
 - Do not run the gateway as root.
 - Run with the least local privileges that still allow the intended repositories and agent CLIs to work.
 - Protect source repositories, SSH keys, git credentials, agent credentials, and package-manager credentials on the host.
