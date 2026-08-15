@@ -245,3 +245,42 @@ export type WorktreeItem = {
   projectId?: string;
   error?: string;
 };
+
+export type RecipeParameterType = "string" | "number" | "boolean" | "enum";
+
+export type RecipeParameterData = {
+  key: string;
+  label: string;
+  type: RecipeParameterType;
+  default?: unknown;
+  required?: boolean;
+  options?: string[];
+};
+
+export type RecipeSummaryData = {
+  id: string;
+  name: string;
+  description?: string;
+  category?: string;
+  parameters: RecipeParameterData[];
+};
+
+export type RecipeDetailData = RecipeSummaryData & { steps: unknown[] };
+
+// A materialized-but-not-yet-created step, as returned by POST /api/recipes/:id/preview.
+// Deliberately looser than StepData (no runId/status/attempt/createdAt - it doesn't exist as a run yet).
+export type RecipePreviewStepData = {
+  id: string;
+  name?: string;
+  executor: string;
+  input?: Record<string, unknown>;
+  dependsOn?: string[];
+  maxAttempts?: number;
+  qualityGate?: { evaluators: Array<Record<string, unknown>>; onFail?: string };
+};
+
+export type RecipePreviewData = {
+  projectId: string;
+  goal: string;
+  steps: RecipePreviewStepData[];
+};

@@ -5,15 +5,17 @@ import {
   GitBranch,
   GitMerge,
   Play,
+  Plus,
   RefreshCw,
   Shield,
-  XCircle,
   Trash2
 } from "lucide-react";
 import { api } from "../api.js";
 import type { DiffData, EventData, GatewayState, ProjectData, RunData, SessionData, TaskData, WorktreeData, WorktreeItem } from "../types.js";
 import { StatusPill } from "./layout.js";
 import { ProjectForm, ProjectList } from "./ProjectPanel.js";
+import { RecipeWizard } from "./RecipeWizard.js";
+import { StepCard } from "./StepCard.js";
 import { SessionLauncher, TaskComposer, TaskTable } from "./TaskPanel.js";
 import { VerificationDrawer } from "./VerificationDrawer.js";
 
@@ -225,44 +227,11 @@ function ApprovalQueue({ tasks }: { tasks: TaskData[] }) {
   );
 }
 
-function evaluationTone(step: RunData["steps"][number]) {
-  const evaluations = step.verification?.evaluations;
-  if (!evaluations || evaluations.passed + evaluations.failed + evaluations.error === 0) return "neutral";
-  if (evaluations.error || evaluations.failed) return "bad";
-  return "good";
-}
-
-function evaluationLabel(step: RunData["steps"][number]) {
-  const evaluations = step.verification?.evaluations;
-  if (!evaluations || evaluations.passed + evaluations.failed + evaluations.error === 0) return "not evaluated";
-  if (evaluations.error) return "ERROR";
-  if (evaluations.failed) return "FAIL";
-  return "PASS";
-}
-
-function latestGateDecision(step: RunData["steps"][number]) {
-  return step.verification?.gateDecisionItems?.at(-1);
-}
-
-function gateDecisionTone(step: RunData["steps"][number]) {
-  const decision = latestGateDecision(step);
-  if (!decision) return "neutral";
-  if (decision.status === "passed") return "good";
-  if (decision.status === "overridden") return "warn";
-  return "bad";
-}
-
-function gateDecisionLabel(step: RunData["steps"][number]) {
-  const decision = latestGateDecision(step);
-  if (!decision) return "no gate decision";
-  if (decision.status === "overridden") return "OVERRIDDEN";
-  return decision.status.toUpperCase();
-}
-
 function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: ProjectData[]; refresh: () => Promise<void> }) {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [drawer, setDrawer] = useState<{ runId: string; stepId: string; kind: "artifact" | "evidence" } | null>(null);
+  const [showWizard, setShowWizard] = useState(false);
 
   const act = async (path: string, label: string) => {
     setBusy(label);
@@ -286,6 +255,9 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
           <h2>Orchestration runs</h2>
           <p>{runs.length} persisted multi-step workflows</p>
         </div>
+        <button type="button" className="secondary-button" onClick={() => setShowWizard(true)}>
+          <Plus size={15} /> New run
+        </button>
       </div>
       {error ? <div className="inline-error">{error}</div> : null}
       <div className="run-list">
@@ -303,51 +275,15 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
               </div>
               <div className="run-steps">
                 {run.steps.map((step) => (
-                  <div className="run-step" key={step.id}>
-                    <div>
-                      <strong>{step.name}</strong>
-                      <span>{step.executor} · attempt {step.attempt}/{step.maxAttempts}</span>
-                      <small>depends on {step.dependsOn.length ? step.dependsOn.join(", ") : "none"}</small>
-                      {step.error ? <small className="run-step-error">{step.error}</small> : null}
-                      <div className="run-verification">
-                        <button
-                          type="button"
-                          className="verification-count-button"
-                          disabled={!step.verification?.artifacts}
-                          onClick={() => setDrawer({ runId: run.id, stepId: step.id, kind: "artifact" })}
-                        >
-                          Artifacts {step.verification?.artifacts || 0}
-                        </button>
-                        <button
-                          type="button"
-                          className="verification-count-button"
-                          disabled={!step.verification?.evidence}
-                          onClick={() => setDrawer({ runId: run.id, stepId: step.id, kind: "evidence" })}
-                        >
-                          Evidence {step.verification?.evidence || 0}
-                        </button>
-                        {step.verification?.latestAttempt ? <span>Latest attempt {step.verification.latestAttempt}</span> : null}
-                        <StatusPill tone={evaluationTone(step)}>{evaluationLabel(step)}</StatusPill>
-                        <StatusPill tone={gateDecisionTone(step)}>{gateDecisionLabel(step)}</StatusPill>
-                      </div>
-                    </div>
-                    <div className="run-step-actions">
-                      <StatusPill tone={step.status === "succeeded" ? "good" : step.status === "failed" ? "bad" : step.status === "waiting_approval" ? "warn" : "neutral"}>{step.status}</StatusPill>
-                      {step.executionRef?.sessionId ? (
-                        <a className="secondary-button table-action" href={`#/session/${step.executionRef.sessionId}`}>Session <ArrowRight size={14} /></a>
-                      ) : null}
-                      {step.status === "waiting_approval" ? (
-                        <>
-                          <button type="button" className="secondary-button table-action" disabled={Boolean(busy)} onClick={() => act(`/api/runs/${run.id}/steps/${step.id}/approve`, `approve:${step.id}`)}>
-                            <Shield size={14} /> Approve
-                          </button>
-                          <button type="button" className="secondary-button table-action danger" disabled={Boolean(busy)} onClick={() => act(`/api/runs/${run.id}/steps/${step.id}/reject`, `reject:${step.id}`)}>
-                            <XCircle size={14} /> Reject
-                          </button>
-                        </>
-                      ) : null}
-                    </div>
-                  </div>
+                  <StepCard
+                    key={step.id}
+                    step={step}
+                    runId={run.id}
+                    busy={Boolean(busy)}
+                    onOpenDrawer={(stepId, kind) => setDrawer({ runId: run.id, stepId, kind })}
+                    onApprove={(stepId) => act(`/api/runs/${run.id}/steps/${stepId}/approve`, `approve:${stepId}`)}
+                    onReject={(stepId) => act(`/api/runs/${run.id}/steps/${stepId}/reject`, `reject:${stepId}`)}
+                  />
                 ))}
               </div>
               <div className="run-card-footer">
@@ -362,6 +298,13 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
       </div>
       {drawer && drawerStep ? (
         <VerificationDrawer step={drawerStep} initialKind={drawer.kind} onClose={() => setDrawer(null)} />
+      ) : null}
+      {showWizard ? (
+        <RecipeWizard
+          projects={projects}
+          onCreated={async () => { setShowWizard(false); await refresh(); }}
+          onClose={() => setShowWizard(false)}
+        />
       ) : null}
     </section>
   );

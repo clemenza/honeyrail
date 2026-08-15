@@ -1,0 +1,42 @@
+id: implement-check-gate-approve
+name: Implement, check, gate, approve
+description: >
+  Runs an agent to implement a change in a fresh worktree, runs the
+  project's check commands against the result, and gates on approval
+  before the run is considered complete.
+category: agent-delivery
+parameters:
+  - key: agent
+    label: Agent
+    type: enum
+    options: [codex, claude, hermes, shell]
+    default: codex
+  - key: title
+    label: Task title
+    type: string
+    required: true
+  - key: prompt
+    label: Task prompt
+    type: string
+    required: true
+  - key: gateOnFail
+    label: On check failure
+    type: enum
+    options: [wait_approval, fail]
+    default: wait_approval
+steps:
+  - id: implement
+    name: Implement change
+    executor: agent-task
+    input:
+      agent: "{{ agent }}"
+      title: "{{ title }}"
+      prompt: "{{ prompt }}"
+  - id: check
+    name: Run project checks
+    executor: check
+    dependsOn: [implement]
+    qualityGate:
+      evaluators:
+        - type: check
+      onFail: "{{ gateOnFail }}"

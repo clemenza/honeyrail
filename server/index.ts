@@ -16,6 +16,7 @@ import { sessionAcceptsInput, startSessionMonitor } from "./session-monitor.js";
 import { readSessionLog, stripAnsi } from "./session-helpers.js";
 import { WorktreeManager } from "./worktrees.js";
 import { OrchestrationService } from "./orchestration/service.js";
+import { loadRecipesFromDirectory } from "./recipes/registry.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, "..");
@@ -47,6 +48,8 @@ async function main() {
     await orchestration.recover();
     orchestration.startPolling(config.orchestrationPollIntervalMs);
 
+    const recipeRegistry = await loadRecipesFromDirectory(resolve(__dirname, "recipes"));
+
     const app = createApp({
         store,
         bus,
@@ -57,7 +60,8 @@ async function main() {
         publicBaseUrl: config.publicBaseUrl,
         attachmentRoot: config.attachmentRoot,
         sessionLogRoot: config.sessionLogRoot,
-        orchestration
+        orchestration,
+        recipeRegistry
     });
 
     startSessionMonitor({

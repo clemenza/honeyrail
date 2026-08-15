@@ -24,6 +24,8 @@ import type { McpContext } from "./mcp-server.js";
 import { createOAuthSupport } from "./oauth.js";
 import { OrchestrationService } from "./orchestration/service.js";
 import { runRoutes } from "./orchestration/routes.js";
+import { RecipeRegistry } from "./recipes/registry.js";
+import { recipeRoutes } from "./recipes/routes.js";
 
 type CreateAppOptions = {
   store: Store;
@@ -44,6 +46,7 @@ type CreateAppOptions = {
   sessionLogRoot?: string;
   defaultWorkspace?: string;
   orchestration?: OrchestrationService;
+  recipeRegistry?: RecipeRegistry;
 };
 
 export function createApp({
@@ -64,7 +67,8 @@ export function createApp({
   attachmentRoot = resolve(homedir(), ".honeyrail", "attachments"),
   sessionLogRoot = resolve(homedir(), ".honeyrail", "sessions"),
   defaultWorkspace = resolve(homedir(), "Workspace"),
-  orchestration: providedOrchestration
+  orchestration: providedOrchestration,
+  recipeRegistry = new RecipeRegistry([])
 }: CreateAppOptions) {
   const app = express();
   const auth = providedAuth || createAuthenticator({ token, accounts, sessionSecret });
@@ -163,6 +167,7 @@ export function createApp({
   app.use(sessionRoutes(ctx));
   app.use(taskRoutes(ctx));
   app.use(runRoutes(orchestration, attachmentRoot));
+  app.use(recipeRoutes(recipeRegistry, orchestration));
 
   // MCP HTTP transport (Streamable HTTP for remote AI agent access)
   const mcpCtx: McpContext = { store, bus, tmux, worktrees, run, sessionLogRoot, attachmentRoot, orchestration };
