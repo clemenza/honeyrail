@@ -91,16 +91,17 @@ export const claudeAdapter: AgentAdapter = {
     if (completedAt === -1) return false;
     const workingAt = lastLineMatchIndex(output, workingStatusLine);
     if (completedAt <= workingAt) return false;
-    const recentTail = output.split("\n").slice(-12).join("\n");
-    // The idle prompt box is the border-wrapped "❯" line Claude Code shows
-    // once a turn finishes; it can be empty or prefilled with a suggested
-    // follow-up command (e.g. "❯ commit this"), so match on the box shape
-    // rather than requiring an empty prompt - otherwise a finished task with
-    // a suggestion sitting in the input never gets detected as complete.
-    // Anchoring on the border lines (absent from interactive prompts like
-    // the AskUserQuestion menu) keeps this from misreading a live question
-    // as a finished turn.
-    return /─{4,}\n❯[^\n]*\n─{4,}/.test(recentTail);
+    // tmux capture-pane pads short output with blank lines to fill the pane
+    // height, and the number of footer/tip lines below the prompt varies -
+    // trim trailing blank padding first so the prompt line isn't pushed out
+    // of the tail window.
+    const recentTail = output.replace(/\s+$/, "").split("\n").slice(-12).join("\n");
+    // Once a turn finishes, Claude Code's prompt line can be empty or
+    // prefilled with a suggested follow-up command (e.g. "❯ commit this"),
+    // so match on the line rather than requiring an empty prompt - otherwise
+    // a finished task with a suggestion sitting in the input never gets
+    // detected as complete.
+    return /(?:^|\n)❯[^\n]*$/m.test(recentTail);
   },
 
   async detectInstallation(run) {

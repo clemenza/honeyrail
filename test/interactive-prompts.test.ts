@@ -171,3 +171,18 @@ const CLAUDE_COMPLETED_WITH_SUGGESTION = `⏺ All 4 tests pass.
 test("detects a completed Claude task even when the prompt box is prefilled with a suggested next command", () => {
   assert.equal(getAgentAdapter("claude").hasCompletedTask?.(CLAUDE_COMPLETED_WITH_SUGGESTION), true);
 });
+
+// tmux capture-pane pads short output with blank lines to fill the pane
+// height, and the footer below the prompt varies in line count (tips,
+// notification hints, etc.) - both push the prompt line further from the
+// end of the string than the fixed-size fixtures above assume.
+const CLAUDE_COMPLETED_WITH_SUGGESTION_AND_PANE_PADDING = `${CLAUDE_COMPLETED_WITH_SUGGESTION.replace(
+  "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents      /rc active",
+  "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n" +
+    "        get pinged when Claude finishes · enable push notifications in /config\n" +
+    "                                                                    /rc active"
+)}\n\n\n\n\n\n\n`;
+
+test("detects completion through a padded pane where the footer pushes the prompt line out of a naive tail window", () => {
+  assert.equal(getAgentAdapter("claude").hasCompletedTask?.(CLAUDE_COMPLETED_WITH_SUGGESTION_AND_PANE_PADDING), true);
+});
