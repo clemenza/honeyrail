@@ -1006,6 +1006,13 @@ test("onBlocked action 'fail' immediately fails a blocked step and skips its dep
   const afterStep = (await store.getStep(created.run.id, "after"))!;
   assert.equal(afterStep.status, "skipped");
   assert.ok(events.some((event) => event.type === "step.blocked"));
+
+  // Durable, unlike the event above (SQLiteStore prunes the event log to
+  // its most recent 200 rows) - this is what the #54 "blocked-step rate"
+  // eval metric actually queries.
+  const blockedEvidence = (await store.listEvidence(created.run.id, "ask")).find((item) => item.kind === "step.blocked");
+  assert.ok(blockedEvidence, "a durable step.blocked evidence record must survive independent of the event log");
+  assert.match(blockedEvidence!.claim || "", /which option\?/);
 });
 
 test("onBlocked wait_approval times out and fails once timeoutMs elapses", async (t) => {

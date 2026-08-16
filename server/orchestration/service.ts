@@ -56,6 +56,8 @@ export type CreateRunInput = {
   goal: string;
   steps: StepDefinition[];
   contractLevel?: ContractLevel;
+  /** id of the Recipe this run was created from, if any - see evals/metrics.ts. */
+  recipeId?: string;
 };
 
 export class OrchestrationService {
@@ -125,7 +127,8 @@ export class OrchestrationService {
       projectId: project.id,
       goal: input.goal,
       status: "pending",
-      contractLevel: input.contractLevel || DEFAULT_CONTRACT_LEVEL
+      contractLevel: input.contractLevel || DEFAULT_CONTRACT_LEVEL,
+      recipeId: input.recipeId
     });
     const steps: Step[] = [];
     for (const definition of input.steps) {
@@ -469,6 +472,20 @@ export class OrchestrationService {
       await publishStepEvent(this.eventContext(), `step.${state.status}`, run, updated);
       if (!wasAlreadyBlocked) {
         await publishStepEvent(this.eventContext(), "step.blocked", run, updated, { question, sessionId, timeoutMs: policy.timeoutMs, action: policy.action });
+        // The event log above is capacity-pruned (see SQLiteStore.appendEvent),
+        // so it can't be relied on to compute the "blocked-step rate" eval
+        // metric (#54) after the fact - especially for the wait_approval path,
+        // where a human answering via answerStep() leaves no other durable
+        // trace once the step unblocks. Evidence has no such cap.
+        await this.store.createEvidence({
+          runId: run.id,
+          stepId: updated.id,
+          attempt: updated.attempt,
+          kind: "step.blocked",
+          claim: question || "Agent stopped to ask a clarifying question",
+          source: "orchestrator",
+          value: { action: policy.action, timeoutMs: policy.timeoutMs, sessionId }
+        });
       }
       current = updated;
       changed = true;

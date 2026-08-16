@@ -109,6 +109,7 @@ export const createRunBody = z.object({
   projectId: z.string(),
   goal: z.string().min(1),
   contractLevel: z.enum(["L0", "L1", "L2", "L3"]).optional(),
+  recipeId: z.string().optional(),
   steps: z.array(z.object({
     id: z.string().min(1),
     name: z.string().optional(),
