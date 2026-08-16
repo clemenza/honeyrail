@@ -8,10 +8,13 @@ import { fileURLToPath } from "node:url";
 import { test, type TestContext } from "node:test";
 
 import { createApp } from "../server/api.js";
+import { AgentTaskExecutor } from "../server/executors/agent-task.js";
 import { CheckExecutor } from "../server/executors/check.js";
+import { PostgresExecutor } from "../server/executors/postgres.js";
 import { ExecutorRegistry } from "../server/executors/registry.js";
 import type { ExecutionHandle, ExecutionState, Executor, StepExecutionContext } from "../server/executors/types.js";
 import { EventBus } from "../server/events.js";
+import { validateContractLevel, validateStepContracts } from "../server/orchestration/dag.js";
 import { OrchestrationService } from "../server/orchestration/service.js";
 import {
   loadRecipesFromDirectory,
@@ -108,6 +111,32 @@ test("shipped implement-check-gate-approve recipe is deterministic and self-cont
 
   const checkStep = materialized.steps.find((step) => step.id === "check")!;
   assert.deepEqual(checkStep.input?.commands, ["python -m pytest -q"]);
+});
+
+test("shipped implement-check-gate-approve recipe declares StepContract produces/consumes and passes dataflow lint", async () => {
+  const registry = await loadRecipesFromDirectory(shippedRecipesDir);
+  const recipe = registry.get("implement-check-gate-approve")!;
+
+  const implementStep = recipe.steps.find((step) => step.id === "implement")!;
+  const checkStep = recipe.steps.find((step) => step.id === "check")!;
+  assert.deepEqual(implementStep.produces, ["diff", "changed_files"]);
+  assert.deepEqual(checkStep.consumes, ["diff"]);
+
+  const materialized = materializeRecipe(recipe, { projectId: "proj_1", parameters: {} });
+  const executors = new ExecutorRegistry([new AgentTaskExecutor(), new CheckExecutor()]);
+  assert.doesNotThrow(() => validateStepContracts(materialized.steps, executors));
+});
+
+test("both shipped recipes declare contract level L2+ and pass validateContractLevel at that level", async () => {
+  const registry = await loadRecipesFromDirectory(shippedRecipesDir);
+  const executors = new ExecutorRegistry([new AgentTaskExecutor(), new CheckExecutor(), new PostgresExecutor()]);
+
+  for (const id of ["implement-check-gate-approve", "postgres-transaction-restart"]) {
+    const recipe = registry.get(id)!;
+    assert.equal(recipe.contractLevel, "L2", `${id} must declare contract level L2+`);
+    const materialized = materializeRecipe(recipe, { projectId: "proj_1", parameters: {} });
+    assert.doesNotThrow(() => validateContractLevel(materialized.contractLevel!, materialized.steps, executors));
+  }
 });
 
 test("RecipeRegistry.list() omits steps", () => {

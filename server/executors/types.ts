@@ -1,5 +1,5 @@
 import type { EventBus } from "../events.js";
-import type { Project, Step, Store } from "../types.js";
+import type { Project, QualityGate, Step, Store } from "../types.js";
 import type { TmuxManager } from "../tmux.js";
 import type { runCommandSafe } from "../utils.js";
 import type { WorktreeManager } from "../worktrees.js";
@@ -54,6 +54,24 @@ export type PreflightContext = {
 
 export interface Executor {
   type: string;
+  /**
+   * Artifact types (see KNOWN_ARTIFACT_TYPES in types.ts) this executor
+   * unconditionally harvests on step success, independent of anything a
+   * recipe declares in a step's `produces`. StepContract dataflow lint treats
+   * these as always available from a step of this executor type, so a
+   * downstream step can `consumes` them without the upstream step having to
+   * redundantly redeclare what its executor already guarantees.
+   */
+  producesTypes?: string[];
+  /**
+   * Static default QualityGate applied to a step of this executor type when
+   * the step declares none of its own - see
+   * OrchestrationService.defaultQualityGate. Also consulted by contract
+   * level L2 lint (validateContractLevel in orchestration/dag.ts) to decide
+   * whether a "verifying" step needs an explicit evaluator declared, or
+   * already has one implicitly through its executor.
+   */
+  impliedQualityGate?: QualityGate;
   /**
    * Optional static check run at run-creation time (before any Run/Step
    * records exist) to reject steps that cannot possibly succeed given their

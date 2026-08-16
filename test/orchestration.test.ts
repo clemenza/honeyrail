@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test, type TestContext } from "node:test";
@@ -14,7 +14,7 @@ import { ShellExecutor } from "../server/executors/shell.js";
 import { ConfigError, type ExecutionHandle, type ExecutionState, type Executor, type PreflightContext, type StepExecutionContext } from "../server/executors/types.js";
 import { EvaluatorRegistry, type Evaluator, type EvaluatorInput, type EvaluatorResult } from "../server/evaluators/registry.js";
 import { EventBus, publishEvent } from "../server/events.js";
-import { validateStepGraph } from "../server/orchestration/dag.js";
+import { validateContractLevel, validateStepContracts, validateStepGraph } from "../server/orchestration/dag.js";
 import { OrchestrationService } from "../server/orchestration/service.js";
 import { assertStepTransition, deriveRunStatus } from "../server/orchestration/state-machine.js";
 import { JsonStore } from "../server/store.js";
@@ -188,6 +188,102 @@ test("DAG validation rejects unknown dependencies, duplicate ids, cycles, and un
   assert.throws(() => validateStepGraph([{ id: "a", executor: "ok", dependsOn: ["missing"] }], registry), /unknown step/);
   assert.throws(() => validateStepGraph([{ id: "a", executor: "ok", dependsOn: ["b"] }, { id: "b", executor: "ok", dependsOn: ["a"] }], registry), /cycle/);
   assert.throws(() => validateStepGraph([{ id: "a", executor: "missing" }], registry), /Unknown executor/);
+});
+
+test("StepContract lint rejects a consumes entry no upstream step produces, and accepts one satisfied via declared produces or executor-inherent producesTypes", () => {
+  const plain = new MemoryExecutor("ok");
+  class ProducingExecutor extends MemoryExecutor {
+    producesTypes = ["diff"];
+  }
+  const registry = new ExecutorRegistry([plain, new ProducingExecutor("agent-task")]);
+
+  // No upstream step declares or auto-harvests "diff".
+  assert.throws(
+    () => validateStepContracts([
+      { id: "a", executor: "ok" },
+      { id: "b", executor: "ok", dependsOn: ["a"], consumes: ["diff"] }
+    ], registry),
+    /Step b consumes "diff", which no upstream step \(via dependsOn\) produces/
+  );
+
+  // Satisfied via an explicitly declared `produces` on the upstream step.
+  assert.doesNotThrow(() => validateStepContracts([
+    { id: "a", executor: "ok", produces: ["diff"] },
+    { id: "b", executor: "ok", dependsOn: ["a"], consumes: ["diff"] }
+  ], registry));
+
+  // Satisfied via the upstream step's executor-inherent producesTypes, with
+  // no explicit `produces` declaration needed on the step itself.
+  assert.doesNotThrow(() => validateStepContracts([
+    { id: "a", executor: "agent-task" },
+    { id: "b", executor: "ok", dependsOn: ["a"], consumes: ["diff"] }
+  ], registry));
+
+  // A sibling step (not a dependsOn ancestor) producing the type doesn't count.
+  assert.throws(
+    () => validateStepContracts([
+      { id: "a", executor: "agent-task" },
+      { id: "b", executor: "ok", consumes: ["diff"] }
+    ], registry),
+    /consumes "diff"/
+  );
+});
+
+test("validateContractLevel: L0 skips contract enforcement entirely; L1 is the same as validateStepContracts", () => {
+  const registry = new ExecutorRegistry([new MemoryExecutor("ok")]);
+  const unsatisfiable = [
+    { id: "a", executor: "ok" },
+    { id: "b", executor: "ok", dependsOn: ["a"], consumes: ["diff"] }
+  ];
+
+  assert.doesNotThrow(() => validateContractLevel("L0", unsatisfiable, registry));
+  assert.throws(() => validateContractLevel("L1", unsatisfiable, registry), /consumes "diff"/);
+});
+
+test("validateContractLevel: L2 requires an evaluator on every verifying step (executor 'check', or one that declares consumes), satisfied by an explicit qualityGate or an executor's implicit default", () => {
+  const registry = new ExecutorRegistry([new MemoryExecutor("ok"), new CheckExecutor()]);
+
+  // A non-check step that consumes an upstream artifact but declares no
+  // evaluator, and whose executor has no implicit default.
+  assert.throws(
+    () => validateContractLevel("L2", [
+      { id: "a", executor: "ok", produces: ["diff"] },
+      { id: "b", executor: "ok", dependsOn: ["a"], consumes: ["diff"] }
+    ], registry),
+    /Contract level L2 requires an evaluator on verifying step "b"/
+  );
+
+  // Same shape, but "b" declares its own evaluator explicitly.
+  assert.doesNotThrow(() => validateContractLevel("L2", [
+    { id: "a", executor: "ok", produces: ["diff"] },
+    { id: "b", executor: "ok", dependsOn: ["a"], consumes: ["diff"], qualityGate: { evaluators: [{ type: "boolean" }] } }
+  ], registry));
+
+  // A "check" step is a verifying step by executor type alone, even with no
+  // consumes declared and no explicit qualityGate - CheckExecutor's
+  // impliedQualityGate satisfies L2 on its own.
+  assert.doesNotThrow(() => validateContractLevel("L2", [
+    { id: "check", executor: "check" }
+  ], registry));
+
+  // A plain non-verifying step (no consumes, not "check") needs nothing.
+  assert.doesNotThrow(() => validateContractLevel("L2", [
+    { id: "a", executor: "ok" }
+  ], registry));
+});
+
+test("validateContractLevel: L3 additionally requires at least one dedicated 'approval' step in the run", () => {
+  const registry = new ExecutorRegistry([new CheckExecutor(), new ApprovalTestExecutor()]);
+
+  assert.throws(
+    () => validateContractLevel("L3", [{ id: "check", executor: "check" }], registry),
+    /Contract level L3 requires at least one "approval" step/
+  );
+
+  assert.doesNotThrow(() => validateContractLevel("L3", [
+    { id: "check", executor: "check" },
+    { id: "gate", executor: "approval", dependsOn: ["check"] }
+  ], registry));
 });
 
 test("scheduleRun: a caller racing an already in-flight schedule waits for it instead of reading a mid-transition run status", async (t) => {
@@ -672,6 +768,174 @@ test("AgentTaskExecutor.start() defaults to unattended and prepends the UNATTEND
 
   const autoTask = (await store.listTasks()).find((task) => task.title === "auto");
   assert.equal(autoTask?.prompt, "implement the feature");
+});
+
+test("AgentTaskExecutor.start() provisions $HR_STEP_DIR/artifacts on disk, exports it to the launched session, and injects the versioned harness conventions ahead of the task prompt", async (t) => {
+  const registry = new ExecutorRegistry([new AgentTaskExecutor()]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-agent-step-dir-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const startedCommands: string[] = [];
+  const attachmentRoot = join(tempDir, "attachments");
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: {
+      listSessions: async () => [],
+      startSession: async ({ command }: any) => { startedCommands.push(command); },
+      killSession: async () => {},
+      capture: async () => "",
+      sendInput: async () => {}
+    } as any,
+    worktrees: {
+      create: async ({ project, title, agent }: any) => ({
+        projectId: project.id,
+        path: join(tempDir, "wt"),
+        branch: `${agent}/${title}`,
+        baseBranch: "main",
+        baseRevision: "base",
+        title,
+        agent
+      })
+    } as any,
+    runCommand: (async () => ({ ok: true, stdout: "", stderr: "" })) as any,
+    sessionLogRoot: join(tempDir, "sessions"),
+    attachmentRoot,
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "step dir",
+    steps: [{ id: "implement", executor: "agent-task", produces: ["diff"], input: { agent: "codex", prompt: "implement the feature" } }]
+  });
+
+  assert.equal(startedCommands.length, 1);
+  const stepDir = join(attachmentRoot, "runs", created.run.id, "implement", "attempt-1", "step");
+  assert.ok(startedCommands[0].includes(`HR_STEP_DIR='${stepDir}'`), "the launch command must export HR_STEP_DIR to the session's shell");
+  assert.ok(startedCommands[0].includes("Harness runtime conventions (prompt v1)"), "the versioned harness conventions block must be injected");
+  assert.ok(startedCommands[0].includes("must produce: diff"), "the step's produces contract must be surfaced to the agent");
+  assert.ok(startedCommands[0].indexOf("Harness runtime conventions") < startedCommands[0].indexOf("implement the feature"), "conventions must precede the task prompt");
+
+  const artifactsDirStat = await stat(join(stepDir, "artifacts"));
+  assert.ok(artifactsDirStat.isDirectory(), "artifacts/ must be provisioned before the agent starts, not created lazily on harvest");
+});
+
+test("agent-written manifest.json entries under $HR_STEP_DIR/artifacts/ are harvested as step artifacts on completion, and completion evidence records the harness prompt version", async (t) => {
+  const registry = new ExecutorRegistry([new AgentTaskExecutor()]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-agent-manifest-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const attachmentRoot = join(tempDir, "attachments");
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: { listSessions: async () => [], startSession: async () => {}, killSession: async () => {}, capture: async () => "", sendInput: async () => {} } as any,
+    worktrees: {
+      create: async ({ project, title, agent }: any) => ({
+        projectId: project.id,
+        path: join(tempDir, "wt"),
+        branch: `${agent}/${title}`,
+        baseBranch: "main",
+        baseRevision: "base",
+        title,
+        agent
+      })
+    } as any,
+    runCommand: (async () => ({ ok: true, stdout: "", stderr: "" })) as any,
+    sessionLogRoot: join(tempDir, "sessions"),
+    attachmentRoot,
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "shell", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "manifest harvest",
+    steps: [{ id: "implement", executor: "agent-task", input: { agent: "shell", prompt: "do work" } }]
+  });
+  const step = (await store.getStep(created.run.id, "implement"))!;
+  assert.equal(step.status, "running");
+
+  // Simulate the agent following the harness convention: writing a file
+  // under artifacts/ and describing it in manifest.json (start() already
+  // provisioned the artifacts/ directory).
+  const stepDir = join(attachmentRoot, "runs", created.run.id, "implement", "attempt-1", "step");
+  await writeFile(join(stepDir, "artifacts", "coverage.json"), JSON.stringify({ lines: 92 }));
+  await writeFile(join(stepDir, "manifest.json"), JSON.stringify({
+    artifacts: [{ name: "coverage.json", path: "artifacts/coverage.json", type: "report", claim: "Coverage after the new tests" }]
+  }));
+
+  await store.updateTask(String(step.executionRef!.taskId), { status: "ready_to_merge" });
+  await service.scheduleRun(created.run.id);
+
+  const artifacts = await store.listArtifacts(created.run.id, "implement");
+  const manifestArtifact = artifacts.find((item) => item.name === "coverage.json")!;
+  assert.ok(manifestArtifact, "manifest-described artifact must be harvested");
+  assert.equal(manifestArtifact.kind, "json");
+  assert.equal(manifestArtifact.artifactType, "report");
+  assert.equal(manifestArtifact.path, join(stepDir, "artifacts", "coverage.json"), "must reference the file in place, not a copy");
+
+  const evidence = await store.listEvidence(created.run.id, "implement");
+  const manifestEvidence = evidence.find((item) => item.kind === "agent.manifest")!;
+  assert.ok(manifestEvidence, "manifest artifact must have matching evidence");
+  assert.equal(manifestEvidence.claim, "Coverage after the new tests");
+  assert.deepEqual(manifestEvidence.artifactIds, [manifestArtifact.id]);
+
+  const completionEvidence = evidence.find((item) => item.kind === "agent.completion")!;
+  assert.equal((completionEvidence.value as Record<string, unknown>).harnessPromptVersion, "1");
+});
+
+test("a file dropped under $HR_STEP_DIR/artifacts/ with no manifest.json entry is still harvested, with a default name/kind and no artifactType", async (t) => {
+  const registry = new ExecutorRegistry([new AgentTaskExecutor()]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-agent-manifest-default-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const attachmentRoot = join(tempDir, "attachments");
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: { listSessions: async () => [], startSession: async () => {}, killSession: async () => {}, capture: async () => "", sendInput: async () => {} } as any,
+    worktrees: {
+      create: async ({ project, title, agent }: any) => ({
+        projectId: project.id,
+        path: join(tempDir, "wt"),
+        branch: `${agent}/${title}`,
+        baseBranch: "main",
+        baseRevision: "base",
+        title,
+        agent
+      })
+    } as any,
+    runCommand: (async () => ({ ok: true, stdout: "", stderr: "" })) as any,
+    sessionLogRoot: join(tempDir, "sessions"),
+    attachmentRoot,
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "shell", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "manifest-less harvest",
+    steps: [{ id: "implement", executor: "agent-task", input: { agent: "shell", prompt: "do work" } }]
+  });
+  const step = (await store.getStep(created.run.id, "implement"))!;
+
+  const stepDir = join(attachmentRoot, "runs", created.run.id, "implement", "attempt-1", "step");
+  await writeFile(join(stepDir, "artifacts", "notes.txt"), "no manifest describes this file");
+
+  await store.updateTask(String(step.executionRef!.taskId), { status: "ready_to_merge" });
+  await service.scheduleRun(created.run.id);
+
+  const artifacts = await store.listArtifacts(created.run.id, "implement");
+  const notesArtifact = artifacts.find((item) => item.name === "notes.txt")!;
+  assert.ok(notesArtifact, "an undeclared file under artifacts/ must still be harvested");
+  assert.equal(notesArtifact.kind, "file");
+  assert.equal(notesArtifact.artifactType, undefined);
 });
 
 test("AgentTaskExecutor.inspect() maps a waiting_input session onto the step state", async () => {
@@ -1370,6 +1634,152 @@ test("a step that fails via a thrown ConfigError is tagged failureKind config_er
   assert.equal(result.run.status, "failed");
   assert.equal((await store.getStep(result.run.id, "a"))!.status, "failed");
   assert.equal((await store.getStep(result.run.id, "a"))!.failureKind, "config_error");
+});
+
+test("createRun rejects at the service layer when a step consumes an artifact type no upstream step produces, and no run is persisted", async (t) => {
+  const registry = new ExecutorRegistry([new MemoryExecutor("ok")]);
+  const { store, service, project } = await withService(t, registry);
+
+  await assert.rejects(
+    () => service.createRun({
+      projectId: project.id,
+      goal: "unsatisfiable dataflow",
+      steps: [
+        { id: "a", executor: "ok" },
+        { id: "b", executor: "ok", dependsOn: ["a"], consumes: ["diff"] }
+      ]
+    }),
+    /Step b consumes "diff", which no upstream step \(via dependsOn\) produces/
+  );
+  assert.deepEqual(await store.listRuns(), []);
+});
+
+test("createRun defaults to contract level L1 when unspecified, persists the run's contractLevel, and an explicit L0 run bypasses the dataflow lint L1 would reject", async (t) => {
+  const registry = new ExecutorRegistry([new MemoryExecutor("ok")]);
+  const { store, service, project } = await withService(t, registry);
+
+  const unsatisfiableDataflow = {
+    projectId: project.id,
+    goal: "shell-only maintenance",
+    steps: [
+      { id: "a", executor: "ok" },
+      { id: "b", executor: "ok", dependsOn: ["a"], consumes: ["diff"] }
+    ]
+  };
+
+  // No contractLevel given - defaults to L1, so the same unsatisfiable
+  // dataflow that L0 tolerates below is rejected here.
+  await assert.rejects(() => service.createRun(unsatisfiableDataflow), /consumes "diff"/);
+
+  // A plain execution DAG at L0 runs with no contract errors even though its
+  // dataflow would fail L1's lint - "execution only" per the L0 definition.
+  const result = await service.createRun({ ...unsatisfiableDataflow, contractLevel: "L0" });
+  assert.equal(result.run.status, "succeeded");
+  assert.equal(result.run.contractLevel, "L0");
+
+  // A run that declares a level explicitly gets it recorded verbatim.
+  const explicitL1 = await service.createRun({
+    projectId: project.id,
+    goal: "explicit L1",
+    contractLevel: "L1",
+    steps: [{ id: "solo", executor: "ok" }]
+  });
+  assert.equal((await store.getRun(explicitL1.run.id))!.contractLevel, "L1");
+});
+
+test("createRun rejects an L2 run whose verifying step declares no evaluator, and no run is persisted; a 'check' step satisfies L2 via its implicit default gate", async (t) => {
+  const registry = new ExecutorRegistry([new MemoryExecutor("ok"), new CheckExecutor()]);
+  const { store, service, project } = await withService(t, registry);
+
+  await assert.rejects(
+    () => service.createRun({
+      projectId: project.id,
+      goal: "unverified consumer",
+      contractLevel: "L2",
+      steps: [
+        { id: "a", executor: "ok", produces: ["diff"] },
+        { id: "b", executor: "ok", dependsOn: ["a"], consumes: ["diff"] }
+      ]
+    }),
+    /Contract level L2 requires an evaluator on verifying step "b"/
+  );
+  assert.deepEqual(await store.listRuns(), []);
+
+  const result = await service.createRun({
+    projectId: project.id,
+    goal: "check step satisfies L2 implicitly",
+    contractLevel: "L2",
+    steps: [{ id: "check", executor: "check", input: { commands: ["true"] } }]
+  });
+  assert.equal(result.run.contractLevel, "L2");
+});
+
+test("createRun accepts a consumes entry satisfied by an upstream step's executor-inherent producesTypes, with no explicit produces declared", async (t) => {
+  class ProducingExecutor extends MemoryExecutor {
+    producesTypes = ["diff"];
+  }
+  const registry = new ExecutorRegistry([new ProducingExecutor("implement-like"), new MemoryExecutor("ok")]);
+  const { service, project } = await withService(t, registry);
+
+  const result = await service.createRun({
+    projectId: project.id,
+    goal: "satisfied via inherent producesTypes",
+    steps: [
+      { id: "implement", executor: "implement-like" },
+      { id: "check", executor: "ok", dependsOn: ["implement"], consumes: ["diff"] }
+    ]
+  });
+  assert.equal(result.run.status, "succeeded");
+});
+
+test("a step that declares produces but never creates a matching artifact is failed with failureKind contract_violation, distinct from execution_failed", async (t) => {
+  const registry = new ExecutorRegistry([new MemoryExecutor("silent")]);
+  const { store, service, project } = await withService(t, registry);
+
+  const result = await service.createRun({
+    projectId: project.id,
+    goal: "unmet contract",
+    steps: [{ id: "a", executor: "silent", produces: ["diff"] }]
+  });
+
+  assert.equal(result.run.status, "failed");
+  const step = await store.getStep(result.run.id, "a");
+  assert.equal(step!.status, "failed");
+  assert.equal(step!.failureKind, "contract_violation");
+  assert.match(step!.error || "", /declares produces \[diff\] but did not produce: diff/);
+});
+
+test("a step that declares produces and creates a matching artifactType-tagged artifact succeeds normally", async (t) => {
+  class ArtifactProducingExecutor implements Executor {
+    type = "artifact-producer";
+    async start(ctx: StepExecutionContext): Promise<ExecutionHandle> {
+      await ctx.store.createArtifact({
+        runId: ctx.runId,
+        stepId: ctx.step.id,
+        attempt: ctx.step.attempt,
+        kind: "text",
+        name: "changes.diff",
+        artifactType: "diff"
+      });
+      return {};
+    }
+    async inspect(): Promise<ExecutionState> {
+      return { status: "succeeded", output: {} };
+    }
+  }
+  const registry = new ExecutorRegistry([new ArtifactProducingExecutor()]);
+  const { store, service, project } = await withService(t, registry);
+
+  const result = await service.createRun({
+    projectId: project.id,
+    goal: "met contract",
+    steps: [{ id: "a", executor: "artifact-producer", produces: ["diff"] }]
+  });
+
+  assert.equal(result.run.status, "succeeded");
+  const step = await store.getStep(result.run.id, "a");
+  assert.equal(step!.status, "succeeded");
+  assert.equal(step!.failureKind, undefined);
 });
 
 async function withHttpServer(t: TestContext, evaluators?: EvaluatorRegistry) {

@@ -1,6 +1,6 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { withUnattendedPreamble } from "../agents/common.js";
+import { HARNESS_PROMPT_VERSION, withHarnessConventions, withUnattendedPreamble } from "../agents/common.js";
 import { getAgentAdapter, isKnownAgent } from "../agents/registry.js";
 import { publishSessionCreated, publishTaskFailed, publishTaskStarted } from "../domain-events.js";
 import { publishEvent } from "../events.js";
@@ -13,8 +13,8 @@ import {
   stripAnsi,
   tmuxName
 } from "../session-helpers.js";
-import type { AgentType, Session, Task, Worktree } from "../types.js";
-import { makeId } from "../utils.js";
+import type { Artifact, AgentType, Session, Task, Worktree } from "../types.js";
+import { makeId, quoteShellArg } from "../utils.js";
 import { ConfigError, type ExecutionHandle, type ExecutionState, type Executor, type PreflightContext, type StepExecutionContext } from "./types.js";
 
 function stringInput(value: unknown, fallback = "") {
@@ -54,6 +54,37 @@ function changeTypeForCode(code: string): string {
 type ChangedFile = { path: string; changeType: string; fromPath?: string };
 
 /**
+ * The per-step scratch directory exposed to the agent as $HR_STEP_DIR (see
+ * AgentTaskExecutor.start()) and harvested from on completion (see the
+ * manifest.json/artifacts/ block in recordCompletionArtifacts below). Lives
+ * under attachmentRoot alongside the derived diff/transcript artifacts,
+ * keyed the same way, so it's already inside the root GET
+ * /api/artifacts/:id/content requires paths to stay within - nothing needs
+ * to be copied out of it to be servable.
+ */
+function stepDirFor(ctx: StepExecutionContext): string {
+  return join(ctx.attachmentRoot, "runs", ctx.runId, ctx.step.id, `attempt-${ctx.step.attempt}`, "step");
+}
+
+type ManifestArtifactEntry = { name?: string; path?: string; type?: string; mediaType?: string; claim?: string };
+
+function normalizeManifestPath(path: string): string {
+  return path.trim().replace(/^\.\//, "").replace(/^artifacts\//, "");
+}
+
+function kindForManifestFile(name: string): Artifact["kind"] {
+  if (name.endsWith(".json")) return "json";
+  if (name.endsWith(".log")) return "log";
+  return "file";
+}
+
+function mediaTypeForManifestFile(name: string): string {
+  if (name.endsWith(".json")) return "application/json";
+  if (name.endsWith(".log") || name.endsWith(".txt") || name.endsWith(".md")) return "text/plain";
+  return "application/octet-stream";
+}
+
+/**
  * `git status --short` porcelain lines look like "XY path" (or
  * "R  old -> new" for renames/copies). Turned into structured
  * path+change-type records so a reviewer (or a downstream evaluator) can
@@ -91,6 +122,7 @@ function parseChangedFiles(status: string): ChangedFile[] {
  */
 async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task): Promise<void> {
   const attemptDir = join(ctx.attachmentRoot, "runs", ctx.runId, ctx.step.id, `attempt-${ctx.step.attempt}`);
+  const stepDir = stepDirFor(ctx);
 
   async function saveEvidence(input: {
     kind: string;
@@ -120,6 +152,7 @@ async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task):
     content: string;
     kind?: "text" | "json";
     mediaType: string;
+    artifactType?: string;
     metadata?: Record<string, unknown>;
     evidence: { kind: string; claim: string; value?: Record<string, unknown> };
   }): Promise<void> {
@@ -136,6 +169,42 @@ async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task):
       path,
       uri: `honeyrail://runs/${ctx.runId}/steps/${ctx.step.id}/attempts/${ctx.step.attempt}/${input.name}`,
       mediaType: input.mediaType,
+      artifactType: input.artifactType,
+      metadata: input.metadata
+    });
+    await publishEvent(ctx.store, ctx.bus, {
+      type: "artifact.created",
+      projectId: ctx.project.id,
+      payload: { runId: ctx.runId, stepId: ctx.step.id, artifactId: artifact.id, kind: artifact.kind, name: artifact.name }
+    });
+    await saveEvidence({ kind: input.evidence.kind, claim: input.evidence.claim, value: input.evidence.value, artifactIds: [artifact.id] });
+  }
+
+  /**
+   * Unlike saveArtifact above, the content already lives on disk under
+   * stepDir/artifacts/ (written by the agent itself) and stepDir is already
+   * inside attachmentRoot, so this registers the existing file in place
+   * instead of writing a copy.
+   */
+  async function registerExistingFileArtifact(input: {
+    name: string;
+    path: string;
+    kind?: Artifact["kind"];
+    mediaType?: string;
+    artifactType?: string;
+    metadata?: Record<string, unknown>;
+    evidence: { kind: string; claim: string; value?: Record<string, unknown> };
+  }): Promise<void> {
+    const artifact = await ctx.store.createArtifact({
+      runId: ctx.runId,
+      stepId: ctx.step.id,
+      attempt: ctx.step.attempt,
+      kind: input.kind || "file",
+      name: input.name,
+      path: input.path,
+      uri: `honeyrail://runs/${ctx.runId}/steps/${ctx.step.id}/attempts/${ctx.step.attempt}/manifest/${input.name}`,
+      mediaType: input.mediaType,
+      artifactType: input.artifactType,
       metadata: input.metadata
     });
     await publishEvent(ctx.store, ctx.bus, {
@@ -156,6 +225,7 @@ async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task):
           name: "changes.diff",
           content: diff,
           mediaType: "text/x-diff",
+          artifactType: "diff",
           metadata: { diffStat, status },
           evidence: {
             kind: "agent.diff",
@@ -171,6 +241,7 @@ async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task):
             content: JSON.stringify(changedFiles, null, 2),
             kind: "json",
             mediaType: "application/json",
+            artifactType: "changed_files",
             metadata: { count: changedFiles.length },
             evidence: {
               kind: "agent.changed_files",
@@ -205,6 +276,55 @@ async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task):
     }
   }
 
+  // Convention + harvest, not trust: this channel is entirely optional - an
+  // agent that never writes to $HR_STEP_DIR/artifacts/ leaves nothing to
+  // find here, and that's fine. manifest.json is itself optional metadata;
+  // its absence or invalidity just means harvested files get default
+  // name/kind and no artifactType, not a failure.
+  try {
+    const artifactsDir = join(stepDir, "artifacts");
+    const entries = await readdir(artifactsDir).catch(() => [] as string[]);
+    if (entries.length) {
+      let manifestEntries: ManifestArtifactEntry[] = [];
+      try {
+        const raw = await readFile(join(stepDir, "manifest.json"), "utf8");
+        const parsed = JSON.parse(raw) as { artifacts?: ManifestArtifactEntry[] };
+        manifestEntries = Array.isArray(parsed.artifacts) ? parsed.artifacts : [];
+      } catch {
+        // Missing/invalid manifest.json - proceed with defaults below.
+      }
+      const metaByPath = new Map(
+        manifestEntries.filter((entry) => entry.path).map((entry) => [normalizeManifestPath(entry.path!), entry])
+      );
+
+      for (const fileName of entries) {
+        const absPath = join(artifactsDir, fileName);
+        const stats = await stat(absPath).catch(() => null);
+        if (!stats?.isFile()) continue;
+        const meta = metaByPath.get(fileName);
+        const name = meta?.name || fileName;
+        try {
+          await registerExistingFileArtifact({
+            name,
+            path: absPath,
+            kind: kindForManifestFile(fileName),
+            mediaType: meta?.mediaType || mediaTypeForManifestFile(fileName),
+            artifactType: meta?.type,
+            metadata: { source: "manifest", sizeBytes: stats.size },
+            evidence: {
+              kind: "agent.manifest",
+              claim: meta?.claim || `Agent reported artifact "${name}"`
+            }
+          });
+        } catch (error) {
+          console.error(`agent-task ${ctx.step.id}: failed to register manifest artifact "${fileName}":`, error);
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`agent-task ${ctx.step.id}: failed to harvest manifest artifacts:`, error);
+  }
+
   try {
     await saveEvidence({
       kind: "agent.completion",
@@ -216,7 +336,8 @@ async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task):
         worktreeId: task.worktreeId,
         sessionId: task.sessionId,
         headRevision: task.headRevision,
-        completedAt: new Date().toISOString()
+        completedAt: new Date().toISOString(),
+        harnessPromptVersion: HARNESS_PROMPT_VERSION
       }
     });
   } catch (error) {
@@ -248,6 +369,11 @@ async function taskStateToExecution(ctx: StepExecutionContext, task: Task | unde
 
 export class AgentTaskExecutor implements Executor {
   type = "agent-task";
+  // recordCompletionArtifacts() above harvests these unconditionally on
+  // success whenever the underlying worktree actually changed - so a
+  // downstream step can `consumes: [diff]`/`[changed_files]` without this
+  // step's recipe entry having to redundantly declare `produces` for them.
+  producesTypes = ["diff", "changed_files"];
 
   async preflight(ctx: PreflightContext): Promise<void> {
     const agent = stringInput(ctx.step.input?.agent, ctx.project.defaultAgent || "codex");
@@ -279,7 +405,10 @@ export class AgentTaskExecutor implements Executor {
     // "interactive" explicitly if it truly needs a human at the terminal.
     const interaction = ctx.step.input.interaction === "interactive" ? "interactive" : "autonomous";
     const unattended = interaction === "autonomous";
-    const launchPrompt = unattended ? withUnattendedPreamble(prompt) : prompt;
+    const stepDir = stepDirFor(ctx);
+    await mkdir(join(stepDir, "artifacts"), { recursive: true });
+    const promptWithConventions = withHarnessConventions(prompt, { stepDir, produces: ctx.step.produces });
+    const launchPrompt = unattended ? withUnattendedPreamble(promptWithConventions) : promptWithConventions;
     const task = await ctx.store.createTask({
       projectId: ctx.project.id,
       title,
@@ -298,7 +427,11 @@ export class AgentTaskExecutor implements Executor {
       await ctx.tmux.startSession({
         name: tmuxSessionName,
         cwd: worktree.path,
-        command: adapter.buildLaunchCommand({ prompt: launchPrompt, model, unattended }),
+        // The launch command already runs through the user's shell (tmux
+        // executes a lone shell-command argument via $SHELL -c), so a plain
+        // leading VAR=value assignment is enough to expose the step's
+        // scratch directory to the agent process - no tmux API changes needed.
+        command: `HR_STEP_DIR=${quoteShellArg(stepDir)} ${adapter.buildLaunchCommand({ prompt: launchPrompt, model, unattended })}`,
         logPath
       });
       session = await ctx.store.createSession({

@@ -108,6 +108,7 @@ const onBlockedBody = z.object({
 export const createRunBody = z.object({
   projectId: z.string(),
   goal: z.string().min(1),
+  contractLevel: z.enum(["L0", "L1", "L2", "L3"]).optional(),
   steps: z.array(z.object({
     id: z.string().min(1),
     name: z.string().optional(),
@@ -116,7 +117,9 @@ export const createRunBody = z.object({
     dependsOn: z.array(z.string()).optional(),
     maxAttempts: z.number().int().positive().optional(),
     qualityGate: qualityGateBody.optional(),
-    onBlocked: onBlockedBody.optional()
+    onBlocked: onBlockedBody.optional(),
+    produces: z.array(z.string().min(1)).optional(),
+    consumes: z.array(z.string().min(1)).optional()
   })).min(1)
 });
 

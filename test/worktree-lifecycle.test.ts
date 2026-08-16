@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test, type TestContext } from "node:test";
@@ -10,6 +10,7 @@ import { createApp } from "../server/api.js";
 import { EventBus } from "../server/events.js";
 import { recoverLegacyTaskWorktrees } from "../server/project-helpers.js";
 import { JsonStore } from "../server/store.js";
+import { runCommandSafe } from "../server/utils.js";
 import { WorktreeManager } from "../server/worktrees.js";
 
 async function withServer(t: TestContext, { worktrees, run, tmux }: { worktrees?: any; run?: any; tmux?: any } = {}) {
@@ -399,8 +400,41 @@ test("WorktreeManager.diff uses base revision when available", async () => {
 
   await manager.diff({ path: "/repo/worktree", branch: "codex/test", baseRevision: "base123" });
 
-  assert.ok(calls.some((call) => call.args.join(" ") === "diff base123..HEAD"));
-  assert.ok(calls.some((call) => call.args.join(" ") === "diff --stat base123..HEAD"));
+  // Single-ref form (no "..HEAD") so the diff includes uncommitted working
+  // tree changes, not just commits - see the comment in WorktreeManager.diff.
+  assert.ok(calls.some((call) => call.args.join(" ") === "diff base123"));
+  assert.ok(calls.some((call) => call.args.join(" ") === "diff --stat base123"));
+});
+
+test("WorktreeManager.diff reports uncommitted changes against a real repo, not just commits", async (t) => {
+  // Regression test for the underlying bug: a task's changes are almost
+  // always left uncommitted (the agent doesn't commit on its own), so a
+  // diff scoped to "baseRevision..HEAD" was always empty - agent-task's
+  // completion artifact (server/executors/agent-task.ts) never had a diff
+  // to record, and every StepContract `produces: [diff]` recipe failed on
+  // its very first attempt.
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-diff-uncommitted-"));
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+  const repoPath = join(tempDir, "repo");
+  await mkdir(repoPath, { recursive: true });
+  await runCommandSafe("git", ["init"], { cwd: repoPath });
+  await runCommandSafe("git", ["checkout", "-B", "main"], { cwd: repoPath });
+  await runCommandSafe("git", ["config", "user.email", "e2e@example.com"], { cwd: repoPath });
+  await runCommandSafe("git", ["config", "user.name", "E2E"], { cwd: repoPath });
+  await writeFile(join(repoPath, "README.md"), "# fixture\n");
+  await runCommandSafe("git", ["add", "-A"], { cwd: repoPath });
+  await runCommandSafe("git", ["commit", "-m", "initial"], { cwd: repoPath });
+  const baseRevision = (await runCommandSafe("git", ["rev-parse", "HEAD"], { cwd: repoPath })).stdout.trim();
+
+  // Uncommitted change, mirroring how an agent leaves its work.
+  await writeFile(join(repoPath, "fizzbuzz.py"), "def fizzbuzz(n):\n    return str(n)\n");
+
+  const manager = new WorktreeManager({ root: tempDir, run: runCommandSafe });
+  const result = await manager.diff({ path: repoPath, branch: "main", baseRevision });
+
+  assert.match(result.diff, /fizzbuzz\.py/);
+  assert.match(result.diff, /\+def fizzbuzz\(n\)/);
+  assert.match(result.diffStat, /fizzbuzz\.py/);
 });
 
 test("WorktreeManager.merge ignores untracked files in the project repo", async () => {

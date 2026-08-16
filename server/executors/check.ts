@@ -21,6 +21,18 @@ function commandsSource(input: Record<string, unknown> | undefined): "step" | "p
 
 export class CheckExecutor implements Executor {
   type = "check";
+  // One artifact per configured command is always created in start() below,
+  // regardless of pass/fail - see the per-run loop that tags each with
+  // artifactType "test_command".
+  producesTypes = ["test_command"];
+  // "check" steps historically failed outright whenever a command failed
+  // (see CheckExecutor.inspect). That executor now always reports
+  // "succeeded" and defers pass/fail to the quality gate instead, so a
+  // check step without an explicit gate gets this default to preserve that
+  // observed behavior instead of silently succeeding on failed checks - and
+  // it's also what satisfies contract level L2's "verifying step needs an
+  // evaluator" requirement for a check step that declares no gate of its own.
+  impliedQualityGate = { evaluators: [{ type: "check" }], onFail: "fail" as const };
 
   preflight(ctx: PreflightContext): void {
     const commands = defaultCheckCommands(ctx.project, Array.isArray(ctx.step.input?.commands) ? ctx.step.input?.commands : undefined);
@@ -86,6 +98,7 @@ export class CheckExecutor implements Executor {
         path: logPath,
         uri: `honeyrail://runs/${ctx.runId}/steps/${ctx.step.id}/checks/${index + 1}`,
         mediaType: "text/plain",
+        artifactType: "test_command",
         metadata: {
           command: run.command,
           status: run.status,

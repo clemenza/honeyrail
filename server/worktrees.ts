@@ -63,12 +63,29 @@ export class WorktreeManager {
     async diff(worktreeInput: string | WorktreeRef) {
         const worktreePath = typeof worktreeInput === "string" ? worktreeInput : worktreeInput.path;
         const baseRevision = typeof worktreeInput === "string" ? "" : String(worktreeInput.baseRevision || "").trim();
-        const diffArgs = baseRevision ? ["diff", `${baseRevision}..HEAD`] : ["diff"];
-        const diffStatArgs = baseRevision ? ["diff", "--stat", `${baseRevision}..HEAD`] : ["diff", "--stat"];
+        // A single-ref `git diff <baseRevision>` (no "..HEAD") compares that
+        // revision against the working tree, so it includes uncommitted
+        // changes - unlike `<baseRevision>..HEAD`, which only sees commits
+        // and stays empty for the entire life of a task, since agents don't
+        // commit on their own (they leave that to an explicit commit/merge
+        // step). Using "..HEAD" here made this always report no diff for a
+        // normal, still-uncommitted run.
+        const diffArgs = baseRevision ? ["diff", baseRevision] : ["diff"];
+        const diffStatArgs = baseRevision ? ["diff", "--stat", baseRevision] : ["diff", "--stat"];
+        // Even the single-ref form above shows nothing for a brand-new,
+        // never-`git add`ed file - `git diff` never includes untracked
+        // paths. `git add -N` (intent-to-add) marks them tracked-but-empty
+        // without staging content, which is enough for them to show up as
+        // full additions in the diff; `git reset` afterward restores the
+        // index to how it was, so calling diff() has no lasting side effect
+        // on the worktree (a later `git add -A` + commit is unaffected
+        // either way, since it always restages everything itself).
+        await this.run("git", ["add", "-N", "-A"], { cwd: worktreePath });
         const diff = await this.checkedRun("git", diffArgs, { cwd: worktreePath });
         const diffStat = await this.checkedRun("git", diffStatArgs, { cwd: worktreePath });
         const status = await this.checkedRun("git", ["status", "--short"], { cwd: worktreePath });
         const commits = await this.run("git", ["log", "--oneline", "--decorate", "--max-count=20"], { cwd: worktreePath });
+        await this.run("git", ["reset"], { cwd: worktreePath });
         return {
             diff: diff.stdout,
             diffStat: diffStat.stdout,

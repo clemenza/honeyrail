@@ -1,4 +1,4 @@
-import type { OnBlockedPolicy, QualityGate, Step } from "../types.js";
+import type { ContractLevel, OnBlockedPolicy, QualityGate, Step } from "../types.js";
 
 export type StepDefinition = {
   id: string;
@@ -9,10 +9,13 @@ export type StepDefinition = {
   maxAttempts?: number;
   qualityGate?: QualityGate;
   onBlocked?: OnBlockedPolicy;
+  produces?: string[];
+  consumes?: string[];
 };
 
 export type ExecutorLookup = {
   has(type: string): boolean;
+  get(type: string): { producesTypes?: string[]; impliedQualityGate?: QualityGate };
 };
 
 export function validateStepGraph(steps: StepDefinition[], executors: ExecutorLookup) {
@@ -52,6 +55,90 @@ export function validateStepGraph(steps: StepDefinition[], executors: ExecutorLo
   }
 
   for (const step of steps) visit(step.id);
+}
+
+/**
+ * StepContract dataflow lint: upgrades the DAG from a bare dependency graph
+ * to an artifact dataflow graph. For every step, each declared `consumes`
+ * entry must be satisfiable by some step reachable via dependsOn ancestry -
+ * either that upstream step's own declared `produces`, or an artifact type
+ * its executor unconditionally auto-harvests (Executor.producesTypes).
+ * Assumes validateStepGraph has already run (ids unique, dependsOn resolved,
+ * no cycles) so ancestry traversal here can't infinite-loop.
+ */
+export function validateStepContracts(steps: StepDefinition[], executors: ExecutorLookup) {
+  const byId = new Map(steps.map((step) => [step.id, step]));
+
+  function ancestorIds(id: string, seen = new Set<string>()): Set<string> {
+    for (const dep of byId.get(id)?.dependsOn || []) {
+      if (!seen.has(dep)) {
+        seen.add(dep);
+        ancestorIds(dep, seen);
+      }
+    }
+    return seen;
+  }
+
+  function effectiveProduces(step: StepDefinition): string[] {
+    const inherent = executors.has(step.executor) ? executors.get(step.executor).producesTypes || [] : [];
+    return [...inherent, ...(step.produces || [])];
+  }
+
+  for (const step of steps) {
+    if (!step.consumes?.length) continue;
+    const available = new Set<string>();
+    for (const ancestorId of ancestorIds(step.id)) {
+      for (const type of effectiveProduces(byId.get(ancestorId)!)) available.add(type);
+    }
+    for (const type of step.consumes) {
+      if (!available.has(type)) {
+        throw new Error(`Step ${step.id} consumes "${type}", which no upstream step (via dependsOn) produces`);
+      }
+    }
+  }
+}
+
+function isVerifyingStep(step: StepDefinition): boolean {
+  return step.executor === "check" || Boolean(step.consumes?.length);
+}
+
+function hasEffectiveEvaluator(step: StepDefinition, executors: ExecutorLookup): boolean {
+  if (step.qualityGate?.evaluators?.length) return true;
+  if (!executors.has(step.executor)) return false;
+  return Boolean(executors.get(step.executor).impliedQualityGate?.evaluators?.length);
+}
+
+/**
+ * StepContract strictness profile lint (see ContractLevel in types.ts).
+ * Cumulative: each level runs all lower levels' checks plus its own.
+ *
+ * - L0: no contract enforcement at all - a plain execution DAG is left alone.
+ * - L1: validateStepContracts above (#51's dataflow lint).
+ * - L2: L1 + every "verifying" step (executor "check", or one that declares
+ *   `consumes` - it exists to look at an upstream step's output) must have
+ *   an evaluator, either declared on the step or implied by its executor
+ *   (e.g. CheckExecutor.impliedQualityGate).
+ * - L3: L2 + at least one dedicated "approval" step must be present
+ *   somewhere in the run.
+ */
+export function validateContractLevel(level: ContractLevel, steps: StepDefinition[], executors: ExecutorLookup) {
+  if (level === "L0") return;
+  validateStepContracts(steps, executors);
+  if (level === "L1") return;
+
+  for (const step of steps) {
+    if (!isVerifyingStep(step)) continue;
+    if (!hasEffectiveEvaluator(step, executors)) {
+      throw new Error(
+        `Contract level L2 requires an evaluator on verifying step "${step.id}" (executor "${step.executor}"): declare a qualityGate.evaluators entry, or use an executor with an implicit default`
+      );
+    }
+  }
+  if (level === "L2") return;
+
+  if (!steps.some((step) => step.executor === "approval")) {
+    throw new Error('Contract level L3 requires at least one "approval" step in the run, but none is declared');
+  }
 }
 
 export function readySteps(steps: Step[]): Step[] {
