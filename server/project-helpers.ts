@@ -125,6 +125,14 @@ export async function ensureNewProjectRepo(repoPath: string, defaultBranch: stri
   if (!init.ok) throw httpError(500, init.stderr || init.stdout || "git init failed");
   const branch = await run("git", ["checkout", "-B", defaultBranch], { cwd: repoPath });
   if (!branch.ok) throw httpError(500, branch.stderr || branch.stdout || "git branch initialization failed");
+  // A freshly `git init`'d branch is "unborn" - it has no commit, so
+  // `git rev-parse <branch>` (used by WorktreeManager.create() for every
+  // task's worktree) fails with "ambiguous argument ... unknown revision".
+  // Every task on a newly-created project hit this on its very first run.
+  // An empty commit gives the branch a real ref to resolve without writing
+  // any files into what's meant to be a blank scaffold.
+  const commit = await run("git", ["commit", "--allow-empty", "-m", "Initial commit"], { cwd: repoPath });
+  if (!commit.ok) throw httpError(500, commit.stderr || commit.stdout || "git initial commit failed");
 }
 
 export async function cloneRepo(repoUrl: string, targetPath: string, run: typeof import("./utils.js").runCommandSafe) {

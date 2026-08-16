@@ -8,7 +8,9 @@ import { test, type TestContext } from "node:test";
 
 import { createApp } from "../server/api.js";
 import { EventBus } from "../server/events.js";
+import { ensureNewProjectRepo } from "../server/project-helpers.js";
 import { JsonStore } from "../server/store.js";
+import { runCommandSafe } from "../server/utils.js";
 
 async function withServer(t: TestContext, { run }: { run?: any } = {}) {
   const tempDir = await mkdtemp(join(tmpdir(), "agw-projects-"));
@@ -103,6 +105,25 @@ test("POST /api/projects creates a new git project at a specified path", async (
   assert.equal(response.status, 201);
   assert.equal(body.project.repoPath, repoPath);
   assert.ok(commands.some((call) => call.cmd === "git" && call.args[0] === "init" && call.cwd === repoPath));
+});
+
+test("ensureNewProjectRepo leaves a branch that git rev-parse can resolve, not an unborn branch", async (t) => {
+  // Regression test: `git init` + `git checkout -B <branch>` alone leaves an
+  // "unborn" branch (no commit yet). WorktreeManager.create() immediately
+  // does `git rev-parse <defaultBranch>` for every task's worktree, which
+  // failed with "fatal: ambiguous argument 'main': unknown revision" on the
+  // very first run of every newly-created project.
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-new-project-repo-"));
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+  const repoPath = join(tempDir, "repo");
+  const gitEnv = { GIT_AUTHOR_NAME: "test", GIT_AUTHOR_EMAIL: "test@example.com", GIT_COMMITTER_NAME: "test", GIT_COMMITTER_EMAIL: "test@example.com" };
+  const run: typeof runCommandSafe = (cmd, args, options = {}) => runCommandSafe(cmd, args, { ...options, env: { ...process.env, ...gitEnv } });
+
+  await ensureNewProjectRepo(repoPath, "main", run);
+
+  const revParse = await runCommandSafe("git", ["rev-parse", "main"], { cwd: repoPath });
+  assert.ok(revParse.ok, `git rev-parse main should resolve: ${revParse.stderr}`);
+  assert.match(revParse.stdout.trim(), /^[0-9a-f]{40}$/);
 });
 
 test("DELETE /api/projects/:id unregisters a project without deleting its directory", async (t) => {
