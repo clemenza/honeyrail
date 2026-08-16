@@ -759,11 +759,11 @@ test("AgentTaskExecutor.start() defaults to unattended and prepends the UNATTEND
   });
 
   assert.equal(startedCommands.length, 2);
-  assert.match(startedCommands[0], /--full-auto/);
+  assert.match(startedCommands[0], /--ask-for-approval never --sandbox workspace-write/);
   assert.ok(startedCommands[0].includes("You are running unattended"));
   assert.ok(startedCommands[0].includes("implement the feature"));
 
-  assert.doesNotMatch(startedCommands[1], /--full-auto/);
+  assert.doesNotMatch(startedCommands[1], /--ask-for-approval never --sandbox workspace-write/);
   assert.ok(!startedCommands[1].includes("You are running unattended"));
 
   const autoTask = (await store.listTasks()).find((task) => task.title === "auto");

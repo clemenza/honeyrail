@@ -33,7 +33,13 @@ export const codexAdapter: AgentAdapter = {
   buildLaunchCommand(input = {}) {
     const prompt = normalizedPrompt(input.prompt);
     const modelArg = modelFlag("--model", input.model);
-    const autoArg = input.unattended ? " --full-auto" : "";
+    // `--full-auto` was a shorthand for these two flags in older Codex CLI
+    // releases; current versions (0.147+) reject it outright ("unexpected
+    // argument '--full-auto'"). Spell out the equivalent directly so
+    // unattended runs don't depend on a removed flag: never stop to ask for
+    // approval, but stay sandboxed to the workspace rather than reaching
+    // for --dangerously-bypass-approvals-and-sandbox.
+    const autoArg = input.unattended ? " --ask-for-approval never --sandbox workspace-write" : "";
     return prompt ? `codex${modelArg}${autoArg} ${quoteShellArg(prompt)}` : `codex${modelArg}${autoArg}`;
   },
 

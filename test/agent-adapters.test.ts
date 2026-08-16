@@ -63,10 +63,13 @@ test("claude launch command preserves env cleanup and model behavior", () => {
   );
 });
 
-test("codex launch command adds --full-auto only in unattended mode", () => {
+test("codex launch command adds the full-auto equivalent flags only in unattended mode", () => {
+  // Current Codex CLI (0.147+) rejects the old `--full-auto` shorthand
+  // outright ("unexpected argument '--full-auto' found"); this spells out
+  // the equivalent flags directly instead.
   const codex = getAgentAdapter("codex");
-  assert.equal(codex.buildLaunchCommand({ prompt: "fix billing mode", unattended: true }), "codex --full-auto 'fix billing mode'");
-  assert.equal(codex.buildLaunchCommand({ unattended: true }), "codex --full-auto");
+  assert.equal(codex.buildLaunchCommand({ prompt: "fix billing mode", unattended: true }), "codex --ask-for-approval never --sandbox workspace-write 'fix billing mode'");
+  assert.equal(codex.buildLaunchCommand({ unattended: true }), "codex --ask-for-approval never --sandbox workspace-write");
   assert.equal(codex.buildLaunchCommand({ prompt: "fix billing mode", unattended: false }), "codex 'fix billing mode'");
 });
 
