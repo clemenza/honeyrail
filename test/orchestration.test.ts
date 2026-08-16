@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test, type TestContext } from "node:test";
@@ -1147,6 +1147,7 @@ test("CheckExecutor reuses worktree check flow and updates linked task/worktree 
   const worktree = await store.createWorktree({ projectId: project.id, taskId: task.id, path: tempDir, branch: "shell/task", baseBranch: "main", baseRevision: "base", title: "task", agent: "shell" });
   const step = await store.createStep({ id: "check", runId: "run_check", name: "Check", executor: "check", input: { worktreeId: worktree.id }, status: "running" });
   const executor = new CheckExecutor();
+  const attachmentRoot = join(tempDir, "attachments");
   const ctx = {
     store,
     bus: new EventBus(),
@@ -1159,7 +1160,7 @@ test("CheckExecutor reuses worktree check flow and updates linked task/worktree 
     runId: "run_check",
     step,
     sessionLogRoot: "",
-    attachmentRoot: ""
+    attachmentRoot
   };
 
   const handle = await executor.start(ctx);
@@ -1172,6 +1173,12 @@ test("CheckExecutor reuses worktree check flow and updates linked task/worktree 
   assert.equal(artifacts.length, 1);
   assert.equal(artifacts[0].kind, "log");
   assert.equal(artifacts[0].metadata?.command, "npm test");
+  // Regression check: the artifact must point at a real file GET
+  // /api/artifacts/:id/content can stream, not just a metadata preview.
+  assert.ok(artifacts[0].path, "check artifact must have a file path");
+  const logContent = await readFile(artifacts[0].path!, "utf8");
+  assert.match(logContent, /\$ npm test/);
+  assert.match(logContent, /--- stdout ---\nok/);
   assert.equal(evidence.length, 1);
   assert.equal(evidence[0].kind, "check.command");
   assert.equal((evidence[0].value as any).exitCode, 0);
