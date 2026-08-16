@@ -26,8 +26,41 @@ export type StepExecutionContext = {
   attachmentRoot: string;
 };
 
+/**
+ * Thrown by an executor's start() (or preflight()) to mark a failure as
+ * caused by the step's static configuration rather than by something that
+ * happened while it ran - e.g. no check commands resolved, or an agent CLI
+ * that doctor-style detection can't find. OrchestrationService uses this to
+ * tag the resulting Step with failureKind "config_error" instead of the
+ * default "execution_failed".
+ */
+export class ConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ConfigError";
+  }
+}
+
+/**
+ * Minimal, pre-run view of a step passed to Executor.preflight() - unlike
+ * StepExecutionContext, no Run/Step records exist yet at run-creation time,
+ * so this only carries what a static configuration check can use.
+ */
+export type PreflightContext = {
+  project: Project;
+  step: { id: string; input?: Record<string, unknown> };
+  runCommand: typeof runCommandSafe;
+};
+
 export interface Executor {
   type: string;
+  /**
+   * Optional static check run at run-creation time (before any Run/Step
+   * records exist) to reject steps that cannot possibly succeed given their
+   * resolved configuration. Throw (a ConfigError, ideally) to reject the run.
+   * Executors without a meaningful static check simply omit this.
+   */
+  preflight?(ctx: PreflightContext): Promise<void> | void;
   start(ctx: StepExecutionContext): Promise<ExecutionHandle>;
   inspect(ctx: StepExecutionContext, handle: ExecutionHandle): Promise<ExecutionState>;
   cancel?(ctx: StepExecutionContext, handle: ExecutionHandle): Promise<void>;

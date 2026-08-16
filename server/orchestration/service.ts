@@ -2,9 +2,9 @@ import type { EventBus } from "../events.js";
 import { createDefaultEvaluatorRegistry, type EvaluatorRegistry } from "../evaluators/registry.js";
 import { createDefaultExecutorRegistry } from "../executors/index.js";
 import type { ExecutorRegistry } from "../executors/registry.js";
-import type { ExecutionState, StepExecutionContext } from "../executors/types.js";
+import { ConfigError, type ExecutionState, type StepExecutionContext } from "../executors/types.js";
 import type { SessionSummaryClient } from "../session-helpers.js";
-import type { Artifact, Evaluation, Evidence, OnBlockedPolicy, Project, QualityGate, QualityGateDecision, ResolvedOnBlockedPolicy, Run, Step, Store, VerificationSummary } from "../types.js";
+import type { Artifact, Evaluation, Evidence, OnBlockedPolicy, Project, QualityGate, QualityGateDecision, ResolvedOnBlockedPolicy, Run, Step, StepFailureKind, Store, VerificationSummary } from "../types.js";
 import type { TmuxManager } from "../tmux.js";
 import type { runCommandSafe } from "../utils.js";
 import type { WorktreeManager } from "../worktrees.js";
@@ -97,11 +97,24 @@ export class OrchestrationService {
     return { store: this.store, bus: this.bus };
   }
 
-  async createRun(input: CreateRunInput): Promise<{ run: Run; steps: Step[] }> {
+  /**
+   * Validates a run's step graph and preflight-checks each step's resolved
+   * configuration without persisting anything - shared by createRun and by
+   * the recipe preview route, so a recipe's wizard preview can reject a
+   * statically-unrunnable run (e.g. a check step with no commands) before
+   * the operator ever reaches the submit button.
+   */
+  async preflightRun(input: CreateRunInput): Promise<Project> {
     const project = await this.store.getProject(input.projectId);
     if (!project) throw new Error("Project not found");
     validateStepGraph(input.steps, this.executors);
     this.validateQualityGateEvaluators(input.steps);
+    await this.runPreflightChecks(input.steps, project);
+    return project;
+  }
+
+  async createRun(input: CreateRunInput): Promise<{ run: Run; steps: Step[] }> {
+    const project = await this.preflightRun(input);
     const run = await this.store.createRun({
       projectId: project.id,
       goal: input.goal,
@@ -165,6 +178,26 @@ export class OrchestrationService {
         if (!this.evaluators.has(definition.type)) {
           throw new Error(`Unknown evaluator type: ${definition.type}`);
         }
+      }
+    }
+  }
+
+  /**
+   * Rejects a run before any Step/Run records are created if a step is
+   * statically unrunnable given its resolved configuration - e.g. a "check"
+   * step with no commands, or an "agent-task" step whose agent CLI
+   * doctor-style detection can't find. Delegates to each executor's optional
+   * preflight() so the check lives with the executor that knows what
+   * "runnable" means for it; executors without one are skipped.
+   */
+  private async runPreflightChecks(steps: StepDefinition[], project: Project) {
+    for (const step of steps) {
+      const executor = this.executors.get(step.executor);
+      if (!executor.preflight) continue;
+      try {
+        await executor.preflight({ project, step: { id: step.id, input: step.input }, runCommand: this.runCommand });
+      } catch (error) {
+        throw new Error((error as Error).message || `Step ${step.id} failed preflight validation`);
       }
     }
   }
@@ -567,6 +600,7 @@ export class OrchestrationService {
       startedAt: step.startedAt || now,
       attempt: step.attempt + 1,
       error: undefined,
+      failureKind: undefined,
       input: await this.resolveStepInput(run, step)
     });
     if (run.status === "pending") {
@@ -598,7 +632,8 @@ export class OrchestrationService {
       }
       await this.completeStepFromState(run, withRef, state);
     } catch (error) {
-      await this.handleStepFailure(run, started, (error as Error).message || "Step failed");
+      const failureKind: StepFailureKind = error instanceof ConfigError ? "config_error" : "execution_failed";
+      await this.handleStepFailure(run, started, (error as Error).message || "Step failed", undefined, undefined, failureKind);
     }
   }
 
@@ -710,7 +745,7 @@ export class OrchestrationService {
     await this.handleStepFailure(run, step, reason, {
       ...(state.output || {}),
       qualityGate: { status: "failed", reason, evaluations: evaluations.map((item) => item.id), decisionId: failedDecision.id }
-    });
+    }, undefined, "verification_failed");
     return "failed";
   }
 
@@ -733,7 +768,7 @@ export class OrchestrationService {
     return decision;
   }
 
-  private async handleStepFailure(run: Run, step: Step, error: string, output?: Record<string, unknown>, blockedQuestion?: string) {
+  private async handleStepFailure(run: Run, step: Step, error: string, output?: Record<string, unknown>, blockedQuestion?: string, failureKind: StepFailureKind = "execution_failed") {
     const cleanOutput = this.withoutStalledMarker(output);
     if (step.attempt < step.maxAttempts) {
       const retrying = await transitionStep(this.store, step, {
@@ -744,7 +779,8 @@ export class OrchestrationService {
         executionRef: undefined,
         startedAt: undefined,
         finishedAt: undefined,
-        blockedSince: undefined
+        blockedSince: undefined,
+        failureKind: undefined
       });
       await publishStepEvent(this.eventContext(), "step.retrying", run, retrying, { error });
       return;
@@ -754,9 +790,10 @@ export class OrchestrationService {
       finishedAt: new Date().toISOString(),
       output: cleanOutput,
       error,
-      blockedSince: undefined
+      blockedSince: undefined,
+      failureKind
     });
-    await publishStepEvent(this.eventContext(), "step.failed", run, updated, { error });
+    await publishStepEvent(this.eventContext(), "step.failed", run, updated, { error, failureKind });
   }
 
   /**
@@ -819,7 +856,8 @@ export class OrchestrationService {
       status: "failed",
       finishedAt: new Date().toISOString(),
       output: { ...(step.output || {}), approved: false },
-      error: reason
+      error: reason,
+      failureKind: "verification_failed"
     });
     await publishStepEvent(this.eventContext(), "step.failed", run, updated, { rejected: true, error: reason });
     await this.scheduleRun(run.id);

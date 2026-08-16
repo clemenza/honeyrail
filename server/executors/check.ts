@@ -1,6 +1,6 @@
 import { defaultCheckCommands, mergeCheckRuns } from "../project-helpers.js";
 import { publishEvent } from "../events.js";
-import type { ExecutionHandle, ExecutionState, Executor, StepExecutionContext } from "./types.js";
+import { ConfigError, type ExecutionHandle, type ExecutionState, type Executor, type PreflightContext, type StepExecutionContext } from "./types.js";
 
 function durationMs(startedAt: string, finishedAt: string) {
   const started = Date.parse(startedAt);
@@ -12,16 +12,31 @@ function preview(value: string, max = 4000) {
   return value.length > max ? value.slice(value.length - max) : value;
 }
 
+/** Where a check step's effective commands came from: an explicit step-level override, or the project's configured test commands. */
+function commandsSource(input: Record<string, unknown> | undefined): "step" | "project" {
+  return Array.isArray(input?.commands) ? "step" : "project";
+}
+
 export class CheckExecutor implements Executor {
   type = "check";
 
+  preflight(ctx: PreflightContext): void {
+    const commands = defaultCheckCommands(ctx.project, Array.isArray(ctx.step.input?.commands) ? ctx.step.input?.commands : undefined);
+    if (!commands.length) {
+      throw new ConfigError(
+        `check step "${ctx.step.id}" resolves to no check commands: project "${ctx.project.name}" has no configured test commands and the step did not override them via input.commands`
+      );
+    }
+  }
+
   async start(ctx: StepExecutionContext): Promise<ExecutionHandle> {
     const worktreeId = String(ctx.step.input.worktreeId || ctx.step.executionRef?.worktreeId || "").trim();
-    if (!worktreeId) throw new Error("Check step requires input.worktreeId");
+    if (!worktreeId) throw new ConfigError("Check step requires input.worktreeId");
     const worktree = await ctx.store.getWorktree(worktreeId);
-    if (!worktree) throw new Error(`Worktree not found: ${worktreeId}`);
+    if (!worktree) throw new ConfigError(`Worktree not found: ${worktreeId}`);
     const commands = defaultCheckCommands(ctx.project, Array.isArray(ctx.step.input.commands) ? ctx.step.input.commands : undefined);
-    if (!commands.length) throw new Error("No check commands configured");
+    if (!commands.length) throw new ConfigError("No check commands configured");
+    const source = commandsSource(ctx.step.input);
     const result = await ctx.worktrees.runChecks({ worktree, commands });
     const checkedAt = new Date().toISOString();
     const checkRuns = mergeCheckRuns(worktree.checkRuns, result.runs);
@@ -78,7 +93,8 @@ export class CheckExecutor implements Executor {
         },
         metadata: {
           startedAt: run.startedAt,
-          finishedAt: run.finishedAt
+          finishedAt: run.finishedAt,
+          commandsSource: source
         }
       });
       evidenceIds.push(evidence.id);
@@ -88,7 +104,7 @@ export class CheckExecutor implements Executor {
         payload: { runId: ctx.runId, stepId: ctx.step.id, evidenceId: evidence.id, kind: evidence.kind, claim: evidence.claim }
       });
     }
-    return { worktreeId, ok: result.ok, checkRuns: result.runs, artifactIds, evidenceIds };
+    return { worktreeId, ok: result.ok, checkRuns: result.runs, artifactIds, evidenceIds, commandsSource: source };
   }
 
   async inspect(_ctx: StepExecutionContext, handle: ExecutionHandle): Promise<ExecutionState> {
@@ -100,7 +116,7 @@ export class CheckExecutor implements Executor {
     // onFail: "wait_approval") ever runs. OrchestrationService applies a
     // default check-type gate for "check" steps that don't declare one, so
     // this does not change the observed default behavior.
-    const output = { worktreeId: handle.worktreeId, checkRuns: handle.checkRuns, ok: Boolean(handle.ok) };
+    const output = { worktreeId: handle.worktreeId, checkRuns: handle.checkRuns, ok: Boolean(handle.ok), commandsSource: handle.commandsSource };
     return { status: "succeeded", output };
   }
 }

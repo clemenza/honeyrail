@@ -49,6 +49,15 @@ export type StepStatus =
   | "skipped"
   | "cancelled";
 
+/**
+ * Distinguishes *why* a step is in status "failed": a config error means the
+ * step could never have succeeded as configured (e.g. no check commands, an
+ * agent CLI that isn't installed) as opposed to execution_failed (the step
+ * ran but its process/executor reported failure) or verification_failed (the
+ * step's own work completed but its quality gate rejected the result).
+ */
+export type StepFailureKind = "config_error" | "execution_failed" | "verification_failed";
+
 export type CheckRun = {
   command: string;
   status: "passed" | "failed";
@@ -202,6 +211,7 @@ export type Step = {
   executionRef?: Record<string, unknown>;
   output?: Record<string, unknown>;
   error?: string;
+  failureKind?: StepFailureKind;
 };
 
 export type Session = {

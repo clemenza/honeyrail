@@ -1,5 +1,5 @@
 import { withUnattendedPreamble } from "../agents/common.js";
-import { getAgentAdapter } from "../agents/registry.js";
+import { getAgentAdapter, isKnownAgent } from "../agents/registry.js";
 import { publishSessionCreated, publishTaskFailed, publishTaskStarted } from "../domain-events.js";
 import {
   errorMessage,
@@ -10,7 +10,7 @@ import {
 } from "../session-helpers.js";
 import type { AgentType, Session, Task, Worktree } from "../types.js";
 import { makeId } from "../utils.js";
-import type { ExecutionHandle, ExecutionState, Executor, StepExecutionContext } from "./types.js";
+import { ConfigError, type ExecutionHandle, type ExecutionState, type Executor, type PreflightContext, type StepExecutionContext } from "./types.js";
 
 function stringInput(value: unknown, fallback = "") {
   const text = String(value ?? "").trim();
@@ -49,6 +49,21 @@ async function taskStateToExecution(ctx: StepExecutionContext, task: Task | unde
 
 export class AgentTaskExecutor implements Executor {
   type = "agent-task";
+
+  async preflight(ctx: PreflightContext): Promise<void> {
+    const agent = stringInput(ctx.step.input?.agent, ctx.project.defaultAgent || "codex");
+    if (!isKnownAgent(agent)) {
+      throw new ConfigError(`agent-task step "${ctx.step.id}" references unknown agent backend "${agent}"`);
+    }
+    const adapter = getAgentAdapter(agent);
+    if (!adapter.detectInstallation) return;
+    const status = await adapter.detectInstallation(ctx.runCommand);
+    if (!status.available) {
+      throw new ConfigError(
+        `agent-task step "${ctx.step.id}" references agent "${agent}", which doctor-style detection could not find on this host${status.detail ? ` (${status.detail})` : ""}`
+      );
+    }
+  }
 
   async start(ctx: StepExecutionContext): Promise<ExecutionHandle> {
     const agent = stringInput(ctx.step.input.agent, ctx.project.defaultAgent || "codex") as AgentType;
