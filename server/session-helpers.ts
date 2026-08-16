@@ -1,10 +1,16 @@
 import { readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
+import xtermHeadless from "@xterm/headless";
 import { getAgentAdapter } from "./agents/registry.js";
 import { type EventBus, publishEvent } from "./events.js";
 import type { TmuxManager } from "./tmux.js";
 import type { GatewayEvent, Session, Store } from "./types.js";
 import { makeId, slugify } from "./utils.js";
+
+// @xterm/headless ships as CJS with its named exports assigned dynamically,
+// which cjs-module-lexer (Node's ESM/CJS interop) can't statically detect -
+// only the default (the whole `exports` object) resolves reliably here.
+const { Terminal } = xtermHeadless;
 
 type HttpError = Error & { status: number };
 
@@ -83,6 +89,53 @@ export async function readSessionLog(path: unknown) {
     return await readFile(String(path), "utf8");
   } catch {
     return "";
+  }
+}
+
+// Must match the pane size tmux gives a session that no client ever attaches
+// to (tmux's `default-size`, 80x24) so line wrapping in the replayed screen
+// matches what actually appeared on screen.
+const REPLAY_COLS = 80;
+const REPLAY_ROWS = 24;
+// Long-running agent sessions can produce far more than one screenful of
+// output; keep enough scrollback that nothing written before the process
+// ended falls off the reconstructed buffer.
+const REPLAY_SCROLLBACK = 100_000;
+
+/**
+ * Reconstructs the final resolved terminal screen from a raw `pipe-pane -o`
+ * byte log, the same way `tmux capture-pane -p` does for a live pane: by
+ * feeding the bytes through a real terminal emulator that tracks cursor
+ * position and resolves `\r`/escape-sequence overwrites, rather than
+ * heuristically stripping lines that look like redraw noise. A regex-based
+ * stripper can't recover a screen cell once two frames have genuinely
+ * overwritten each other in the raw stream.
+ */
+export async function replayTerminalLog(raw: string): Promise<string> {
+  const text = String(raw || "");
+  if (!text) return "";
+  const term = new Terminal({
+    cols: REPLAY_COLS,
+    rows: REPLAY_ROWS,
+    scrollback: REPLAY_SCROLLBACK,
+    allowProposedApi: true,
+    // The pty normally turns outgoing "\n" into "\r\n" (ONLCR), and that's
+    // what a real pipe-pane log almost always contains - but treat a bare
+    // "\n" as a full newline too, so output stays readable even if some
+    // byte in the stream skipped that translation.
+    convertEol: true
+  });
+  try {
+    await new Promise<void>((resolve) => term.write(text, () => resolve()));
+    const buffer = term.buffer.active;
+    const lines: string[] = [];
+    for (let i = 0; i < buffer.length; i++) {
+      lines.push(buffer.getLine(i)?.translateToString(true) ?? "");
+    }
+    while (lines.length && lines[lines.length - 1] === "") lines.pop();
+    return lines.join("\n");
+  } finally {
+    term.dispose();
   }
 }
 

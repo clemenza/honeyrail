@@ -8,7 +8,7 @@ import {
   markSessionFailed,
   publishInitialAgentPrompt,
   readSessionLog,
-  stripAnsi,
+  replayTerminalLog,
   restartSessionWithModel,
   sessionLogPath,
   tmuxName
@@ -81,7 +81,7 @@ export function sessionRoutes(ctx: RouteContext) {
       await store.updateSession(session.id, { lastOutputAt: new Date().toISOString() });
     } catch (error) {
       const reason = errorMessage(error);
-      const logOutput = stripAnsi(await readSessionLog(session.logPath));
+      const logOutput = await replayTerminalLog(await readSessionLog(session.logPath));
       output = logOutput || `capture unavailable: ${reason}`;
       const isTerminal = ["failed", "killed", "completed", "merged", "cancelled"].includes(String(session.status));
       if (!isTerminal) {
