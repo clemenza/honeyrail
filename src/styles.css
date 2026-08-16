@@ -623,6 +623,41 @@ button:active:not(:disabled) {
   margin-top: 2px;
 }
 
+/* ─── Eval metrics ─── */
+.eval-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: var(--space-md);
+  margin-top: var(--space-lg);
+}
+
+.eval-metric-card {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-lg);
+  background: var(--color-bg-elevated);
+}
+
+.eval-metric-card span {
+  color: var(--color-text-muted);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.eval-metric-card strong {
+  color: var(--color-text);
+  font-size: 28px;
+  line-height: 1.1;
+}
+
+.eval-metric-card small {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
 .dashboard-tools,
 .dashboard-empty-action {
   display: grid;

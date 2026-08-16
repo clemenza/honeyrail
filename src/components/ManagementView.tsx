@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { api } from "../api.js";
 import type { DiffData, EventData, GatewayState, ProjectData, RunData, SessionData, TaskData, WorktreeData, WorktreeItem } from "../types.js";
+import { EvalsPanel } from "./EvalsPanel.js";
 import { StatusPill } from "./layout.js";
 import { ProjectForm, ProjectList } from "./ProjectPanel.js";
 import { RecipeWizard } from "./RecipeWizard.js";
@@ -459,6 +460,19 @@ export function MainContent({ activeView, state, loaded, selectedProject, setSel
       <div className="content-grid">
         <div className="primary-column">
           <RunsPanel runs={state.runs} projects={state.projects} refresh={refresh} />
+        </div>
+        <div className="secondary-column">
+          <EventFeed events={state.events} className="event-feed-hide-mobile" />
+        </div>
+      </div>
+    );
+  }
+
+  if (activeView === "evals") {
+    return (
+      <div className="content-grid">
+        <div className="primary-column">
+          <EvalsPanel projects={state.projects} />
         </div>
         <div className="secondary-column">
           <EventFeed events={state.events} className="event-feed-hide-mobile" />
