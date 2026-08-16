@@ -124,6 +124,18 @@ export type QualityGate = {
   onFail?: "fail" | "wait_approval";
 };
 
+export type OnBlockedAction = "wait_approval" | "auto_answer" | "fail";
+export type OnBlockedTimeoutAction = "auto_answer" | "fail";
+
+export type OnBlockedPolicy = {
+  action?: OnBlockedAction;
+  timeoutMs?: number;
+  onTimeout?: OnBlockedTimeoutAction;
+  maxAutoAnswers?: number;
+};
+
+export type ResolvedOnBlockedPolicy = Required<OnBlockedPolicy>;
+
 export type QualityGateDecisionStatus = "passed" | "failed" | "overridden";
 
 export type QualityGateDecision = {
@@ -182,6 +194,8 @@ export type Step = {
   attempt: number;
   maxAttempts: number;
   qualityGate?: QualityGate;
+  onBlocked?: OnBlockedPolicy;
+  blockedSince?: string;
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;

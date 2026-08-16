@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { claudeSubscriptionEnvOverrides } from "../server/agents/claude.js";
+import { findBlockedReason, UNATTENDED_PREAMBLE, withUnattendedPreamble } from "../server/agents/common.js";
 import { getAgentAdapter, knownAgentIds, listAgentAdapters } from "../server/agents/registry.js";
 import { hermesArchPrefix } from "../server/agents/hermes.js";
 import type { ImageAttachment } from "../server/attachments.js";
@@ -62,6 +63,25 @@ test("claude launch command preserves env cleanup and model behavior", () => {
   );
 });
 
+test("codex launch command adds --full-auto only in unattended mode", () => {
+  const codex = getAgentAdapter("codex");
+  assert.equal(codex.buildLaunchCommand({ prompt: "fix billing mode", unattended: true }), "codex --full-auto 'fix billing mode'");
+  assert.equal(codex.buildLaunchCommand({ unattended: true }), "codex --full-auto");
+  assert.equal(codex.buildLaunchCommand({ prompt: "fix billing mode", unattended: false }), "codex 'fix billing mode'");
+});
+
+test("claude launch command uses project-only settings in unattended mode", () => {
+  const claude = getAgentAdapter("claude");
+  assert.equal(
+    claude.buildLaunchCommand({ prompt: "fix billing mode", unattended: true }),
+    `${claudeCleanEnvPrefix} claude --dangerously-skip-permissions --setting-sources project 'fix billing mode'`
+  );
+  assert.equal(
+    claude.buildLaunchCommand({ prompt: "fix billing mode", unattended: false }),
+    `${claudeCleanEnvPrefix} claude --dangerously-skip-permissions --setting-sources user 'fix billing mode'`
+  );
+});
+
 test("hermes launch command preserves oneshot and interactive behavior", () => {
   const arch = process.platform === "darwin" ? "arch -arm64 " : "";
   const hermes = getAgentAdapter("hermes");
@@ -96,4 +116,26 @@ test("adapter input formatting preserves generic and claude attachment behavior"
     claude.formatInput({ text: "inspect", attachments: paths }),
     "inspect /tmp/one image.png /tmp/two'quote.md"
   );
+});
+
+test("withUnattendedPreamble prepends the unattended instructions to a prompt", () => {
+  const result = withUnattendedPreamble("fix the billing bug");
+  assert.ok(result.startsWith(UNATTENDED_PREAMBLE));
+  assert.ok(result.endsWith("fix the billing bug"));
+  assert.match(UNATTENDED_PREAMBLE, /BLOCKED:/);
+  assert.equal(withUnattendedPreamble(""), UNATTENDED_PREAMBLE);
+});
+
+test("findBlockedReason detects a structured BLOCKED: stop in the recent tail", () => {
+  assert.deepEqual(findBlockedReason("some output\nBLOCKED: missing API credentials\nmore output"), { message: "missing API credentials" });
+  assert.equal(findBlockedReason("no blocked marker here"), null);
+  assert.equal(findBlockedReason("BLOCKED:   "), null);
+});
+
+test("findBlockedReason only inspects the recent tail, not stale scrollback", () => {
+  const output = [
+    "BLOCKED: an old reason from a previous, already-resolved attempt",
+    ...Array.from({ length: 45 }, (_, index) => `line ${index}`)
+  ].join("\n");
+  assert.equal(findBlockedReason(output), null);
 });

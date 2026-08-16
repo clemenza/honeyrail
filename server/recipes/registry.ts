@@ -41,13 +41,25 @@ const qualityGateSchema = z.object({
   onFail: z.string().optional()
 });
 
+// Like qualityGate.onFail above, each field is a plain string/number-or-string
+// so a recipe author can template it (e.g. "{{ onBlockedAction }}"); the
+// strict enums are enforced once materializeRecipe's output is re-validated
+// by createRunBody in the routes layer.
+const onBlockedSchema = z.object({
+  action: z.string().optional(),
+  timeoutMs: z.union([z.number(), z.string()]).optional(),
+  onTimeout: z.string().optional(),
+  maxAutoAnswers: z.union([z.number(), z.string()]).optional()
+});
+
 const recipeParameterSchema = z.object({
   key: z.string().min(1),
   label: z.string().min(1),
   type: z.enum(["string", "number", "boolean", "enum"]),
   default: z.unknown().optional(),
   required: z.boolean().optional(),
-  options: z.array(z.string()).optional()
+  options: z.array(z.string()).optional(),
+  multiplier: z.number().positive().optional()
 });
 
 const recipeStepTemplateSchema = z.object({
@@ -57,7 +69,8 @@ const recipeStepTemplateSchema = z.object({
   input: z.record(z.string(), z.unknown()).optional(),
   dependsOn: z.array(z.string()).optional(),
   maxAttempts: z.number().int().positive().optional(),
-  qualityGate: qualityGateSchema.optional()
+  qualityGate: qualityGateSchema.optional(),
+  onBlocked: onBlockedSchema.optional()
 });
 
 const recipeSchema = z.object({
@@ -126,6 +139,13 @@ function coerceParameterValue(param: RecipeParameter, raw: unknown, issues: { pa
       return raw;
     }
     case "number": {
+      // Number("") === 0 and Number(null) === 0 are both finite, and
+      // Number(true/false) === 1/0, so each would otherwise pass silently
+      // as a valid number instead of the missing/wrong-type value it is.
+      if (raw === "" || raw === null || typeof raw === "boolean") {
+        issues.push({ path, message: "Must be a finite number" });
+        return undefined;
+      }
       const num = Number(raw);
       if (!Number.isFinite(num)) {
         issues.push({ path, message: "Must be a finite number" });
@@ -198,7 +218,12 @@ export function materializeRecipe(
       continue;
     }
     const value = coerceParameterValue(param, raw, issues);
-    if (value !== undefined) resolved.set(param.key, { type: param.type, value });
+    if (value === undefined) continue;
+    // A numeric parameter can declare a multiplier so it can be entered in a
+    // user-friendly unit (e.g. "Timeout (minutes)") while the template
+    // resolves it into the unit a step field actually expects (ms).
+    const finalValue = param.type === "number" && param.multiplier ? (value as number) * param.multiplier : value;
+    resolved.set(param.key, { type: param.type, value: finalValue });
   }
 
   if (issues.length) throw new RecipeValidationError(issues);
@@ -208,6 +233,9 @@ export function materializeRecipe(
     if (step.input) step.input = templateSubstitute(step.input, resolved, declaredKeys) as Record<string, unknown>;
     if (step.qualityGate) {
       step.qualityGate = templateSubstitute(step.qualityGate, resolved, declaredKeys) as NonNullable<RecipeStepTemplate["qualityGate"]>;
+    }
+    if (step.onBlocked) {
+      step.onBlocked = templateSubstitute(step.onBlocked, resolved, declaredKeys) as NonNullable<RecipeStepTemplate["onBlocked"]>;
     }
   }
 

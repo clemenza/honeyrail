@@ -98,6 +98,13 @@ const qualityGateBody = z.object({
   onFail: z.enum(["fail", "wait_approval"]).optional()
 });
 
+const onBlockedBody = z.object({
+  action: z.enum(["wait_approval", "auto_answer", "fail"]).optional(),
+  timeoutMs: z.number().int().positive().optional(),
+  onTimeout: z.enum(["auto_answer", "fail"]).optional(),
+  maxAutoAnswers: z.number().int().positive().optional()
+});
+
 export const createRunBody = z.object({
   projectId: z.string(),
   goal: z.string().min(1),
@@ -108,12 +115,17 @@ export const createRunBody = z.object({
     input: stepInput.optional(),
     dependsOn: z.array(z.string()).optional(),
     maxAttempts: z.number().int().positive().optional(),
-    qualityGate: qualityGateBody.optional()
+    qualityGate: qualityGateBody.optional(),
+    onBlocked: onBlockedBody.optional()
   })).min(1)
 });
 
 export const rejectStepBody = z.object({
   reason: z.string().optional()
+});
+
+export const answerStepBody = z.object({
+  text: z.string().min(1)
 });
 
 export const recipeRunBody = z.object({

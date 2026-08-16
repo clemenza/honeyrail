@@ -169,6 +169,12 @@ M2 adds first-class verification data above execution status. A step can now emi
 
 For concrete REST payloads, see [docs/orchestration-dag-example.md](docs/orchestration-dag-example.md).
 
+## Human-in-the-loop & timeouts
+
+An `agent-task` step can never hold a run open forever waiting on a clarifying question. Run-launched agents default to an unattended mode that tells them not to ask and to state assumptions instead; if one asks (or stalls) anyway, an `onBlocked` policy per step controls whether it waits for an operator, gets auto-answered by an LLM, or fails outright, with a timeout in every case. A blocked step can be answered directly from the Runs UI or via `POST /api/runs/:runId/steps/:stepId/answer`, without opening its tmux session.
+
+See [docs/human-in-the-loop.md](docs/human-in-the-loop.md) for the `interaction`/`onBlocked` fields, the answer endpoint, and the `BLOCKED:` escape hatch an unattended agent uses when it's genuinely stuck.
+
 ## Interfaces
 
 - Web UI: project registry, task creation, session console, worktree inventory, diffs, checks, commits, and merges.

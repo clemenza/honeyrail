@@ -2,7 +2,7 @@ import { Router } from "express";
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import { resolve, sep } from "node:path";
-import { validate, createRunBody, rejectStepBody } from "../validation.js";
+import { validate, answerStepBody, createRunBody, rejectStepBody } from "../validation.js";
 import { asyncRoute, httpError } from "../route-context.js";
 import type { OrchestrationService } from "./service.js";
 
@@ -99,6 +99,10 @@ export function runRoutes(orchestration: OrchestrationService, attachmentRoot: s
 
   router.post("/api/runs/:runId/steps/:stepId/reject", validate(rejectStepBody), asyncRoute(async (req, res) => {
     res.json(await orchestration.rejectStep(String(req.params.runId), String(req.params.stepId), req.body.reason));
+  }));
+
+  router.post("/api/runs/:runId/steps/:stepId/answer", validate(answerStepBody), asyncRoute(async (req, res) => {
+    res.json(await orchestration.answerStep(String(req.params.runId), String(req.params.stepId), req.body.text));
   }));
 
   return router;

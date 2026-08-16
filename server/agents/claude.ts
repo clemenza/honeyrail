@@ -69,9 +69,14 @@ export const claudeAdapter: AgentAdapter = {
     const prompt = normalizedPrompt(input.prompt);
     const model = normalizedModel(input.model);
     const modelArg = model ? ` --model ${quoteShellArg(model)}` : "";
+    // In unattended (run-launched) mode, don't load user-level settings —
+    // a user-level skill (e.g. superpowers:brainstorming) can show an
+    // AskUserQuestion menu that nothing is watching to answer. Project
+    // settings still load so repo-scoped config/skills keep working.
+    const settingSources = input.unattended ? "project" : "user";
     return prompt
-      ? `${claudeCommandPrefix} --dangerously-skip-permissions --setting-sources user${modelArg} ${quoteShellArg(prompt)}`
-      : `${claudeCommandPrefix} --dangerously-skip-permissions --setting-sources user${modelArg}`;
+      ? `${claudeCommandPrefix} --dangerously-skip-permissions --setting-sources ${settingSources}${modelArg} ${quoteShellArg(prompt)}`
+      : `${claudeCommandPrefix} --dangerously-skip-permissions --setting-sources ${settingSources}${modelArg}`;
   },
 
   formatInput: formatClaudeInput,

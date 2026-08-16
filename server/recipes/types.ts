@@ -1,4 +1,4 @@
-import type { QualityGate } from "../types.js";
+import type { OnBlockedPolicy, QualityGate } from "../types.js";
 
 export type RecipeParameterType = "string" | "number" | "boolean" | "enum";
 
@@ -9,6 +9,8 @@ export type RecipeParameter = {
   default?: unknown;
   required?: boolean;
   options?: string[];
+  /** For type "number": multiplies the resolved value before templating, so a user-friendly unit (e.g. minutes) can resolve into what a step field actually expects (e.g. ms). */
+  multiplier?: number;
 };
 
 export type RecipeStepTemplate = {
@@ -19,6 +21,7 @@ export type RecipeStepTemplate = {
   dependsOn?: string[];
   maxAttempts?: number;
   qualityGate?: QualityGate;
+  onBlocked?: OnBlockedPolicy;
 };
 
 export type Recipe = {

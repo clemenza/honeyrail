@@ -1,9 +1,11 @@
+import { withUnattendedPreamble } from "../agents/common.js";
 import { getAgentAdapter } from "../agents/registry.js";
 import { publishSessionCreated, publishTaskFailed, publishTaskStarted } from "../domain-events.js";
 import {
   errorMessage,
   publishInitialAgentPrompt,
   sessionLogPath,
+  stripAnsi,
   tmuxName
 } from "../session-helpers.js";
 import type { AgentType, Session, Task, Worktree } from "../types.js";
@@ -15,7 +17,18 @@ function stringInput(value: unknown, fallback = "") {
   return text || fallback;
 }
 
-function taskStateToExecution(task: Task | undefined): ExecutionState {
+const QUESTION_TAIL_LINES = 20;
+
+async function captureQuestion(ctx: StepExecutionContext, session: Session): Promise<string> {
+  try {
+    const output = await ctx.tmux.capture(session.tmuxSessionName, 40);
+    return stripAnsi(output).trim().split("\n").slice(-QUESTION_TAIL_LINES).join("\n");
+  } catch {
+    return "";
+  }
+}
+
+async function taskStateToExecution(ctx: StepExecutionContext, task: Task | undefined): Promise<ExecutionState> {
   if (!task) return { status: "failed", error: "Linked task disappeared" };
   if (task.status === "failed" || task.status === "cancelled") {
     return { status: task.status === "cancelled" ? "cancelled" : "failed", error: task.error };
@@ -23,7 +36,15 @@ function taskStateToExecution(task: Task | undefined): ExecutionState {
   if (task.status === "done" || task.status === "merged" || task.status === "ready_to_merge") {
     return { status: "succeeded", output: { taskStatus: task.status, taskId: task.id, worktreeId: task.worktreeId, sessionId: task.sessionId } };
   }
-  return { status: "running", output: { taskStatus: task.status, taskId: task.id, worktreeId: task.worktreeId, sessionId: task.sessionId } };
+  const baseOutput = { taskStatus: task.status, taskId: task.id, worktreeId: task.worktreeId, sessionId: task.sessionId };
+  if (task.status === "agent_running" && task.sessionId) {
+    const session = await ctx.store.getSession(task.sessionId);
+    if (session?.status === "waiting_input" || session?.status === "waiting_approval") {
+      const question = await captureQuestion(ctx, session);
+      return { status: session.status, output: { ...baseOutput, question } };
+    }
+  }
+  return { status: "running", output: baseOutput };
 }
 
 export class AgentTaskExecutor implements Executor {
@@ -33,8 +54,18 @@ export class AgentTaskExecutor implements Executor {
     const agent = stringInput(ctx.step.input.agent, ctx.project.defaultAgent || "codex") as AgentType;
     const adapter = getAgentAdapter(agent);
     const title = stringInput(ctx.step.input.title, ctx.step.name || "Agent task");
-    const prompt = stringInput(ctx.step.input.prompt, title);
+    // A retry after the agent stopped to ask a clarifying question runs with
+    // an enriched prompt (see enrichRetryInput in orchestration/service.ts)
+    // telling it not to ask again; the original prompt is kept in step.input
+    // untouched so the UI can still show it.
+    const prompt = stringInput(ctx.step.input.effectivePrompt) || stringInput(ctx.step.input.prompt, title);
     const model = stringInput(ctx.step.input.model);
+    // agent-task steps are always run-launched, so "autonomous" (no
+    // clarifying questions) is the default; a step can opt into
+    // "interactive" explicitly if it truly needs a human at the terminal.
+    const interaction = ctx.step.input.interaction === "interactive" ? "interactive" : "autonomous";
+    const unattended = interaction === "autonomous";
+    const launchPrompt = unattended ? withUnattendedPreamble(prompt) : prompt;
     const task = await ctx.store.createTask({
       projectId: ctx.project.id,
       title,
@@ -53,7 +84,7 @@ export class AgentTaskExecutor implements Executor {
       await ctx.tmux.startSession({
         name: tmuxSessionName,
         cwd: worktree.path,
-        command: adapter.buildLaunchCommand({ prompt, model }),
+        command: adapter.buildLaunchCommand({ prompt: launchPrompt, model, unattended }),
         logPath
       });
       session = await ctx.store.createSession({
@@ -104,7 +135,7 @@ export class AgentTaskExecutor implements Executor {
   async inspect(ctx: StepExecutionContext, handle: ExecutionHandle): Promise<ExecutionState> {
     const taskId = String(handle.taskId || "");
     const task = taskId ? await ctx.store.getTask(taskId) : undefined;
-    return taskStateToExecution(task);
+    return taskStateToExecution(ctx, task);
   }
 
   async cancel(ctx: StepExecutionContext, handle: ExecutionHandle): Promise<void> {

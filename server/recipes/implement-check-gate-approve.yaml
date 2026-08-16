@@ -24,6 +24,25 @@ parameters:
     type: enum
     options: [wait_approval, fail]
     default: wait_approval
+  - key: interaction
+    label: Interaction mode
+    type: enum
+    options: [autonomous, interactive]
+    default: autonomous
+  - key: model
+    label: Model
+    type: string
+    default: ""
+  - key: onBlocked
+    label: On agent clarification
+    type: enum
+    options: [wait_approval, auto_answer, fail]
+    default: wait_approval
+  - key: blockedTimeoutMinutes
+    label: Blocked timeout (minutes)
+    type: number
+    default: 30
+    multiplier: 60000
 steps:
   - id: implement
     name: Implement change
@@ -32,6 +51,11 @@ steps:
       agent: "{{ agent }}"
       title: "{{ title }}"
       prompt: "{{ prompt }}"
+      interaction: "{{ interaction }}"
+      model: "{{ model }}"
+    onBlocked:
+      action: "{{ onBlocked }}"
+      timeoutMs: "{{ blockedTimeoutMinutes }}"
   - id: check
     name: Run project checks
     executor: check

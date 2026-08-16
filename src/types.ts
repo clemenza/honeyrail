@@ -48,6 +48,13 @@ export type WorktreeData = {
   error?: string;
 };
 
+export type OnBlockedPolicyData = {
+  action?: "wait_approval" | "auto_answer" | "fail";
+  timeoutMs?: number;
+  onTimeout?: "auto_answer" | "fail";
+  maxAutoAnswers?: number;
+};
+
 export type StepData = {
   id: string;
   runId: string;
@@ -62,6 +69,8 @@ export type StepData = {
     evaluators: Array<Record<string, unknown>>;
     onFail?: string;
   };
+  onBlocked?: OnBlockedPolicyData;
+  blockedSince?: string;
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;

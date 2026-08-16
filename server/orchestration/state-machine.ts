@@ -7,8 +7,11 @@ const STEP_TRANSITIONS: Record<StepStatus, StepStatus[]> = {
   pending: ["ready", "skipped", "cancelled"],
   ready: ["running", "waiting_approval", "failed", "cancelled"],
   running: ["pending", "succeeded", "failed", "waiting_input", "waiting_approval", "cancelled"],
-  waiting_input: ["running", "succeeded", "failed", "cancelled"],
-  waiting_approval: ["succeeded", "failed", "cancelled"],
+  // "pending" is reachable here too: a blocked agent-task step (onBlocked
+  // action "fail", or a wait_approval/auto_answer that timed out) retries
+  // through handleStepFailure while still in a waiting_* status.
+  waiting_input: ["running", "pending", "succeeded", "failed", "cancelled"],
+  waiting_approval: ["running", "pending", "succeeded", "failed", "cancelled"],
   succeeded: [],
   failed: ["pending", "cancelled"],
   skipped: [],

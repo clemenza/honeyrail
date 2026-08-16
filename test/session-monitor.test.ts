@@ -33,6 +33,21 @@ test("inferSessionStatus marks stale sessions without recent output", () => {
   assert.equal(inferSessionStatus("working...", old, 1_000), "stale");
 });
 
+test("inferSessionStatus detects Claude Code's AskUserQuestion menu", () => {
+  const output = [
+    "What kind of todo list app do you want?",
+    "",
+    "❯ 1. Simple CLI todo list",
+    "  2. Web app with React",
+    "  3. Mobile app with React Native",
+    "  4. Desktop app with Electron",
+    "  5. Chat about this",
+    "",
+    "Enter to select · ↑/↓ to navigate · Esc to cancel"
+  ].join("\n");
+  assert.equal(inferSessionStatus(output, new Date().toISOString(), 60_000), "waiting_input");
+});
+
 test("sessionAcceptsInput keeps waiting and stale sessions interactive", () => {
   assert.equal(sessionAcceptsInput("running"), true);
   assert.equal(sessionAcceptsInput("waiting_approval"), true);
@@ -105,6 +120,44 @@ test("reconcileSessions marks related records failed when tmux session disappear
   assert.equal((await store.getWorktree(worktree.id))!.status, "failed");
   assert.equal((await store.listTasks()).find((item) => item.id === task.id)!.status, "failed");
   assert.equal(events.at(-1).payload.status, "failed");
+});
+
+test("reconcileSessions fails a task cleanly on a structured BLOCKED: stop from an unattended agent", async (t) => {
+  const store = await makeStore(t, "agw-monitor-blocked-");
+  const bus = new EventBus();
+  const events: any[] = [];
+  bus.subscribe((event) => events.push(event));
+  const task = await store.createTask({ projectId: "proj_1", title: "unattended task", agent: "codex", status: "agent_running" });
+  const worktree = await store.createWorktree({ projectId: "proj_1", taskId: task.id, path: "/tmp/wt", branch: "codex/unattended", status: "created" });
+  const session = await store.createSession({
+    projectId: "proj_1",
+    taskId: task.id,
+    worktreeId: worktree.id,
+    name: "unattended",
+    agent: "codex",
+    tmuxSessionName: "agw_blocked",
+    cwd: "/tmp/wt",
+    status: "running"
+  });
+  await store.updateTask(task.id, { sessionId: session.id, worktreeId: worktree.id });
+
+  const killed: string[] = [];
+  await reconcileSessions({
+    store,
+    bus,
+    staleMs: 60_000,
+    tmux: {
+      capture: async () => "doing work...\nBLOCKED: the target database is unreachable from this sandbox",
+      killSession: async (name: string) => { killed.push(name); }
+    } as any
+  });
+
+  assert.deepEqual(killed, ["agw_blocked"]);
+  assert.equal((await store.getSession(session.id))!.status, "failed");
+  assert.equal((await store.getSession(session.id))!.error, "the target database is unreachable from this sandbox");
+  assert.equal((await store.listTasks()).find((item) => item.id === task.id)!.status, "failed");
+  assert.equal(events.at(-1).type, "task.failed");
+  assert.equal(events.at(-1).payload.code, "agent_blocked");
 });
 
 test("reconcileSessions fails a Codex task and prompts for an upgrade when the CLI is too old", async (t) => {

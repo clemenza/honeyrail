@@ -93,7 +93,9 @@ export function createApp({
     worktrees,
     runCommand: run,
     sessionLogRoot,
-    attachmentRoot
+    attachmentRoot,
+    autoAnswerClient: sessionSummaryClient,
+    autoAnswerModel: process.env.HONEYRAIL_AUTO_ANSWER_MODEL || summaryModel
   });
 
   app.use(cors({ exposedHeaders: ["mcp-session-id", "www-authenticate", "x-artifact-size", "x-artifact-truncated"] }));
