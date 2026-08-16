@@ -1,3 +1,5 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { defaultCheckCommands, mergeCheckRuns } from "../project-helpers.js";
 import { publishEvent } from "../events.js";
 import { ConfigError, type ExecutionHandle, type ExecutionState, type Executor, type PreflightContext, type StepExecutionContext } from "./types.js";
@@ -55,18 +57,39 @@ export class CheckExecutor implements Executor {
     }
     const artifactIds: string[] = [];
     const evidenceIds: string[] = [];
+    const attemptDir = join(ctx.attachmentRoot, "runs", ctx.runId, ctx.step.id, `attempt-${ctx.step.attempt}`);
+    await mkdir(attemptDir, { recursive: true });
     for (const [index, run] of result.runs.entries()) {
+      const name = `check-${index + 1}.log`;
+      // The full command transcript is written to disk and linked via
+      // artifact.path so GET /api/artifacts/:id/content can actually stream
+      // it; metadata keeps only short previews for quick inline display.
+      const logPath = join(attemptDir, name);
+      const exitCode = run.exitCode ?? (run.status === "passed" ? 0 : 1);
+      const transcript = [
+        `$ ${run.command}`,
+        `exit code: ${exitCode}`,
+        "",
+        "--- stdout ---",
+        run.stdout || "(empty)",
+        "",
+        "--- stderr ---",
+        run.stderr || "(empty)"
+      ].join("\n");
+      await writeFile(logPath, transcript);
       const artifact = await ctx.store.createArtifact({
         runId: ctx.runId,
         stepId: ctx.step.id,
+        attempt: ctx.step.attempt,
         kind: "log",
-        name: `check-${index + 1}.log`,
+        name,
+        path: logPath,
         uri: `honeyrail://runs/${ctx.runId}/steps/${ctx.step.id}/checks/${index + 1}`,
         mediaType: "text/plain",
         metadata: {
           command: run.command,
           status: run.status,
-          exitCode: run.exitCode ?? (run.status === "passed" ? 0 : 1),
+          exitCode,
           stdoutPreview: preview(run.stdout || ""),
           stderrPreview: preview(run.stderr || "")
         }
@@ -77,10 +100,10 @@ export class CheckExecutor implements Executor {
         projectId: ctx.project.id,
         payload: { runId: ctx.runId, stepId: ctx.step.id, artifactId: artifact.id, kind: artifact.kind, name: artifact.name }
       });
-      const exitCode = run.exitCode ?? (run.status === "passed" ? 0 : 1);
       const evidence = await ctx.store.createEvidence({
         runId: ctx.runId,
         stepId: ctx.step.id,
+        attempt: ctx.step.attempt,
         kind: "check.command",
         claim: `Command \`${run.command}\` ${run.status}`,
         source: "check",

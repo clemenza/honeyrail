@@ -1,9 +1,13 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { withUnattendedPreamble } from "../agents/common.js";
 import { getAgentAdapter, isKnownAgent } from "../agents/registry.js";
 import { publishSessionCreated, publishTaskFailed, publishTaskStarted } from "../domain-events.js";
+import { publishEvent } from "../events.js";
 import {
   errorMessage,
   publishInitialAgentPrompt,
+  readSessionLog,
   sessionLogPath,
   stripAnsi,
   tmuxName
@@ -28,12 +32,113 @@ async function captureQuestion(ctx: StepExecutionContext, session: Session): Pro
   }
 }
 
+/**
+ * agent-task steps otherwise finish with zero Artifacts/Evidence - there's
+ * nothing for a reviewer to look at beyond "it succeeded". Capture the two
+ * things that actually explain what the agent did: the code diff (the
+ * primary thing anyone reviewing a run cares about) and the cleaned session
+ * transcript (the reasoning/commands behind it). Runs once, right when a
+ * task is first observed done - inspectActiveSteps() stops polling a step
+ * once it returns "succeeded", so this can't double-fire for the same
+ * attempt. Best-effort: a missing worktree/session or a git failure here
+ * must not turn a genuinely successful task into a failed step.
+ */
+async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task): Promise<void> {
+  const attemptDir = join(ctx.attachmentRoot, "runs", ctx.runId, ctx.step.id, `attempt-${ctx.step.attempt}`);
+
+  async function saveArtifact(input: {
+    name: string;
+    content: string;
+    mediaType: string;
+    metadata?: Record<string, unknown>;
+    evidence: { kind: string; claim: string; value?: Record<string, unknown> };
+  }): Promise<void> {
+    if (!input.content.trim()) return;
+    await mkdir(attemptDir, { recursive: true });
+    const path = join(attemptDir, input.name);
+    await writeFile(path, input.content);
+    const artifact = await ctx.store.createArtifact({
+      runId: ctx.runId,
+      stepId: ctx.step.id,
+      attempt: ctx.step.attempt,
+      kind: "text",
+      name: input.name,
+      path,
+      uri: `honeyrail://runs/${ctx.runId}/steps/${ctx.step.id}/attempts/${ctx.step.attempt}/${input.name}`,
+      mediaType: input.mediaType,
+      metadata: input.metadata
+    });
+    await publishEvent(ctx.store, ctx.bus, {
+      type: "artifact.created",
+      projectId: ctx.project.id,
+      payload: { runId: ctx.runId, stepId: ctx.step.id, artifactId: artifact.id, kind: artifact.kind, name: artifact.name }
+    });
+    const evidence = await ctx.store.createEvidence({
+      runId: ctx.runId,
+      stepId: ctx.step.id,
+      attempt: ctx.step.attempt,
+      kind: input.evidence.kind,
+      claim: input.evidence.claim,
+      source: "agent-task",
+      artifactIds: [artifact.id],
+      value: input.evidence.value
+    });
+    await publishEvent(ctx.store, ctx.bus, {
+      type: "evidence.recorded",
+      projectId: ctx.project.id,
+      payload: { runId: ctx.runId, stepId: ctx.step.id, evidenceId: evidence.id, kind: evidence.kind, claim: evidence.claim }
+    });
+  }
+
+  if (task.worktreeId) {
+    try {
+      const worktree = await ctx.store.getWorktree(task.worktreeId);
+      if (worktree) {
+        const { diff, diffStat, status } = await ctx.worktrees.diff(worktree);
+        const statLine = diffStat.trim().split("\n").filter(Boolean).pop();
+        await saveArtifact({
+          name: "changes.diff",
+          content: diff,
+          mediaType: "text/x-diff",
+          metadata: { diffStat, status },
+          evidence: {
+            kind: "agent.diff",
+            claim: statLine ? `Agent changed: ${statLine}` : "Agent produced a code diff",
+            value: { diffStat, status }
+          }
+        });
+      }
+    } catch {
+      // A diff failure (e.g. worktree already merged/discarded) shouldn't
+      // turn a completed task into a failed step.
+    }
+  }
+
+  if (task.sessionId) {
+    try {
+      const session = await ctx.store.getSession(task.sessionId);
+      if (session) {
+        const transcript = stripAnsi(await readSessionLog(session.logPath));
+        await saveArtifact({
+          name: "session-transcript.log",
+          content: transcript,
+          mediaType: "text/plain",
+          evidence: { kind: "agent.transcript", claim: "Agent session transcript captured" }
+        });
+      }
+    } catch {
+      // Same reasoning as above - transcript capture is supplementary.
+    }
+  }
+}
+
 async function taskStateToExecution(ctx: StepExecutionContext, task: Task | undefined): Promise<ExecutionState> {
   if (!task) return { status: "failed", error: "Linked task disappeared" };
   if (task.status === "failed" || task.status === "cancelled") {
     return { status: task.status === "cancelled" ? "cancelled" : "failed", error: task.error };
   }
   if (task.status === "done" || task.status === "merged" || task.status === "ready_to_merge") {
+    await recordCompletionArtifacts(ctx, task);
     return { status: "succeeded", output: { taskStatus: task.status, taskId: task.id, worktreeId: task.worktreeId, sessionId: task.sessionId } };
   }
   const baseOutput = { taskStatus: task.status, taskId: task.id, worktreeId: task.worktreeId, sessionId: task.sessionId };
