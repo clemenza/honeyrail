@@ -66,7 +66,7 @@ export class OrchestrationService {
   private stalledThresholdMs: number;
   private autoAnswerClient?: SessionSummaryClient;
   private autoAnswerModel: string;
-  private scheduling = new Set<string>();
+  private scheduling = new Map<string, Promise<void>>();
 
   constructor(runtime: OrchestrationRuntime) {
     this.store = runtime.store;
@@ -310,13 +310,18 @@ export class OrchestrationService {
   }
 
   async scheduleRun(runId: string): Promise<void> {
-    if (this.scheduling.has(runId)) return;
-    this.scheduling.add(runId);
-    try {
-      await this.scheduleLoop(runId);
-    } finally {
+    // A caller (e.g. createRun) that finds scheduling already in flight for
+    // this run - typically the background poller having won a race to start
+    // it first - must wait for that pass to finish rather than no-op and
+    // immediately read back a state mid-transition (e.g. a run briefly
+    // "running" before the same pass marks it "waiting_approval").
+    const inFlight = this.scheduling.get(runId);
+    if (inFlight) return inFlight;
+    const promise = this.scheduleLoop(runId).finally(() => {
       this.scheduling.delete(runId);
-    }
+    });
+    this.scheduling.set(runId, promise);
+    return promise;
   }
 
   private async scheduleRunsForTask(taskId: string) {

@@ -15,6 +15,7 @@ import {
   sessionLogPath,
   tmuxName,
   readSessionLog,
+  replayTerminalLog,
   markSessionFailed
 } from "./session-helpers.js";
 import { sessionAcceptsInput } from "./session-monitor.js";
@@ -182,7 +183,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
         await store.updateSession(session.id, { lastOutputAt: new Date().toISOString() });
       } catch (error) {
         const reason = errorMessage(error);
-        const logOutput = await readSessionLog(session.logPath);
+        const logOutput = await replayTerminalLog(await readSessionLog(session.logPath));
         output = logOutput
           ? `${logOutput}\n\ncapture unavailable: ${reason}`
           : `capture unavailable: ${reason}`;

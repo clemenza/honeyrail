@@ -13,7 +13,7 @@ import { SQLiteStore } from "./sqlite-store.js";
 import { TmuxManager } from "./tmux.js";
 import { runCommandSafe } from "./utils.js";
 import { sessionAcceptsInput, startSessionMonitor } from "./session-monitor.js";
-import { readSessionLog, stripAnsi } from "./session-helpers.js";
+import { readSessionLog, replayTerminalLog } from "./session-helpers.js";
 import { WorktreeManager } from "./worktrees.js";
 import { OrchestrationService } from "./orchestration/service.js";
 import { loadRecipesFromDirectory } from "./recipes/registry.js";
@@ -106,7 +106,7 @@ async function main() {
                 socket.send(await tmux.capture(session.tmuxSessionName, 80));
             } catch {
                 tmuxAlive = false;
-                const logContent = stripAnsi(await readSessionLog(session.logPath));
+                const logContent = await replayTerminalLog(await readSessionLog(session.logPath));
                 if (logContent) {
                     const lines = logContent.split("\n");
                     socket.send(lines.slice(-200).join("\n"));

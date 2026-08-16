@@ -8,6 +8,7 @@ import {
   errorMessage,
   publishInitialAgentPrompt,
   readSessionLog,
+  replayTerminalLog,
   sessionLogPath,
   stripAnsi,
   tmuxName
@@ -118,7 +119,7 @@ async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task):
     try {
       const session = await ctx.store.getSession(task.sessionId);
       if (session) {
-        const transcript = stripAnsi(await readSessionLog(session.logPath));
+        const transcript = await replayTerminalLog(await readSessionLog(session.logPath));
         await saveArtifact({
           name: "session-transcript.log",
           content: transcript,

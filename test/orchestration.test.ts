@@ -190,6 +190,48 @@ test("DAG validation rejects unknown dependencies, duplicate ids, cycles, and un
   assert.throws(() => validateStepGraph([{ id: "a", executor: "missing" }], registry), /Unknown executor/);
 });
 
+test("scheduleRun: a caller racing an already in-flight schedule waits for it instead of reading a mid-transition run status", async (t) => {
+  // Regression for a race between OrchestrationService.createRun()'s own
+  // scheduleRun() call and the background poller's concurrent
+  // scheduleNonTerminalRuns() tick picking up the same freshly-created run.
+  // The old guard (a bare Set) let a second concurrent caller no-op
+  // immediately instead of waiting, so it (and callers awaiting it, like
+  // createRun) could observe the run mid-transition - e.g. "running" - a
+  // few milliseconds before the in-flight pass finished settling it to
+  // "waiting_approval".
+  class DelayedApprovalExecutor implements Executor {
+    type = "approval";
+    starts = 0;
+    async start(): Promise<ExecutionHandle> {
+      this.starts += 1;
+      // Long enough that a second scheduleRun() call issued right after the
+      // first reliably lands while this pass is still in progress.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      return { waitingApproval: true };
+    }
+    async inspect(): Promise<ExecutionState> {
+      return { status: "waiting_approval" };
+    }
+  }
+
+  const gate = new DelayedApprovalExecutor();
+  const registry = new ExecutorRegistry([gate]);
+  const { store, service, project } = await withService(t, registry);
+
+  const run = await store.createRun({ projectId: project.id, goal: "race", status: "pending" });
+  await store.createStep({ id: "gate", runId: run.id, name: "gate", executor: "approval" });
+
+  const first = service.scheduleRun(run.id);
+  const second = service.scheduleRun(run.id);
+  await second;
+
+  assert.equal(gate.starts, 1, "the racing caller must join the in-flight scheduling pass, not trigger a second one");
+  const settled = await store.getRun(run.id);
+  assert.equal(settled!.status, "waiting_approval", "a caller that awaits scheduleRun must observe the fully-settled run status, not a mid-transition one");
+
+  await first;
+});
+
 test("scheduler executes a linear DAG, a branched DAG, and blocks downstream on failure", async (t) => {
   const ok = new MemoryExecutor("ok");
   const fail = new MemoryExecutor("fail", [{ status: "failed", error: "boom" }]);
