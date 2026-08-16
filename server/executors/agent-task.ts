@@ -33,23 +33,92 @@ async function captureQuestion(ctx: StepExecutionContext, session: Session): Pro
   }
 }
 
+const CHANGE_TYPE_BY_CODE: Record<string, string> = {
+  A: "added",
+  D: "deleted",
+  R: "renamed",
+  C: "copied",
+  U: "unmerged",
+  M: "modified",
+  "?": "untracked"
+};
+
+function changeTypeForCode(code: string): string {
+  for (const symbol of code) {
+    const changeType = CHANGE_TYPE_BY_CODE[symbol];
+    if (changeType) return changeType;
+  }
+  return "modified";
+}
+
+type ChangedFile = { path: string; changeType: string; fromPath?: string };
+
+/**
+ * `git status --short` porcelain lines look like "XY path" (or
+ * "R  old -> new" for renames/copies). Turned into structured
+ * path+change-type records so a reviewer (or a downstream evaluator) can
+ * consume "what changed" without parsing diff hunks.
+ */
+function parseChangedFiles(status: string): ChangedFile[] {
+  return status
+    .split("\n")
+    .map((line) => line.replace(/\r$/, ""))
+    .filter((line) => line.trim())
+    .map((line) => {
+      const code = line.slice(0, 2);
+      const rest = line.slice(3);
+      const changeType = changeTypeForCode(code);
+      if (changeType === "renamed" || changeType === "copied") {
+        const [fromPath, path] = rest.split(" -> ");
+        if (path) return { path, changeType, fromPath };
+      }
+      return { path: rest, changeType };
+    });
+}
+
 /**
  * agent-task steps otherwise finish with zero Artifacts/Evidence - there's
- * nothing for a reviewer to look at beyond "it succeeded". Capture the two
- * things that actually explain what the agent did: the code diff (the
- * primary thing anyone reviewing a run cares about) and the cleaned session
- * transcript (the reasoning/commands behind it). Runs once, right when a
- * task is first observed done - inspectActiveSteps() stops polling a step
- * once it returns "succeeded", so this can't double-fire for the same
- * attempt. Best-effort: a missing worktree/session or a git failure here
- * must not turn a genuinely successful task into a failed step.
+ * nothing for a reviewer to look at beyond "it succeeded". Capture what the
+ * runtime can derive deterministically, without any agent cooperation: the
+ * code diff and a structured changed-files list (the primary things anyone
+ * reviewing a run cares about), the cleaned session transcript (the
+ * reasoning/commands behind it), and the task's completion metadata. Runs
+ * once, right when a task is first observed done - inspectActiveSteps()
+ * stops polling a step once it returns "succeeded", so this can't
+ * double-fire for the same attempt. Each harvest is independently
+ * best-effort: a missing worktree/session or a git failure here is logged
+ * but must not turn a genuinely successful task into a failed step.
  */
 async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task): Promise<void> {
   const attemptDir = join(ctx.attachmentRoot, "runs", ctx.runId, ctx.step.id, `attempt-${ctx.step.attempt}`);
 
+  async function saveEvidence(input: {
+    kind: string;
+    claim: string;
+    value?: Record<string, unknown>;
+    artifactIds?: string[];
+  }): Promise<void> {
+    const evidence = await ctx.store.createEvidence({
+      runId: ctx.runId,
+      stepId: ctx.step.id,
+      attempt: ctx.step.attempt,
+      kind: input.kind,
+      claim: input.claim,
+      source: "agent-task",
+      artifactIds: input.artifactIds,
+      value: input.value
+    });
+    await publishEvent(ctx.store, ctx.bus, {
+      type: "evidence.recorded",
+      projectId: ctx.project.id,
+      payload: { runId: ctx.runId, stepId: ctx.step.id, evidenceId: evidence.id, kind: evidence.kind, claim: evidence.claim }
+    });
+  }
+
   async function saveArtifact(input: {
     name: string;
     content: string;
+    kind?: "text" | "json";
     mediaType: string;
     metadata?: Record<string, unknown>;
     evidence: { kind: string; claim: string; value?: Record<string, unknown> };
@@ -62,7 +131,7 @@ async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task):
       runId: ctx.runId,
       stepId: ctx.step.id,
       attempt: ctx.step.attempt,
-      kind: "text",
+      kind: input.kind || "text",
       name: input.name,
       path,
       uri: `honeyrail://runs/${ctx.runId}/steps/${ctx.step.id}/attempts/${ctx.step.attempt}/${input.name}`,
@@ -74,21 +143,7 @@ async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task):
       projectId: ctx.project.id,
       payload: { runId: ctx.runId, stepId: ctx.step.id, artifactId: artifact.id, kind: artifact.kind, name: artifact.name }
     });
-    const evidence = await ctx.store.createEvidence({
-      runId: ctx.runId,
-      stepId: ctx.step.id,
-      attempt: ctx.step.attempt,
-      kind: input.evidence.kind,
-      claim: input.evidence.claim,
-      source: "agent-task",
-      artifactIds: [artifact.id],
-      value: input.evidence.value
-    });
-    await publishEvent(ctx.store, ctx.bus, {
-      type: "evidence.recorded",
-      projectId: ctx.project.id,
-      payload: { runId: ctx.runId, stepId: ctx.step.id, evidenceId: evidence.id, kind: evidence.kind, claim: evidence.claim }
-    });
+    await saveEvidence({ kind: input.evidence.kind, claim: input.evidence.claim, value: input.evidence.value, artifactIds: [artifact.id] });
   }
 
   if (task.worktreeId) {
@@ -108,10 +163,27 @@ async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task):
             value: { diffStat, status }
           }
         });
+
+        const changedFiles = parseChangedFiles(status);
+        if (changedFiles.length) {
+          await saveArtifact({
+            name: "changed_files.json",
+            content: JSON.stringify(changedFiles, null, 2),
+            kind: "json",
+            mediaType: "application/json",
+            metadata: { count: changedFiles.length },
+            evidence: {
+              kind: "agent.changed_files",
+              claim: `Agent touched ${changedFiles.length} file${changedFiles.length === 1 ? "" : "s"}`,
+              value: { count: changedFiles.length }
+            }
+          });
+        }
       }
-    } catch {
+    } catch (error) {
       // A diff failure (e.g. worktree already merged/discarded) shouldn't
       // turn a completed task into a failed step.
+      console.error(`agent-task ${ctx.step.id}: failed to capture diff/changed-files artifacts:`, error);
     }
   }
 
@@ -127,9 +199,30 @@ async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task):
           evidence: { kind: "agent.transcript", claim: "Agent session transcript captured" }
         });
       }
-    } catch {
+    } catch (error) {
       // Same reasoning as above - transcript capture is supplementary.
+      console.error(`agent-task ${ctx.step.id}: failed to capture session transcript artifact:`, error);
     }
+  }
+
+  try {
+    await saveEvidence({
+      kind: "agent.completion",
+      claim: `Task finished with status "${task.status}"`,
+      value: {
+        taskId: task.id,
+        taskStatus: task.status,
+        agent: task.agent,
+        worktreeId: task.worktreeId,
+        sessionId: task.sessionId,
+        headRevision: task.headRevision,
+        completedAt: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    // Completion metadata is supplementary - a store failure here shouldn't
+    // turn a genuinely successful task into a failed step either.
+    console.error(`agent-task ${ctx.step.id}: failed to record completion metadata evidence:`, error);
   }
 }
 
