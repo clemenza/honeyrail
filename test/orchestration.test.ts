@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test, type TestContext } from "node:test";
@@ -711,6 +711,174 @@ test("AgentTaskExecutor.start() defaults to unattended and prepends the UNATTEND
 
   const autoTask = (await store.listTasks()).find((task) => task.title === "auto");
   assert.equal(autoTask?.prompt, "implement the feature");
+});
+
+test("AgentTaskExecutor.start() provisions $HR_STEP_DIR/artifacts on disk, exports it to the launched session, and injects the versioned harness conventions ahead of the task prompt", async (t) => {
+  const registry = new ExecutorRegistry([new AgentTaskExecutor()]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-agent-step-dir-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const startedCommands: string[] = [];
+  const attachmentRoot = join(tempDir, "attachments");
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: {
+      listSessions: async () => [],
+      startSession: async ({ command }: any) => { startedCommands.push(command); },
+      killSession: async () => {},
+      capture: async () => "",
+      sendInput: async () => {}
+    } as any,
+    worktrees: {
+      create: async ({ project, title, agent }: any) => ({
+        projectId: project.id,
+        path: join(tempDir, "wt"),
+        branch: `${agent}/${title}`,
+        baseBranch: "main",
+        baseRevision: "base",
+        title,
+        agent
+      })
+    } as any,
+    runCommand: (async () => ({ ok: true, stdout: "", stderr: "" })) as any,
+    sessionLogRoot: join(tempDir, "sessions"),
+    attachmentRoot,
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "step dir",
+    steps: [{ id: "implement", executor: "agent-task", produces: ["diff"], input: { agent: "codex", prompt: "implement the feature" } }]
+  });
+
+  assert.equal(startedCommands.length, 1);
+  const stepDir = join(attachmentRoot, "runs", created.run.id, "implement", "attempt-1", "step");
+  assert.ok(startedCommands[0].includes(`HR_STEP_DIR='${stepDir}'`), "the launch command must export HR_STEP_DIR to the session's shell");
+  assert.ok(startedCommands[0].includes("Harness runtime conventions (prompt v1)"), "the versioned harness conventions block must be injected");
+  assert.ok(startedCommands[0].includes("must produce: diff"), "the step's produces contract must be surfaced to the agent");
+  assert.ok(startedCommands[0].indexOf("Harness runtime conventions") < startedCommands[0].indexOf("implement the feature"), "conventions must precede the task prompt");
+
+  const artifactsDirStat = await stat(join(stepDir, "artifacts"));
+  assert.ok(artifactsDirStat.isDirectory(), "artifacts/ must be provisioned before the agent starts, not created lazily on harvest");
+});
+
+test("agent-written manifest.json entries under $HR_STEP_DIR/artifacts/ are harvested as step artifacts on completion, and completion evidence records the harness prompt version", async (t) => {
+  const registry = new ExecutorRegistry([new AgentTaskExecutor()]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-agent-manifest-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const attachmentRoot = join(tempDir, "attachments");
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: { listSessions: async () => [], startSession: async () => {}, killSession: async () => {}, capture: async () => "", sendInput: async () => {} } as any,
+    worktrees: {
+      create: async ({ project, title, agent }: any) => ({
+        projectId: project.id,
+        path: join(tempDir, "wt"),
+        branch: `${agent}/${title}`,
+        baseBranch: "main",
+        baseRevision: "base",
+        title,
+        agent
+      })
+    } as any,
+    runCommand: (async () => ({ ok: true, stdout: "", stderr: "" })) as any,
+    sessionLogRoot: join(tempDir, "sessions"),
+    attachmentRoot,
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "shell", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "manifest harvest",
+    steps: [{ id: "implement", executor: "agent-task", input: { agent: "shell", prompt: "do work" } }]
+  });
+  const step = (await store.getStep(created.run.id, "implement"))!;
+  assert.equal(step.status, "running");
+
+  // Simulate the agent following the harness convention: writing a file
+  // under artifacts/ and describing it in manifest.json (start() already
+  // provisioned the artifacts/ directory).
+  const stepDir = join(attachmentRoot, "runs", created.run.id, "implement", "attempt-1", "step");
+  await writeFile(join(stepDir, "artifacts", "coverage.json"), JSON.stringify({ lines: 92 }));
+  await writeFile(join(stepDir, "manifest.json"), JSON.stringify({
+    artifacts: [{ name: "coverage.json", path: "artifacts/coverage.json", type: "report", claim: "Coverage after the new tests" }]
+  }));
+
+  await store.updateTask(String(step.executionRef!.taskId), { status: "ready_to_merge" });
+  await service.scheduleRun(created.run.id);
+
+  const artifacts = await store.listArtifacts(created.run.id, "implement");
+  const manifestArtifact = artifacts.find((item) => item.name === "coverage.json")!;
+  assert.ok(manifestArtifact, "manifest-described artifact must be harvested");
+  assert.equal(manifestArtifact.kind, "json");
+  assert.equal(manifestArtifact.artifactType, "report");
+  assert.equal(manifestArtifact.path, join(stepDir, "artifacts", "coverage.json"), "must reference the file in place, not a copy");
+
+  const evidence = await store.listEvidence(created.run.id, "implement");
+  const manifestEvidence = evidence.find((item) => item.kind === "agent.manifest")!;
+  assert.ok(manifestEvidence, "manifest artifact must have matching evidence");
+  assert.equal(manifestEvidence.claim, "Coverage after the new tests");
+  assert.deepEqual(manifestEvidence.artifactIds, [manifestArtifact.id]);
+
+  const completionEvidence = evidence.find((item) => item.kind === "agent.completion")!;
+  assert.equal((completionEvidence.value as Record<string, unknown>).harnessPromptVersion, "1");
+});
+
+test("a file dropped under $HR_STEP_DIR/artifacts/ with no manifest.json entry is still harvested, with a default name/kind and no artifactType", async (t) => {
+  const registry = new ExecutorRegistry([new AgentTaskExecutor()]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-agent-manifest-default-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const attachmentRoot = join(tempDir, "attachments");
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: { listSessions: async () => [], startSession: async () => {}, killSession: async () => {}, capture: async () => "", sendInput: async () => {} } as any,
+    worktrees: {
+      create: async ({ project, title, agent }: any) => ({
+        projectId: project.id,
+        path: join(tempDir, "wt"),
+        branch: `${agent}/${title}`,
+        baseBranch: "main",
+        baseRevision: "base",
+        title,
+        agent
+      })
+    } as any,
+    runCommand: (async () => ({ ok: true, stdout: "", stderr: "" })) as any,
+    sessionLogRoot: join(tempDir, "sessions"),
+    attachmentRoot,
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "shell", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "manifest-less harvest",
+    steps: [{ id: "implement", executor: "agent-task", input: { agent: "shell", prompt: "do work" } }]
+  });
+  const step = (await store.getStep(created.run.id, "implement"))!;
+
+  const stepDir = join(attachmentRoot, "runs", created.run.id, "implement", "attempt-1", "step");
+  await writeFile(join(stepDir, "artifacts", "notes.txt"), "no manifest describes this file");
+
+  await store.updateTask(String(step.executionRef!.taskId), { status: "ready_to_merge" });
+  await service.scheduleRun(created.run.id);
+
+  const artifacts = await store.listArtifacts(created.run.id, "implement");
+  const notesArtifact = artifacts.find((item) => item.name === "notes.txt")!;
+  assert.ok(notesArtifact, "an undeclared file under artifacts/ must still be harvested");
+  assert.equal(notesArtifact.kind, "file");
+  assert.equal(notesArtifact.artifactType, undefined);
 });
 
 test("AgentTaskExecutor.inspect() maps a waiting_input session onto the step state", async () => {

@@ -43,6 +43,41 @@ export function withUnattendedPreamble(prompt: unknown): string {
   return trimmed ? `${UNATTENDED_PREAMBLE}\n${trimmed}` : UNATTENDED_PREAMBLE;
 }
 
+/**
+ * Bumped whenever the text below changes materially. Recorded on every
+ * agent-task step's completion evidence (see recordCompletionArtifacts in
+ * executors/agent-task.ts) so harness prompt iterations can be A/B compared
+ * across runs without contaminating historical eval data with a silent
+ * prompt change.
+ */
+export const HARNESS_PROMPT_VERSION = "1";
+
+/**
+ * The manifest/artifacts channel described here is convention, not trust:
+ * the runtime never depends on an agent following it - diff/changed-files/
+ * transcript (#48) are harvested unconditionally regardless of whether the
+ * agent writes anything here. This only supplements what the runtime can't
+ * derive on its own (e.g. "which file is the new test").
+ */
+export function buildHarnessPrompt({ stepDir, produces }: { stepDir: string; produces?: string[] }): string {
+  const lines = [
+    `Harness runtime conventions (prompt v${HARNESS_PROMPT_VERSION}):`,
+    "- Your code diff and the list of changed files are captured automatically after you finish - don't restate them.",
+    `- For anything else worth recording that the runtime can't derive on its own (e.g. "this is the new test file that verifies the change"), write files under ${stepDir}/artifacts/ and optionally describe them in ${stepDir}/manifest.json as {"artifacts": [{"name": "<file>", "path": "artifacts/<file>", "type": "<optional contract type>", "claim": "<what this demonstrates>"}]}.`
+  ];
+  if (produces?.length) {
+    lines.push(`- This step's contract declares it must produce: ${produces.join(", ")}. Anything in that list the runtime can't derive automatically needs to show up via the manifest above.`);
+  }
+  lines.push("This is a convention, not a requirement - skip the manifest entirely if there's nothing extra to report.");
+  return lines.join("\n");
+}
+
+export function withHarnessConventions(prompt: unknown, opts: { stepDir: string; produces?: string[] }): string {
+  const trimmed = normalizedPrompt(prompt);
+  const conventions = buildHarnessPrompt(opts);
+  return trimmed ? `${conventions}\n\n${trimmed}` : conventions;
+}
+
 const BLOCKED_LINE_PATTERN = /^BLOCKED:\s*(.+)$/m;
 
 /**
