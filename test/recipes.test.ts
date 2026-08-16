@@ -95,6 +95,21 @@ test("shipped implement-check-gate-approve recipe wires interaction/onBlocked de
   assert.equal(overriddenStep.onBlocked?.timeoutMs, 300_000);
 });
 
+test("shipped implement-check-gate-approve recipe is deterministic and self-contained with zero parameters", async () => {
+  const registry = await loadRecipesFromDirectory(shippedRecipesDir);
+  const recipe = registry.get("implement-check-gate-approve")!;
+
+  const materialized = materializeRecipe(recipe, { projectId: "proj_1", parameters: {} });
+  const implementStep = materialized.steps.find((step) => step.id === "implement")!;
+  assert.match(String(implementStep.input?.title), /fizzbuzz/i);
+  assert.match(String(implementStep.input?.prompt), /fizzbuzz\.py/);
+  assert.match(String(implementStep.input?.prompt), /test_fizzbuzz\.py/);
+  assert.match(String(implementStep.input?.prompt), /python -m pytest -q/);
+
+  const checkStep = materialized.steps.find((step) => step.id === "check")!;
+  assert.deepEqual(checkStep.input?.commands, ["python -m pytest -q"]);
+});
+
 test("RecipeRegistry.list() omits steps", () => {
   const registry = new RecipeRegistry([demoRecipe]);
   const [summary] = registry.list();

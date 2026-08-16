@@ -1,9 +1,11 @@
 id: implement-check-gate-approve
 name: Implement, check, gate, approve
 description: >
-  Runs an agent to implement a change in a fresh worktree, runs the
-  project's check commands against the result, and gates on approval
-  before the run is considered complete.
+  Runs an agent to implement a change in a fresh worktree, re-verifies it
+  with a fixed, step-level check command, and gates on approval before the
+  run is considered complete. The default task (fizzbuzz + its own pytest
+  suite) is deterministic and self-contained, so the recipe runs end-to-end
+  on a freshly registered repo with zero project configuration.
 category: agent-delivery
 parameters:
   - key: agent
@@ -14,11 +16,19 @@ parameters:
   - key: title
     label: Task title
     type: string
-    required: true
+    default: Implement fizzbuzz with tests
   - key: prompt
     label: Task prompt
     type: string
-    required: true
+    default: >
+      Create fizzbuzz.py at the worktree root implementing fizzbuzz(n): it
+      returns "Fizz" for multiples of 3, "Buzz" for multiples of 5,
+      "FizzBuzz" for multiples of both, and otherwise str(n). Create
+      test_fizzbuzz.py with pytest cases covering a multiple of 3 (3), a
+      multiple of 5 (5), a multiple of both (15), and a plain number. Run
+      `python -m pytest -q` yourself and make sure it passes before
+      finishing. If anything is ambiguous, state your assumption and
+      proceed instead of asking.
   - key: gateOnFail
     label: On check failure
     type: enum
@@ -57,9 +67,11 @@ steps:
       action: "{{ onBlocked }}"
       timeoutMs: "{{ blockedTimeoutMinutes }}"
   - id: check
-    name: Run project checks
+    name: Re-verify with pytest
     executor: check
     dependsOn: [implement]
+    input:
+      commands: ["python -m pytest -q"]
     qualityGate:
       evaluators:
         - type: check
