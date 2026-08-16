@@ -1,4 +1,4 @@
-export type ViewId = "dashboard" | "projects" | "sessions" | "worktrees" | "runs" | "approvals";
+export type ViewId = "dashboard" | "projects" | "sessions" | "worktrees" | "runs" | "approvals" | "evals";
 
 export type ProjectData = {
   id: string;
@@ -293,4 +293,24 @@ export type RecipePreviewData = {
   projectId: string;
   goal: string;
   steps: RecipePreviewStepData[];
+};
+
+export type RateStatData = { satisfied: number; total: number; rate: number | null };
+
+export type EvalMetricsFilterData = {
+  projectId?: string;
+  recipeId?: string;
+  contractLevel?: "L0" | "L1" | "L2" | "L3";
+  promptVersion?: string;
+};
+
+export type EvalMetricsData = {
+  filter: EvalMetricsFilterData;
+  runCount: number;
+  contractCompliance: RateStatData;
+  manifestEmission: RateStatData;
+  verifyRunnable: RateStatData;
+  qualityGatePass: RateStatData;
+  humanOverride: RateStatData;
+  blockedStep: RateStatData;
 };

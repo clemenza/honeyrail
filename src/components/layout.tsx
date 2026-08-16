@@ -3,6 +3,7 @@ import {
   Activity,
   Braces,
   FolderGit2,
+  Gauge,
   GitBranch,
   ListTree,
   LogOut,
@@ -41,7 +42,8 @@ const NAV_ITEMS: Array<[ViewId, LucideIcon, string]> = [
   ["sessions", SquareTerminal, "Sessions"],
   ["worktrees", GitBranch, "Worktrees"],
   ["runs", ListTree, "Runs"],
-  ["approvals", Shield, "Approvals"]
+  ["approvals", Shield, "Approvals"],
+  ["evals", Gauge, "Evals"]
 ];
 
 export const VIEW_META: Record<string, { title: string; subtitle: string }> = {
@@ -68,6 +70,10 @@ export const VIEW_META: Record<string, { title: string; subtitle: string }> = {
   approvals: {
     title: "Approvals",
     subtitle: "agent waits, review actions, and recent control events"
+  },
+  evals: {
+    title: "Evals",
+    subtitle: "harness reliability metrics across persisted runs"
   }
 };
 
