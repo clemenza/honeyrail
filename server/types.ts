@@ -53,10 +53,20 @@ export type StepStatus =
  * Distinguishes *why* a step is in status "failed": a config error means the
  * step could never have succeeded as configured (e.g. no check commands, an
  * agent CLI that isn't installed) as opposed to execution_failed (the step
- * ran but its process/executor reported failure) or verification_failed (the
- * step's own work completed but its quality gate rejected the result).
+ * ran but its process/executor reported failure), verification_failed (the
+ * step's own work completed but its quality gate rejected the result), or
+ * contract_violation (the step succeeded but omitted an artifact its recipe
+ * declared it `produces` - see StepContract validation in orchestration/dag.ts).
  */
-export type StepFailureKind = "config_error" | "execution_failed" | "verification_failed";
+export type StepFailureKind = "config_error" | "execution_failed" | "verification_failed" | "contract_violation";
+
+/**
+ * Closed vocabulary of artifact types with dataflow-lint semantics for
+ * StepContract `produces`/`consumes` declarations. A step may also declare a
+ * custom string type outside this list; it's still checked for dataflow
+ * satisfiability, just has no dedicated auto-harvest behind it.
+ */
+export const KNOWN_ARTIFACT_TYPES = ["diff", "changed_files", "test_files", "test_command", "report", "manifest"] as const;
 
 export type CheckRun = {
   command: string;
@@ -80,6 +90,8 @@ export type Artifact = {
   uri?: string;
   path?: string;
   mediaType?: string;
+  /** StepContract dataflow type (e.g. "diff", "changed_files") this artifact satisfies, if any. See KNOWN_ARTIFACT_TYPES. */
+  artifactType?: string;
   metadata?: Record<string, unknown>;
   createdAt: string;
 };
@@ -205,6 +217,10 @@ export type Step = {
   qualityGate?: QualityGate;
   onBlocked?: OnBlockedPolicy;
   blockedSince?: string;
+  /** Artifact types this step's recipe declares it produces, beyond what its executor auto-harvests. Checked at run creation (StepContract lint) and at step completion (contract_violation on omission). */
+  produces?: string[];
+  /** Artifact types this step's recipe declares it needs from an upstream step. Checked at run creation (StepContract lint); satisfiability is by dependsOn ancestry. */
+  consumes?: string[];
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;

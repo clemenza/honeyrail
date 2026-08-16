@@ -21,6 +21,10 @@ function commandsSource(input: Record<string, unknown> | undefined): "step" | "p
 
 export class CheckExecutor implements Executor {
   type = "check";
+  // One artifact per configured command is always created in start() below,
+  // regardless of pass/fail - see the per-run loop that tags each with
+  // artifactType "test_command".
+  producesTypes = ["test_command"];
 
   preflight(ctx: PreflightContext): void {
     const commands = defaultCheckCommands(ctx.project, Array.isArray(ctx.step.input?.commands) ? ctx.step.input?.commands : undefined);
@@ -86,6 +90,7 @@ export class CheckExecutor implements Executor {
         path: logPath,
         uri: `honeyrail://runs/${ctx.runId}/steps/${ctx.step.id}/checks/${index + 1}`,
         mediaType: "text/plain",
+        artifactType: "test_command",
         metadata: {
           command: run.command,
           status: run.status,

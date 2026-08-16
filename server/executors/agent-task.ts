@@ -120,6 +120,7 @@ async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task):
     content: string;
     kind?: "text" | "json";
     mediaType: string;
+    artifactType?: string;
     metadata?: Record<string, unknown>;
     evidence: { kind: string; claim: string; value?: Record<string, unknown> };
   }): Promise<void> {
@@ -136,6 +137,7 @@ async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task):
       path,
       uri: `honeyrail://runs/${ctx.runId}/steps/${ctx.step.id}/attempts/${ctx.step.attempt}/${input.name}`,
       mediaType: input.mediaType,
+      artifactType: input.artifactType,
       metadata: input.metadata
     });
     await publishEvent(ctx.store, ctx.bus, {
@@ -156,6 +158,7 @@ async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task):
           name: "changes.diff",
           content: diff,
           mediaType: "text/x-diff",
+          artifactType: "diff",
           metadata: { diffStat, status },
           evidence: {
             kind: "agent.diff",
@@ -171,6 +174,7 @@ async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task):
             content: JSON.stringify(changedFiles, null, 2),
             kind: "json",
             mediaType: "application/json",
+            artifactType: "changed_files",
             metadata: { count: changedFiles.length },
             evidence: {
               kind: "agent.changed_files",
@@ -248,6 +252,11 @@ async function taskStateToExecution(ctx: StepExecutionContext, task: Task | unde
 
 export class AgentTaskExecutor implements Executor {
   type = "agent-task";
+  // recordCompletionArtifacts() above harvests these unconditionally on
+  // success whenever the underlying worktree actually changed - so a
+  // downstream step can `consumes: [diff]`/`[changed_files]` without this
+  // step's recipe entry having to redundantly declare `produces` for them.
+  producesTypes = ["diff", "changed_files"];
 
   async preflight(ctx: PreflightContext): Promise<void> {
     const agent = stringInput(ctx.step.input?.agent, ctx.project.defaultAgent || "codex");

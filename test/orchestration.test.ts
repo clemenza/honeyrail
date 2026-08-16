@@ -14,7 +14,7 @@ import { ShellExecutor } from "../server/executors/shell.js";
 import { ConfigError, type ExecutionHandle, type ExecutionState, type Executor, type PreflightContext, type StepExecutionContext } from "../server/executors/types.js";
 import { EvaluatorRegistry, type Evaluator, type EvaluatorInput, type EvaluatorResult } from "../server/evaluators/registry.js";
 import { EventBus, publishEvent } from "../server/events.js";
-import { validateStepGraph } from "../server/orchestration/dag.js";
+import { validateStepContracts, validateStepGraph } from "../server/orchestration/dag.js";
 import { OrchestrationService } from "../server/orchestration/service.js";
 import { assertStepTransition, deriveRunStatus } from "../server/orchestration/state-machine.js";
 import { JsonStore } from "../server/store.js";
@@ -188,6 +188,45 @@ test("DAG validation rejects unknown dependencies, duplicate ids, cycles, and un
   assert.throws(() => validateStepGraph([{ id: "a", executor: "ok", dependsOn: ["missing"] }], registry), /unknown step/);
   assert.throws(() => validateStepGraph([{ id: "a", executor: "ok", dependsOn: ["b"] }, { id: "b", executor: "ok", dependsOn: ["a"] }], registry), /cycle/);
   assert.throws(() => validateStepGraph([{ id: "a", executor: "missing" }], registry), /Unknown executor/);
+});
+
+test("StepContract lint rejects a consumes entry no upstream step produces, and accepts one satisfied via declared produces or executor-inherent producesTypes", () => {
+  const plain = new MemoryExecutor("ok");
+  class ProducingExecutor extends MemoryExecutor {
+    producesTypes = ["diff"];
+  }
+  const registry = new ExecutorRegistry([plain, new ProducingExecutor("agent-task")]);
+
+  // No upstream step declares or auto-harvests "diff".
+  assert.throws(
+    () => validateStepContracts([
+      { id: "a", executor: "ok" },
+      { id: "b", executor: "ok", dependsOn: ["a"], consumes: ["diff"] }
+    ], registry),
+    /Step b consumes "diff", which no upstream step \(via dependsOn\) produces/
+  );
+
+  // Satisfied via an explicitly declared `produces` on the upstream step.
+  assert.doesNotThrow(() => validateStepContracts([
+    { id: "a", executor: "ok", produces: ["diff"] },
+    { id: "b", executor: "ok", dependsOn: ["a"], consumes: ["diff"] }
+  ], registry));
+
+  // Satisfied via the upstream step's executor-inherent producesTypes, with
+  // no explicit `produces` declaration needed on the step itself.
+  assert.doesNotThrow(() => validateStepContracts([
+    { id: "a", executor: "agent-task" },
+    { id: "b", executor: "ok", dependsOn: ["a"], consumes: ["diff"] }
+  ], registry));
+
+  // A sibling step (not a dependsOn ancestor) producing the type doesn't count.
+  assert.throws(
+    () => validateStepContracts([
+      { id: "a", executor: "agent-task" },
+      { id: "b", executor: "ok", consumes: ["diff"] }
+    ], registry),
+    /consumes "diff"/
+  );
 });
 
 test("scheduleRun: a caller racing an already in-flight schedule waits for it instead of reading a mid-transition run status", async (t) => {
@@ -1370,6 +1409,92 @@ test("a step that fails via a thrown ConfigError is tagged failureKind config_er
   assert.equal(result.run.status, "failed");
   assert.equal((await store.getStep(result.run.id, "a"))!.status, "failed");
   assert.equal((await store.getStep(result.run.id, "a"))!.failureKind, "config_error");
+});
+
+test("createRun rejects at the service layer when a step consumes an artifact type no upstream step produces, and no run is persisted", async (t) => {
+  const registry = new ExecutorRegistry([new MemoryExecutor("ok")]);
+  const { store, service, project } = await withService(t, registry);
+
+  await assert.rejects(
+    () => service.createRun({
+      projectId: project.id,
+      goal: "unsatisfiable dataflow",
+      steps: [
+        { id: "a", executor: "ok" },
+        { id: "b", executor: "ok", dependsOn: ["a"], consumes: ["diff"] }
+      ]
+    }),
+    /Step b consumes "diff", which no upstream step \(via dependsOn\) produces/
+  );
+  assert.deepEqual(await store.listRuns(), []);
+});
+
+test("createRun accepts a consumes entry satisfied by an upstream step's executor-inherent producesTypes, with no explicit produces declared", async (t) => {
+  class ProducingExecutor extends MemoryExecutor {
+    producesTypes = ["diff"];
+  }
+  const registry = new ExecutorRegistry([new ProducingExecutor("implement-like"), new MemoryExecutor("ok")]);
+  const { service, project } = await withService(t, registry);
+
+  const result = await service.createRun({
+    projectId: project.id,
+    goal: "satisfied via inherent producesTypes",
+    steps: [
+      { id: "implement", executor: "implement-like" },
+      { id: "check", executor: "ok", dependsOn: ["implement"], consumes: ["diff"] }
+    ]
+  });
+  assert.equal(result.run.status, "succeeded");
+});
+
+test("a step that declares produces but never creates a matching artifact is failed with failureKind contract_violation, distinct from execution_failed", async (t) => {
+  const registry = new ExecutorRegistry([new MemoryExecutor("silent")]);
+  const { store, service, project } = await withService(t, registry);
+
+  const result = await service.createRun({
+    projectId: project.id,
+    goal: "unmet contract",
+    steps: [{ id: "a", executor: "silent", produces: ["diff"] }]
+  });
+
+  assert.equal(result.run.status, "failed");
+  const step = await store.getStep(result.run.id, "a");
+  assert.equal(step!.status, "failed");
+  assert.equal(step!.failureKind, "contract_violation");
+  assert.match(step!.error || "", /declares produces \[diff\] but did not produce: diff/);
+});
+
+test("a step that declares produces and creates a matching artifactType-tagged artifact succeeds normally", async (t) => {
+  class ArtifactProducingExecutor implements Executor {
+    type = "artifact-producer";
+    async start(ctx: StepExecutionContext): Promise<ExecutionHandle> {
+      await ctx.store.createArtifact({
+        runId: ctx.runId,
+        stepId: ctx.step.id,
+        attempt: ctx.step.attempt,
+        kind: "text",
+        name: "changes.diff",
+        artifactType: "diff"
+      });
+      return {};
+    }
+    async inspect(): Promise<ExecutionState> {
+      return { status: "succeeded", output: {} };
+    }
+  }
+  const registry = new ExecutorRegistry([new ArtifactProducingExecutor()]);
+  const { store, service, project } = await withService(t, registry);
+
+  const result = await service.createRun({
+    projectId: project.id,
+    goal: "met contract",
+    steps: [{ id: "a", executor: "artifact-producer", produces: ["diff"] }]
+  });
+
+  assert.equal(result.run.status, "succeeded");
+  const step = await store.getStep(result.run.id, "a");
+  assert.equal(step!.status, "succeeded");
+  assert.equal(step!.failureKind, undefined);
 });
 
 async function withHttpServer(t: TestContext, evaluators?: EvaluatorRegistry) {

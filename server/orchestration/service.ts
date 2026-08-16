@@ -9,7 +9,7 @@ import type { TmuxManager } from "../tmux.js";
 import type { runCommandSafe } from "../utils.js";
 import type { WorktreeManager } from "../worktrees.js";
 import { generateAutoAnswer } from "./auto-answer.js";
-import { blockedStepsAfterFailure, readySteps, type StepDefinition, validateStepGraph } from "./dag.js";
+import { blockedStepsAfterFailure, readySteps, type StepDefinition, validateStepContracts, validateStepGraph } from "./dag.js";
 import { publishRunEvent, publishStepEvent } from "./events.js";
 import { deriveRunStatus, isRunTerminal, isStepTerminal, transitionRun, transitionStep } from "./state-machine.js";
 
@@ -108,6 +108,7 @@ export class OrchestrationService {
     const project = await this.store.getProject(input.projectId);
     if (!project) throw new Error("Project not found");
     validateStepGraph(input.steps, this.executors);
+    validateStepContracts(input.steps, this.executors);
     this.validateQualityGateEvaluators(input.steps);
     await this.runPreflightChecks(input.steps, project);
     return project;
@@ -132,7 +133,9 @@ export class OrchestrationService {
         maxAttempts: definition.maxAttempts || 1,
         status: "pending",
         qualityGate: definition.qualityGate,
-        onBlocked: definition.onBlocked
+        onBlocked: definition.onBlocked,
+        produces: definition.produces,
+        consumes: definition.consumes
       }));
     }
     await publishRunEvent(this.eventContext(), "run.created", run, { stepCount: steps.length });
@@ -645,6 +648,11 @@ export class OrchestrationService {
   private async completeStepFromState(run: Run, step: Step, state: ExecutionState) {
     const finishedAt = new Date().toISOString();
     if (state.status === "succeeded") {
+      const contractViolation = await this.checkStepContract(run, step);
+      if (contractViolation) {
+        await this.handleStepFailure(run, step, contractViolation, state.output, undefined, "contract_violation");
+        return;
+      }
       const gateResult = await this.applyQualityGate(run, step, state);
       if (gateResult === "waiting_approval" || gateResult === "failed") return;
       const updated = await transitionStep(this.store, step, {
@@ -670,6 +678,26 @@ export class OrchestrationService {
       return;
     }
     await this.handleStepFailure(run, step, state.error || "Step failed", state.output);
+  }
+
+  /**
+   * StepContract runtime enforcement: a step that declares `produces` types
+   * must actually have created an artifact tagged with each one for the
+   * current attempt by the time it reports success - fail-fast with correct
+   * attribution to the *producing* step, rather than letting a downstream
+   * `consumes` step discover the gap later. Returns a failure message, or
+   * null if the step declares nothing or satisfied everything it declared.
+   */
+  private async checkStepContract(run: Run, step: Step): Promise<string | null> {
+    const declared = step.produces || [];
+    if (!declared.length) return null;
+    const artifacts = await this.store.listArtifacts(run.id, step.id);
+    const produced = new Set(
+      artifacts.filter((artifact) => artifact.attempt === step.attempt && artifact.artifactType).map((artifact) => artifact.artifactType)
+    );
+    const missing = declared.filter((type) => !produced.has(type));
+    if (!missing.length) return null;
+    return `Step "${step.id}" declares produces [${declared.join(", ")}] but did not produce: ${missing.join(", ")}`;
   }
 
   private defaultQualityGate(step: Step): QualityGate | undefined {

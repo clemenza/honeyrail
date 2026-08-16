@@ -89,6 +89,12 @@ const STEP_FAILURE_KIND_SCHEMA_SQL = `
   ALTER TABLE steps ADD COLUMN failure_kind TEXT;
 `;
 
+const STEP_CONTRACT_SCHEMA_SQL = `
+  ALTER TABLE steps ADD COLUMN produces TEXT;
+  ALTER TABLE steps ADD COLUMN consumes TEXT;
+  ALTER TABLE artifacts ADD COLUMN artifact_type TEXT;
+`;
+
 const LEGACY_RECORDS_SQL = `
   CREATE TABLE IF NOT EXISTS records (
     collection TEXT NOT NULL,
@@ -346,6 +352,11 @@ const SCHEMA_MIGRATIONS: SchemaMigration[] = [
     version: 7,
     name: "step-failure-kind",
     up: (db) => db.exec(STEP_FAILURE_KIND_SCHEMA_SQL)
+  },
+  {
+    version: 8,
+    name: "step-contracts",
+    up: (db) => db.exec(STEP_CONTRACT_SCHEMA_SQL)
   }
 ];
 
@@ -486,8 +497,8 @@ export class SQLiteStore implements Store {
   }
 
   private upsertStepRow(step: Step, createdAt: string) {
-    this.db.prepare(`INSERT OR REPLACE INTO steps (id, run_id, name, executor, input, depends_on, status, attempt, max_attempts, created_at, started_at, finished_at, execution_ref, output, error, quality_gate, on_blocked, blocked_since, failure_kind)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    this.db.prepare(`INSERT OR REPLACE INTO steps (id, run_id, name, executor, input, depends_on, status, attempt, max_attempts, created_at, started_at, finished_at, execution_ref, output, error, quality_gate, on_blocked, blocked_since, failure_kind, produces, consumes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       step.id, step.runId, step.name || "", step.executor,
       JSON.stringify(step.input || {}), JSON.stringify(step.dependsOn || []),
       step.status || "pending", step.attempt ?? 0, step.maxAttempts ?? 1,
@@ -498,15 +509,17 @@ export class SQLiteStore implements Store {
       step.qualityGate ? JSON.stringify(step.qualityGate) : null,
       step.onBlocked ? JSON.stringify(step.onBlocked) : null,
       step.blockedSince ?? null,
-      step.failureKind ?? null
+      step.failureKind ?? null,
+      step.produces ? JSON.stringify(step.produces) : null,
+      step.consumes ? JSON.stringify(step.consumes) : null
     );
   }
 
   private upsertArtifactRow(artifact: Artifact) {
-    this.db.prepare(`INSERT OR REPLACE INTO artifacts (id, run_id, step_id, attempt, kind, name, uri, path, media_type, metadata, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    this.db.prepare(`INSERT OR REPLACE INTO artifacts (id, run_id, step_id, attempt, kind, name, uri, path, media_type, artifact_type, metadata, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       artifact.id, artifact.runId, artifact.stepId ?? null, artifact.attempt ?? null, artifact.kind, artifact.name || "",
-      artifact.uri ?? null, artifact.path ?? null, artifact.mediaType ?? null,
+      artifact.uri ?? null, artifact.path ?? null, artifact.mediaType ?? null, artifact.artifactType ?? null,
       artifact.metadata ? JSON.stringify(artifact.metadata) : null,
       artifact.createdAt
     );
@@ -636,7 +649,9 @@ export class SQLiteStore implements Store {
       onBlocked: row.on_blocked ? parseJson<Step["onBlocked"]>(row.on_blocked as string, undefined) : undefined,
       blockedSince: row.blocked_since as string | undefined,
       error: row.error as string | undefined,
-      failureKind: row.failure_kind as Step["failureKind"]
+      failureKind: row.failure_kind as Step["failureKind"],
+      produces: row.produces ? parseJson<Step["produces"]>(row.produces as string, undefined) : undefined,
+      consumes: row.consumes ? parseJson<Step["consumes"]>(row.consumes as string, undefined) : undefined
     };
   }
 
@@ -651,6 +666,7 @@ export class SQLiteStore implements Store {
       uri: row.uri as string | undefined,
       path: row.path as string | undefined,
       mediaType: row.media_type as string | undefined,
+      artifactType: row.artifact_type as string | undefined,
       metadata: row.metadata ? parseJson<Record<string, unknown>>(row.metadata as string, {}) : undefined,
       createdAt: String(row.created_at || "")
     };

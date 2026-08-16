@@ -55,6 +55,15 @@ export type PreflightContext = {
 export interface Executor {
   type: string;
   /**
+   * Artifact types (see KNOWN_ARTIFACT_TYPES in types.ts) this executor
+   * unconditionally harvests on step success, independent of anything a
+   * recipe declares in a step's `produces`. StepContract dataflow lint treats
+   * these as always available from a step of this executor type, so a
+   * downstream step can `consumes` them without the upstream step having to
+   * redundantly redeclare what its executor already guarantees.
+   */
+  producesTypes?: string[];
+  /**
    * Optional static check run at run-creation time (before any Run/Step
    * records exist) to reject steps that cannot possibly succeed given their
    * resolved configuration. Throw (a ConfigError, ideally) to reject the run.

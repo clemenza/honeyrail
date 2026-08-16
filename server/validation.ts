@@ -116,7 +116,9 @@ export const createRunBody = z.object({
     dependsOn: z.array(z.string()).optional(),
     maxAttempts: z.number().int().positive().optional(),
     qualityGate: qualityGateBody.optional(),
-    onBlocked: onBlockedBody.optional()
+    onBlocked: onBlockedBody.optional(),
+    produces: z.array(z.string().min(1)).optional(),
+    consumes: z.array(z.string().min(1)).optional()
   })).min(1)
 });
 

@@ -22,6 +22,8 @@ export type RecipeStepTemplate = {
   maxAttempts?: number;
   qualityGate?: QualityGate;
   onBlocked?: OnBlockedPolicy;
+  produces?: string[];
+  consumes?: string[];
 };
 
 export type Recipe = {

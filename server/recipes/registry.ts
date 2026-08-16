@@ -70,7 +70,9 @@ const recipeStepTemplateSchema = z.object({
   dependsOn: z.array(z.string()).optional(),
   maxAttempts: z.number().int().positive().optional(),
   qualityGate: qualityGateSchema.optional(),
-  onBlocked: onBlockedSchema.optional()
+  onBlocked: onBlockedSchema.optional(),
+  produces: z.array(z.string().min(1)).optional(),
+  consumes: z.array(z.string().min(1)).optional()
 });
 
 const recipeSchema = z.object({

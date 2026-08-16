@@ -66,10 +66,12 @@ steps:
     onBlocked:
       action: "{{ onBlocked }}"
       timeoutMs: "{{ blockedTimeoutMinutes }}"
+    produces: [diff, changed_files]
   - id: check
     name: Re-verify with pytest
     executor: check
     dependsOn: [implement]
+    consumes: [diff]
     input:
       commands: ["python -m pytest -q"]
     qualityGate:

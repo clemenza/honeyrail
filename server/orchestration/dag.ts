@@ -9,10 +9,13 @@ export type StepDefinition = {
   maxAttempts?: number;
   qualityGate?: QualityGate;
   onBlocked?: OnBlockedPolicy;
+  produces?: string[];
+  consumes?: string[];
 };
 
 export type ExecutorLookup = {
   has(type: string): boolean;
+  get(type: string): { producesTypes?: string[] };
 };
 
 export function validateStepGraph(steps: StepDefinition[], executors: ExecutorLookup) {
@@ -52,6 +55,47 @@ export function validateStepGraph(steps: StepDefinition[], executors: ExecutorLo
   }
 
   for (const step of steps) visit(step.id);
+}
+
+/**
+ * StepContract dataflow lint: upgrades the DAG from a bare dependency graph
+ * to an artifact dataflow graph. For every step, each declared `consumes`
+ * entry must be satisfiable by some step reachable via dependsOn ancestry -
+ * either that upstream step's own declared `produces`, or an artifact type
+ * its executor unconditionally auto-harvests (Executor.producesTypes).
+ * Assumes validateStepGraph has already run (ids unique, dependsOn resolved,
+ * no cycles) so ancestry traversal here can't infinite-loop.
+ */
+export function validateStepContracts(steps: StepDefinition[], executors: ExecutorLookup) {
+  const byId = new Map(steps.map((step) => [step.id, step]));
+
+  function ancestorIds(id: string, seen = new Set<string>()): Set<string> {
+    for (const dep of byId.get(id)?.dependsOn || []) {
+      if (!seen.has(dep)) {
+        seen.add(dep);
+        ancestorIds(dep, seen);
+      }
+    }
+    return seen;
+  }
+
+  function effectiveProduces(step: StepDefinition): string[] {
+    const inherent = executors.has(step.executor) ? executors.get(step.executor).producesTypes || [] : [];
+    return [...inherent, ...(step.produces || [])];
+  }
+
+  for (const step of steps) {
+    if (!step.consumes?.length) continue;
+    const available = new Set<string>();
+    for (const ancestorId of ancestorIds(step.id)) {
+      for (const type of effectiveProduces(byId.get(ancestorId)!)) available.add(type);
+    }
+    for (const type of step.consumes) {
+      if (!available.has(type)) {
+        throw new Error(`Step ${step.id} consumes "${type}", which no upstream step (via dependsOn) produces`);
+      }
+    }
+  }
 }
 
 export function readySteps(steps: Step[]): Step[] {
