@@ -20,6 +20,17 @@ function evaluationLabel(step: StepLike) {
   return "PASS";
 }
 
+// Reflects CheckExecutor's commandsSource (executors/check.ts): whether the
+// commands a "check" step ran came from a step-level override or the
+// project's configured test commands. Falls back to the pre-run input shape
+// (used by RecipeWizard's preview, before any step has executed).
+function checkCommandsSource(step: StepLike): "step" | "project" | undefined {
+  if (step.executor !== "check") return undefined;
+  const outputSource = (step.output as Record<string, unknown> | undefined)?.commandsSource;
+  if (outputSource === "step" || outputSource === "project") return outputSource;
+  return Array.isArray((step.input as Record<string, unknown> | undefined)?.commands) ? "step" : "project";
+}
+
 function latestGateDecision(step: StepLike) {
   return step.verification?.gateDecisionItems?.at(-1);
 }
@@ -37,6 +48,16 @@ function gateDecisionLabel(step: StepLike) {
   if (!decision) return "no gate decision";
   if (decision.status === "overridden") return "OVERRIDDEN";
   return decision.status.toUpperCase();
+}
+
+const FAILURE_KIND_LABEL: Record<string, string> = {
+  config_error: "CONFIG ERROR",
+  execution_failed: "EXECUTION FAILED",
+  verification_failed: "VERIFICATION FAILED"
+};
+
+function failureKindLabel(step: StepLike) {
+  return FAILURE_KIND_LABEL[step.failureKind || ""] || null;
 }
 
 function isQualityGateWaiting(step: StepLike) {
@@ -130,6 +151,9 @@ export function StepCard({ step, runId, onApprove, onReject, onAnswer, onOpenDra
         <strong>{step.name || step.id}</strong>
         <span>{step.executor}{step.attempt !== undefined && step.maxAttempts !== undefined ? ` · attempt ${step.attempt}/${step.maxAttempts}` : ""}</span>
         <small>depends on {step.dependsOn?.length ? step.dependsOn.join(", ") : "none"}</small>
+        {step.status === "failed" && failureKindLabel(step) ? (
+          <StatusPill tone={step.failureKind === "config_error" ? "warn" : "bad"}>{failureKindLabel(step)}</StatusPill>
+        ) : null}
         {step.error ? <small className="run-step-error">{step.error}</small> : null}
         <div className="run-verification">
           <button
@@ -149,6 +173,7 @@ export function StepCard({ step, runId, onApprove, onReject, onAnswer, onOpenDra
             Evidence {step.verification?.evidence || 0}
           </button>
           {step.verification?.latestAttempt ? <span>Latest attempt {step.verification.latestAttempt}</span> : null}
+          {checkCommandsSource(step) ? <span>Commands: {checkCommandsSource(step) === "step" ? "step override" : "project defaults"}</span> : null}
           <StatusPill tone={evaluationTone(step)}>{evaluationLabel(step)}</StatusPill>
           <StatusPill tone={gateDecisionTone(step)}>{gateDecisionLabel(step)}</StatusPill>
         </div>

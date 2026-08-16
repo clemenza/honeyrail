@@ -28,6 +28,11 @@ export function recipeRoutes(registry: RecipeRegistry, orchestration: Orchestrat
       throw error;
     }
     const parsed = createRunBody.parse(materialized);
+    try {
+      await orchestration.preflightRun(parsed);
+    } catch (error) {
+      throw httpError((error as Error).message === "Project not found" ? 404 : 400, (error as Error).message);
+    }
     res.json({ run: parsed });
   }));
 

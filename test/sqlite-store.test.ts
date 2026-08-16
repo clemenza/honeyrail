@@ -56,7 +56,7 @@ test("SQLiteStore persists projects, sessions, tasks, worktrees, events, and set
   assert.equal((await store.getTask(task.id))!.title, "fix");
   assert.equal((await store.getWorktree(worktree.id))!.branch, "codex/fix");
   assert.equal((await store.listEvents()).at(-1)!.id, event.id);
-  assert.equal(readSchemaVersion(dbPath), 6);
+  assert.equal(readSchemaVersion(dbPath), 7);
 
   await store.updateTask(task.id, { status: "ready_to_merge" });
   await store.updateWorktree(worktree.id, { status: "committed" });
@@ -77,7 +77,7 @@ test("SQLiteStore schema migrations are idempotent on repeated startup", async (
   const second = new SQLiteStore(dbPath);
   t.after(() => second.close());
 
-  assert.equal(readSchemaVersion(dbPath), 6);
+  assert.equal(readSchemaVersion(dbPath), 7);
   assert.equal((await second.getProject(project.id))!.name, "stable");
   assert.equal((await second.listProjects()).length, 1);
 });
@@ -112,7 +112,7 @@ test("SQLiteStore upgrades v1 records schema to the structured schema without lo
   const store = new SQLiteStore(dbPath);
   t.after(() => store.close());
 
-  assert.equal(readSchemaVersion(dbPath), 6);
+  assert.equal(readSchemaVersion(dbPath), 7);
   assert.equal((await store.getProject("proj_v1"))!.repoPath, "/repo/v1");
   assert.equal((await store.getSession("sess_v1"))!.worktreeId, "wt_v1");
   assert.equal((await store.getTask("task_v1"))!.sessionId, "sess_v1");
@@ -256,7 +256,7 @@ test("SQLiteStore upgrades v2 execution schema to v5 attempt-aware verification 
   const reopened = new SQLiteStore(dbPath);
   t.after(() => reopened.close());
 
-  assert.equal(readSchemaVersion(dbPath), 6);
+  assert.equal(readSchemaVersion(dbPath), 7);
   assert.equal((await reopened.getProject("proj_v2"))!.name, "v2");
   assert.equal((await reopened.getRun(run.id))!.goal, "persist m1");
   assert.equal((await reopened.getStep(run.id, "step_a"))!.input.command, "true");

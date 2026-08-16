@@ -77,6 +77,7 @@ export type StepData = {
   executionRef?: Record<string, unknown>;
   output?: Record<string, unknown>;
   error?: string;
+  failureKind?: "config_error" | "execution_failed" | "verification_failed";
   verification?: VerificationData;
 };
 

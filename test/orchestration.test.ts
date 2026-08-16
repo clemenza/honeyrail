@@ -11,7 +11,7 @@ import { ExecutorRegistry } from "../server/executors/registry.js";
 import { AgentTaskExecutor } from "../server/executors/agent-task.js";
 import { CheckExecutor } from "../server/executors/check.js";
 import { ShellExecutor } from "../server/executors/shell.js";
-import type { ExecutionHandle, ExecutionState, Executor, StepExecutionContext } from "../server/executors/types.js";
+import { ConfigError, type ExecutionHandle, type ExecutionState, type Executor, type PreflightContext, type StepExecutionContext } from "../server/executors/types.js";
 import { EvaluatorRegistry, type Evaluator, type EvaluatorInput, type EvaluatorResult } from "../server/evaluators/registry.js";
 import { EventBus, publishEvent } from "../server/events.js";
 import { validateStepGraph } from "../server/orchestration/dag.js";
@@ -194,7 +194,7 @@ test("scheduler executes a linear DAG, a branched DAG, and blocks downstream on 
   const ok = new MemoryExecutor("ok");
   const fail = new MemoryExecutor("fail", [{ status: "failed", error: "boom" }]);
   const registry = new ExecutorRegistry([ok, fail]);
-  const { service, project } = await withService(t, registry);
+  const { store, service, project } = await withService(t, registry);
 
   const linear = await service.createRun({
     projectId: project.id,
@@ -228,6 +228,8 @@ test("scheduler executes a linear DAG, a branched DAG, and blocks downstream on 
     ]
   });
   assert.equal(failed.run.status, "failed");
+  assert.equal(failed.steps.find((step) => step.id === "a")!.status, "failed");
+  assert.equal((await store.getStep(failed.run.id, "a"))!.failureKind, "execution_failed");
   assert.equal(failed.steps.find((step) => step.id === "b")!.status, "skipped");
 });
 
@@ -283,6 +285,7 @@ test("quality gate fail blocks downstream scheduling", async (t) => {
 
   assert.equal(result.run.status, "failed");
   assert.equal((await store.getStep(result.run.id, "a"))!.status, "failed");
+  assert.equal((await store.getStep(result.run.id, "a"))!.failureKind, "verification_failed");
   assert.equal((await store.getStep(result.run.id, "b"))!.status, "skipped");
   assert.equal((await store.listEvaluations(result.run.id, "a"))[0].status, "failed");
 });
@@ -1173,6 +1176,151 @@ test("CheckExecutor reuses worktree check flow and updates linked task/worktree 
   assert.equal(evidence[0].kind, "check.command");
   assert.equal((evidence[0].value as any).exitCode, 0);
   assert.deepEqual(evidence[0].artifactIds, [artifacts[0].id]);
+  assert.equal(evidence[0].metadata?.commandsSource, "project");
+  assert.equal((handle as any).commandsSource, "project");
+});
+
+test("CheckExecutor evidence records 'step' as the commands source when the step overrides them", async (t) => {
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-check-executor-override-"));
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "shell", testCommands: ["npm test"], runCommands: [] });
+  const worktree = await store.createWorktree({ projectId: project.id, path: tempDir, branch: "shell/task", baseBranch: "main", baseRevision: "base", title: "task", agent: "shell" });
+  const step = await store.createStep({ id: "check", runId: "run_check_override", name: "Check", executor: "check", input: { worktreeId: worktree.id, commands: ["echo override"] }, status: "running" });
+  const executor = new CheckExecutor();
+  const ctx = {
+    store,
+    bus: new EventBus(),
+    tmux: {} as any,
+    worktrees: {
+      runChecks: async () => ({ ok: true, runs: [{ command: "echo override", status: "passed", stdout: "override", stderr: "", startedAt: "s", finishedAt: "f" }] })
+    } as any,
+    runCommand: (async () => ({ ok: true, stdout: "", stderr: "" })) as any,
+    project,
+    runId: "run_check_override",
+    step,
+    sessionLogRoot: "",
+    attachmentRoot: ""
+  };
+
+  const handle = await executor.start(ctx);
+  const evidence = await store.listEvidence("run_check_override", "check");
+  assert.equal(evidence[0].metadata?.commandsSource, "step");
+  assert.equal((handle as any).commandsSource, "step");
+});
+
+test("CheckExecutor.preflight rejects a step whose commands resolve to empty, and passes once the project or step provides them", () => {
+  const executor = new CheckExecutor();
+  const projectNoCommands = { id: "proj_1", name: "demo", repoPath: "/repo", defaultBranch: "main", defaultAgent: "shell", testCommands: [], runCommands: [] };
+  const projectWithCommands = { ...projectNoCommands, testCommands: ["npm test"] };
+
+  assert.throws(
+    () => executor.preflight!({ project: projectNoCommands, step: { id: "check", input: {} }, runCommand: runCommandSafe } as PreflightContext),
+    (error: unknown) => error instanceof ConfigError && /no check commands/.test(error.message)
+  );
+
+  assert.doesNotThrow(() => executor.preflight!({ project: projectWithCommands, step: { id: "check", input: {} }, runCommand: runCommandSafe } as PreflightContext));
+  assert.doesNotThrow(() => executor.preflight!({ project: projectNoCommands, step: { id: "check", input: { commands: ["echo hi"] } }, runCommand: runCommandSafe } as PreflightContext));
+});
+
+test("AgentTaskExecutor.preflight rejects an unknown agent and an agent doctor-style detection can't find", async () => {
+  const executor = new AgentTaskExecutor();
+  const project = { id: "proj_1", name: "demo", repoPath: "/repo", defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] } as any;
+  const notFound = (async () => ({ ok: false, stdout: "", stderr: "" })) as any;
+  const found = (async () => ({ ok: true, stdout: "1.0.0", stderr: "" })) as any;
+
+  await assert.rejects(
+    () => Promise.resolve(executor.preflight!({ project, step: { id: "implement", input: { agent: "bogus" } }, runCommand: found })),
+    (error: unknown) => error instanceof ConfigError && /unknown agent backend/.test(error.message)
+  );
+  await assert.rejects(
+    () => Promise.resolve(executor.preflight!({ project, step: { id: "implement", input: { agent: "codex" } }, runCommand: notFound })),
+    (error: unknown) => error instanceof ConfigError && /doctor-style detection could not find/.test(error.message)
+  );
+  await assert.doesNotReject(() => Promise.resolve(executor.preflight!({ project, step: { id: "implement", input: { agent: "codex" } }, runCommand: found })));
+});
+
+test("createRun rejects at the service layer when a check step's commands resolve to empty, and no run is persisted", async (t) => {
+  const registry = new ExecutorRegistry([new CheckExecutor(), new MemoryExecutor("agent-task")]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-preflight-check-"));
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const service = new OrchestrationService({
+    store,
+    bus: new EventBus(),
+    tmux: {} as any,
+    worktrees: {} as any,
+    runCommand: (async () => ({ ok: true, stdout: "", stderr: "" })) as any,
+    sessionLogRoot: "",
+    attachmentRoot: "",
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "shell", testCommands: [], runCommands: [] });
+
+  await assert.rejects(
+    () => service.createRun({
+      projectId: project.id,
+      goal: "implement, check",
+      steps: [
+        { id: "implement", executor: "agent-task" },
+        { id: "check", executor: "check", dependsOn: ["implement"] }
+      ]
+    }),
+    /check.*no check commands|resolves to no check commands/
+  );
+  assert.deepEqual(await store.listRuns(), []);
+});
+
+test("createRun rejects at the service layer when an agent-task step's agent CLI can't be found by doctor-style detection", async (t) => {
+  const registry = new ExecutorRegistry([new AgentTaskExecutor()]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-preflight-agent-"));
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const service = new OrchestrationService({
+    store,
+    bus: new EventBus(),
+    tmux: {} as any,
+    worktrees: {} as any,
+    runCommand: (async () => ({ ok: false, stdout: "", stderr: "" })) as any,
+    sessionLogRoot: "",
+    attachmentRoot: "",
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+
+  await assert.rejects(
+    () => service.createRun({
+      projectId: project.id,
+      goal: "implement",
+      steps: [{ id: "implement", executor: "agent-task", input: { agent: "codex" } }]
+    }),
+    /doctor-style detection could not find/
+  );
+  assert.deepEqual(await store.listRuns(), []);
+});
+
+test("a step that fails via a thrown ConfigError is tagged failureKind config_error, distinct from a plain execution failure", async (t) => {
+  class ThrowsConfigError implements Executor {
+    type = "boom";
+    async start(): Promise<ExecutionHandle> {
+      throw new ConfigError("cannot possibly run");
+    }
+    async inspect(): Promise<ExecutionState> {
+      return { status: "running" };
+    }
+  }
+  const registry = new ExecutorRegistry([new ThrowsConfigError()]);
+  const { store, service, project } = await withService(t, registry);
+
+  const result = await service.createRun({
+    projectId: project.id,
+    goal: "config error",
+    steps: [{ id: "a", executor: "boom" }]
+  });
+
+  assert.equal(result.run.status, "failed");
+  assert.equal((await store.getStep(result.run.id, "a"))!.status, "failed");
+  assert.equal((await store.getStep(result.run.id, "a"))!.failureKind, "config_error");
 });
 
 async function withHttpServer(t: TestContext, evaluators?: EvaluatorRegistry) {

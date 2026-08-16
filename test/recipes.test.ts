@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { test, type TestContext } from "node:test";
 
 import { createApp } from "../server/api.js";
+import { CheckExecutor } from "../server/executors/check.js";
 import { ExecutorRegistry } from "../server/executors/registry.js";
 import type { ExecutionHandle, ExecutionState, Executor, StepExecutionContext } from "../server/executors/types.js";
 import { EventBus } from "../server/events.js";
@@ -284,4 +285,72 @@ test("POST /api/recipes/:id/runs 404s for an unknown project id", async (t) => {
     body: JSON.stringify({ projectId: "missing_project", parameters: { message: "hi" } })
   });
   assert.equal(res.status, 404);
+});
+
+const checkRecipe: Recipe = {
+  id: "check-only",
+  name: "Check only",
+  description: "A recipe used to exercise preflight validation on a bare check step",
+  category: "test",
+  parameters: [],
+  steps: [{ id: "check", executor: "check", input: { worktreeId: "wt_placeholder" } }]
+};
+
+async function withCheckHttpServer(t: TestContext, testCommands: string[]) {
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-recipes-preflight-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const executors = new ExecutorRegistry([new CheckExecutor()]);
+  const orchestration = new OrchestrationService({
+    store,
+    bus,
+    tmux: {} as any,
+    worktrees: {} as any,
+    runCommand: (async () => ({ ok: true, stdout: "", stderr: "" })) as any,
+    sessionLogRoot: "",
+    attachmentRoot: "",
+    executors
+  });
+  const recipeRegistry = new RecipeRegistry([checkRecipe]);
+  const app = createApp({
+    store,
+    bus,
+    tmux: { listSessions: async () => [] } as any,
+    worktrees: {} as any,
+    run: (async () => ({ ok: true, stdout: "", stderr: "" })) as any,
+    token: null,
+    attachmentRoot: join(tempDir, "attachments"),
+    sessionLogRoot: join(tempDir, "sessions"),
+    orchestration,
+    recipeRegistry
+  });
+  const server = createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands, runCommands: [] });
+  t.after(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(tempDir, { recursive: true, force: true });
+  });
+  return { baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, project, orchestration };
+}
+
+test("POST /api/recipes/:id/preview rejects with 400 when a check step resolves to no commands, so the wizard can't reach submit", async (t) => {
+  const { baseUrl, project } = await withCheckHttpServer(t, []);
+  const res = await fetch(`${baseUrl}/api/recipes/check-only/preview`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ projectId: project.id })
+  });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /no check commands/);
+});
+
+test("POST /api/recipes/:id/preview succeeds once the project has check commands configured", async (t) => {
+  const { baseUrl, project } = await withCheckHttpServer(t, ["npm test"]);
+  const res = await fetch(`${baseUrl}/api/recipes/check-only/preview`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ projectId: project.id })
+  });
+  assert.equal(res.status, 200);
 });

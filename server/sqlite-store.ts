@@ -85,6 +85,10 @@ const BLOCKED_STEP_SCHEMA_SQL = `
   ALTER TABLE steps ADD COLUMN blocked_since TEXT;
 `;
 
+const STEP_FAILURE_KIND_SCHEMA_SQL = `
+  ALTER TABLE steps ADD COLUMN failure_kind TEXT;
+`;
+
 const LEGACY_RECORDS_SQL = `
   CREATE TABLE IF NOT EXISTS records (
     collection TEXT NOT NULL,
@@ -337,6 +341,11 @@ const SCHEMA_MIGRATIONS: SchemaMigration[] = [
     version: 6,
     name: "blocked-step-policy-and-timeout",
     up: (db) => db.exec(BLOCKED_STEP_SCHEMA_SQL)
+  },
+  {
+    version: 7,
+    name: "step-failure-kind",
+    up: (db) => db.exec(STEP_FAILURE_KIND_SCHEMA_SQL)
   }
 ];
 
@@ -477,8 +486,8 @@ export class SQLiteStore implements Store {
   }
 
   private upsertStepRow(step: Step, createdAt: string) {
-    this.db.prepare(`INSERT OR REPLACE INTO steps (id, run_id, name, executor, input, depends_on, status, attempt, max_attempts, created_at, started_at, finished_at, execution_ref, output, error, quality_gate, on_blocked, blocked_since)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    this.db.prepare(`INSERT OR REPLACE INTO steps (id, run_id, name, executor, input, depends_on, status, attempt, max_attempts, created_at, started_at, finished_at, execution_ref, output, error, quality_gate, on_blocked, blocked_since, failure_kind)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       step.id, step.runId, step.name || "", step.executor,
       JSON.stringify(step.input || {}), JSON.stringify(step.dependsOn || []),
       step.status || "pending", step.attempt ?? 0, step.maxAttempts ?? 1,
@@ -488,7 +497,8 @@ export class SQLiteStore implements Store {
       step.error ?? null,
       step.qualityGate ? JSON.stringify(step.qualityGate) : null,
       step.onBlocked ? JSON.stringify(step.onBlocked) : null,
-      step.blockedSince ?? null
+      step.blockedSince ?? null,
+      step.failureKind ?? null
     );
   }
 
@@ -625,7 +635,8 @@ export class SQLiteStore implements Store {
       qualityGate: row.quality_gate ? parseJson<Step["qualityGate"]>(row.quality_gate as string, undefined) : undefined,
       onBlocked: row.on_blocked ? parseJson<Step["onBlocked"]>(row.on_blocked as string, undefined) : undefined,
       blockedSince: row.blocked_since as string | undefined,
-      error: row.error as string | undefined
+      error: row.error as string | undefined,
+      failureKind: row.failure_kind as Step["failureKind"]
     };
   }
 
