@@ -92,7 +92,15 @@ export const claudeAdapter: AgentAdapter = {
     const workingAt = lastLineMatchIndex(output, workingStatusLine);
     if (completedAt <= workingAt) return false;
     const recentTail = output.split("\n").slice(-12).join("\n");
-    return /(?:^|\n)❯\s*$/m.test(recentTail);
+    // The idle prompt box is the border-wrapped "❯" line Claude Code shows
+    // once a turn finishes; it can be empty or prefilled with a suggested
+    // follow-up command (e.g. "❯ commit this"), so match on the box shape
+    // rather than requiring an empty prompt - otherwise a finished task with
+    // a suggestion sitting in the input never gets detected as complete.
+    // Anchoring on the border lines (absent from interactive prompts like
+    // the AskUserQuestion menu) keeps this from misreading a live question
+    // as a finished turn.
+    return /─{4,}\n❯[^\n]*\n─{4,}/.test(recentTail);
   },
 
   async detectInstallation(run) {

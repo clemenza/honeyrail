@@ -154,3 +154,20 @@ test("does not classify ordinary Claude output that merely mentions a duration a
   const chatter = "⏺ Keepers historically worked for long hours in harsh coastal conditions.\n\n✢ Moseying… (9s · ↓ 233 tokens)\n\n❯";
   assert.equal(getAgentAdapter("claude").hasCompletedTask?.(chatter), false);
 });
+
+// Captured verbatim from a real stuck run: Claude Code prefills the prompt
+// box with a suggested follow-up command (e.g. "commit this") once a turn
+// finishes, instead of leaving it empty - the completion check must still
+// recognize this as idle/done, or the step never leaves "running".
+const CLAUDE_COMPLETED_WITH_SUGGESTION = `⏺ All 4 tests pass.
+
+✻ Sautéed for 55s
+
+────────────────────────────────────────────────────────────────────────────────
+❯ commit this
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents      /rc active`;
+
+test("detects a completed Claude task even when the prompt box is prefilled with a suggested next command", () => {
+  assert.equal(getAgentAdapter("claude").hasCompletedTask?.(CLAUDE_COMPLETED_WITH_SUGGESTION), true);
+});

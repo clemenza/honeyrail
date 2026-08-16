@@ -236,6 +236,41 @@ test("reconcileSessions completes a linked task when Codex returns to its prompt
   assert.deepEqual(events.slice(-2).map((event) => event.type), ["task.completed", "session.status_changed"]);
 });
 
+test("reconcileSessions does not refresh lastOutputAt just because the pane is non-blank, so a truly idle session goes stale", async (t) => {
+  const store = await makeStore(t, "agw-monitor-lastoutput-");
+  const bus = new EventBus();
+  const events: any[] = [];
+  bus.subscribe((event) => events.push(event));
+  const staleLastOutputAt = new Date(Date.now() - 120_000).toISOString();
+  const session = await store.createSession({
+    projectId: "proj_1",
+    name: "quietly idle",
+    agent: "claude",
+    tmuxSessionName: "agw_idle",
+    cwd: "/tmp",
+    status: "running",
+    createdAt: staleLastOutputAt
+  });
+  await store.updateSession(session.id, { lastOutputAt: staleLastOutputAt });
+
+  // `output.trim()` alone used to be enough to reset lastOutputAt to "now"
+  // on every poll, since a non-blank pane is the normal case - that masked
+  // genuinely idle sessions from ever being detected as stale. There's no
+  // logPath here, so logFileChanged (hasNewOutput) is false throughout.
+  await reconcileSessions({
+    store,
+    bus,
+    staleMs: 1_000,
+    tmux: {
+      capture: async () => "── previous turn output, unchanged for two minutes ──"
+    } as any
+  });
+
+  const updated = await store.getSession(session.id);
+  assert.equal(updated!.status, "stale");
+  assert.equal(updated!.lastOutputAt, staleLastOutputAt, "lastOutputAt must not be bumped when the log hasn't actually grown");
+});
+
 test("reconcileSessions auto-answers a known interactive prompt instead of flagging waiting_approval", async (t) => {
   const store = await makeStore(t, "agw-monitor-autoanswer-");
   const bus = new EventBus();

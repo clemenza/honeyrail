@@ -237,7 +237,14 @@ export async function reconcileSessions({ store, bus, tmux, staleMs }: Omit<Sess
       const previousStatus = session.status;
       const statusChanged = previousStatus !== nextStatus;
       const updates: Partial<Session> = { lastHealthCheckAt: capturedAt };
-      if (output.trim() || hasNewOutput) updates.lastOutputAt = capturedAt;
+      // Only advance lastOutputAt when the log actually grew. `output.trim()`
+      // is true for basically every poll once the agent has printed
+      // anything, so using it here silently defeats the stale/stalled
+      // watchdogs (inferSessionStatus's staleMs check and the orchestration
+      // service's stalledThresholdMs watchdog) - they'd never see elapsed
+      // time grow because lastOutputAt kept resetting to "now" on a static
+      // screen.
+      if (hasNewOutput) updates.lastOutputAt = capturedAt;
       if (statusChanged) updates.status = nextStatus;
       if (Object.keys(updates).length) await store.updateSession(session.id, updates);
       if (statusChanged) {
