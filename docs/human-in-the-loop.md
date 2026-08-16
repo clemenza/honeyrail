@@ -18,7 +18,7 @@ Every `agent-task` step accepts an `interaction` field on its `input`:
 }
 ```
 
-- `"autonomous"` (the default — `agent-task` steps are always run-launched, so nothing is watching the terminal): the executor prepends an `UNATTENDED_PREAMBLE` to the prompt telling the agent not to ask clarifying questions, to pick the simplest reasonable interpretation and list assumptions instead, and launches the CLI in its least-interactive mode (`codex --full-auto`; Claude Code with `--setting-sources project` instead of `user`, so a user-level skill like `superpowers:brainstorming` can't surface an `AskUserQuestion` menu).
+- `"autonomous"` (the default — `agent-task` steps are always run-launched, so nothing is watching the terminal): the executor prepends an `UNATTENDED_PREAMBLE` to the prompt telling the agent not to ask clarifying questions, to pick the simplest reasonable interpretation and list assumptions instead, and launches the CLI in its least-interactive mode (`codex --ask-for-approval never --sandbox workspace-write`; Claude Code with `--setting-sources project` instead of `user`, so a user-level skill like `superpowers:brainstorming` can't surface an `AskUserQuestion` menu).
 - `"interactive"` opts a step out of all of the above, for the rare case where a run-launched step genuinely needs a human at the terminal.
 
 This only applies to `agent-task` steps created by a run. Sessions launched from the UI or MCP directly are unaffected.
