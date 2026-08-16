@@ -211,6 +211,8 @@ export type Run = {
   status: RunStatus;
   /** Recorded for filtering/eval segmentation - see ContractLevel. */
   contractLevel?: ContractLevel;
+  /** id of the Recipe this run was created from, if any - for eval metrics filtering (see evals/metrics.ts). */
+  recipeId?: string;
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;

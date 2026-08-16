@@ -26,6 +26,7 @@ import { OrchestrationService } from "./orchestration/service.js";
 import { runRoutes } from "./orchestration/routes.js";
 import { RecipeRegistry } from "./recipes/registry.js";
 import { recipeRoutes } from "./recipes/routes.js";
+import { evalRoutes } from "./evals/routes.js";
 
 type CreateAppOptions = {
   store: Store;
@@ -170,6 +171,7 @@ export function createApp({
   app.use(taskRoutes(ctx));
   app.use(runRoutes(orchestration, attachmentRoot));
   app.use(recipeRoutes(recipeRegistry, orchestration));
+  app.use(evalRoutes(store));
 
   // MCP HTTP transport (Streamable HTTP for remote AI agent access)
   const mcpCtx: McpContext = { store, bus, tmux, worktrees, run, sessionLogRoot, attachmentRoot, orchestration };

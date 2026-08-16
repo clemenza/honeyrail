@@ -98,7 +98,13 @@ export function validateStepContracts(steps: StepDefinition[], executors: Execut
   }
 }
 
-function isVerifyingStep(step: StepDefinition): boolean {
+/**
+ * A step "verifies" upstream work if it's the canonical check executor, or
+ * it declares it needs an upstream artifact to look at. Shared with
+ * evals/metrics.ts (#54) so the "verify-runnable rate" metric segments
+ * steps identically to what L2 contract lint considers a verifying step.
+ */
+export function isVerifyingStep(step: StepDefinition): boolean {
   return step.executor === "check" || Boolean(step.consumes?.length);
 }
 

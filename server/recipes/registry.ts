@@ -206,7 +206,7 @@ function templateSubstitute(value: unknown, resolved: Map<string, ResolvedValue>
 export function materializeRecipe(
   recipe: Recipe,
   input: { projectId: string; goal?: string; parameters?: Record<string, unknown> }
-): { projectId: string; goal: string; steps: RecipeStepTemplate[]; contractLevel?: Recipe["contractLevel"] } {
+): { projectId: string; goal: string; steps: RecipeStepTemplate[]; contractLevel?: Recipe["contractLevel"]; recipeId: string } {
   const issues: { path: string; message: string }[] = [];
   const declaredKeys = new Set(recipe.parameters.map((param) => param.key));
   for (const key of Object.keys(input.parameters || {})) {
@@ -246,6 +246,7 @@ export function materializeRecipe(
     projectId: input.projectId,
     goal: input.goal || recipe.name,
     steps: clonedSteps,
-    contractLevel: recipe.contractLevel
+    contractLevel: recipe.contractLevel,
+    recipeId: recipe.id
   };
 }
