@@ -95,6 +95,10 @@ const STEP_CONTRACT_SCHEMA_SQL = `
   ALTER TABLE artifacts ADD COLUMN artifact_type TEXT;
 `;
 
+const CONTRACT_LEVEL_SCHEMA_SQL = `
+  ALTER TABLE runs ADD COLUMN contract_level TEXT;
+`;
+
 const LEGACY_RECORDS_SQL = `
   CREATE TABLE IF NOT EXISTS records (
     collection TEXT NOT NULL,
@@ -357,6 +361,11 @@ const SCHEMA_MIGRATIONS: SchemaMigration[] = [
     version: 8,
     name: "step-contracts",
     up: (db) => db.exec(STEP_CONTRACT_SCHEMA_SQL)
+  },
+  {
+    version: 9,
+    name: "run-contract-level",
+    up: (db) => db.exec(CONTRACT_LEVEL_SCHEMA_SQL)
   }
 ];
 
@@ -489,9 +498,9 @@ export class SQLiteStore implements Store {
   }
 
   private upsertRunRow(run: Run, createdAt: string) {
-    this.db.prepare(`INSERT OR REPLACE INTO runs (id, project_id, goal, status, created_at, started_at, finished_at, cancelled_at, error)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      run.id, run.projectId, run.goal || "", run.status || "pending", createdAt,
+    this.db.prepare(`INSERT OR REPLACE INTO runs (id, project_id, goal, status, contract_level, created_at, started_at, finished_at, cancelled_at, error)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      run.id, run.projectId, run.goal || "", run.status || "pending", run.contractLevel ?? null, createdAt,
       run.startedAt ?? null, run.finishedAt ?? null, run.cancelledAt ?? null, run.error ?? null
     );
   }
@@ -621,6 +630,7 @@ export class SQLiteStore implements Store {
       projectId: String(row.project_id || ""),
       goal: String(row.goal || ""),
       status: (String(row.status || "pending")) as Run["status"],
+      contractLevel: row.contract_level as Run["contractLevel"],
       createdAt: String(row.created_at || ""),
       startedAt: row.started_at as string | undefined,
       finishedAt: row.finished_at as string | undefined,

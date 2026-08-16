@@ -4,12 +4,12 @@ import { createDefaultExecutorRegistry } from "../executors/index.js";
 import type { ExecutorRegistry } from "../executors/registry.js";
 import { ConfigError, type ExecutionState, type StepExecutionContext } from "../executors/types.js";
 import type { SessionSummaryClient } from "../session-helpers.js";
-import type { Artifact, Evaluation, Evidence, OnBlockedPolicy, Project, QualityGate, QualityGateDecision, ResolvedOnBlockedPolicy, Run, Step, StepFailureKind, Store, VerificationSummary } from "../types.js";
+import type { Artifact, ContractLevel, Evaluation, Evidence, OnBlockedPolicy, Project, QualityGate, QualityGateDecision, ResolvedOnBlockedPolicy, Run, Step, StepFailureKind, Store, VerificationSummary } from "../types.js";
 import type { TmuxManager } from "../tmux.js";
 import type { runCommandSafe } from "../utils.js";
 import type { WorktreeManager } from "../worktrees.js";
 import { generateAutoAnswer } from "./auto-answer.js";
-import { blockedStepsAfterFailure, readySteps, type StepDefinition, validateStepContracts, validateStepGraph } from "./dag.js";
+import { blockedStepsAfterFailure, readySteps, type StepDefinition, validateContractLevel, validateStepGraph } from "./dag.js";
 import { publishRunEvent, publishStepEvent } from "./events.js";
 import { deriveRunStatus, isRunTerminal, isStepTerminal, transitionRun, transitionStep } from "./state-machine.js";
 
@@ -47,10 +47,15 @@ const DEFAULT_ON_BLOCKED: ResolvedOnBlockedPolicy = {
 
 const DEFAULT_STALLED_THRESHOLD_MS = 20 * 60_000;
 
+// Preserves validateStepContracts' original unconditional behavior (#51) for
+// any run/recipe that doesn't declare a level.
+const DEFAULT_CONTRACT_LEVEL: ContractLevel = "L1";
+
 export type CreateRunInput = {
   projectId: string;
   goal: string;
   steps: StepDefinition[];
+  contractLevel?: ContractLevel;
 };
 
 export class OrchestrationService {
@@ -108,7 +113,7 @@ export class OrchestrationService {
     const project = await this.store.getProject(input.projectId);
     if (!project) throw new Error("Project not found");
     validateStepGraph(input.steps, this.executors);
-    validateStepContracts(input.steps, this.executors);
+    validateContractLevel(input.contractLevel || DEFAULT_CONTRACT_LEVEL, input.steps, this.executors);
     this.validateQualityGateEvaluators(input.steps);
     await this.runPreflightChecks(input.steps, project);
     return project;
@@ -119,7 +124,8 @@ export class OrchestrationService {
     const run = await this.store.createRun({
       projectId: project.id,
       goal: input.goal,
-      status: "pending"
+      status: "pending",
+      contractLevel: input.contractLevel || DEFAULT_CONTRACT_LEVEL
     });
     const steps: Step[] = [];
     for (const definition of input.steps) {
@@ -700,14 +706,12 @@ export class OrchestrationService {
     return `Step "${step.id}" declares produces [${declared.join(", ")}] but did not produce: ${missing.join(", ")}`;
   }
 
+  // Delegates to the step's executor for its static default gate (e.g.
+  // CheckExecutor.impliedQualityGate) instead of hardcoding by executor
+  // type here - single source of truth shared with contract level L2 lint
+  // (validateContractLevel in orchestration/dag.ts).
   private defaultQualityGate(step: Step): QualityGate | undefined {
-    // "check" steps historically failed outright whenever a command failed
-    // (see CheckExecutor.inspect). That executor now always reports
-    // "succeeded" and defers pass/fail to the quality gate instead, so a
-    // check step without an explicit gate gets this default to preserve
-    // that observed behavior instead of silently succeeding on failed checks.
-    if (step.executor === "check") return { evaluators: [{ type: "check" }], onFail: "fail" };
-    return undefined;
+    return this.executors.has(step.executor) ? this.executors.get(step.executor).impliedQualityGate : undefined;
   }
 
   private async applyQualityGate(run: Run, step: Step, state: ExecutionState): Promise<"passed" | "failed" | "waiting_approval"> {

@@ -1,5 +1,5 @@
 import type { EventBus } from "../events.js";
-import type { Project, Step, Store } from "../types.js";
+import type { Project, QualityGate, Step, Store } from "../types.js";
 import type { TmuxManager } from "../tmux.js";
 import type { runCommandSafe } from "../utils.js";
 import type { WorktreeManager } from "../worktrees.js";
@@ -63,6 +63,15 @@ export interface Executor {
    * redundantly redeclare what its executor already guarantees.
    */
   producesTypes?: string[];
+  /**
+   * Static default QualityGate applied to a step of this executor type when
+   * the step declares none of its own - see
+   * OrchestrationService.defaultQualityGate. Also consulted by contract
+   * level L2 lint (validateContractLevel in orchestration/dag.ts) to decide
+   * whether a "verifying" step needs an explicit evaluator declared, or
+   * already has one implicitly through its executor.
+   */
+  impliedQualityGate?: QualityGate;
   /**
    * Optional static check run at run-creation time (before any Run/Step
    * records exist) to reject steps that cannot possibly succeed given their

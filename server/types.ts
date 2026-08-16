@@ -192,11 +192,25 @@ export type Project = {
   runCommands: string[];
 };
 
+/**
+ * StepContract strictness profile for a run, from lightest to strictest:
+ * L0 execution only (no contract enforcement); L1 artifact dataflow
+ * contracts enforced (validateStepContracts); L2 = L1 + every "verifying"
+ * step (executor "check", or one that declares `consumes`) needs an
+ * evaluator, explicit or implied by its executor; L3 = L2 + at least one
+ * dedicated "approval" step. See validateContractLevel in orchestration/dag.ts.
+ * Defaults to "L1" when a run/recipe doesn't declare one, preserving the
+ * StepContract dataflow lint's original unconditional behavior.
+ */
+export type ContractLevel = "L0" | "L1" | "L2" | "L3";
+
 export type Run = {
   id: string;
   projectId: string;
   goal: string;
   status: RunStatus;
+  /** Recorded for filtering/eval segmentation - see ContractLevel. */
+  contractLevel?: ContractLevel;
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;

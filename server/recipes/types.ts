@@ -1,4 +1,4 @@
-import type { OnBlockedPolicy, QualityGate } from "../types.js";
+import type { ContractLevel, OnBlockedPolicy, QualityGate } from "../types.js";
 
 export type RecipeParameterType = "string" | "number" | "boolean" | "enum";
 
@@ -31,6 +31,8 @@ export type Recipe = {
   name: string;
   description?: string;
   category?: string;
+  /** Defaults to "L1" (see ContractLevel) when a recipe doesn't declare one. */
+  contractLevel?: ContractLevel;
   parameters: RecipeParameter[];
   steps: RecipeStepTemplate[];
 };

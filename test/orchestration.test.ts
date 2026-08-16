@@ -14,7 +14,7 @@ import { ShellExecutor } from "../server/executors/shell.js";
 import { ConfigError, type ExecutionHandle, type ExecutionState, type Executor, type PreflightContext, type StepExecutionContext } from "../server/executors/types.js";
 import { EvaluatorRegistry, type Evaluator, type EvaluatorInput, type EvaluatorResult } from "../server/evaluators/registry.js";
 import { EventBus, publishEvent } from "../server/events.js";
-import { validateStepContracts, validateStepGraph } from "../server/orchestration/dag.js";
+import { validateContractLevel, validateStepContracts, validateStepGraph } from "../server/orchestration/dag.js";
 import { OrchestrationService } from "../server/orchestration/service.js";
 import { assertStepTransition, deriveRunStatus } from "../server/orchestration/state-machine.js";
 import { JsonStore } from "../server/store.js";
@@ -227,6 +227,63 @@ test("StepContract lint rejects a consumes entry no upstream step produces, and 
     ], registry),
     /consumes "diff"/
   );
+});
+
+test("validateContractLevel: L0 skips contract enforcement entirely; L1 is the same as validateStepContracts", () => {
+  const registry = new ExecutorRegistry([new MemoryExecutor("ok")]);
+  const unsatisfiable = [
+    { id: "a", executor: "ok" },
+    { id: "b", executor: "ok", dependsOn: ["a"], consumes: ["diff"] }
+  ];
+
+  assert.doesNotThrow(() => validateContractLevel("L0", unsatisfiable, registry));
+  assert.throws(() => validateContractLevel("L1", unsatisfiable, registry), /consumes "diff"/);
+});
+
+test("validateContractLevel: L2 requires an evaluator on every verifying step (executor 'check', or one that declares consumes), satisfied by an explicit qualityGate or an executor's implicit default", () => {
+  const registry = new ExecutorRegistry([new MemoryExecutor("ok"), new CheckExecutor()]);
+
+  // A non-check step that consumes an upstream artifact but declares no
+  // evaluator, and whose executor has no implicit default.
+  assert.throws(
+    () => validateContractLevel("L2", [
+      { id: "a", executor: "ok", produces: ["diff"] },
+      { id: "b", executor: "ok", dependsOn: ["a"], consumes: ["diff"] }
+    ], registry),
+    /Contract level L2 requires an evaluator on verifying step "b"/
+  );
+
+  // Same shape, but "b" declares its own evaluator explicitly.
+  assert.doesNotThrow(() => validateContractLevel("L2", [
+    { id: "a", executor: "ok", produces: ["diff"] },
+    { id: "b", executor: "ok", dependsOn: ["a"], consumes: ["diff"], qualityGate: { evaluators: [{ type: "boolean" }] } }
+  ], registry));
+
+  // A "check" step is a verifying step by executor type alone, even with no
+  // consumes declared and no explicit qualityGate - CheckExecutor's
+  // impliedQualityGate satisfies L2 on its own.
+  assert.doesNotThrow(() => validateContractLevel("L2", [
+    { id: "check", executor: "check" }
+  ], registry));
+
+  // A plain non-verifying step (no consumes, not "check") needs nothing.
+  assert.doesNotThrow(() => validateContractLevel("L2", [
+    { id: "a", executor: "ok" }
+  ], registry));
+});
+
+test("validateContractLevel: L3 additionally requires at least one dedicated 'approval' step in the run", () => {
+  const registry = new ExecutorRegistry([new CheckExecutor(), new ApprovalTestExecutor()]);
+
+  assert.throws(
+    () => validateContractLevel("L3", [{ id: "check", executor: "check" }], registry),
+    /Contract level L3 requires at least one "approval" step/
+  );
+
+  assert.doesNotThrow(() => validateContractLevel("L3", [
+    { id: "check", executor: "check" },
+    { id: "gate", executor: "approval", dependsOn: ["check"] }
+  ], registry));
 });
 
 test("scheduleRun: a caller racing an already in-flight schedule waits for it instead of reading a mid-transition run status", async (t) => {
@@ -1595,6 +1652,66 @@ test("createRun rejects at the service layer when a step consumes an artifact ty
     /Step b consumes "diff", which no upstream step \(via dependsOn\) produces/
   );
   assert.deepEqual(await store.listRuns(), []);
+});
+
+test("createRun defaults to contract level L1 when unspecified, persists the run's contractLevel, and an explicit L0 run bypasses the dataflow lint L1 would reject", async (t) => {
+  const registry = new ExecutorRegistry([new MemoryExecutor("ok")]);
+  const { store, service, project } = await withService(t, registry);
+
+  const unsatisfiableDataflow = {
+    projectId: project.id,
+    goal: "shell-only maintenance",
+    steps: [
+      { id: "a", executor: "ok" },
+      { id: "b", executor: "ok", dependsOn: ["a"], consumes: ["diff"] }
+    ]
+  };
+
+  // No contractLevel given - defaults to L1, so the same unsatisfiable
+  // dataflow that L0 tolerates below is rejected here.
+  await assert.rejects(() => service.createRun(unsatisfiableDataflow), /consumes "diff"/);
+
+  // A plain execution DAG at L0 runs with no contract errors even though its
+  // dataflow would fail L1's lint - "execution only" per the L0 definition.
+  const result = await service.createRun({ ...unsatisfiableDataflow, contractLevel: "L0" });
+  assert.equal(result.run.status, "succeeded");
+  assert.equal(result.run.contractLevel, "L0");
+
+  // A run that declares a level explicitly gets it recorded verbatim.
+  const explicitL1 = await service.createRun({
+    projectId: project.id,
+    goal: "explicit L1",
+    contractLevel: "L1",
+    steps: [{ id: "solo", executor: "ok" }]
+  });
+  assert.equal((await store.getRun(explicitL1.run.id))!.contractLevel, "L1");
+});
+
+test("createRun rejects an L2 run whose verifying step declares no evaluator, and no run is persisted; a 'check' step satisfies L2 via its implicit default gate", async (t) => {
+  const registry = new ExecutorRegistry([new MemoryExecutor("ok"), new CheckExecutor()]);
+  const { store, service, project } = await withService(t, registry);
+
+  await assert.rejects(
+    () => service.createRun({
+      projectId: project.id,
+      goal: "unverified consumer",
+      contractLevel: "L2",
+      steps: [
+        { id: "a", executor: "ok", produces: ["diff"] },
+        { id: "b", executor: "ok", dependsOn: ["a"], consumes: ["diff"] }
+      ]
+    }),
+    /Contract level L2 requires an evaluator on verifying step "b"/
+  );
+  assert.deepEqual(await store.listRuns(), []);
+
+  const result = await service.createRun({
+    projectId: project.id,
+    goal: "check step satisfies L2 implicitly",
+    contractLevel: "L2",
+    steps: [{ id: "check", executor: "check", input: { commands: ["true"] } }]
+  });
+  assert.equal(result.run.contractLevel, "L2");
 });
 
 test("createRun accepts a consumes entry satisfied by an upstream step's executor-inherent producesTypes, with no explicit produces declared", async (t) => {

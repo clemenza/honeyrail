@@ -80,6 +80,7 @@ const recipeSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional(),
   category: z.string().optional(),
+  contractLevel: z.enum(["L0", "L1", "L2", "L3"]).optional(),
   parameters: z.array(recipeParameterSchema),
   steps: z.array(recipeStepTemplateSchema).min(1)
 });
@@ -205,7 +206,7 @@ function templateSubstitute(value: unknown, resolved: Map<string, ResolvedValue>
 export function materializeRecipe(
   recipe: Recipe,
   input: { projectId: string; goal?: string; parameters?: Record<string, unknown> }
-): { projectId: string; goal: string; steps: RecipeStepTemplate[] } {
+): { projectId: string; goal: string; steps: RecipeStepTemplate[]; contractLevel?: Recipe["contractLevel"] } {
   const issues: { path: string; message: string }[] = [];
   const declaredKeys = new Set(recipe.parameters.map((param) => param.key));
   for (const key of Object.keys(input.parameters || {})) {
@@ -244,6 +245,7 @@ export function materializeRecipe(
   return {
     projectId: input.projectId,
     goal: input.goal || recipe.name,
-    steps: clonedSteps
+    steps: clonedSteps,
+    contractLevel: recipe.contractLevel
   };
 }

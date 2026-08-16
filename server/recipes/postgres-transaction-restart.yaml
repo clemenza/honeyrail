@@ -4,6 +4,7 @@ description: >
   Validates commit/rollback correctness and restart recovery for a
   PostgreSQL target using the postgres executor's alpha scenario.
 category: database-verification
+contractLevel: L2
 parameters:
   - key: dockerImage
     label: Docker image
