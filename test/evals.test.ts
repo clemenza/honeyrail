@@ -41,7 +41,13 @@ async function buildFixture(store: JsonStore) {
     input: {}, status: "succeeded", produces: ["diff", "changed_files"]
   });
   await store.createStep({ id: "check", runId: runA.id, name: "Check", executor: "check", input: {}, status: "succeeded", consumes: ["diff"] });
-  await store.createEvidence({ runId: runA.id, stepId: "implement", kind: "agent.completion", claim: "done", value: { harnessPromptVersion: "1" } });
+  await store.createEvidence({
+    runId: runA.id,
+    stepId: "implement",
+    kind: "agent.completion",
+    claim: "done",
+    value: { harnessPromptVersion: "1", instructionFile: { path: "AGENTS.md", label: "improved", sha256: "a".repeat(64) } }
+  });
   await store.createEvidence({ runId: runA.id, stepId: "implement", kind: "agent.manifest", claim: "coverage.json" });
   await store.createQualityGateDecision({ runId: runA.id, stepId: "check", attempt: 1, status: "passed", evaluationIds: [], decidedBy: "system" });
 
@@ -52,7 +58,13 @@ async function buildFixture(store: JsonStore) {
   });
   await store.createStep({ id: "check2", runId: runB.id, name: "Check", executor: "check", input: {}, status: "skipped", consumes: ["diff"] });
   await store.createStep({ id: "flaky-agent", runId: runB.id, name: "Flaky", executor: "agent-task", input: {}, status: "failed" });
-  await store.createEvidence({ runId: runB.id, stepId: "implement2", kind: "agent.completion", claim: "done", value: { harnessPromptVersion: "2" } });
+  await store.createEvidence({
+    runId: runB.id,
+    stepId: "implement2",
+    kind: "agent.completion",
+    claim: "done",
+    value: { harnessPromptVersion: "2", instructionFile: { path: "AGENTS.md", label: "baseline", sha256: "b".repeat(64) } }
+  });
   await store.createEvidence({ runId: runB.id, stepId: "flaky-agent", kind: "step.blocked", claim: "which framework?" });
   await store.createQualityGateDecision({ runId: runB.id, stepId: "check2", attempt: 1, status: "failed", evaluationIds: [], decidedBy: "operator" });
 
@@ -105,6 +117,22 @@ test("computeEvalMetrics: promptVersion filter isolates a single run so two harn
   assert.notEqual(v1.contractCompliance.rate, v2.contractCompliance.rate);
 });
 
+test("computeEvalMetrics: instructionLabel filter isolates the runs of one instruction-file variant (#25 A/B eval)", async (t) => {
+  const store = await makeStore(t);
+  await buildFixture(store);
+
+  const improved = await computeEvalMetrics(store, { instructionLabel: "improved" });
+  assert.equal(improved.runCount, 1);
+  assert.deepEqual(improved.contractCompliance, { satisfied: 1, total: 1, rate: 1 });
+
+  const baseline = await computeEvalMetrics(store, { instructionLabel: "baseline" });
+  assert.equal(baseline.runCount, 1);
+  assert.deepEqual(baseline.contractCompliance, { satisfied: 0, total: 1, rate: 0 });
+
+  const unknown = await computeEvalMetrics(store, { instructionLabel: "no-such-variant" });
+  assert.equal(unknown.runCount, 0);
+});
+
 test("computeEvalMetrics: an unmatched filter returns zero runs and every rate is null, not NaN or zero", async (t) => {
   const store = await makeStore(t);
   await buildFixture(store);
@@ -148,6 +176,11 @@ test("GET /api/evals/metrics serves the same computation over REST, filterable b
   const filteredBody = await filtered.json();
   assert.equal(filteredBody.runCount, 1);
   assert.deepEqual(filteredBody.contractCompliance, { satisfied: 1, total: 1, rate: 1 });
+
+  const byLabel = await fetch(`${baseUrl}/api/evals/metrics?instructionLabel=baseline`);
+  assert.equal(byLabel.status, 200);
+  const byLabelBody = await byLabel.json();
+  assert.equal(byLabelBody.runCount, 1);
 
   const invalid = await fetch(`${baseUrl}/api/evals/metrics?contractLevel=L9`);
   assert.equal(invalid.status, 400);

@@ -73,7 +73,45 @@ const demoRecipe: Recipe = {
 test("loadRecipesFromDirectory loads the shipped recipes without throwing", async () => {
   const registry = await loadRecipesFromDirectory(shippedRecipesDir);
   const ids = registry.list().map((recipe) => recipe.id).sort();
-  assert.deepEqual(ids, ["implement-check-gate-approve", "postgres-transaction-restart"]);
+  assert.deepEqual(ids, ["eval-instruction-ab-trial", "implement-check-gate-approve", "postgres-transaction-restart"]);
+});
+
+test("shipped eval-instruction-ab-trial recipe materializes the instruction file into the agent-task step", async () => {
+  const registry = await loadRecipesFromDirectory(shippedRecipesDir);
+  const recipe = registry.get("eval-instruction-ab-trial")!;
+
+  const materialized = materializeRecipe(recipe, {
+    projectId: "proj_1",
+    parameters: {
+      prompt: "implement fizzbuzz",
+      instructionContent: "# Agent instructions\nRun checks.\n",
+      instructionLabel: "improved",
+      checkCommand: "python -m pytest -q test_fizzbuzz.py"
+    }
+  });
+  assert.equal(materialized.contractLevel, "L2");
+
+  const implementStep = materialized.steps.find((step) => step.id === "implement")!;
+  // Template substitution must reach inside the nested instructionFile object.
+  assert.deepEqual(implementStep.input?.instructionFile, {
+    path: "AGENTS.md",
+    content: "# Agent instructions\nRun checks.\n",
+    label: "improved"
+  });
+  // Eval trials must terminate unattended: a blocked agent fails the trial.
+  assert.equal(implementStep.onBlocked?.action, "fail");
+  assert.deepEqual(implementStep.produces, ["diff", "changed_files"]);
+
+  const checkStep = materialized.steps.find((step) => step.id === "check")!;
+  assert.deepEqual(checkStep.input?.commands, ["python -m pytest -q test_fizzbuzz.py"]);
+  assert.deepEqual(checkStep.consumes, ["diff"]);
+  assert.equal(checkStep.qualityGate?.onFail, "fail");
+
+  // The two required parameters really are required.
+  assert.throws(
+    () => materializeRecipe(recipe, { projectId: "proj_1", parameters: { prompt: "x", instructionLabel: "a" } }),
+    RecipeValidationError
+  );
 });
 
 test("shipped implement-check-gate-approve recipe wires interaction/onBlocked defaults and overrides", async () => {

@@ -1,0 +1,75 @@
+id: eval-instruction-ab-trial
+name: "Eval trial: instruction-file A/B"
+description: >
+  One (variant, task, trial) cell of an instruction-file A/B eval (#25):
+  injects the given instruction-file variant into a fresh worktree, runs
+  the agent on a scoped task, re-verifies with a fixed check command, and
+  gates on the result. Fully unattended - a blocked agent or a failed
+  check fails the trial instead of waiting for a human, so a matrix of
+  trials always terminates. Drive the full matrix with
+  scripts/evals-ab-demo.ts; segment aggregate metrics by variant via
+  GET /api/evals/metrics?instructionLabel=<label>.
+category: evals
+contractLevel: L2
+parameters:
+  - key: agent
+    label: Agent
+    type: enum
+    options: [codex, claude, hermes, shell]
+    default: codex
+  - key: title
+    label: Task title
+    type: string
+    default: Eval trial task
+  - key: prompt
+    label: Task prompt
+    type: string
+    required: true
+  - key: checkCommand
+    label: Check command
+    type: string
+    default: python -m pytest -q
+  - key: instructionPath
+    label: Instruction file path
+    type: string
+    default: AGENTS.md
+  - key: instructionContent
+    label: Instruction file content
+    type: string
+    required: true
+  - key: instructionLabel
+    label: Instruction variant label
+    type: string
+    required: true
+  - key: model
+    label: Model
+    type: string
+    default: ""
+steps:
+  - id: implement
+    name: Implement change
+    executor: agent-task
+    input:
+      agent: "{{ agent }}"
+      title: "{{ title }}"
+      prompt: "{{ prompt }}"
+      interaction: autonomous
+      model: "{{ model }}"
+      instructionFile:
+        path: "{{ instructionPath }}"
+        content: "{{ instructionContent }}"
+        label: "{{ instructionLabel }}"
+    onBlocked:
+      action: fail
+    produces: [diff, changed_files]
+  - id: check
+    name: Re-verify with check command
+    executor: check
+    dependsOn: [implement]
+    consumes: [diff]
+    input:
+      commands: ["{{ checkCommand }}"]
+    qualityGate:
+      evaluators:
+        - type: check
+      onFail: fail
