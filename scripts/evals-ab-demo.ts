@@ -17,6 +17,7 @@
  *
  * Options:
  *   --base-url <url>            HoneyRail API base (default http://127.0.0.1:4178)
+ *   --token <token>             Bearer token for auth (default: $HONEYRAIL_TOKEN)
  *   --project-id <id>           Existing project to run against
  *   --seed-into <dir>           Create the seed repo fixture there and register it as a project
  *   --agent <id>                Agent backend for every trial (default codex)
@@ -52,10 +53,13 @@ const fixtureRoot = resolve(__dirname, "..", "examples", "harness-ab-eval");
 const RECIPE_ID = "eval-instruction-ab-trial";
 const TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled"]);
 
+let authToken: string | undefined;
+
 type TaskSpec = { id: string; title: string; prompt: string; checkCommand: string };
 type VariantSpec = { label: string; path: string; content: string; sha256: string };
 type CliOptions = {
   baseUrl: string;
+  token?: string;
   projectId?: string;
   seedInto?: string;
   agent: string;
@@ -75,6 +79,7 @@ type CliOptions = {
 function parseArgs(argv: string[]): CliOptions {
   const options: CliOptions = {
     baseUrl: "http://127.0.0.1:4178",
+    token: process.env.HONEYRAIL_TOKEN || undefined,
     agent: "codex",
     model: "",
     trials: 3,
@@ -96,6 +101,7 @@ function parseArgs(argv: string[]): CliOptions {
     };
     switch (arg) {
       case "--base-url": options.baseUrl = next().replace(/\/$/, ""); break;
+      case "--token": options.token = next(); break;
       case "--project-id": options.projectId = next(); break;
       case "--seed-into": options.seedInto = next(); break;
       case "--agent": options.agent = next(); break;
@@ -128,7 +134,11 @@ function parseArgs(argv: string[]): CliOptions {
 async function api<T>(baseUrl: string, path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${baseUrl}${path}`, {
     ...init,
-    headers: { "content-type": "application/json", ...(init?.headers || {}) }
+    headers: {
+      "content-type": "application/json",
+      ...(authToken ? { authorization: `Bearer ${authToken}` } : {}),
+      ...(init?.headers || {})
+    }
   });
   const text = await response.text();
   if (!response.ok) {
@@ -299,6 +309,7 @@ async function writeReport(outDir: string, state: StateFile): Promise<string> {
 
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
+  authToken = options.token;
   const outDir = resolve(options.out);
   await mkdir(outDir, { recursive: true });
   const statePath = join(outDir, "state.json");
