@@ -21,6 +21,7 @@ export function evalRoutes(store: Store) {
       projectId: stringParam(req.query.projectId),
       recipeId: stringParam(req.query.recipeId),
       promptVersion: stringParam(req.query.promptVersion),
+      instructionLabel: stringParam(req.query.instructionLabel),
       contractLevel: contractLevel as EvalMetricsFilter["contractLevel"]
     };
     res.json(await computeEvalMetrics(store, filter));

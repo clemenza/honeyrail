@@ -1,5 +1,6 @@
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join } from "node:path";
 import { HARNESS_PROMPT_VERSION, withHarnessConventions, withUnattendedPreamble } from "../agents/common.js";
 import { getAgentAdapter, isKnownAgent } from "../agents/registry.js";
 import { publishSessionCreated, publishTaskFailed, publishTaskStarted } from "../domain-events.js";
@@ -20,6 +21,49 @@ import { ConfigError, type ExecutionHandle, type ExecutionState, type Executor, 
 function stringInput(value: unknown, fallback = "") {
   const text = String(value ?? "").trim();
   return text || fallback;
+}
+
+export type InstructionFileInput = { path: string; content: string; label?: string };
+
+/**
+ * Parses a step's optional input.instructionFile — the seed of the future
+ * HarnessProfile (#25): one instruction file (e.g. AGENTS.md / CLAUDE.md)
+ * written into the task worktree before agent launch, so two harness
+ * configurations can be A/B-evaluated over the same tasks through the
+ * agent CLI's native instruction-file channel rather than prompt text.
+ * Empty/absent content means "no injection", so a recipe can expose the
+ * whole thing as an optional parameter. Malformed shapes throw ConfigError,
+ * which preflight surfaces before any step runs.
+ */
+export function parseInstructionFile(value: unknown): InstructionFileInput | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new ConfigError("instructionFile must be an object of shape { path, content, label? }");
+  }
+  const record = value as Record<string, unknown>;
+  const content = typeof record.content === "string" ? record.content : "";
+  if (!content.trim()) return null;
+  const path = stringInput(record.path);
+  if (!path) throw new ConfigError("instructionFile.path is required when instructionFile.content is set");
+  if (isAbsolute(path) || path.split(/[/\\]/).includes("..")) {
+    throw new ConfigError(`instructionFile.path must be a relative path inside the worktree without "..", got "${path}"`);
+  }
+  const label = stringInput(record.label) || undefined;
+  return { path, content, label };
+}
+
+/**
+ * Compact identity of an injected instruction file for evidence and eval
+ * segmentation (label = which variant, sha256 = exactly which content) —
+ * the content itself stays out of the store.
+ */
+function instructionFileSummary(file: InstructionFileInput): Record<string, unknown> {
+  return {
+    path: file.path,
+    label: file.label,
+    sha256: createHash("sha256").update(file.content).digest("hex"),
+    bytes: Buffer.byteLength(file.content)
+  };
 }
 
 const QUESTION_TAIL_LINES = 20;
@@ -123,6 +167,12 @@ function parseChangedFiles(status: string): ChangedFile[] {
 async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task): Promise<void> {
   const attemptDir = join(ctx.attachmentRoot, "runs", ctx.runId, ctx.step.id, `attempt-${ctx.step.attempt}`);
   const stepDir = stepDirFor(ctx);
+  let instructionFile: InstructionFileInput | null = null;
+  try {
+    instructionFile = parseInstructionFile(ctx.step.input?.instructionFile);
+  } catch {
+    // A shape start() would have rejected can't have been injected.
+  }
 
   async function saveEvidence(input: {
     kind: string;
@@ -219,6 +269,16 @@ async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task):
     try {
       const worktree = await ctx.store.getWorktree(task.worktreeId);
       if (worktree) {
+        // An injected instruction file exists exactly for the agent session:
+        // removing it before the diff/changed-files harvest keeps harness
+        // configuration out of the measured code change and out of any later
+        // commit/merge of the worktree branch. (On a failed/cancelled step no
+        // harvest runs, but those worktrees are never merged.)
+        if (instructionFile) {
+          await rm(join(worktree.path, instructionFile.path), { force: true }).catch((error) => {
+            console.error(`agent-task ${ctx.step.id}: failed to remove injected instruction file:`, error);
+          });
+        }
         const { diff, diffStat, status } = await ctx.worktrees.diff(worktree);
         const statLine = diffStat.trim().split("\n").filter(Boolean).pop();
         await saveArtifact({
@@ -337,7 +397,11 @@ async function recordCompletionArtifacts(ctx: StepExecutionContext, task: Task):
         sessionId: task.sessionId,
         headRevision: task.headRevision,
         completedAt: new Date().toISOString(),
-        harnessPromptVersion: HARNESS_PROMPT_VERSION
+        harnessPromptVersion: HARNESS_PROMPT_VERSION,
+        // Which instruction-file variant this trial ran under - the
+        // segmentation key eval metrics filter on (see EvalMetricsFilter
+        // .instructionLabel), sibling to harnessPromptVersion above.
+        ...(instructionFile ? { instructionFile: instructionFileSummary(instructionFile) } : {})
       }
     });
   } catch (error) {
@@ -380,6 +444,9 @@ export class AgentTaskExecutor implements Executor {
     if (!isKnownAgent(agent)) {
       throw new ConfigError(`agent-task step "${ctx.step.id}" references unknown agent backend "${agent}"`);
     }
+    // Throws ConfigError on a malformed/unsafe declaration, so a run that
+    // could only fail at injection time is rejected before any step starts.
+    parseInstructionFile(ctx.step.input?.instructionFile);
     const adapter = getAgentAdapter(agent);
     if (!adapter.detectInstallation) return;
     const status = await adapter.detectInstallation(ctx.runCommand);
@@ -405,6 +472,7 @@ export class AgentTaskExecutor implements Executor {
     // "interactive" explicitly if it truly needs a human at the terminal.
     const interaction = ctx.step.input.interaction === "interactive" ? "interactive" : "autonomous";
     const unattended = interaction === "autonomous";
+    const instructionFile = parseInstructionFile(ctx.step.input.instructionFile);
     const stepDir = stepDirFor(ctx);
     await mkdir(join(stepDir, "artifacts"), { recursive: true });
     const promptWithConventions = withHarnessConventions(prompt, { stepDir, produces: ctx.step.produces });
@@ -420,6 +488,34 @@ export class AgentTaskExecutor implements Executor {
     let session: Session | null = null;
     try {
       const createdWorktree = await ctx.worktrees.create({ project: ctx.project, title, agent });
+      if (instructionFile) {
+        const target = join(createdWorktree.path, instructionFile.path);
+        // Refuse to shadow repo content: overwriting a tracked file would
+        // make its later removal (see recordCompletionArtifacts) show up as
+        // a deletion in the harvested diff, silently corrupting the eval.
+        if (await stat(target).catch(() => null)) {
+          throw new ConfigError(
+            `instructionFile.path "${instructionFile.path}" already exists in the worktree - pick a path the repository does not contain`
+          );
+        }
+        await mkdir(dirname(target), { recursive: true });
+        await writeFile(target, instructionFile.content);
+        const summary = instructionFileSummary(instructionFile);
+        const evidence = await ctx.store.createEvidence({
+          runId: ctx.runId,
+          stepId: ctx.step.id,
+          attempt: ctx.step.attempt,
+          kind: "harness.instruction_file",
+          claim: `Injected instruction file "${instructionFile.path}"${instructionFile.label ? ` (variant "${instructionFile.label}")` : ""} before agent launch`,
+          source: "agent-task",
+          value: summary
+        });
+        await publishEvent(ctx.store, ctx.bus, {
+          type: "evidence.recorded",
+          projectId: ctx.project.id,
+          payload: { runId: ctx.runId, stepId: ctx.step.id, evidenceId: evidence.id, kind: evidence.kind, claim: evidence.claim }
+        });
+      }
       worktree = await ctx.store.createWorktree({ ...createdWorktree, taskId: task.id } as Partial<Worktree>);
       const tmuxSessionName = tmuxName("task", title);
       const sessionId = makeId("sess");

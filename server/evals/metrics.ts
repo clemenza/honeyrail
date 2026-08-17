@@ -9,6 +9,8 @@ export type EvalMetricsFilter = {
   contractLevel?: ContractLevel;
   /** Matches a run if any of its agent-task steps' completion evidence recorded this harness prompt version (#52). */
   promptVersion?: string;
+  /** Matches a run if any of its agent-task steps' completion evidence recorded an injected instruction file with this variant label (#25 A/B eval). */
+  instructionLabel?: string;
 };
 
 type RateStat = { satisfied: number; total: number; rate: number | null };
@@ -80,6 +82,19 @@ export async function computeEvalMetrics(store: Store, filter: EvalMetricsFilter
           .filter((version): version is string => typeof version === "string")
       );
       if (!promptVersions.has(filter.promptVersion)) continue;
+    }
+
+    if (filter.instructionLabel) {
+      const labels = new Set(
+        evidence
+          .filter((item) => item.kind === "agent.completion")
+          .map((item) => {
+            const injected = (item.value as Record<string, unknown> | undefined)?.instructionFile;
+            return (injected as Record<string, unknown> | undefined)?.label;
+          })
+          .filter((label): label is string => typeof label === "string")
+      );
+      if (!labels.has(filter.instructionLabel)) continue;
     }
 
     runCount += 1;
