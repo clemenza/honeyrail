@@ -8,7 +8,10 @@ description: >
   check fails the trial instead of waiting for a human, so a matrix of
   trials always terminates. Drive the full matrix with
   scripts/evals-ab-demo.ts; segment aggregate metrics by variant via
-  GET /api/evals/metrics?instructionLabel=<label>.
+  GET /api/evals/metrics?instructionLabel=<label>. The prompt and
+  instruction-file fields default to the fixture's baseline variant/fizzbuzz
+  task so a single cell can be launched from the UI with zero configuration;
+  override them per (variant, task) cell for a real comparison.
 category: evals
 contractLevel: L2
 parameters:
@@ -25,6 +28,13 @@ parameters:
     label: Task prompt
     type: string
     required: true
+    default: >
+      Create fizzbuzz.py at the worktree root with a function fizzbuzz(n: int)
+      -> str that returns "Fizz" for multiples of 3, "Buzz" for multiples of
+      5, "FizzBuzz" for multiples of both, and str(n) otherwise. Create
+      test_fizzbuzz.py at the worktree root with pytest cases covering 3, 5,
+      15, and a plain number. The verification command is
+      `python -m pytest -q test_fizzbuzz.py`.
   - key: checkCommand
     label: Check command
     type: string
@@ -37,10 +47,15 @@ parameters:
     label: Instruction file content
     type: string
     required: true
+    default: |
+      # Agent instructions
+
+      Complete the task you are given. Be quick and keep the change small.
   - key: instructionLabel
     label: Instruction variant label
     type: string
     required: true
+    default: baseline
   - key: model
     label: Model
     type: string
