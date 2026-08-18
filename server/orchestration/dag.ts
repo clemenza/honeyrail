@@ -147,12 +147,18 @@ export function validateContractLevel(level: ContractLevel, steps: StepDefinitio
   }
 }
 
-export function readySteps(steps: Step[]): Step[] {
+/**
+ * @param limit Caps how many eligible steps are returned, in `steps` array
+ * order (stable/deterministic - see the run's `maxParallel`, #78). Omit for
+ * the original unbounded behavior.
+ */
+export function readySteps(steps: Step[], limit?: number): Step[] {
   const byId = new Map(steps.map((step) => [step.id, step]));
-  return steps.filter((step) => {
+  const eligible = steps.filter((step) => {
     if (step.status !== "pending") return false;
     return step.dependsOn.every((dep) => byId.get(dep)?.status === "succeeded");
   });
+  return limit === undefined ? eligible : eligible.slice(0, Math.max(0, limit));
 }
 
 export function blockedStepsAfterFailure(steps: Step[]): Step[] {

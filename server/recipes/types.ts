@@ -33,6 +33,8 @@ export type Recipe = {
   category?: string;
   /** Defaults to "L1" (see ContractLevel) when a recipe doesn't declare one. */
   contractLevel?: ContractLevel;
+  /** Concurrency ceiling applied to every run created from this recipe - see Run.maxParallel (#78). Omit for unlimited parallelism. */
+  maxParallel?: number;
   parameters: RecipeParameter[];
   steps: RecipeStepTemplate[];
 };

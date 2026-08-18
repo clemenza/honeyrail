@@ -58,7 +58,12 @@ export type CreateRunInput = {
   contractLevel?: ContractLevel;
   /** id of the Recipe this run was created from, if any - see evals/metrics.ts. */
   recipeId?: string;
+  /** Concurrency ceiling for this run's steps - see Run.maxParallel (#78). */
+  maxParallel?: number;
 };
+
+/** Step statuses that occupy one of the run's maxParallel "slots" (#78) - ready to start or already active, not yet terminal. */
+const ACTIVE_STEP_STATUSES = new Set<Step["status"]>(["ready", "running", "waiting_input", "waiting_approval"]);
 
 export class OrchestrationService {
   private store: Store;
@@ -128,7 +133,8 @@ export class OrchestrationService {
       goal: input.goal,
       status: "pending",
       contractLevel: input.contractLevel || DEFAULT_CONTRACT_LEVEL,
-      recipeId: input.recipeId
+      recipeId: input.recipeId,
+      maxParallel: input.maxParallel
     });
     const steps: Step[] = [];
     for (const definition of input.steps) {
@@ -614,9 +620,22 @@ export class OrchestrationService {
     return changed;
   }
 
+  /**
+   * How many more steps this run may promote to "ready" right now, given
+   * its maxParallel ceiling (#78) and how many steps already occupy a slot
+   * (ready/running/waiting_input/waiting_approval). Undefined/<=0
+   * maxParallel means no ceiling, preserving the original
+   * unlimited-parallelism behavior.
+   */
+  private remainingParallelCapacity(run: Run, steps: Step[]): number | undefined {
+    if (!run.maxParallel || run.maxParallel <= 0) return undefined;
+    const active = steps.filter((step) => ACTIVE_STEP_STATUSES.has(step.status)).length;
+    return Math.max(0, run.maxParallel - active);
+  }
+
   private async markReadySteps(run: Run, steps: Step[]) {
     let changed = false;
-    for (const step of readySteps(steps)) {
+    for (const step of readySteps(steps, this.remainingParallelCapacity(run, steps))) {
       const updated = await transitionStep(this.store, step, { status: "ready" });
       await publishStepEvent(this.eventContext(), "step.ready", run, updated);
       changed = true;
