@@ -106,12 +106,22 @@ test("shipped eval-instruction-ab-trial recipe materializes the instruction file
   assert.deepEqual(checkStep.input?.commands, ["python -m pytest -q test_fizzbuzz.py"]);
   assert.deepEqual(checkStep.consumes, ["diff"]);
   assert.equal(checkStep.qualityGate?.onFail, "fail");
+});
 
-  // The two required parameters really are required.
-  assert.throws(
-    () => materializeRecipe(recipe, { projectId: "proj_1", parameters: { prompt: "x", instructionLabel: "a" } }),
-    RecipeValidationError
-  );
+test("shipped eval-instruction-ab-trial recipe is self-contained with zero parameters, using the baseline sample variant", async () => {
+  const registry = await loadRecipesFromDirectory(shippedRecipesDir);
+  const recipe = registry.get("eval-instruction-ab-trial")!;
+
+  const materialized = materializeRecipe(recipe, { projectId: "proj_1", parameters: {} });
+  const implementStep = materialized.steps.find((step) => step.id === "implement")!;
+  const instructionFile = implementStep.input?.instructionFile as { path: string; content: string; label: string };
+  assert.equal(instructionFile.path, "AGENTS.md");
+  assert.equal(instructionFile.label, "baseline");
+  assert.match(instructionFile.content, /Agent instructions/);
+  assert.match(String(implementStep.input?.prompt), /fizzbuzz\.py/);
+
+  const checkStep = materialized.steps.find((step) => step.id === "check")!;
+  assert.deepEqual(checkStep.input?.commands, ["python -m pytest -q"]);
 });
 
 test("shipped implement-check-gate-approve recipe wires interaction/onBlocked defaults and overrides", async () => {
