@@ -43,9 +43,9 @@ If an agent asks a question anyway, the step's status becomes `waiting_input` or
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `action` | `"wait_approval"` | What to do as soon as the step is detected as blocked. `"fail"` fails the step immediately (respecting `maxAttempts` — see below). `"auto_answer"` asks the configured LLM to answer on the operator's behalf. `"wait_approval"` just waits, surfacing the block, until `timeoutMs` elapses. |
+| `action` | `"wait_approval"` | What to do as soon as the step is detected as blocked. `"fail"` gives up on the step immediately, respecting `maxAttempts` (see below) - once attempts are exhausted the step's terminal status is `blocked`, not `failed` (it never got a chance to succeed or fail on its own merits - see [Terminal states](#terminal-states) below). `"auto_answer"` asks the configured LLM to answer on the operator's behalf. `"wait_approval"` just waits, surfacing the block, until `timeoutMs` elapses. |
 | `timeoutMs` | `1800000` (30 minutes) | How long a `"wait_approval"` (or an unresolved `"auto_answer"`) block is allowed to sit before `onTimeout` applies. |
-| `onTimeout` | `"fail"` | `"fail"` or `"auto_answer"` — what happens once `timeoutMs` elapses without resolution. |
+| `onTimeout` | `"fail"` | `"fail"` or `"auto_answer"` — what happens once `timeoutMs` elapses without resolution. `"fail"` also terminates the step (and run) as `blocked`, not `failed`, once `maxAttempts` is exhausted. |
 | `maxAutoAnswers` | `2` | Caps how many times `"auto_answer"` will answer for a single step attempt before falling through to `onTimeout`. |
 
 A step whose linked session goes quiet — no new terminal output for a while (default 20 minutes) — is treated the same way: flagged as blocked and run through the same policy, so a wedged CLI can't hold a run open indefinitely either.
@@ -54,6 +54,10 @@ This policy is deliberately scoped to agent clarification prompts. It does **not
 
 - the dedicated `approval` executor (a human-approval step waits indefinitely by design), or
 - a quality gate's `onFail: "wait_approval"` (unchanged semantics, resolved via the existing approve/reject endpoints).
+
+### Terminal states
+
+A step (and the run it belongs to) that exhausts `maxAttempts` while blocked terminates as `blocked`, a status distinct from `failed`. This matters for eval scoring: a rate-limit prompt, a stalled session, or any other unresolved clarification is operational noise, not a signal that the agent's work was actually wrong - conflating the two corrupted pass-rate comparisons before this distinction existed (see the harness A/B eval smoke test writeup). `blocked` steps still cascade a `skipped` status to their dependents exactly like `failed` ones do. The eval report (`server/evals/ab-report.ts`) classifies every trial into one of four buckets - `passed` / `task_failed` / `verify_failed` / `blocked` - and excludes `blocked` from pass-rate denominators.
 
 ### Retrying with what the agent already tried
 

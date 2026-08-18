@@ -42,6 +42,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import {
   buildComparisonReport,
+  classifyTrialOutcome,
   type ComparisonReportInput,
   type TrialRecord
 } from "../server/evals/ab-report.js";
@@ -51,7 +52,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixtureRoot = resolve(__dirname, "..", "examples", "harness-ab-eval");
 
 const RECIPE_ID = "eval-instruction-ab-trial";
-const TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled"]);
+const TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "blocked", "cancelled"]);
 
 let authToken: string | undefined;
 
@@ -210,7 +211,10 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
-type RunDetail = { run: { id: string; status: string; startedAt?: string; finishedAt?: string; error?: string } };
+type RunDetail = {
+  run: { id: string; status: string; startedAt?: string; finishedAt?: string; error?: string };
+  steps?: Array<{ status: string; failureKind?: string }>;
+};
 
 async function executeCell(
   options: CliOptions,
@@ -275,13 +279,14 @@ async function executeCell(
     runId,
     runStatus,
     gatePassed: runStatus === "succeeded" && gateDecisions.length > 0 && gateDecisions.every((decision) => decision.status === "passed"),
+    steps: detail.steps?.map((step) => ({ status: step.status, failureKind: step.failureKind })),
     startedAt,
     finishedAt,
     wallTimeMs,
     evidence: evidence.map((item) => ({ id: item.id, kind: item.kind, claim: item.claim })),
     error: detail.run.error
   };
-  console.log(`  run ${runId} finished: status=${runStatus} gate=${record.gatePassed ? "passed" : "failed"}`);
+  console.log(`  run ${runId} finished: status=${runStatus} outcome=${classifyTrialOutcome(record)} gate=${record.gatePassed ? "passed" : "failed"}`);
   return record;
 }
 
@@ -375,8 +380,11 @@ async function main(): Promise<void> {
   }
 
   const reportPath = await writeReport(outDir, state);
-  const passes = state.trials.filter((trial) => trial.gatePassed).length;
-  console.log(`Done: ${passes}/${state.trials.length} trials passed their gate.`);
+  const outcomes = state.trials.map((trial) => classifyTrialOutcome(trial));
+  const passes = outcomes.filter((outcome) => outcome === "passed").length;
+  const blocked = outcomes.filter((outcome) => outcome === "blocked").length;
+  const scored = state.trials.length - blocked;
+  console.log(`Done: ${passes}/${scored} trials passed their gate${blocked ? ` (${blocked} blocked, excluded)` : ""}.`);
   console.log(`State: ${statePath}`);
   console.log(`Report: ${reportPath}`);
 }

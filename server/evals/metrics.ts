@@ -1,7 +1,7 @@
 import { isVerifyingStep } from "../orchestration/dag.js";
 import type { ContractLevel, Step, Store } from "../types.js";
 
-const TERMINAL_STEP_STATUSES = new Set<Step["status"]>(["succeeded", "failed", "skipped", "cancelled"]);
+const TERMINAL_STEP_STATUSES = new Set<Step["status"]>(["succeeded", "failed", "blocked", "skipped", "cancelled"]);
 
 export type EvalMetricsFilter = {
   projectId?: string;

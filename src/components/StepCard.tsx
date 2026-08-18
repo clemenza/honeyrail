@@ -181,7 +181,7 @@ export function StepCard({ step, runId, onApprove, onReject, onAnswer, onOpenDra
       </div>
       {runId && step.status ? (
         <div className="run-step-actions">
-          <StatusPill tone={step.status === "succeeded" ? "good" : step.status === "failed" ? "bad" : step.status === "waiting_approval" || blocked ? "warn" : "neutral"}>{step.status}</StatusPill>
+          <StatusPill tone={step.status === "succeeded" ? "good" : step.status === "failed" ? "bad" : step.status === "waiting_approval" || step.status === "blocked" || blocked ? "warn" : "neutral"}>{step.status}</StatusPill>
           {step.executionRef?.sessionId ? (
             <a className="secondary-button table-action" href={`#/session/${step.executionRef.sessionId}`}>Session <ArrowRight size={14} /></a>
           ) : null}

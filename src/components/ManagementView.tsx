@@ -264,7 +264,7 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
       <div className="run-list">
         {runs.slice().reverse().map((run) => {
           const project = projects.find((item) => item.id === run.projectId);
-          const terminal = ["succeeded", "failed", "cancelled"].includes(run.status);
+          const terminal = ["succeeded", "failed", "blocked", "cancelled"].includes(run.status);
           const hasBlockedStep = run.steps.some((step) => isAgentBlocked(step));
           return (
             <article className="run-card" key={run.id}>
