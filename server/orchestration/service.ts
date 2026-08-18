@@ -492,7 +492,7 @@ export class OrchestrationService {
     }
 
     if (policy.action === "fail") {
-      await this.handleStepFailure(run, current, `Agent requested clarification: ${question || "no question captured"}`, current.output, question);
+      await this.handleStepFailure(run, current, `Agent requested clarification: ${question || "no question captured"}`, current.output, question, "execution_failed", "blocked");
       return true;
     }
 
@@ -509,7 +509,7 @@ export class OrchestrationService {
       const answered = await this.tryAutoAnswer(run, project, current, question, policy);
       if (answered) return true;
     }
-    await this.handleStepFailure(run, current, `Blocked step timed out after ${Math.round(policy.timeoutMs / 60000)}m waiting for input`, current.output, question);
+    await this.handleStepFailure(run, current, `Blocked step timed out after ${Math.round(policy.timeoutMs / 60000)}m waiting for input`, current.output, question, "execution_failed", "blocked");
     return true;
   }
 
@@ -606,7 +606,7 @@ export class OrchestrationService {
       const updated = await transitionStep(this.store, step, {
         status: "skipped",
         finishedAt: new Date().toISOString(),
-        error: "Skipped because an upstream dependency failed"
+        error: "Skipped because an upstream dependency failed or was blocked"
       });
       await publishStepEvent(this.eventContext(), "step.skipped", run, updated);
       changed = true;
@@ -822,7 +822,23 @@ export class OrchestrationService {
     return decision;
   }
 
-  private async handleStepFailure(run: Run, step: Step, error: string, output?: Record<string, unknown>, blockedQuestion?: string, failureKind: StepFailureKind = "execution_failed") {
+  /**
+   * @param terminalStatus "blocked" (default "failed") when the step never
+   * got a chance to succeed or fail on its own merits - the onBlocked policy
+   * gave up on an unresolved clarification prompt or a stalled session, once
+   * retries are exhausted. failureKind is meaningless in that case (there's
+   * no execution/verification outcome to classify) so it's dropped. See the
+   * StepStatus "blocked" doc comment (#69).
+   */
+  private async handleStepFailure(
+    run: Run,
+    step: Step,
+    error: string,
+    output?: Record<string, unknown>,
+    blockedQuestion?: string,
+    failureKind: StepFailureKind = "execution_failed",
+    terminalStatus: "failed" | "blocked" = "failed"
+  ) {
     const cleanOutput = this.withoutStalledMarker(output);
     if (step.attempt < step.maxAttempts) {
       const retrying = await transitionStep(this.store, step, {
@@ -839,15 +855,16 @@ export class OrchestrationService {
       await publishStepEvent(this.eventContext(), "step.retrying", run, retrying, { error });
       return;
     }
+    const resolvedFailureKind = terminalStatus === "blocked" ? undefined : failureKind;
     const updated = await transitionStep(this.store, step, {
-      status: "failed",
+      status: terminalStatus,
       finishedAt: new Date().toISOString(),
       output: cleanOutput,
       error,
       blockedSince: undefined,
-      failureKind
+      failureKind: resolvedFailureKind
     });
-    await publishStepEvent(this.eventContext(), "step.failed", run, updated, { error, failureKind });
+    await publishStepEvent(this.eventContext(), `step.${terminalStatus}`, run, updated, { error, failureKind: resolvedFailureKind });
   }
 
   /**
@@ -979,7 +996,7 @@ export class OrchestrationService {
     const next = deriveRunStatus(steps);
     if (next === run.status) return false;
     const updates: Partial<Run> = { status: next };
-    if (next === "succeeded" || next === "failed") updates.finishedAt = new Date().toISOString();
+    if (next === "succeeded" || next === "failed" || next === "blocked") updates.finishedAt = new Date().toISOString();
     const updated = await transitionRun(this.store, run, updates as Partial<Run> & { status: Run["status"] });
     await publishRunEvent(this.eventContext(), `run.${next}`, updated);
     return true;

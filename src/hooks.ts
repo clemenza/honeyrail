@@ -293,7 +293,7 @@ export function useGatewayData(enabled = true) {
     });
     stream.addEventListener("task.failed", incrementalHandler);
     stream.addEventListener("task.completed", incrementalHandler);
-    for (const type of ["run.created", "run.started", "run.running", "run.waiting_input", "run.waiting_approval", "run.succeeded", "run.failed", "run.cancelled", "step.ready", "step.started", "step.waiting_input", "step.waiting_approval", "step.succeeded", "step.failed", "step.retrying", "step.skipped", "step.cancelled", "artifact.created", "evidence.recorded", "evaluation.completed", "quality_gate.passed", "quality_gate.failed", "quality_gate.decision", "quality_gate.waiting_approval"]) {
+    for (const type of ["run.created", "run.started", "run.running", "run.waiting_input", "run.waiting_approval", "run.succeeded", "run.failed", "run.blocked", "run.cancelled", "step.ready", "step.started", "step.waiting_input", "step.waiting_approval", "step.succeeded", "step.failed", "step.blocked", "step.retrying", "step.skipped", "step.cancelled", "artifact.created", "evidence.recorded", "evaluation.completed", "quality_gate.passed", "quality_gate.failed", "quality_gate.decision", "quality_gate.waiting_approval"]) {
       stream.addEventListener(type, () => refresh());
     }
 

@@ -36,6 +36,7 @@ export type RunStatus =
   | "waiting_approval"
   | "succeeded"
   | "failed"
+  | "blocked"
   | "cancelled";
 
 export type StepStatus =
@@ -46,6 +47,16 @@ export type StepStatus =
   | "waiting_approval"
   | "succeeded"
   | "failed"
+  /**
+   * Terminal, distinct from "failed": the step's own onBlocked policy
+   * (action "fail", or "wait_approval"/"auto_answer" timing out) gave up on
+   * an unresolved clarification prompt or a stalled session, after
+   * exhausting maxAttempts retries. Unlike "failed", this never reflects the
+   * agent's actual work product - see StepFailureKind for what "failed"
+   * still distinguishes. Kept out of eval pass-rate denominators (#69) since
+   * it carries no pass/fail signal about the task.
+   */
+  | "blocked"
   | "skipped"
   | "cancelled";
 

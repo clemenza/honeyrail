@@ -157,7 +157,9 @@ export function readySteps(steps: Step[]): Step[] {
 
 export function blockedStepsAfterFailure(steps: Step[]): Step[] {
   const byId = new Map(steps.map((step) => [step.id, step]));
-  const failedOrBlocked = new Set(steps.filter((step) => step.status === "failed" || step.status === "skipped").map((step) => step.id));
+  const failedOrBlocked = new Set(
+    steps.filter((step) => step.status === "failed" || step.status === "blocked" || step.status === "skipped").map((step) => step.id)
+  );
   let changed = true;
   while (changed) {
     changed = false;

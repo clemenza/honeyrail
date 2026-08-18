@@ -178,8 +178,27 @@ async function withService(t: TestContext, registry?: ExecutorRegistry, evaluato
 test("state machine rejects invalid step transitions and derives terminal run state", () => {
   assert.doesNotThrow(() => assertStepTransition("pending", "ready"));
   assert.throws(() => assertStepTransition("succeeded", "running"), /Invalid step transition/);
+  assert.doesNotThrow(() => assertStepTransition("waiting_input", "blocked"));
   assert.equal(deriveRunStatus([{ id: "a", runId: "r", name: "A", executor: "x", input: {}, dependsOn: [], status: "succeeded", attempt: 1, maxAttempts: 1, createdAt: "now" }]), "succeeded");
   assert.equal(deriveRunStatus([{ id: "a", runId: "r", name: "A", executor: "x", input: {}, dependsOn: [], status: "waiting_approval", attempt: 1, maxAttempts: 1, createdAt: "now" }]), "waiting_approval");
+  // #69: a blocked step (onBlocked policy gave up, distinct from a genuine
+  // task/verify failure) takes the run to "blocked", not "failed" - even
+  // ahead of another still-active waiting_input branch, mirroring the
+  // fail-fast precedence "failed" already has.
+  assert.equal(
+    deriveRunStatus([
+      { id: "a", runId: "r", name: "A", executor: "x", input: {}, dependsOn: [], status: "blocked", attempt: 1, maxAttempts: 1, createdAt: "now" },
+      { id: "b", runId: "r", name: "B", executor: "x", input: {}, dependsOn: [], status: "waiting_input", attempt: 1, maxAttempts: 1, createdAt: "now" }
+    ]),
+    "blocked"
+  );
+  assert.equal(
+    deriveRunStatus([
+      { id: "a", runId: "r", name: "A", executor: "x", input: {}, dependsOn: [], status: "blocked", attempt: 1, maxAttempts: 1, createdAt: "now" },
+      { id: "b", runId: "r", name: "B", executor: "x", input: {}, dependsOn: [], status: "failed", attempt: 1, maxAttempts: 1, createdAt: "now" }
+    ]),
+    "failed"
+  );
 });
 
 test("DAG validation rejects unknown dependencies, duplicate ids, cycles, and unknown executors", () => {
@@ -971,7 +990,7 @@ test("AgentTaskExecutor.inspect() maps a waiting_approval session onto the step 
   assert.equal(state.status, "waiting_approval");
 });
 
-test("onBlocked action 'fail' immediately fails a blocked step and skips its dependents", async (t) => {
+test("onBlocked action 'fail' terminates a blocked step as 'blocked' (not 'failed') and skips its dependents", async (t) => {
   const registry = new ExecutorRegistry([new AlwaysWaitingExecutor("agent-task"), new MemoryExecutor("check")]);
   const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-blocked-fail-"));
   const store = new JsonStore(join(tempDir, "store.json"));
@@ -1001,10 +1020,12 @@ test("onBlocked action 'fail' immediately fails a blocked step and skips its dep
   });
 
   const askStep = (await store.getStep(created.run.id, "ask"))!;
-  assert.equal(askStep.status, "failed");
+  assert.equal(askStep.status, "blocked");
+  assert.equal(askStep.failureKind, undefined);
   assert.match(askStep.error || "", /Agent requested clarification: which option\?/);
   const afterStep = (await store.getStep(created.run.id, "after"))!;
   assert.equal(afterStep.status, "skipped");
+  assert.equal((await store.getRun(created.run.id))!.status, "blocked");
   assert.ok(events.some((event) => event.type === "step.blocked"));
 
   // Durable, unlike the event above (SQLiteStore prunes the event log to
@@ -1015,7 +1036,7 @@ test("onBlocked action 'fail' immediately fails a blocked step and skips its dep
   assert.match(blockedEvidence!.claim || "", /which option\?/);
 });
 
-test("onBlocked wait_approval times out and fails once timeoutMs elapses", async (t) => {
+test("onBlocked wait_approval times out and terminates 'blocked' once timeoutMs elapses", async (t) => {
   const registry = new ExecutorRegistry([new AlwaysWaitingExecutor("agent-task", "waiting_approval", "should I proceed?")]);
   const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-blocked-timeout-"));
   const store = new JsonStore(join(tempDir, "store.json"));
@@ -1045,7 +1066,7 @@ test("onBlocked wait_approval times out and fails once timeoutMs elapses", async
   await new Promise((resolve) => setTimeout(resolve, 200));
   await service.scheduleRun(created.run.id);
   step = (await store.getStep(created.run.id, "ask"))!;
-  assert.equal(step.status, "failed");
+  assert.equal(step.status, "blocked");
   assert.match(step.error || "", /timed out/);
 });
 
@@ -1074,13 +1095,13 @@ test("a blocked step retried under maxAttempts gets an enriched prompt telling i
   });
 
   const step = (await store.getStep(created.run.id, "ask"))!;
-  assert.equal(step.status, "failed");
+  assert.equal(step.status, "blocked");
   assert.equal(step.attempt, 2);
   assert.equal(step.input.prompt, "build the app");
   assert.match(String(step.input.effectivePrompt), /^build the app\n\nPrevious attempt stopped to ask: "which framework\?"/);
 });
 
-test("the stall watchdog blocks a running step with no fresh session output and times it out", async (t) => {
+test("the stall watchdog blocks a running step with no fresh session output and terminates it 'blocked'", async (t) => {
   const registry = new ExecutorRegistry([new StaysRunningExecutor("agent-task", "sess_stall")]);
   const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-stalled-"));
   const store = new JsonStore(join(tempDir, "store.json"));
@@ -1124,7 +1145,7 @@ test("the stall watchdog blocks a running step with no fresh session output and 
   await new Promise((resolve) => setTimeout(resolve, 200));
   await service.scheduleRun(created.run.id);
   step = (await store.getStep(created.run.id, "ask"))!;
-  assert.equal(step.status, "failed");
+  assert.equal(step.status, "blocked");
   assert.match(step.error || "", /timed out/i);
 });
 
@@ -1296,7 +1317,7 @@ test("onBlocked auto_answer falls through to onTimeout when no client is configu
   await new Promise((resolve) => setTimeout(resolve, 200));
   await service.scheduleRun(created.run.id);
   const step = (await store.getStep(created.run.id, "ask"))!;
-  assert.equal(step.status, "failed");
+  assert.equal(step.status, "blocked");
   assert.match(step.error || "", /timed out/);
 });
 
