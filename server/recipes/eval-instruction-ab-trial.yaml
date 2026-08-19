@@ -75,7 +75,7 @@ steps:
         content: "{{ instructionContent }}"
         label: "{{ instructionLabel }}"
     onBlocked:
-      action: fail
+      action: auto_retry
     produces: [diff, changed_files]
   - id: check
     name: Re-verify with check command

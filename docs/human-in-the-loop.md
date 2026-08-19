@@ -25,7 +25,7 @@ This only applies to `agent-task` steps created by a run. Sessions launched from
 
 ## The `onBlocked` policy
 
-If an agent asks a question anyway, the step's status becomes `waiting_input` or `waiting_approval` (the executor detects this from the linked session's status, which in turn comes from pattern-matching the terminal output — see [docs/agent-adapters.md](agent-adapters.md)). What happens next is controlled by the step's `onBlocked` policy:
+If an agent asks a question anyway, the step's status becomes `waiting_input` or `waiting_approval` (the executor detects this from the linked session's status, which in turn comes from pattern-matching the terminal output — see [docs/agent-adapters.md](agent-adapters.md)). What happens next is controlled by the step's `onBlocked` policy — HoneyRail's unattended-execution contract (#70):
 
 ```json
 {
@@ -33,9 +33,9 @@ If an agent asks a question anyway, the step's status becomes `waiting_input` or
   "executor": "agent-task",
   "input": { "...": "..." },
   "onBlocked": {
-    "action": "wait_approval",
+    "action": "mark_blocked",
     "timeoutMs": 1800000,
-    "onTimeout": "fail",
+    "onTimeout": "auto_retry",
     "maxAutoAnswers": 2
   }
 }
@@ -43,10 +43,12 @@ If an agent asks a question anyway, the step's status becomes `waiting_input` or
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `action` | `"wait_approval"` | What to do as soon as the step is detected as blocked. `"fail"` gives up on the step immediately, respecting `maxAttempts` (see below) - once attempts are exhausted the step's terminal status is `blocked`, not `failed` (it never got a chance to succeed or fail on its own merits - see [Terminal states](#terminal-states) below). `"auto_answer"` asks the configured LLM to answer on the operator's behalf. `"wait_approval"` just waits, surfacing the block, until `timeoutMs` elapses. |
-| `timeoutMs` | `1800000` (30 minutes) | How long a `"wait_approval"` (or an unresolved `"auto_answer"`) block is allowed to sit before `onTimeout` applies. |
-| `onTimeout` | `"fail"` | `"fail"` or `"auto_answer"` — what happens once `timeoutMs` elapses without resolution. `"fail"` also terminates the step (and run) as `blocked`, not `failed`, once `maxAttempts` is exhausted. |
+| `action` | `"mark_blocked"` for `interaction: "autonomous"` steps (the common case — see above), `"wait_approval"` for `"interactive"` ones | What to do as soon as the step is detected as blocked. `"mark_blocked"` gives up immediately, no attempt consumed — the step (and run) goes straight to terminal `blocked` for a human/script to inspect or [retry](#retrying-a-blocked-step) explicitly; nothing is auto-retried, since nobody unattended is watching to judge whether retrying makes sense. `"auto_retry"` gives up on the current attempt and retries immediately, respecting `maxAttempts` (see below) — once attempts are exhausted the step's terminal status is `blocked`, not `failed` (it never got a chance to succeed or fail on its own merits — see [Terminal states](#terminal-states) below). `"auto_answer"` asks the configured LLM to answer on the operator's behalf. `"wait_approval"` escalates to a human via the [Answer](#answering-a-blocked-step) UI/endpoint, surfacing the block until `timeoutMs` elapses — the sensible default for an `interaction: "interactive"` step, where a human genuinely is expected at the terminal, but a poor default for an unattended one (see the Background this issue was filed against: a run with nobody watching sitting on `wait_approval` for 30 minutes before finally giving up). |
+| `timeoutMs` | `1800000` (30 minutes) | How long a `"wait_approval"` (or an unresolved `"auto_answer"`) block is allowed to sit before `onTimeout` applies. Irrelevant to `"mark_blocked"`/`"auto_retry"`, which never wait. |
+| `onTimeout` | `"auto_retry"` | `"auto_retry"` or `"auto_answer"` — what happens once `timeoutMs` elapses without resolution. `"auto_retry"` retries respecting `maxAttempts`, terminating `blocked` (not `failed`) once exhausted, same as the `action` of the same name. |
 | `maxAutoAnswers` | `2` | Caps how many times `"auto_answer"` will answer for a single step attempt before falling through to `onTimeout`. |
+
+Any policy still bounds how long a step can sit blocked before reaching a terminal state — `"mark_blocked"` and `"auto_retry"` act immediately, `"wait_approval"`/`"auto_answer"` are bounded by `timeoutMs` — so a run can never hang indefinitely regardless of which one is configured.
 
 A step whose linked session goes quiet — no new terminal output for a while (default 20 minutes) — is treated the same way: flagged as blocked and run through the same policy, so a wedged CLI can't hold a run open indefinitely either.
 
@@ -79,6 +81,16 @@ POST /api/runs/:runId/steps/:stepId/answer
 This types `text` (+ Enter) into the step's session through the same path as `POST /api/sessions/:id/input`, clears the block, and publishes a `step.answered` event. It only works for a step actually blocked on an agent clarification (`waiting_input`/`waiting_approval`, not the dedicated `approval` executor or a quality-gate wait — use approve/reject for those).
 
 The Runs UI shows this inline: a blocked step's card displays the agent's question (last 20 lines), a text input with an Answer button, and a countdown to the `onBlocked` timeout. The Runs list shows a `blocked` badge on any run with a step in this state.
+
+### Retrying a blocked step
+
+A step terminated `blocked` (most commonly by the default `"mark_blocked"` policy, which never retries itself) can be resumed explicitly:
+
+```
+POST /api/runs/:runId/steps/:stepId/retry
+```
+
+This resets the step to `pending` for the next scheduling pass and, if the run itself was `blocked` only because of this step, resumes the run to `running` too. It works for any step whose status is `blocked`, regardless of which `onBlocked` action put it there. The Runs UI shows a Retry button on a blocked step's card.
 
 ### `onBlocked: "auto_answer"`
 

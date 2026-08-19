@@ -27,8 +27,9 @@ or REST surfaces:
    worktree fails the step rather than shadowing repo content.
 2. **The `eval-instruction-ab-trial` recipe.** One (variant, task, trial)
    cell: inject → implement → re-verify with the task's fixed check
-   command → gate. Fully unattended by construction — a blocked agent or a
-   failed check fails the trial (`onBlocked: fail`, `onFail: fail`), so a
+   command → gate. Fully unattended by construction — a blocked agent
+   terminates the step `blocked` rather than hanging (`onBlocked: auto_retry`,
+   see #70) and a failed check fails the trial (`onFail: fail`), so a
    matrix always terminates without a human.
 3. **The task suite** (`examples/harness-ab-eval/`). Five scoped,
    deterministic Python tasks, each with its own check command scoped to

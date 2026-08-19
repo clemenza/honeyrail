@@ -47,7 +47,7 @@ parameters:
   - key: onBlocked
     label: On agent clarification
     type: enum
-    options: [wait_approval, auto_answer, fail]
+    options: [wait_approval, auto_answer, auto_retry, mark_blocked]
     default: wait_approval
   - key: blockedTimeoutMinutes
     label: Blocked timeout (minutes)

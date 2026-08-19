@@ -4,7 +4,7 @@ import { createDefaultExecutorRegistry } from "../executors/index.js";
 import type { ExecutorRegistry } from "../executors/registry.js";
 import { ConfigError, type ExecutionState, type StepExecutionContext } from "../executors/types.js";
 import type { SessionSummaryClient } from "../session-helpers.js";
-import type { Artifact, ContractLevel, Evaluation, Evidence, OnBlockedPolicy, Project, QualityGate, QualityGateDecision, ResolvedOnBlockedPolicy, Run, Step, StepFailureKind, Store, VerificationSummary } from "../types.js";
+import type { Artifact, ContractLevel, Evaluation, Evidence, OnBlockedAction, OnBlockedPolicy, Project, QualityGate, QualityGateDecision, ResolvedOnBlockedPolicy, Run, Step, StepFailureKind, Store, VerificationSummary } from "../types.js";
 import type { TmuxManager } from "../tmux.js";
 import type { runCommandSafe } from "../utils.js";
 import type { WorktreeManager } from "../worktrees.js";
@@ -38,10 +38,12 @@ export type OrchestrationRuntime = {
   autoAnswerModel?: string;
 };
 
-const DEFAULT_ON_BLOCKED: ResolvedOnBlockedPolicy = {
-  action: "wait_approval",
+// #70: the resolved default action depends on whether anyone is actually
+// watching the step (see resolveOnBlocked below) - these are the shared
+// defaults for everything else in the policy.
+const DEFAULT_ON_BLOCKED_SHARED: Omit<ResolvedOnBlockedPolicy, "action"> = {
   timeoutMs: 30 * 60_000,
-  onTimeout: "fail",
+  onTimeout: "auto_retry",
   maxAutoAnswers: 2
 };
 
@@ -438,8 +440,21 @@ export class OrchestrationService {
     return step.status === "waiting_approval" && (step.output?.qualityGate as { status?: string } | undefined)?.status === "waiting_approval";
   }
 
+  /**
+   * #70: an agent-task step defaults to "autonomous" (see agent-task.ts) -
+   * nobody is watching its terminal - so the default policy is to mark it
+   * blocked immediately rather than sit in wait_approval hoping a human
+   * shows up. A step explicitly opted into interaction: "interactive" keeps
+   * the original wait_approval default, since a human genuinely is expected
+   * there. Either default is still overridden by whatever the step/recipe
+   * declares in onBlocked.
+   */
+  private defaultOnBlockedAction(step: Step): OnBlockedAction {
+    return step.input?.interaction === "interactive" ? "wait_approval" : "mark_blocked";
+  }
+
   private resolveOnBlocked(step: Step): ResolvedOnBlockedPolicy {
-    return { ...DEFAULT_ON_BLOCKED, ...(step.onBlocked || {}) };
+    return { ...DEFAULT_ON_BLOCKED_SHARED, action: this.defaultOnBlockedAction(step), ...(step.onBlocked || {}) };
   }
 
   private async markStepUnblocked(run: Run, step: Step, opts: { clearStalledMarker?: boolean } = {}): Promise<boolean> {
@@ -497,7 +512,14 @@ export class OrchestrationService {
       changed = true;
     }
 
-    if (policy.action === "fail") {
+    if (policy.action === "mark_blocked") {
+      await this.handleStepFailure(
+        run, current, `Agent requested clarification: ${question || "no question captured"}`, current.output, question, "execution_failed", "blocked", true
+      );
+      return true;
+    }
+
+    if (policy.action === "auto_retry") {
       await this.handleStepFailure(run, current, `Agent requested clarification: ${question || "no question captured"}`, current.output, question, "execution_failed", "blocked");
       return true;
     }
@@ -848,6 +870,11 @@ export class OrchestrationService {
    * retries are exhausted. failureKind is meaningless in that case (there's
    * no execution/verification outcome to classify) so it's dropped. See the
    * StepStatus "blocked" doc comment (#69).
+   * @param skipRetry #70's "mark_blocked" policy: go straight to
+   * `terminalStatus` even if attempts remain, instead of the usual
+   * auto-retry-while-attempts-remain behavior below - the point of
+   * mark_blocked is to stop and wait for a human/script to look at it
+   * (or retry it explicitly via retryStep), not to keep guessing.
    */
   private async handleStepFailure(
     run: Run,
@@ -856,10 +883,11 @@ export class OrchestrationService {
     output?: Record<string, unknown>,
     blockedQuestion?: string,
     failureKind: StepFailureKind = "execution_failed",
-    terminalStatus: "failed" | "blocked" = "failed"
+    terminalStatus: "failed" | "blocked" = "failed",
+    skipRetry = false
   ) {
     const cleanOutput = this.withoutStalledMarker(output);
-    if (step.attempt < step.maxAttempts) {
+    if (!skipRetry && step.attempt < step.maxAttempts) {
       const retrying = await transitionStep(this.store, step, {
         status: "pending",
         error,
@@ -983,6 +1011,36 @@ export class OrchestrationService {
     await publishStepEvent(this.eventContext(), "step.running", run, updated);
     await this.scheduleRun(run.id);
     return { run: (await this.store.getRun(run.id)) || run, step: updated };
+  }
+
+  /**
+   * Manually resumes a step terminated "blocked" (#69/#70) - most notably
+   * one that hit the "mark_blocked" onBlocked policy, which deliberately
+   * never retries itself (see handleStepFailure's skipRetry) so an
+   * operator/script decides instead. Resets the step to "pending" for the
+   * next scheduling pass and un-terminals the run if it was "blocked" only
+   * because of this step, so scheduleRun can act on it again.
+   */
+  async retryStep(runId: string, stepId: string): Promise<{ run: Run; step: Step }> {
+    const run = await this.requireRun(runId);
+    const step = await this.requireStep(run.id, stepId);
+    if (step.status !== "blocked") throw new Error(`Step is not blocked: ${step.status}`);
+    const retried = await transitionStep(this.store, step, {
+      status: "pending",
+      error: undefined,
+      output: this.withoutStalledMarker(step.output),
+      executionRef: undefined,
+      startedAt: undefined,
+      finishedAt: undefined,
+      blockedSince: undefined
+    });
+    await publishStepEvent(this.eventContext(), "step.retrying", run, retried, { manual: true });
+    if (run.status === "blocked") {
+      const resumed = await transitionRun(this.store, run, { status: "running", finishedAt: undefined });
+      await publishRunEvent(this.eventContext(), "run.running", resumed);
+    }
+    await this.scheduleRun(run.id);
+    return { run: (await this.store.getRun(run.id)) || run, step: retried };
   }
 
   async cancelRun(runId: string): Promise<Run> {

@@ -99,9 +99,9 @@ const qualityGateBody = z.object({
 });
 
 const onBlockedBody = z.object({
-  action: z.enum(["wait_approval", "auto_answer", "fail"]).optional(),
+  action: z.enum(["mark_blocked", "auto_retry", "auto_answer", "wait_approval"]).optional(),
   timeoutMs: z.number().int().positive().optional(),
-  onTimeout: z.enum(["auto_answer", "fail"]).optional(),
+  onTimeout: z.enum(["auto_answer", "auto_retry"]).optional(),
   maxAutoAnswers: z.number().int().positive().optional()
 });
 

@@ -49,9 +49,9 @@ export type WorktreeData = {
 };
 
 export type OnBlockedPolicyData = {
-  action?: "wait_approval" | "auto_answer" | "fail";
+  action?: "mark_blocked" | "auto_retry" | "auto_answer" | "wait_approval";
   timeoutMs?: number;
-  onTimeout?: "auto_answer" | "fail";
+  onTimeout?: "auto_answer" | "auto_retry";
   maxAutoAnswers?: number;
 };
 

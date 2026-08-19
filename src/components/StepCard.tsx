@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { ArrowRight, Shield, XCircle } from "lucide-react";
+import { ArrowRight, RotateCcw, Shield, XCircle } from "lucide-react";
 import type { StepData } from "../types.js";
 import { StatusPill } from "./layout.js";
 
@@ -135,12 +135,14 @@ function BlockedStepPanel({ step, onAnswer, busy }: { step: StepLike; onAnswer?:
   );
 }
 
-export function StepCard({ step, runId, onApprove, onReject, onAnswer, onOpenDrawer, busy }: {
+export function StepCard({ step, runId, onApprove, onReject, onAnswer, onRetry, onOpenDrawer, busy }: {
   step: StepLike;
   runId?: string;
   onApprove?: (stepId: string) => void;
   onReject?: (stepId: string) => void;
   onAnswer?: (stepId: string, text: string) => void;
+  /** Resumes a step terminated "blocked" - most notably by the #70 "mark_blocked" onBlocked policy, which never retries itself. */
+  onRetry?: (stepId: string) => void;
   onOpenDrawer?: (stepId: string, kind: "artifact" | "evidence") => void;
   busy?: boolean;
 }) {
@@ -194,6 +196,11 @@ export function StepCard({ step, runId, onApprove, onReject, onAnswer, onOpenDra
                 <XCircle size={14} /> Reject
               </button>
             </>
+          ) : null}
+          {step.status === "blocked" ? (
+            <button type="button" className="secondary-button table-action" disabled={Boolean(busy)} onClick={() => onRetry?.(step.id)}>
+              <RotateCcw size={14} /> Retry
+            </button>
           ) : null}
         </div>
       ) : null}

@@ -289,6 +289,7 @@ function RunsPanel({ runs, projects, refresh }: { runs: RunData[]; projects: Pro
                     onApprove={(stepId) => act(`/api/runs/${run.id}/steps/${stepId}/approve`, `approve:${stepId}`)}
                     onReject={(stepId) => act(`/api/runs/${run.id}/steps/${stepId}/reject`, `reject:${stepId}`)}
                     onAnswer={(stepId, text) => act(`/api/runs/${run.id}/steps/${stepId}/answer`, `answer:${stepId}`, { text })}
+                    onRetry={(stepId) => act(`/api/runs/${run.id}/steps/${stepId}/retry`, `retry:${stepId}`)}
                   />
                 ))}
               </div>
