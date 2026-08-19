@@ -224,6 +224,15 @@ export type Run = {
   contractLevel?: ContractLevel;
   /** id of the Recipe this run was created from, if any - for eval metrics filtering (see evals/metrics.ts). */
   recipeId?: string;
+  /**
+   * Caps how many of this run's steps the orchestrator will have
+   * concurrently occupying a "slot" (ready/running/waiting_input/
+   * waiting_approval) at once - see readySteps() in orchestration/dag.ts
+   * (#78). Undefined (or <= 0) preserves the original unlimited-parallelism
+   * behavior: every step whose dependencies are satisfied starts
+   * immediately, with no orchestrator-side ceiling.
+   */
+  maxParallel?: number;
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;

@@ -209,6 +209,17 @@ test("materializeRecipe coerces typed parameters and substitutes whole-string te
   assert.equal(materialized.goal, demoRecipe.name);
 });
 
+// #78: a recipe can declare a static maxParallel ceiling, forwarded as-is
+// into the materialized run params (mirrors contractLevel).
+test("materializeRecipe forwards a recipe's maxParallel into the materialized run", () => {
+  const capped: Recipe = { ...demoRecipe, maxParallel: 2 };
+  const materialized = materializeRecipe(capped, { projectId: "proj_1", parameters: { message: "hello" } });
+  assert.equal(materialized.maxParallel, 2);
+
+  const uncapped = materializeRecipe(demoRecipe, { projectId: "proj_1", parameters: { message: "hello" } });
+  assert.equal(uncapped.maxParallel, undefined);
+});
+
 test("materializeRecipe rejects unknown parameter keys", () => {
   assert.throws(
     () => materializeRecipe(demoRecipe, { projectId: "proj_1", parameters: { message: "hi", bogus: 1 } }),

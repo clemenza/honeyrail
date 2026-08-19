@@ -103,6 +103,10 @@ const RUN_RECIPE_ID_SCHEMA_SQL = `
   ALTER TABLE runs ADD COLUMN recipe_id TEXT;
 `;
 
+const RUN_MAX_PARALLEL_SCHEMA_SQL = `
+  ALTER TABLE runs ADD COLUMN max_parallel INTEGER;
+`;
+
 const LEGACY_RECORDS_SQL = `
   CREATE TABLE IF NOT EXISTS records (
     collection TEXT NOT NULL,
@@ -375,6 +379,11 @@ const SCHEMA_MIGRATIONS: SchemaMigration[] = [
     version: 10,
     name: "run-recipe-id",
     up: (db) => db.exec(RUN_RECIPE_ID_SCHEMA_SQL)
+  },
+  {
+    version: 11,
+    name: "run-max-parallel",
+    up: (db) => db.exec(RUN_MAX_PARALLEL_SCHEMA_SQL)
   }
 ];
 
@@ -507,9 +516,9 @@ export class SQLiteStore implements Store {
   }
 
   private upsertRunRow(run: Run, createdAt: string) {
-    this.db.prepare(`INSERT OR REPLACE INTO runs (id, project_id, goal, status, contract_level, recipe_id, created_at, started_at, finished_at, cancelled_at, error)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      run.id, run.projectId, run.goal || "", run.status || "pending", run.contractLevel ?? null, run.recipeId ?? null, createdAt,
+    this.db.prepare(`INSERT OR REPLACE INTO runs (id, project_id, goal, status, contract_level, recipe_id, max_parallel, created_at, started_at, finished_at, cancelled_at, error)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      run.id, run.projectId, run.goal || "", run.status || "pending", run.contractLevel ?? null, run.recipeId ?? null, run.maxParallel ?? null, createdAt,
       run.startedAt ?? null, run.finishedAt ?? null, run.cancelledAt ?? null, run.error ?? null
     );
   }
@@ -641,6 +650,7 @@ export class SQLiteStore implements Store {
       status: (String(row.status || "pending")) as Run["status"],
       contractLevel: row.contract_level as Run["contractLevel"],
       recipeId: row.recipe_id as string | undefined,
+      maxParallel: row.max_parallel as number | undefined,
       createdAt: String(row.created_at || ""),
       startedAt: row.started_at as string | undefined,
       finishedAt: row.finished_at as string | undefined,

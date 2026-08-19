@@ -14,7 +14,7 @@ import { ShellExecutor } from "../server/executors/shell.js";
 import { ConfigError, type ExecutionHandle, type ExecutionState, type Executor, type PreflightContext, type StepExecutionContext } from "../server/executors/types.js";
 import { EvaluatorRegistry, type Evaluator, type EvaluatorInput, type EvaluatorResult } from "../server/evaluators/registry.js";
 import { EventBus, publishEvent } from "../server/events.js";
-import { validateContractLevel, validateStepContracts, validateStepGraph } from "../server/orchestration/dag.js";
+import { readySteps, validateContractLevel, validateStepContracts, validateStepGraph } from "../server/orchestration/dag.js";
 import { OrchestrationService } from "../server/orchestration/service.js";
 import { assertStepTransition, deriveRunStatus } from "../server/orchestration/state-machine.js";
 import { JsonStore } from "../server/store.js";
@@ -110,6 +110,33 @@ class StaysRunningExecutor implements Executor {
   }
 
   async inspect(): Promise<ExecutionState> {
+    return { status: "running" };
+  }
+}
+
+/**
+ * A per-step-controllable executor for #78 maxParallel tests: each step
+ * stays "running" until its id is added to `completed`, so a test can start
+ * a batch, observe how many actually started, then release one at a time to
+ * see whether a freed slot admits the next pending step.
+ */
+class ControllableExecutor implements Executor {
+  type: string;
+  starts: string[] = [];
+  completed = new Set<string>();
+
+  constructor(type: string) {
+    this.type = type;
+  }
+
+  async start(ctx: StepExecutionContext): Promise<ExecutionHandle> {
+    this.starts.push(ctx.step.id);
+    return { stepId: ctx.step.id };
+  }
+
+  async inspect(_ctx: StepExecutionContext, handle: ExecutionHandle): Promise<ExecutionState> {
+    const stepId = handle.stepId as string;
+    if (this.completed.has(stepId)) return { status: "succeeded", output: {} };
     return { status: "running" };
   }
 }
@@ -2088,4 +2115,112 @@ test("GET /api/artifacts/:id/content truncates files larger than the size cap an
   assert.equal(res.headers.get("x-artifact-truncated"), "true");
   const body = await res.text();
   assert.equal(body.length, MAX_ARTIFACT_CONTENT_BYTES);
+});
+
+// #78: server-side maxParallel concurrency limit for DAG steps.
+
+test("readySteps caps how many eligible steps it returns to `limit`, in step order", () => {
+  const base = { runId: "r", name: "s", executor: "x", input: {}, attempt: 1, maxAttempts: 1, createdAt: "now" } as const;
+  const steps = [
+    { ...base, id: "a", dependsOn: [], status: "pending" as const },
+    { ...base, id: "b", dependsOn: [], status: "pending" as const },
+    { ...base, id: "c", dependsOn: [], status: "pending" as const }
+  ];
+  assert.deepEqual(readySteps(steps).map((step) => step.id), ["a", "b", "c"]);
+  assert.deepEqual(readySteps(steps, 2).map((step) => step.id), ["a", "b"]);
+  assert.deepEqual(readySteps(steps, 0), []);
+  assert.deepEqual(readySteps(steps, -1), []);
+});
+
+test("a run's maxParallel never lets more than K independent steps run at once, and admits the next one as slots free up", async (t) => {
+  const executor = new ControllableExecutor("ctl");
+  const registry = new ExecutorRegistry([executor]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-max-parallel-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: {} as any,
+    worktrees: {} as any,
+    runCommand: runCommandSafe,
+    sessionLogRoot: "",
+    attachmentRoot: "",
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "max-parallel",
+    maxParallel: 2,
+    steps: [
+      { id: "a", executor: "ctl", input: {} },
+      { id: "b", executor: "ctl", input: {} },
+      { id: "c", executor: "ctl", input: {} },
+      { id: "d", executor: "ctl", input: {} }
+    ]
+  });
+
+  // Only 2 of the 4 independent steps started - the rest stay "pending",
+  // never promoted to "ready" past the ceiling.
+  assert.equal(executor.starts.length, 2);
+  let steps = await store.listSteps(created.run.id);
+  assert.equal(steps.filter((step) => step.status === "running").length, 2);
+  assert.equal(steps.filter((step) => step.status === "pending").length, 2);
+
+  // Freeing one slot admits exactly one more step, never exceeding 2 active.
+  executor.completed.add(executor.starts[0]);
+  await service.scheduleRun(created.run.id);
+  assert.equal(executor.starts.length, 3);
+  steps = await store.listSteps(created.run.id);
+  assert.equal(steps.filter((step) => step.status === "running").length, 2);
+  assert.equal(steps.filter((step) => step.status === "succeeded").length, 1);
+  assert.equal(steps.filter((step) => step.status === "pending").length, 1);
+
+  // Draining the rest reaches all 4 started, never more than 2 at a time
+  // (asserted above at each step), and the run eventually succeeds.
+  for (const stepId of [...executor.starts]) executor.completed.add(stepId);
+  await service.scheduleRun(created.run.id);
+  steps = await store.listSteps(created.run.id);
+  for (const step of steps) executor.completed.add(step.id);
+  await service.scheduleRun(created.run.id);
+  assert.equal(executor.starts.length, 4);
+  const run = await store.getRun(created.run.id);
+  assert.equal(run!.status, "succeeded");
+});
+
+test("a run without maxParallel keeps unlimited-parallelism: all independent ready steps start together", async (t) => {
+  const executor = new ControllableExecutor("ctl");
+  const registry = new ExecutorRegistry([executor]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-max-parallel-unset-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: {} as any,
+    worktrees: {} as any,
+    runCommand: runCommandSafe,
+    sessionLogRoot: "",
+    attachmentRoot: "",
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "no-max-parallel",
+    steps: [
+      { id: "a", executor: "ctl", input: {} },
+      { id: "b", executor: "ctl", input: {} },
+      { id: "c", executor: "ctl", input: {} }
+    ]
+  });
+
+  assert.equal(executor.starts.length, 3);
+  const steps = await store.listSteps(created.run.id);
+  assert.equal(steps.filter((step) => step.status === "running").length, 3);
 });
