@@ -166,11 +166,46 @@ DSH_PERMISSION_MODE=<unset|danger-full-access> dsh --profile headless --patch co
 
 - `interactivePrompts: false` is accurate — headless has no answerer, fails closed on anything
   needing one, never blocks on stdin.
-- `modelSelection`: true, but routed through the same `--patch cordis.patch.yml` file
-  (`id: agent-default-model`), not a CLI flag.
+- `modelSelection`: the spike confirmed model choice *is* patchable (`agent-default-model`'s
+  `config.model`), but only through the same single `cordis.patch.yml` the `instructionFile`
+  mechanism already owns for the Route A variant content — there's no `--model` flag and the
+  adapter has no way to write a second patch file on its own. #88 ships this capability as
+  `false` rather than claim something nothing in the adapter actually implements or tests.
 - `attachments`/`images`: not tested in this spike (out of scope — headless's only documented
   input is the `task` positional string); #88 already specs these as `false`.
-- Completion detection: real process exit (`0`/`1`), no tail marker needed in principle, but #88's
-  plan to reuse `hasCompletedByTailMarker` via an appended `; echo HR_DSH_DONE` is a reasonable
-  choice for consistency with the existing tmux-pane-based executor rather than a re-architecture,
-  and doesn't conflict with anything found here.
+- Completion detection: real process exit (`0`/`1`), but #88 still needs the tail-marker +
+  idle-forever tail (`; echo HR_DSH_DONE; while :; do sleep 3600; done`), not just the marker —
+  headless is a true one-shot subprocess that exits on its own, so without the idle loop the tmux
+  pane (and the shell running it) would close the instant the marker prints, racing
+  session-monitor's poller. Same reasoning as null-agent/minimal-agent's own keep-alive tails.
+
+## #88 implementation note: live end-to-end verification
+
+Built the adapter (`server/agents/dsh.ts`, registered in `server/agents/registry.ts`, `"dsh"`
+added to `server/types.ts`'s `AgentType`) and verified it for real, not just via unit tests: spun
+up a second, fully isolated HoneyRail instance (scratch `HONEYRAIL_CONFIG`/`HONEYRAIL_DATA`/
+`HONEYRAIL_WORKTREE_ROOT`, its own port and token) against a scratch git repo, and posted a raw
+`POST /api/runs` DAG (agent-task with `agent: "dsh"` + a `check` step) directly rather than
+through `eval-instruction-ab-trial.yaml` — its `agent` parameter enum is deliberately left
+unchanged per #88's scope, so `dsh` isn't reachable through that recipe yet (the follow-up recipe
+issue carries its own options). Two things came out of that run:
+
+- **`doctor`/`/api/health` correctly listed `dsh` as available**, with the right pinned version,
+  confirming `listAgentAdapters()`'s existing generic iteration in `doctor.ts`/`api.ts` needed no
+  adapter-specific change to pick it up.
+- **A shared-tmux-server gotcha, not a bug in this adapter**: the launching process's own env
+  having `DEEPSEEK_API_KEY` isn't enough — `tmux new-session` on an already-running tmux server
+  uses environment captured at *that server's* startup, not the client's current env, unless the
+  var was propagated via `tmux set-environment -g` (or the session is started fresh). The first
+  live run correctly hit `findFatalError`'s `dsh_missing_credential` path end-to-end (worktree
+  created, session launched, tmux killed, task/step/run all correctly marked `failed` with the
+  adapter's exact message) even though the key was genuinely set in the server process's
+  environment — because the shared tmux server on this host predated that env var. After
+  `tmux set-environment -g DEEPSEEK_API_KEY ...`, a second run completed the full pipeline
+  end-to-end: dsh wrote a correct `fizzbuzz.py`/`test_fizzbuzz.py`, the diff was harvested, the
+  `check` step's `pytest` gate passed, and the run reached `succeeded`. Whoever deploys this
+  adapter for real needs `DEEPSEEK_API_KEY` in the tmux server's environment specifically, not
+  just wherever HoneyRail itself is started — worth a callout in deployment docs if that isn't
+  already the pattern operators expect from the other CLI-wrapping adapters (codex/claude/hermes
+  hit the same tmux-inheritance constraint for their own credentials, so this isn't dsh-specific,
+  but it's easy to trip over the first time).

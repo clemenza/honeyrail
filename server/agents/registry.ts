@@ -6,8 +6,9 @@ import { claudeAdapter } from "./claude.js";
 import { hermesAdapter } from "./hermes.js";
 import { nullAgentAdapter } from "./null-agent.js";
 import { minimalAgentAdapter } from "./minimal-agent.js";
+import { dshAdapter } from "./dsh.js";
 
-const adapters = [shellAdapter, codexAdapter, claudeAdapter, hermesAdapter, nullAgentAdapter, minimalAgentAdapter] as const;
+const adapters = [shellAdapter, codexAdapter, claudeAdapter, hermesAdapter, nullAgentAdapter, minimalAgentAdapter, dshAdapter] as const;
 const adapterById = new Map<string, AgentAdapter>(adapters.map((adapter) => [adapter.id, adapter]));
 
 export class UnknownAgentError extends Error {

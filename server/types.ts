@@ -35,8 +35,15 @@ export type TaskStatus =
  * They're only reachable through a DAG `agent-task` step's `input.agent`
  * (validated at runtime via isKnownAgent, not a zod enum) or a recipe
  * parameter that explicitly lists them as options.
+ *
+ * "dsh" (#87/#88) is a real agent CLI, not a calibration probe, but stays
+ * out of those same enums for a different reason: it's a developer-preview
+ * harness expected to break between releases (see
+ * docs/dsh-adapter-notes.md), so it's opt-in only via a recipe parameter
+ * (or a DAG step's `input.agent`) until it's proven stable enough for
+ * general interactive use.
  */
-export type AgentType = "shell" | "codex" | "claude" | "hermes" | "null" | "minimal";
+export type AgentType = "shell" | "codex" | "claude" | "hermes" | "null" | "minimal" | "dsh";
 
 export type RunStatus =
   | "pending"
