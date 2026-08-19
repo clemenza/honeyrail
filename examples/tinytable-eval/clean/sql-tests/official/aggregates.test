@@ -5,7 +5,7 @@
 # unaffected by the defect (COUNT(*) must always include every row).
 
 statement ok
-CREATE TABLE people (name, age, dept)
+CREATE TABLE people (name TEXT, age INTEGER, dept TEXT)
 
 statement ok
 INSERT INTO people VALUES ('Ann', 30, 'eng')
@@ -48,7 +48,7 @@ SELECT MAX(age) FROM people
 
 # min/max on an empty result is NULL.
 statement ok
-CREATE TABLE empty_t (x)
+CREATE TABLE empty_t (x INTEGER)
 
 statement ok
 INSERT INTO empty_t VALUES (1)
@@ -65,7 +65,7 @@ NULL
 
 # a fully-populated column is also fine to COUNT(col) directly.
 statement ok
-CREATE TABLE full_t (x)
+CREATE TABLE full_t (x INTEGER)
 
 statement ok
 INSERT INTO full_t VALUES (1)

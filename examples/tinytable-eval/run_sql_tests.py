@@ -103,7 +103,11 @@ def parse_test_file(path: pathlib.Path) -> list[Record]:
 
 
 def _render(value) -> str:
-    return "NULL" if value is None else str(value)
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):  # check before str(): str(True) is "True", not "TRUE"
+        return "TRUE" if value else "FALSE"
+    return str(value)
 
 
 def _check_query(record: QueryRecord, columns: list[str], rows: list[tuple]) -> Optional[str]:

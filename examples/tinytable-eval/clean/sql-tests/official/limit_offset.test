@@ -3,7 +3,7 @@
 # order is the seeded defect (see golden/ once it exists).
 
 statement ok
-CREATE TABLE t (x)
+CREATE TABLE t (x INTEGER)
 
 statement ok
 INSERT INTO t VALUES (1)

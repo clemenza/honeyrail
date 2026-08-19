@@ -1,7 +1,7 @@
 # AND / OR / NOT composition - see SPEC.md's Predicates section.
 
 statement ok
-CREATE TABLE people (name, dept, age)
+CREATE TABLE people (name TEXT, dept TEXT, age INTEGER)
 
 statement ok
 INSERT INTO people VALUES ('Ann', 'eng', 30)

@@ -2,7 +2,7 @@
 # Never uses `= NULL`/`!= NULL` here - see where_null_semantics.test for that.
 
 statement ok
-CREATE TABLE people (name, age, dept)
+CREATE TABLE people (name TEXT, age INTEGER, dept TEXT)
 
 statement ok
 INSERT INTO people VALUES ('Ann', 30, 'eng')
@@ -102,7 +102,7 @@ Di
 
 # a column missing from an INSERT's column list behaves like NULL.
 statement ok
-CREATE TABLE sparse (x, y)
+CREATE TABLE sparse (x INTEGER, y INTEGER)
 
 statement ok
 INSERT INTO sparse (x) VALUES (1)

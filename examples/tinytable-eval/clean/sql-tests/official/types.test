@@ -1,0 +1,41 @@
+# Column types - see SPEC.md's Column Types section.
+
+statement ok
+CREATE TABLE t (name TEXT, age INTEGER, active BOOLEAN, score REAL)
+
+statement ok
+INSERT INTO t VALUES ('Ann', 30, TRUE, 4.5)
+
+# NULL is always allowed, regardless of declared type.
+statement ok
+INSERT INTO t VALUES ('Bo', NULL, FALSE, NULL)
+
+query TIBR nosort
+SELECT name, age, active, score FROM t ORDER BY name
+----
+Ann
+30
+TRUE
+4.5
+Bo
+NULL
+FALSE
+NULL
+
+# a value of the wrong type is rejected on INSERT ...
+statement error declared TEXT
+INSERT INTO t VALUES (5, 1, TRUE, 1.0)
+
+# ... and BOOLEAN is distinct from INTEGER, not just "0 or 1" - bool is a
+# Python subclass of int, so this is exactly the kind of mistake a naive
+# type check could get wrong.
+statement error declared BOOLEAN
+INSERT INTO t VALUES ('Cy', 1, 1, 1.0)
+
+# ... and on UPDATE too.
+statement error declared INTEGER
+UPDATE t SET age = 'thirty' WHERE name = 'Ann'
+
+# an untyped CREATE TABLE column is a syntax error.
+statement error expected a column type
+CREATE TABLE bad (x)

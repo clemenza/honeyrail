@@ -4,7 +4,7 @@
 # are the two seeded defects (see golden/ once it exists).
 
 statement ok
-CREATE TABLE t (x)
+CREATE TABLE t (x INTEGER)
 
 statement ok
 INSERT INTO t VALUES (3)
@@ -31,7 +31,7 @@ SELECT x FROM t ORDER BY x DESC
 
 # NULL placement, ascending only.
 statement ok
-CREATE TABLE t2 (x)
+CREATE TABLE t2 (x INTEGER)
 
 statement ok
 INSERT INTO t2 VALUES (2)
@@ -58,7 +58,7 @@ NULL
 
 # ORDER BY after a WHERE orders only the matched rows.
 statement ok
-CREATE TABLE people (name, age)
+CREATE TABLE people (name TEXT, age INTEGER)
 
 statement ok
 INSERT INTO people VALUES ('Ann', 30)

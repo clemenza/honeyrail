@@ -5,7 +5,7 @@
 # insert stores exactly what was given, and a second insert doesn't touch
 # columns not named in an UPDATE.
 statement ok
-CREATE TABLE t (x, y)
+CREATE TABLE t (x INTEGER, y TEXT)
 
 statement ok
 INSERT INTO t (x, y) VALUES (1, 'keep')
@@ -21,7 +21,7 @@ keep
 
 # update returns/affects only matching rows; non-matching rows are untouched.
 statement ok
-CREATE TABLE dept (name, dept)
+CREATE TABLE dept (name TEXT, dept TEXT)
 
 statement ok
 INSERT INTO dept VALUES ('Ann', 'eng')

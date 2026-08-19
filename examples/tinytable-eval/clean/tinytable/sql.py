@@ -5,6 +5,12 @@ section for the exact grammar) against the existing Table/Predicate/Query
 engine in core.py - this module is purely a translation layer, not a second
 implementation of the underlying semantics.
 
+CREATE TABLE columns are typed (INTEGER/REAL/TEXT/BOOLEAN - see
+COLUMN_TYPES); INSERT/UPDATE reject a value whose Python type doesn't
+exactly match its column's declared type (NULL is always allowed
+regardless of type). core.py itself stays schemaless - typing is enforced
+here, at the SQL boundary, not in the underlying engine.
+
 Deliberately out of scope: JOINs, subqueries, GROUP BY, multiple aggregates
 or an aggregate mixed with plain columns in one SELECT, transactions that
 span statements other than SAVEPOINT/ROLLBACK TO/RELEASE/COMMIT. All of
@@ -69,12 +75,15 @@ def tokenize(text: str) -> list[Token]:
     return tokens
 
 
-_KEYWORDS = {
-    "CREATE", "TABLE", "INDEX", "UNIQUE", "ON", "INSERT", "INTO", "VALUES",
-    "UPDATE", "SET", "DELETE", "FROM", "WHERE", "SELECT", "ORDER", "BY",
-    "ASC", "DESC", "NULLS", "FIRST", "LAST", "LIMIT", "OFFSET", "AND", "OR",
-    "NOT", "BETWEEN", "IN", "IS", "NULL", "SAVEPOINT", "ROLLBACK", "TO",
-    "RELEASE", "COMMIT", "COUNT", "MIN", "MAX",
+# Column types a CREATE TABLE may declare, mapped to the exact Python type
+# a value must have to satisfy them (checked with `type(v) is T`, not
+# `isinstance`, so e.g. a BOOLEAN can never sneak into an INTEGER column -
+# bool is a subclass of int in Python).
+COLUMN_TYPES: dict[str, type] = {
+    "INTEGER": int,
+    "REAL": float,
+    "TEXT": str,
+    "BOOLEAN": bool,
 }
 
 
@@ -86,7 +95,7 @@ _KEYWORDS = {
 @dataclass
 class CreateTable:
     table: str
-    columns: list[str]
+    columns: list[tuple[str, str]]  # (name, type) in declared order
 
 
 @dataclass
@@ -244,6 +253,12 @@ class Parser:
         if self._at_keyword("NULL"):
             self._advance()
             return None
+        if self._at_keyword("TRUE"):
+            self._advance()
+            return True
+        if self._at_keyword("FALSE"):
+            self._advance()
+            return False
         if tok.kind in ("STRING", "NUMBER"):
             self._advance()
             return tok.value
@@ -282,6 +297,25 @@ class Parser:
         self._eat_op(")")
         return cols
 
+    def _parse_column_defs(self) -> list[tuple[str, str]]:
+        self._eat_op("(")
+        defs = [self._parse_column_def()]
+        while self._try_op(","):
+            defs.append(self._parse_column_def())
+        self._eat_op(")")
+        return defs
+
+    def _parse_column_def(self) -> tuple[str, str]:
+        name = self._eat_ident()
+        for type_name in COLUMN_TYPES:
+            if self._try_keyword(type_name):
+                return (name, type_name)
+        tok = self._peek()
+        raise SqlError(
+            f"expected a column type ({'/'.join(COLUMN_TYPES)}) after column {name!r}, "
+            f"got {tok.kind} {tok.value!r} at position {tok.pos}"
+        )
+
     def _parse_create(self):
         self._eat_keyword("CREATE")
         if self._try_keyword("UNIQUE"):
@@ -303,7 +337,7 @@ class Parser:
             return CreateIndex(table=table, column=column, unique=False)
         self._eat_keyword("TABLE")
         table = self._eat_ident()
-        columns = self._parse_column_list()
+        columns = self._parse_column_defs()
         return CreateTable(table=table, columns=columns)
 
     def _parse_insert(self):
@@ -539,6 +573,20 @@ class Database:
     def __init__(self):
         self._tables: dict[str, core.Table] = {}
         self._schemas: dict[str, list[str]] = {}
+        self._column_types: dict[str, dict[str, str]] = {}
+
+    def _check_types(self, table: str, values: dict) -> None:
+        types = self._column_types.get(table, {})
+        for column, value in values.items():
+            type_name = types.get(column)
+            if type_name is None or value is None:  # untyped column, or NULL - always fine
+                continue
+            expected = COLUMN_TYPES[type_name]
+            if type(value) is not expected:
+                raise SqlError(
+                    f"column {column!r} of table {table!r} is declared {type_name} "
+                    f"but got a {type(value).__name__} value: {value!r}"
+                )
 
     def table(self, name: str) -> core.Table:
         if name not in self._tables:
@@ -562,7 +610,8 @@ class Database:
             if stmt.table in self._tables:
                 raise SqlError(f"table {stmt.table!r} already exists")
             self._tables[stmt.table] = core.Table(stmt.table)
-            self._schemas[stmt.table] = list(stmt.columns)
+            self._schemas[stmt.table] = [name for name, _ in stmt.columns]
+            self._column_types[stmt.table] = dict(stmt.columns)
             return None
         if isinstance(stmt, CreateIndex):
             table = self.table(stmt.table)
@@ -578,12 +627,15 @@ class Database:
                 raise SqlError(f"INSERT INTO {stmt.table} needs an explicit column list (no CREATE TABLE schema on record)")
             if len(columns) != len(stmt.values):
                 raise SqlError(f"column count {len(columns)} does not match value count {len(stmt.values)}")
-            table.insert(dict(zip(columns, stmt.values)))
+            row = dict(zip(columns, stmt.values))
+            self._check_types(stmt.table, row)
+            table.insert(row)
             return None
         if isinstance(stmt, Update):
             table = self.table(stmt.table)
             predicate = _build_predicate(stmt.where) if stmt.where is not None else _AllPredicate()
             changes = dict(stmt.assignments)
+            self._check_types(stmt.table, changes)
             table.update(predicate, changes)
             return None
         if isinstance(stmt, Delete):

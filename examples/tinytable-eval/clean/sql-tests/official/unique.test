@@ -3,7 +3,7 @@
 # the seeded defect (see golden/ once it exists).
 
 statement ok
-CREATE TABLE people (email, n)
+CREATE TABLE people (email TEXT, n INTEGER)
 
 statement ok
 CREATE UNIQUE INDEX uq_email ON people(email)
@@ -26,7 +26,7 @@ SELECT n FROM people
 
 # unique() declared on existing data is validated immediately.
 statement ok
-CREATE TABLE dup (email)
+CREATE TABLE dup (email TEXT)
 
 statement ok
 INSERT INTO dup VALUES ('a@x.com')
@@ -40,7 +40,7 @@ CREATE UNIQUE INDEX uq_dup ON dup(email)
 # update() checks the new value, but a row keeping its own value never
 # self-conflicts.
 statement ok
-CREATE TABLE t2 (email, n)
+CREATE TABLE t2 (email TEXT, n INTEGER)
 
 statement ok
 CREATE UNIQUE INDEX uq_t2_email ON t2(email)

@@ -3,7 +3,7 @@
 # right after a rollback is the seeded defect (see golden/ once it exists).
 
 statement ok
-CREATE TABLE t (x)
+CREATE TABLE t (x INTEGER)
 
 statement ok
 INSERT INTO t VALUES (1)
@@ -57,7 +57,7 @@ ROLLBACK TO s2
 
 # RELEASE discards a savepoint but keeps its changes.
 statement ok
-CREATE TABLE t2 (x)
+CREATE TABLE t2 (x INTEGER)
 
 statement ok
 INSERT INTO t2 VALUES (1)
@@ -82,7 +82,7 @@ ROLLBACK TO r1
 
 # a bare COMMIT discards every open savepoint.
 statement ok
-CREATE TABLE t3 (x)
+CREATE TABLE t3 (x INTEGER)
 
 statement ok
 SAVEPOINT a
@@ -101,7 +101,7 @@ ROLLBACK TO b
 
 # rolling back to an unknown savepoint name is an error.
 statement ok
-CREATE TABLE t4 (x)
+CREATE TABLE t4 (x INTEGER)
 
 statement error no such savepoint
 ROLLBACK TO nope

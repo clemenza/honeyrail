@@ -15,7 +15,7 @@ in this document is a literal, verified statement sequence, true of
 ```python
 from tinytable import Database
 db = Database()
-db.execute("CREATE TABLE t (x)")
+db.execute("CREATE TABLE t (x INTEGER)")
 db.execute("INSERT INTO t VALUES (1)")
 result = db.execute("SELECT x FROM t")   # QueryResult(columns=["x"], rows=[(1,)])
 ```
@@ -41,7 +41,9 @@ trailing `;` is optional and ignored.
 statement   := create_table | create_index | insert | update | delete
              | select | savepoint | rollback | release | commit
 
-create_table := CREATE TABLE ident '(' ident (',' ident)* ')'
+create_table := CREATE TABLE ident '(' column_def (',' column_def)* ')'
+column_def    := ident column_type
+column_type   := INTEGER | REAL | TEXT | BOOLEAN
 create_index  := CREATE [UNIQUE] INDEX ident ON ident '(' ident ')'
 insert        := INSERT INTO ident ['(' ident (',' ident)* ')']
                  VALUES '(' value (',' value)* ')'
@@ -69,24 +71,57 @@ comparison  := ident ( '=' value | ('!='|'<>') value
                       | BETWEEN value AND value
                       | IN '(' value (',' value)* ')'
                       | IS NULL | IS NOT NULL )
-value       := NUMBER | STRING | NULL
+value       := NUMBER | STRING | NULL | TRUE | FALSE
 ```
 
-`CREATE TABLE t (a, b, c)` declares column *names* only - there is no type
-system; a column holds whatever value was last written to it, or `None`/SQL
-`NULL` if never written. This declared list is what `SELECT *` and a
-column-list-omitted `INSERT INTO t VALUES (...)` use for positional
-ordering; an explicit `INSERT INTO t (b) VALUES (5)` or `UPDATE ... SET
-b = 5` may still name any column, declared or not - the underlying engine is
-schemaless. `CREATE UNIQUE INDEX` both builds a secondary index and adds a
-uniqueness constraint on that column (see "Uniqueness" below); a plain
-`CREATE INDEX` only builds the index.
+`CREATE TABLE t (a INTEGER, b TEXT, c BOOLEAN)` declares both column names
+*and types* - see "Column Types" below. This declared list is what
+`SELECT *` and a column-list-omitted `INSERT INTO t VALUES (...)` use for
+positional ordering; an explicit `INSERT INTO t (b) VALUES ('x')` or
+`UPDATE ... SET b = 'x'` may still name any column, declared or not - only
+a *declared* column's type is enforced (see below), an undeclared one is
+untyped, same as if `CREATE TABLE` had never mentioned it. `CREATE UNIQUE
+INDEX` both builds a secondary index and adds a uniqueness constraint on
+that column (see "Uniqueness" below); a plain `CREATE INDEX` only builds
+the index.
 
 `SAVEPOINT`/`ROLLBACK TO`/`RELEASE`/`COMMIT` are **database-wide**: they
 apply to every table that currently exists. A table `CREATE`'d after a
 `SAVEPOINT` simply has nothing to roll back to for that name (rolling back
 does not un-create it); `ROLLBACK TO`/`RELEASE` on a name no table currently
 holds raises an error containing `no such savepoint`.
+
+## Column Types
+
+Every `CREATE TABLE` column has exactly one of four types: `INTEGER`,
+`REAL`, `TEXT`, `BOOLEAN` (literals `TRUE`/`FALSE`). `INSERT`/`UPDATE`
+reject a value whose type doesn't exactly match its column's declared
+type, with an error containing `declared <TYPE>`. **`NULL` is always
+allowed regardless of declared type** - typing constrains what a
+*present* value can be, it says nothing about whether the column can be
+absent.
+
+```sql
+CREATE TABLE t (name TEXT, age INTEGER, active BOOLEAN, score REAL)
+INSERT INTO t VALUES ('Ann', 30, TRUE, 4.5)
+INSERT INTO t VALUES ('Bo', NULL, FALSE, NULL)   -- NULL is fine for any type
+INSERT INTO t VALUES (5, 30, TRUE, 4.5)          -- raises: name is declared TEXT, got INTEGER
+```
+
+Type checking is **exact**, not "compatible": a `BOOLEAN` column rejects an
+`INTEGER` value even though `TRUE`/`FALSE` and `1`/`0` are
+interchangeable in plenty of other SQL dialects - conflating them is
+exactly the kind of bug this rule exists to catch, not something to
+special-case around.
+
+```sql
+CREATE TABLE t2 (active BOOLEAN)
+INSERT INTO t2 VALUES (1)   -- raises: active is declared BOOLEAN, got INTEGER - not accepted as "truthy"
+```
+
+An `INSERT`/`UPDATE` naming a column that isn't in the table's declared
+list (see "SQL Surface" above - this is allowed, the underlying engine is
+schemaless) is simply untyped: no type check applies to it at all.
 
 ## NULL semantics (three-valued logic)
 
@@ -99,7 +134,7 @@ side of the comparison is `NULL`** - including when *both* sides are
 useful ways to test for `NULL` - use `IS NULL`/`IS NOT NULL` instead).
 
 ```sql
-CREATE TABLE t (x)
+CREATE TABLE t (x INTEGER)
 INSERT INTO t VALUES (NULL)
 SELECT x FROM t WHERE x = NULL       -- returns 0 rows: NULL = NULL is NOT a match
 SELECT x FROM t WHERE x != NULL      -- returns 0 rows: NULL != NULL is NOT a match either
@@ -107,7 +142,7 @@ SELECT x FROM t WHERE x IS NULL      -- returns 1 row: this is how you test for 
 ```
 
 ```sql
-CREATE TABLE people (name, age)
+CREATE TABLE people (name TEXT, age INTEGER)
 INSERT INTO people VALUES ('Ann', NULL)
 INSERT INTO people VALUES ('Bo', 30)
 INSERT INTO people VALUES ('Cy', 25)
@@ -140,7 +175,7 @@ column holding `NULL`, for every rule above.
   never moves the `NULL` block to the other end.
 
 ```sql
-CREATE TABLE t (k, tag)
+CREATE TABLE t (k INTEGER, tag TEXT)
 INSERT INTO t VALUES (1, 'a')
 INSERT INTO t VALUES (1, 'b')
 SELECT tag FROM t ORDER BY k           -- 'a', 'b' (insertion order preserved)
@@ -148,7 +183,7 @@ SELECT tag FROM t ORDER BY k DESC      -- 'a', 'b' (still - stable, not reversed
 ```
 
 ```sql
-CREATE TABLE t2 (x)
+CREATE TABLE t2 (x INTEGER)
 INSERT INTO t2 VALUES (2)
 INSERT INTO t2 VALUES (NULL)
 INSERT INTO t2 VALUES (1)
@@ -166,7 +201,7 @@ from the front of the already-ordered result; `LIMIT` caps how many rows
 remain *after* that skip, not before it.
 
 ```sql
-CREATE TABLE t (x)
+CREATE TABLE t (x INTEGER)
 INSERT INTO t VALUES (1)
 INSERT INTO t VALUES (2)
 INSERT INTO t VALUES (3)
@@ -188,7 +223,7 @@ cases, as the same query would against an unindexed column** - this is the
 central invariant a range-scan bug would violate.
 
 ```sql
-CREATE TABLE t (x)
+CREATE TABLE t (x INTEGER)
 INSERT INTO t VALUES (5)
 CREATE INDEX idx ON t(x)
 SELECT x FROM t WHERE x >= 5     -- still returns 5: the boundary is included
@@ -209,7 +244,7 @@ enforced on every subsequent `INSERT`/`UPDATE`.
 `NULL` in a unique column, simultaneously.
 
 ```sql
-CREATE TABLE t (email)
+CREATE TABLE t (email TEXT)
 CREATE UNIQUE INDEX uq ON t(email)
 INSERT INTO t VALUES (NULL)
 INSERT INTO t VALUES (NULL)     -- NOT a conflict
@@ -217,7 +252,7 @@ SELECT COUNT(*) FROM t          -- 2
 ```
 
 ```sql
-CREATE TABLE t2 (email)
+CREATE TABLE t2 (email TEXT)
 CREATE UNIQUE INDEX uq2 ON t2(email)
 INSERT INTO t2 VALUES ('a@x.com')
 INSERT INTO t2 VALUES ('a@x.com')   -- raises: unique constraint violated ... already present
@@ -231,7 +266,7 @@ row-id order. A row keeping its own existing value is never a
 self-conflict:
 
 ```sql
-CREATE TABLE t (email, n)
+CREATE TABLE t (email TEXT, n INTEGER)
 CREATE UNIQUE INDEX uq ON t(email)
 INSERT INTO t VALUES ('a@x.com', 1)
 UPDATE t SET n = 2 WHERE email = 'a@x.com'    -- fine - same row, same email
@@ -257,7 +292,7 @@ valid afterward (you may `ROLLBACK TO` it again); any savepoint created
 after it is discarded.
 
 ```sql
-CREATE TABLE t (x)
+CREATE TABLE t (x INTEGER)
 INSERT INTO t VALUES (1)
 CREATE INDEX idx ON t(x)
 SAVEPOINT s1
@@ -283,7 +318,7 @@ Exactly one aggregate per `SELECT`, never mixed with plain columns.
   `COUNT(col)` excludes `NULL`.
 
 ```sql
-CREATE TABLE t (x)
+CREATE TABLE t (x INTEGER)
 INSERT INTO t VALUES (1)
 INSERT INTO t VALUES (NULL)
 SELECT COUNT(*) FROM t     -- 2: includes the NULL row
@@ -300,6 +335,8 @@ SELECT COUNT(x) FROM t     -- 1: excludes it
 |---|---|
 | a unique constraint is or would be violated | `already present` |
 | `ROLLBACK TO`/`RELEASE` a name no table has | `no such savepoint` |
+| an `INSERT`/`UPDATE` value's type doesn't match its column's declared type | `declared <TYPE>` |
+| a `CREATE TABLE` column with no type, or an unrecognized type name | `expected a column type` |
 | a syntax error, or an unsupported statement shape (JOIN, mixed aggregates, missing table, etc.) | (implementation-specific `SqlError` message - not scored on exact wording, only that an error is raised) |
 
 ## Test Script Format
@@ -329,12 +366,14 @@ INSERT INTO t VALUES ('a@x.com')
 ```
 
 **`query <types> [nosort|rowsort]`** - `types` is one letter per expected
-result column (`T` text, `I` integer, `R` real - purely documentation plus
-a column-count check, tinytable itself has no type system). Lines up to a
+result column (`T` text, `I` integer, `R` real, `B` boolean - purely
+documentation plus a column-count check; the runner doesn't cross-check a
+letter against the SQL column's actual declared type). Lines up to a
 line containing exactly `----` are the SQL text (a `SELECT`); lines after
 `----` up to the next blank line are the expected result, **one value per
 line**, flattened row-major (row 0's columns, then row 1's columns, ...).
-`NULL` is written as the literal token `NULL`. An empty expected block
+`NULL` is written as the literal token `NULL`; a `BOOLEAN` value is written
+as `TRUE`/`FALSE` (not `1`/`0` or Python's `True`/`False`). An empty expected block
 (`----` immediately followed by a blank line) means zero rows.
 
 `nosort` (the default) requires the exact row/column order returned;
