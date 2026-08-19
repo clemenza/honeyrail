@@ -14,9 +14,9 @@ const STEP_TRANSITIONS: Record<StepStatus, StepStatus[]> = {
   waiting_approval: ["running", "pending", "succeeded", "failed", "blocked", "cancelled"],
   succeeded: [],
   failed: ["pending", "cancelled"],
-  // Retryable by default (#69), like "failed" - nothing currently drives a
-  // manual retry through this path, but the same "pending"/"cancelled"
-  // reachability is kept available for one.
+  // Retryable by default (#69) - OrchestrationService.retryStep (#70) drives
+  // a manual retry through this path for the "mark_blocked" onBlocked
+  // policy, which deliberately never auto-retries itself.
   blocked: ["pending", "cancelled"],
   skipped: [],
   cancelled: []
@@ -29,7 +29,12 @@ const RUN_TRANSITIONS: Record<RunStatus, RunStatus[]> = {
   waiting_approval: ["running", "succeeded", "failed", "blocked", "cancelled"],
   succeeded: [],
   failed: [],
-  blocked: [],
+  // Unlike "failed", a blocked run can leave its terminal state: retryStep
+  // (#70) resumes it back to "running" once the blocked step it's retrying
+  // is reset to "pending" - mark_blocked's "retryable" is a lever an
+  // operator/script pulls explicitly, not something the run gets stuck
+  // behind forever.
+  blocked: ["running"],
   cancelled: []
 };
 

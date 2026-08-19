@@ -9,7 +9,7 @@ These adapters belong to the current execution plane. Future orchestration `Exec
 The shared interface lives in `server/agents/types.ts`. Each adapter provides:
 
 - `id`, display labels, stability, and capability metadata.
-- `buildLaunchCommand(input)`, which returns the tmux startup command.
+- `buildLaunchCommand(input)`, which returns the tmux startup command. `input.unattended` is the #70 unattended-execution contract: when true (every run-launched `agent-task` step defaults to this — see [docs/human-in-the-loop.md](human-in-the-loop.md)), an adapter should prefer passing through the CLI's own non-interactive flag where one exists (e.g. codex's `--ask-for-approval never --sandbox workspace-write`, Claude Code's `--setting-sources project`) instead of relying solely on prompt text to suppress interactive prompts. Adapters without a CLI-level non-interactive flag (or without any interactive prompts to suppress at all, like `shell`) simply ignore the flag.
 - `formatInput(context)`, which formats operator text and uploaded attachment paths.
 - `findInteractivePromptResponse(output)`, when the CLI has known trust or update prompts that can be answered safely.
 - `detectInstallation(run)`, which checks local CLI availability and version without network access.

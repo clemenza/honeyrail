@@ -16,7 +16,7 @@ import { EvaluatorRegistry, type Evaluator, type EvaluatorInput, type EvaluatorR
 import { EventBus, publishEvent } from "../server/events.js";
 import { readySteps, validateContractLevel, validateStepContracts, validateStepGraph } from "../server/orchestration/dag.js";
 import { OrchestrationService } from "../server/orchestration/service.js";
-import { assertStepTransition, deriveRunStatus } from "../server/orchestration/state-machine.js";
+import { assertStepTransition, deriveRunStatus, isRunTerminal } from "../server/orchestration/state-machine.js";
 import { JsonStore } from "../server/store.js";
 import { runCommandSafe } from "../server/utils.js";
 
@@ -1017,7 +1017,7 @@ test("AgentTaskExecutor.inspect() maps a waiting_approval session onto the step 
   assert.equal(state.status, "waiting_approval");
 });
 
-test("onBlocked action 'fail' terminates a blocked step as 'blocked' (not 'failed') and skips its dependents", async (t) => {
+test("onBlocked action 'auto_retry' terminates a blocked step as 'blocked' (not 'failed') and skips its dependents", async (t) => {
   const registry = new ExecutorRegistry([new AlwaysWaitingExecutor("agent-task"), new MemoryExecutor("check")]);
   const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-blocked-fail-"));
   const store = new JsonStore(join(tempDir, "store.json"));
@@ -1041,7 +1041,7 @@ test("onBlocked action 'fail' terminates a blocked step as 'blocked' (not 'faile
     projectId: project.id,
     goal: "blocked-fail",
     steps: [
-      { id: "ask", executor: "agent-task", input: { prompt: "do work" }, onBlocked: { action: "fail" } },
+      { id: "ask", executor: "agent-task", input: { prompt: "do work" }, onBlocked: { action: "auto_retry" } },
       { id: "after", executor: "check", dependsOn: ["ask"] }
     ]
   });
@@ -1084,7 +1084,7 @@ test("onBlocked wait_approval times out and terminates 'blocked' once timeoutMs 
   const created = await service.createRun({
     projectId: project.id,
     goal: "blocked-timeout",
-    steps: [{ id: "ask", executor: "agent-task", input: { prompt: "do work" }, onBlocked: { action: "wait_approval", timeoutMs: 30, onTimeout: "fail" } }]
+    steps: [{ id: "ask", executor: "agent-task", input: { prompt: "do work" }, onBlocked: { action: "wait_approval", timeoutMs: 30, onTimeout: "auto_retry" } }]
   });
   let step = (await store.getStep(created.run.id, "ask"))!;
   assert.equal(step.status, "waiting_approval");
@@ -1118,7 +1118,7 @@ test("a blocked step retried under maxAttempts gets an enriched prompt telling i
   const created = await service.createRun({
     projectId: project.id,
     goal: "blocked-retry",
-    steps: [{ id: "ask", executor: "agent-task", input: { prompt: "build the app" }, maxAttempts: 2, onBlocked: { action: "fail" } }]
+    steps: [{ id: "ask", executor: "agent-task", input: { prompt: "build the app" }, maxAttempts: 2, onBlocked: { action: "auto_retry" } }]
   });
 
   const step = (await store.getStep(created.run.id, "ask"))!;
@@ -1162,7 +1162,11 @@ test("the stall watchdog blocks a running step with no fresh session output and 
   const created = await service.createRun({
     projectId: project.id,
     goal: "stalled",
-    steps: [{ id: "ask", executor: "agent-task", input: {}, onBlocked: { timeoutMs: 30, onTimeout: "fail" } }]
+    // Explicit "wait_approval" - #70 defaults an undeclared onBlocked to
+    // "mark_blocked" for an unattended (autonomous) step, which would
+    // terminate immediately and never exercise the timeout path this test
+    // is about.
+    steps: [{ id: "ask", executor: "agent-task", input: {}, onBlocked: { action: "wait_approval", timeoutMs: 30, onTimeout: "auto_retry" } }]
   });
   let step = (await store.getStep(created.run.id, "ask"))!;
   assert.equal(step.status, "waiting_input");
@@ -1197,7 +1201,7 @@ test("dedicated approval executor steps are not subject to the onBlocked timeout
   const created = await service.createRun({
     projectId: project.id,
     goal: "approval-untimed",
-    steps: [{ id: "approve", executor: "approval", onBlocked: { timeoutMs: 30, onTimeout: "fail" } }]
+    steps: [{ id: "approve", executor: "approval", onBlocked: { timeoutMs: 30, onTimeout: "auto_retry" } }]
   });
 
   await new Promise((resolve) => setTimeout(resolve, 200));
@@ -1231,7 +1235,10 @@ test("answerStep sends the operator's text into the blocked session and unblocks
   const created = await service.createRun({
     projectId: project.id,
     goal: "answer",
-    steps: [{ id: "ask", executor: "agent-task", input: { prompt: "build the app" }, onBlocked: { timeoutMs: 60_000 } }]
+    // Explicit "wait_approval" - #70 defaults an undeclared onBlocked to
+    // "mark_blocked" for an unattended step, which would terminate the step
+    // immediately instead of leaving it waiting for answerStep to resolve.
+    steps: [{ id: "ask", executor: "agent-task", input: { prompt: "build the app" }, onBlocked: { action: "wait_approval", timeoutMs: 60_000 } }]
   });
   let step = (await store.getStep(created.run.id, "ask"))!;
   assert.equal(step.status, "waiting_input");
@@ -1338,7 +1345,7 @@ test("onBlocked auto_answer falls through to onTimeout when no client is configu
   const created = await service.createRun({
     projectId: project.id,
     goal: "auto-answer-unconfigured",
-    steps: [{ id: "ask", executor: "agent-task", input: { prompt: "build" }, onBlocked: { action: "auto_answer", timeoutMs: 30, onTimeout: "fail" } }]
+    steps: [{ id: "ask", executor: "agent-task", input: { prompt: "build" }, onBlocked: { action: "auto_answer", timeoutMs: 30, onTimeout: "auto_retry" } }]
   });
 
   await new Promise((resolve) => setTimeout(resolve, 200));
@@ -1346,6 +1353,136 @@ test("onBlocked auto_answer falls through to onTimeout when no client is configu
   const step = (await store.getStep(created.run.id, "ask"))!;
   assert.equal(step.status, "blocked");
   assert.match(step.error || "", /timed out/);
+});
+
+// #70: the unattended-execution contract - what happens when an agent-task
+// step hits an interactive prompt nothing is watching to answer. All three
+// tests below share AlwaysWaitingExecutor as "a mock adapter that reliably
+// triggers an interactive prompt" (it reports waiting_input/waiting_approval
+// forever, exactly like a CLI stuck at a menu) and each proves the DAG
+// reaches a terminal state under its policy instead of hanging.
+
+async function setupOnBlockedRun(t: TestContext, onBlocked: Record<string, unknown> | undefined, opts: { maxAttempts?: number; interaction?: string } = {}) {
+  const registry = new ExecutorRegistry([new AlwaysWaitingExecutor("agent-task", "waiting_input", "which option?")]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-unattended-contract-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: {} as any,
+    worktrees: {} as any,
+    runCommand: runCommandSafe,
+    sessionLogRoot: "",
+    attachmentRoot: "",
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+  const input: Record<string, unknown> = { prompt: "do work" };
+  if (opts.interaction) input.interaction = opts.interaction;
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "unattended-contract",
+    steps: [{ id: "ask", executor: "agent-task", input, maxAttempts: opts.maxAttempts ?? 1, onBlocked }]
+  });
+  return { store, service, created };
+}
+
+test("#70 policy 'mark_blocked' is the default for an unattended step with no onBlocked declared, terminates 'blocked' immediately, and never consumes a retry", async (t) => {
+  const { store, created } = await setupOnBlockedRun(t, undefined, { maxAttempts: 3 });
+  // No polling/timeout needed - mark_blocked acts the moment the step is
+  // detected blocked, so the DAG never even reaches a "waiting" pause.
+  const step = (await store.getStep(created.run.id, "ask"))!;
+  assert.equal(step.status, "blocked");
+  assert.equal(step.attempt, 1, "mark_blocked must not auto-retry, even with attempts remaining");
+  const run = (await store.getRun(created.run.id))!;
+  assert.equal(run.status, "blocked");
+  assert.ok(isRunTerminal(run.status), "the run must reach a terminal state - never hang");
+});
+
+test("#70 policy 'auto_retry' retries up to maxAttempts, then terminates 'blocked' - never hangs", async (t) => {
+  const { store, created } = await setupOnBlockedRun(t, { action: "auto_retry" }, { maxAttempts: 2 });
+  const step = (await store.getStep(created.run.id, "ask"))!;
+  assert.equal(step.status, "blocked");
+  assert.equal(step.attempt, 2, "auto_retry consumes attempts before giving up");
+  assert.ok(isRunTerminal((await store.getRun(created.run.id))!.status));
+});
+
+test("#70 policy 'wait_approval' (escalate-to-approval) is bounded by timeoutMs, then terminates 'blocked' - never hangs", async (t) => {
+  const { store, service, created } = await setupOnBlockedRun(t, { action: "wait_approval", timeoutMs: 30, onTimeout: "auto_retry" });
+  let step = (await store.getStep(created.run.id, "ask"))!;
+  assert.equal(step.status, "waiting_input", "escalates into the waiting/Answer UI state instead of terminating immediately");
+  assert.ok(!isRunTerminal((await store.getRun(created.run.id))!.status), "genuinely waiting, not yet terminal");
+
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  await service.scheduleRun(created.run.id);
+  step = (await store.getStep(created.run.id, "ask"))!;
+  assert.equal(step.status, "blocked");
+  assert.ok(isRunTerminal((await store.getRun(created.run.id))!.status), "the run must reach a terminal state - never hang");
+});
+
+test("#70 an interaction: 'interactive' step still defaults to 'wait_approval' - a human is genuinely expected there", async (t) => {
+  const { store, created } = await setupOnBlockedRun(t, undefined, { interaction: "interactive" });
+  const step = (await store.getStep(created.run.id, "ask"))!;
+  assert.equal(step.status, "waiting_input");
+  assert.notEqual(step.status, "blocked");
+});
+
+test("retryStep resumes a 'blocked' step and its run, and clears the run's terminal state", async (t) => {
+  class RetryableBlockExecutor implements Executor {
+    type = "agent-task";
+    blocked = true;
+    async start(): Promise<ExecutionHandle> {
+      return {};
+    }
+    async inspect(): Promise<ExecutionState> {
+      if (this.blocked) return { status: "waiting_input", output: { question: "which option?" } };
+      return { status: "succeeded", output: { ok: true } };
+    }
+  }
+  const executor = new RetryableBlockExecutor();
+  const registry = new ExecutorRegistry([executor]);
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-retry-step-"));
+  const store = new JsonStore(join(tempDir, "store.json"));
+  const bus = new EventBus();
+  const service = new OrchestrationService({
+    store,
+    bus,
+    tmux: {} as any,
+    worktrees: {} as any,
+    runCommand: runCommandSafe,
+    sessionLogRoot: "",
+    attachmentRoot: "",
+    executors: registry
+  });
+  const project = await store.createProject({ name: "demo", repoPath: tempDir, defaultBranch: "main", defaultAgent: "codex", testCommands: [], runCommands: [] });
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+
+  const created = await service.createRun({
+    projectId: project.id,
+    goal: "retry-step",
+    steps: [{ id: "ask", executor: "agent-task", input: { prompt: "do work" } }]
+  });
+  assert.equal((await store.getStep(created.run.id, "ask"))!.status, "blocked");
+  assert.equal((await store.getRun(created.run.id))!.status, "blocked");
+
+  await assert.rejects(() => service.retryStep(created.run.id, "does-not-exist"), /not found/i);
+
+  executor.blocked = false;
+  const result = await service.retryStep(created.run.id, "ask");
+  assert.equal(result.step.status, "succeeded");
+  assert.equal(result.run.status, "succeeded");
+
+  const step = (await store.getStep(created.run.id, "ask"))!;
+  assert.equal(step.status, "succeeded");
+  assert.equal(step.blockedSince, undefined);
+});
+
+test("retryStep rejects a step that isn't blocked", async (t) => {
+  const { store, service, created } = await setupOnBlockedRun(t, { action: "wait_approval", timeoutMs: 60_000 });
+  assert.equal((await store.getStep(created.run.id, "ask"))!.status, "waiting_input");
+  await assert.rejects(() => service.retryStep(created.run.id, "ask"), /is not blocked/);
 });
 
 test("task.failed immediately fails the linked agent step and run without a restart", async (t) => {
@@ -1974,7 +2111,14 @@ test("REST POST /api/runs/:runId/steps/:stepId/answer sends input and unblocks a
   const createRes = await fetch(`${baseUrl}/api/runs`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ projectId: project.id, goal: "answer over REST", steps: [{ id: "ask", executor: "agent-task", input: { prompt: "build" } }] })
+    // Explicit "wait_approval" - #70 defaults an undeclared onBlocked to
+    // "mark_blocked" for an unattended step, which would terminate the step
+    // immediately instead of leaving it waiting to be answered over REST.
+    body: JSON.stringify({
+      projectId: project.id,
+      goal: "answer over REST",
+      steps: [{ id: "ask", executor: "agent-task", input: { prompt: "build" }, onBlocked: { action: "wait_approval" } }]
+    })
   });
   const created = await createRes.json();
   assert.equal(created.steps[0].status, "waiting_input");

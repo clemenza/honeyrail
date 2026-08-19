@@ -98,8 +98,8 @@ test("shipped eval-instruction-ab-trial recipe materializes the instruction file
     content: "# Agent instructions\nRun checks.\n",
     label: "improved"
   });
-  // Eval trials must terminate unattended: a blocked agent fails the trial.
-  assert.equal(implementStep.onBlocked?.action, "fail");
+  // Eval trials must terminate unattended: a blocked agent doesn't hang the trial.
+  assert.equal(implementStep.onBlocked?.action, "auto_retry");
   assert.deepEqual(implementStep.produces, ["diff", "changed_files"]);
 
   const checkStep = materialized.steps.find((step) => step.id === "check")!;
@@ -137,12 +137,12 @@ test("shipped implement-check-gate-approve recipe wires interaction/onBlocked de
 
   const overridden = materializeRecipe(recipe, {
     projectId: "proj_1",
-    parameters: { title: "t", prompt: "p", interaction: "interactive", onBlocked: "fail", blockedTimeoutMinutes: 5, model: "gpt-5-codex" }
+    parameters: { title: "t", prompt: "p", interaction: "interactive", onBlocked: "auto_retry", blockedTimeoutMinutes: 5, model: "gpt-5-codex" }
   });
   const overriddenStep = overridden.steps.find((step) => step.id === "implement")!;
   assert.equal(overriddenStep.input?.interaction, "interactive");
   assert.equal(overriddenStep.input?.model, "gpt-5-codex");
-  assert.equal(overriddenStep.onBlocked?.action, "fail");
+  assert.equal(overriddenStep.onBlocked?.action, "auto_retry");
   assert.equal(overriddenStep.onBlocked?.timeoutMs, 300_000);
 });
 

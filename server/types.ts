@@ -156,8 +156,26 @@ export type QualityGate = {
   onFail?: "fail" | "wait_approval";
 };
 
-export type OnBlockedAction = "wait_approval" | "auto_answer" | "fail";
-export type OnBlockedTimeoutAction = "auto_answer" | "fail";
+/**
+ * The #70 unattended-execution contract: what to do when an agent-task step
+ * is detected blocked on a clarification prompt (or a stalled session).
+ * - "mark_blocked": give up immediately, no retry consumed - the step (and
+ *   run) goes straight to terminal "blocked" for a human/script to inspect
+ *   or retry later (see OrchestrationService.retryStep). The default for
+ *   unattended (interaction: "autonomous") steps, since nothing is watching
+ *   to answer a wait_approval and burning attempts guessing is worse than
+ *   just stopping cleanly.
+ * - "auto_retry": kill the stuck attempt and retry immediately (enriched
+ *   with what the agent asked, so it doesn't ask again) up to maxAttempts,
+ *   then terminal "blocked".
+ * - "auto_answer": ask the configured LLM to answer on the operator's
+ *   behalf; falls through to onTimeout if unconfigured or it fails.
+ * - "wait_approval": escalate to a human via the Answer/Approvals UI,
+ *   bounded by timeoutMs so it can never hang indefinitely. The default for
+ *   interactive steps, where a human is actually expected at the terminal.
+ */
+export type OnBlockedAction = "mark_blocked" | "auto_retry" | "auto_answer" | "wait_approval";
+export type OnBlockedTimeoutAction = "auto_answer" | "auto_retry";
 
 export type OnBlockedPolicy = {
   action?: OnBlockedAction;

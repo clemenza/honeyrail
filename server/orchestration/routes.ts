@@ -105,5 +105,9 @@ export function runRoutes(orchestration: OrchestrationService, attachmentRoot: s
     res.json(await orchestration.answerStep(String(req.params.runId), String(req.params.stepId), req.body.text));
   }));
 
+  router.post("/api/runs/:runId/steps/:stepId/retry", asyncRoute(async (req, res) => {
+    res.json(await orchestration.retryStep(String(req.params.runId), String(req.params.stepId)));
+  }));
+
   return router;
 }
