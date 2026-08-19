@@ -60,6 +60,7 @@ jobs:
         # spawns internally do (installed above) - so a plain background
         # process polled via /api/health is simpler and more portable here.
         run: |
+          mkdir -p "$(dirname "$HONEYRAIL_LOG_FILE")"
           NODE_ENV=production nohup npm start > "$HONEYRAIL_LOG_FILE" 2>&1 &
           for _ in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:4178/api/health >/dev/null 2>&1; then
