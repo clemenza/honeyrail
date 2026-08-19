@@ -1,0 +1,27 @@
+# Kills m06 (limit/offset ordering): LIMIT and OFFSET must apply as
+# filter, then order, then offset, then limit - i.e. OFFSET skips from the
+# front of the ordered result and LIMIT caps what remains *after* that skip
+# - see SPEC.md's "LIMIT n / OFFSET n" section. A defective implementation
+# that applies LIMIT before OFFSET would skip into rows the limit should
+# have kept, or return too few rows.
+
+statement ok
+CREATE TABLE t (x INTEGER)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+statement ok
+INSERT INTO t VALUES (2)
+
+statement ok
+INSERT INTO t VALUES (3)
+
+statement ok
+INSERT INTO t VALUES (4)
+
+query I nosort
+SELECT x FROM t ORDER BY x LIMIT 2 OFFSET 1
+----
+2
+3

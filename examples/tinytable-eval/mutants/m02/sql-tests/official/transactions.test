@@ -1,0 +1,107 @@
+# SAVEPOINT / ROLLBACK TO / RELEASE / COMMIT - see SPEC.md's transaction
+# section. No CREATE INDEX anywhere in this file - checking index contents
+# right after a rollback is the seeded defect (see golden/ once it exists).
+
+statement ok
+CREATE TABLE t (x INTEGER)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+statement ok
+SAVEPOINT s1
+
+statement ok
+INSERT INTO t VALUES (2)
+
+statement ok
+DELETE FROM t WHERE x = 1
+
+query I rowsort
+SELECT x FROM t
+----
+2
+
+statement ok
+ROLLBACK TO s1
+
+query I rowsort
+SELECT x FROM t
+----
+1
+
+# a savepoint remains valid after rolling back to it once.
+statement ok
+INSERT INTO t VALUES (3)
+
+statement ok
+ROLLBACK TO s1
+
+query I rowsort
+SELECT x FROM t
+----
+1
+
+# rolling back discards any savepoint created after it.
+statement ok
+SAVEPOINT s2
+
+statement ok
+INSERT INTO t VALUES (4)
+
+statement ok
+ROLLBACK TO s1
+
+statement error no such savepoint
+ROLLBACK TO s2
+
+# RELEASE discards a savepoint but keeps its changes.
+statement ok
+CREATE TABLE t2 (x INTEGER)
+
+statement ok
+INSERT INTO t2 VALUES (1)
+
+statement ok
+SAVEPOINT r1
+
+statement ok
+INSERT INTO t2 VALUES (2)
+
+statement ok
+RELEASE r1
+
+query I rowsort
+SELECT x FROM t2
+----
+1
+2
+
+statement error no such savepoint
+ROLLBACK TO r1
+
+# a bare COMMIT discards every open savepoint.
+statement ok
+CREATE TABLE t3 (x INTEGER)
+
+statement ok
+SAVEPOINT a
+
+statement ok
+SAVEPOINT b
+
+statement ok
+COMMIT
+
+statement error no such savepoint
+ROLLBACK TO a
+
+statement error no such savepoint
+ROLLBACK TO b
+
+# rolling back to an unknown savepoint name is an error.
+statement ok
+CREATE TABLE t4 (x INTEGER)
+
+statement error no such savepoint
+ROLLBACK TO nope
