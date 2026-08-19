@@ -467,6 +467,11 @@ export class AgentTaskExecutor implements Executor {
     // untouched so the UI can still show it.
     const prompt = stringInput(ctx.step.input.effectivePrompt) || stringInput(ctx.step.input.prompt, title);
     const model = stringInput(ctx.step.input.model);
+    // Only "minimal" (#71) reads this - a calibration knob for adapters that
+    // call a model API directly, ignored by every CLI-wrapping adapter.
+    const temperature = typeof ctx.step.input.temperature === "number" && Number.isFinite(ctx.step.input.temperature)
+      ? ctx.step.input.temperature
+      : undefined;
     // agent-task steps are always run-launched, so "autonomous" (no
     // clarifying questions) is the default; a step can opt into
     // "interactive" explicitly if it truly needs a human at the terminal.
@@ -527,7 +532,7 @@ export class AgentTaskExecutor implements Executor {
         // executes a lone shell-command argument via $SHELL -c), so a plain
         // leading VAR=value assignment is enough to expose the step's
         // scratch directory to the agent process - no tmux API changes needed.
-        command: `HR_STEP_DIR=${quoteShellArg(stepDir)} ${adapter.buildLaunchCommand({ prompt: launchPrompt, model, unattended })}`,
+        command: `HR_STEP_DIR=${quoteShellArg(stepDir)} ${adapter.buildLaunchCommand({ prompt: launchPrompt, model, unattended, temperature })}`,
         logPath
       });
       session = await ctx.store.createSession({

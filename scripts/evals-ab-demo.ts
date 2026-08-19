@@ -20,7 +20,7 @@
  *   --token <token>             Bearer token for auth (default: $HONEYRAIL_TOKEN)
  *   --project-id <id>           Existing project to run against
  *   --seed-into <dir>           Create the seed repo fixture there and register it as a project
- *   --agent <id>                Agent backend for every trial (default codex)
+ *   --agent <id>                Agent backend for every trial (default codex; codex|claude|hermes|shell|null|minimal - see docs/agent-adapters.md. "null"/"minimal" are #71 calibration baselines, not real agents)
  *   --model <id>                Model override passed to the agent (default: agent default)
  *   --trials <n>                Trials per (variant, task) cell (default 3)
  *   --tasks <id,id>             Subset of task ids from tasks.json (default all)

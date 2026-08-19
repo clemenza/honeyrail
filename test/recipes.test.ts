@@ -108,6 +108,34 @@ test("shipped eval-instruction-ab-trial recipe materializes the instruction file
   assert.equal(checkStep.qualityGate?.onFail, "fail");
 });
 
+// #71: the recipe's `agent` enum lists the bare word `null` as an option -
+// a YAML footgun, since an unquoted `null` list entry parses as the JS
+// value null, not the string "null". This proves the YAML source actually
+// quotes it and the calibration-probe agent id survives materialization as
+// a real string, end to end through the real loader (not just an assertion
+// about the parsed Recipe object).
+test("shipped eval-instruction-ab-trial recipe accepts the 'null' calibration-agent option as a real string, not YAML's null value", async () => {
+  const registry = await loadRecipesFromDirectory(shippedRecipesDir);
+  const recipe = registry.get("eval-instruction-ab-trial")!;
+  const agentParam = recipe.parameters.find((param) => param.key === "agent")!;
+  assert.deepEqual(agentParam.options, ["codex", "claude", "hermes", "shell", "null", "minimal"]);
+  assert.equal(typeof agentParam.options![4], "string");
+
+  const materialized = materializeRecipe(recipe, {
+    projectId: "proj_1",
+    parameters: {
+      agent: "null",
+      prompt: "implement fizzbuzz",
+      instructionContent: "# Agent instructions\nRun checks.\n",
+      instructionLabel: "baseline",
+      checkCommand: "python -m pytest -q test_fizzbuzz.py"
+    }
+  });
+  const implementStep = materialized.steps.find((step) => step.id === "implement")!;
+  assert.equal(implementStep.input?.agent, "null");
+  assert.equal(typeof implementStep.input?.agent, "string");
+});
+
 test("shipped eval-instruction-ab-trial recipe is self-contained with zero parameters, using the baseline sample variant", async () => {
   const registry = await loadRecipesFromDirectory(shippedRecipesDir);
   const recipe = registry.get("eval-instruction-ab-trial")!;

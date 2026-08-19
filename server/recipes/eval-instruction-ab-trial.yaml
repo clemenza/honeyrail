@@ -18,7 +18,10 @@ parameters:
   - key: agent
     label: Agent
     type: enum
-    options: [codex, claude, hermes, shell]
+    # null/minimal (#71) are calibration-probe baselines, not real agents -
+    # included here specifically so this recipe (evals-ab-demo.ts's default)
+    # can run the smoke matrix against them for task-difficulty calibration.
+    options: [codex, claude, hermes, shell, "null", minimal]
     default: codex
   - key: title
     label: Task title

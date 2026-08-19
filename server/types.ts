@@ -27,7 +27,16 @@ export type TaskStatus =
   | "cancelled"
   | "merged";
 
-export type AgentType = "shell" | "codex" | "claude" | "hermes";
+/**
+ * "null" and "minimal" (#71) are calibration probes, not production-grade
+ * agents - deliberately excluded from the interactive session/task/project
+ * agent-selection surfaces (see server/validation.ts's agentType enum and
+ * server/mcp-server.ts) since they don't belong in real interactive use.
+ * They're only reachable through a DAG `agent-task` step's `input.agent`
+ * (validated at runtime via isKnownAgent, not a zod enum) or a recipe
+ * parameter that explicitly lists them as options.
+ */
+export type AgentType = "shell" | "codex" | "claude" | "hermes" | "null" | "minimal";
 
 export type RunStatus =
   | "pending"
