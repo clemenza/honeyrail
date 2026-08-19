@@ -1,0 +1,22 @@
+# Kills m07 (constraint semantics): NULL must never participate in a
+# unique() constraint - any number of rows may hold NULL in a unique
+# column simultaneously - see SPEC.md's "Uniqueness" section. A defective
+# unique index that treats NULL as a real value would raise on the second
+# INSERT below instead of allowing both.
+
+statement ok
+CREATE TABLE t (email TEXT)
+
+statement ok
+CREATE UNIQUE INDEX uq ON t(email)
+
+statement ok
+INSERT INTO t VALUES (NULL)
+
+statement ok
+INSERT INTO t VALUES (NULL)
+
+query I nosort
+SELECT COUNT(*) FROM t
+----
+2

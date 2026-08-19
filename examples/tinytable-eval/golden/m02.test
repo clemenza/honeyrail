@@ -1,0 +1,19 @@
+# Kills m02 (index boundary off-by-one): an indexed `>=` scan must include
+# a row whose value exactly equals the queried boundary, same as an
+# unindexed scan would - see SPEC.md's "Secondary index" section. A
+# defective `ge` scan that treats the boundary as exclusive (i.e. behaves
+# like `gt`) would drop the matching row here.
+
+statement ok
+CREATE TABLE t (x INTEGER)
+
+statement ok
+INSERT INTO t VALUES (5)
+
+statement ok
+CREATE INDEX idx ON t(x)
+
+query I nosort
+SELECT x FROM t WHERE x >= 5
+----
+5
