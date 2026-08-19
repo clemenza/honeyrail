@@ -1,0 +1,121 @@
+# where(): eq/ne/lt/le/gt/ge/between/in_ - see SPEC.md's Predicates section.
+# Never uses `= NULL`/`!= NULL` here - see where_null_semantics.test for that.
+
+statement ok
+CREATE TABLE people (name, age, dept)
+
+statement ok
+INSERT INTO people VALUES ('Ann', 30, 'eng')
+
+statement ok
+INSERT INTO people VALUES ('Bo', 25, 'eng')
+
+statement ok
+INSERT INTO people VALUES ('Cy', 40, 'sales')
+
+statement ok
+INSERT INTO people VALUES ('Di', NULL, 'sales')
+
+statement ok
+INSERT INTO people VALUES ('Ev', 35, NULL)
+
+query T rowsort
+SELECT name FROM people WHERE age = 30
+----
+Ann
+
+# ne(age, 30): a NULL age is neither "=30" nor "!=30" - three-valued logic
+# (this is the general point; where_null_semantics.test drills into it).
+query T rowsort
+SELECT name FROM people WHERE age != 30
+----
+Bo
+Cy
+Ev
+
+query T rowsort
+SELECT name FROM people WHERE age < 30
+----
+Bo
+
+query T rowsort
+SELECT name FROM people WHERE age <= 30
+----
+Ann
+Bo
+
+query T rowsort
+SELECT name FROM people WHERE age > 30
+----
+Cy
+Ev
+
+# `ge` here is a full scan (no index on `age` in this file) - see index.test
+# for `ge`'s own boundary correctness, kept separate from index usage.
+query T rowsort
+SELECT name FROM people WHERE age >= 30
+----
+Ann
+Cy
+Ev
+
+query T rowsort
+SELECT name FROM people WHERE age >= 41
+----
+
+query T rowsort
+SELECT name FROM people WHERE age BETWEEN 25 AND 35
+----
+Ann
+Bo
+Ev
+
+query T rowsort
+SELECT name FROM people WHERE dept IN ('eng', 'sales')
+----
+Ann
+Bo
+Cy
+Di
+
+# NULL inside IN(...) is inert - it can't match a NULL-valued row.
+query T rowsort
+SELECT name FROM people WHERE dept IN ('eng', 'sales', NULL)
+----
+Ann
+Bo
+Cy
+Di
+
+query T rowsort
+SELECT name FROM people WHERE dept IS NULL
+----
+Ev
+
+query T rowsort
+SELECT name FROM people WHERE dept IS NOT NULL
+----
+Ann
+Bo
+Cy
+Di
+
+# a column missing from an INSERT's column list behaves like NULL.
+statement ok
+CREATE TABLE sparse (x, y)
+
+statement ok
+INSERT INTO sparse (x) VALUES (1)
+
+statement ok
+INSERT INTO sparse (x, y) VALUES (2, 5)
+
+query I rowsort
+SELECT x FROM sparse WHERE y IS NULL
+----
+1
+
+query I rowsort
+SELECT x FROM sparse WHERE y = 5
+----
+2

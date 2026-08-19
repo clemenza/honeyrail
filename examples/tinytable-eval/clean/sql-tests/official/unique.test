@@ -1,0 +1,63 @@
+# unique() - see SPEC.md's Table.unique section.
+# Never inserts two NULLs into the same unique() column in one file - that's
+# the seeded defect (see golden/ once it exists).
+
+statement ok
+CREATE TABLE people (email, n)
+
+statement ok
+CREATE UNIQUE INDEX uq_email ON people(email)
+
+statement ok
+INSERT INTO people VALUES ('a@x.com', 1)
+
+statement error already present
+INSERT INTO people VALUES ('a@x.com', 2)
+
+# a single NULL never conflicts with anything.
+statement ok
+INSERT INTO people VALUES (NULL, 3)
+
+query I rowsort
+SELECT n FROM people
+----
+1
+3
+
+# unique() declared on existing data is validated immediately.
+statement ok
+CREATE TABLE dup (email)
+
+statement ok
+INSERT INTO dup VALUES ('a@x.com')
+
+statement ok
+INSERT INTO dup VALUES ('a@x.com')
+
+statement error already present
+CREATE UNIQUE INDEX uq_dup ON dup(email)
+
+# update() checks the new value, but a row keeping its own value never
+# self-conflicts.
+statement ok
+CREATE TABLE t2 (email, n)
+
+statement ok
+CREATE UNIQUE INDEX uq_t2_email ON t2(email)
+
+statement ok
+INSERT INTO t2 VALUES ('a@x.com', 1)
+
+statement ok
+INSERT INTO t2 VALUES ('b@x.com', 1)
+
+statement error already present
+UPDATE t2 SET email = 'a@x.com' WHERE email = 'b@x.com'
+
+statement ok
+UPDATE t2 SET n = 2 WHERE email = 'a@x.com'
+
+query I rowsort
+SELECT n FROM t2 WHERE email = 'a@x.com'
+----
+2

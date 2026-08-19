@@ -1,0 +1,107 @@
+# create_index() - see SPEC.md's Table.create_index section: an index must
+# agree with a full scan.
+#
+# This file avoids `ge` at a value that exactly equals an indexed row's
+# value (that boundary is the one seeded defect - see golden/ once it
+# exists). `ge(x, 0)` below is safe: 0 never equals any row's `x`, and a
+# bisect-based range scan only diverges between an inclusive/exclusive
+# boundary when the queried value is actually present in the data.
+
+statement ok
+CREATE TABLE people (name, dept, age)
+
+statement ok
+INSERT INTO people VALUES ('Ann', 'eng', 30)
+
+statement ok
+INSERT INTO people VALUES ('Bo', 'eng', 25)
+
+statement ok
+INSERT INTO people VALUES ('Cy', 'sales', 40)
+
+statement ok
+INSERT INTO people VALUES ('Ev', NULL, 35)
+
+statement ok
+CREATE INDEX idx_dept ON people(dept)
+
+query T rowsort
+SELECT name FROM people WHERE dept = 'eng'
+----
+Ann
+Bo
+
+statement ok
+CREATE INDEX idx_age ON people(age)
+
+query T rowsort
+SELECT name FROM people WHERE age < 35
+----
+Ann
+Bo
+
+query T rowsort
+SELECT name FROM people WHERE age <= 35
+----
+Ann
+Bo
+Ev
+
+query T rowsort
+SELECT name FROM people WHERE age > 35
+----
+Cy
+
+# between via an index, including exact boundary values, is unaffected by
+# the seeded `ge` defect (a separate code path - see SPEC.md).
+query T rowsort
+SELECT name FROM people WHERE age BETWEEN 25 AND 35
+----
+Ann
+Bo
+Ev
+
+query T rowsort
+SELECT name FROM people WHERE age BETWEEN 30 AND 30
+----
+Ann
+
+# an index only narrows candidates; the full AND predicate is still applied.
+query T rowsort
+SELECT name FROM people WHERE dept = 'eng' AND age > 28
+----
+Ann
+
+# create_index() on a table that already has rows builds a usable index
+# immediately.
+query T rowsort
+SELECT name FROM people WHERE dept = 'sales'
+----
+Cy
+
+# an index tracks inserts and deletes.
+statement ok
+CREATE TABLE t (x)
+
+statement ok
+CREATE INDEX idx_x ON t(x)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+statement ok
+INSERT INTO t VALUES (2)
+
+query I rowsort
+SELECT x FROM t WHERE x >= 0
+----
+1
+2
+
+statement ok
+DELETE FROM t WHERE x = 1
+
+query I rowsort
+SELECT x FROM t WHERE x >= 0
+----
+2

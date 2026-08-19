@@ -24,8 +24,15 @@ from .core import (
     ne,
     not_null,
 )
+from .sql import Database, QueryResult, SqlError, parse
 
 __all__ = [
+    # SQL front end - the primary interface (see SPEC.md).
+    "Database",
+    "QueryResult",
+    "SqlError",
+    "parse",
+    # Underlying engine - what Database/sql.py execute() translates into.
     "Table",
     "Query",
     "Predicate",

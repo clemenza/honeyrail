@@ -1,0 +1,56 @@
+# insert/update/delete - see SPEC.md's Table section.
+# Every record here builds its own table; state does not leak between files
+# (run_sql_tests.py gives each .test file a fresh Database).
+
+# insert stores exactly what was given, and a second insert doesn't touch
+# columns not named in an UPDATE.
+statement ok
+CREATE TABLE t (x, y)
+
+statement ok
+INSERT INTO t (x, y) VALUES (1, 'keep')
+
+statement ok
+UPDATE t SET x = 2 WHERE x = 1
+
+query TT rowsort
+SELECT x, y FROM t
+----
+2
+keep
+
+# update returns/affects only matching rows; non-matching rows are untouched.
+statement ok
+CREATE TABLE dept (name, dept)
+
+statement ok
+INSERT INTO dept VALUES ('Ann', 'eng')
+
+statement ok
+INSERT INTO dept VALUES ('Bo', 'eng')
+
+statement ok
+INSERT INTO dept VALUES ('Cy', 'sales')
+
+statement ok
+UPDATE dept SET dept = 'engineering' WHERE dept = 'eng'
+
+query T rowsort
+SELECT name FROM dept WHERE dept = 'engineering'
+----
+Ann
+Bo
+
+query T rowsort
+SELECT name FROM dept WHERE dept = 'eng'
+----
+
+# delete removes exactly the matching rows.
+statement ok
+DELETE FROM dept WHERE dept = 'sales'
+
+query T rowsort
+SELECT name FROM dept
+----
+Ann
+Bo

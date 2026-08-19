@@ -1,0 +1,82 @@
+# COUNT/MIN/MAX - see SPEC.md's Aggregates section.
+# Never calls COUNT(col) on a column that has a NULL value present - NULL
+# exclusion there is the seeded defect (see golden/ once it exists).
+# COUNT(*) is exercised against data that DOES include NULLs, since that's
+# unaffected by the defect (COUNT(*) must always include every row).
+
+statement ok
+CREATE TABLE people (name, age, dept)
+
+statement ok
+INSERT INTO people VALUES ('Ann', 30, 'eng')
+
+statement ok
+INSERT INTO people VALUES ('Bo', 25, 'eng')
+
+statement ok
+INSERT INTO people VALUES ('Cy', 40, 'sales')
+
+statement ok
+INSERT INTO people VALUES ('Di', NULL, 'sales')
+
+query I nosort
+SELECT COUNT(*) FROM people
+----
+4
+
+# `dept` is fully populated (no NULLs) - safe for COUNT(dept).
+query I nosort
+SELECT COUNT(dept) FROM people
+----
+4
+
+query I nosort
+SELECT COUNT(*) FROM people WHERE dept = 'eng'
+----
+2
+
+# min/max ignore NULLs.
+query I nosort
+SELECT MIN(age) FROM people
+----
+25
+
+query I nosort
+SELECT MAX(age) FROM people
+----
+40
+
+# min/max on an empty result is NULL.
+statement ok
+CREATE TABLE empty_t (x)
+
+statement ok
+INSERT INTO empty_t VALUES (1)
+
+query I nosort
+SELECT MIN(x) FROM empty_t WHERE x = 999
+----
+NULL
+
+query I nosort
+SELECT MAX(x) FROM empty_t WHERE x = 999
+----
+NULL
+
+# a fully-populated column is also fine to COUNT(col) directly.
+statement ok
+CREATE TABLE full_t (x)
+
+statement ok
+INSERT INTO full_t VALUES (1)
+
+statement ok
+INSERT INTO full_t VALUES (2)
+
+statement ok
+INSERT INTO full_t VALUES (3)
+
+query I nosort
+SELECT COUNT(x) FROM full_t
+----
+3
