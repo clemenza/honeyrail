@@ -25,6 +25,27 @@ export function modelFlag(flag: string, model: unknown) {
   return modelValue ? ` ${flag} ${quoteShellArg(modelValue)}` : "";
 }
 
+/**
+ * Detects a fixed completion marker among the last `tailLines` *non-blank*
+ * lines of captured tmux output - for an adapter that prints one clean
+ * marker line and then goes permanently silent (null/minimal, #71), rather
+ * than codex/claude's continuously-redrawn TUI status line.
+ *
+ * `output.split("\n").slice(-N)` (the pattern codex/claude/hermes use) only
+ * works when real content keeps arriving near the end of the capture. tmux
+ * pads a short-lived pane's capture with blank lines out to the full pane
+ * height, so a marker printed once and never followed by anything else can
+ * end up on line 1 of a 24-line capture - nowhere near the raw last N
+ * lines, even though it's unambiguously the *last thing the pane printed*.
+ * Filtering blanks first and then taking the tail fixes that: since nothing
+ * more is ever printed after the marker, it's always the last non-blank
+ * line, regardless of pane height or how much blank padding follows it.
+ */
+export function hasCompletedByTailMarker(output: string, marker: string, tailLines = 5): boolean {
+  const nonBlankLines = output.split("\n").map((line) => line.trimEnd()).filter((line) => line.length > 0);
+  return nonBlankLines.slice(-tailLines).some((line) => line.includes(marker));
+}
+
 // Prepended to the prompt for unattended (run-launched) agent-task steps so
 // the CLI doesn't stop to ask a clarifying question that nobody is watching
 // the terminal to answer. `BLOCKED:` is the structured escape hatch for

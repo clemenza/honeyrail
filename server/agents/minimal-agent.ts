@@ -1,5 +1,5 @@
 import { fileURLToPath } from "node:url";
-import { formatGenericInput, normalizedModel, normalizedPrompt } from "./common.js";
+import { formatGenericInput, hasCompletedByTailMarker, normalizedModel, normalizedPrompt } from "./common.js";
 import type { AgentAdapter, AgentInstallationStatus } from "./types.js";
 import { quoteShellArg } from "../utils.js";
 
@@ -53,7 +53,7 @@ export const minimalAgentAdapter: AgentAdapter = {
   formatInput: formatGenericInput,
 
   hasCompletedTask(output) {
-    return output.split("\n").slice(-20).some((line) => line.includes(DONE_MARKER));
+    return hasCompletedByTailMarker(output, DONE_MARKER);
   },
 
   async detectInstallation(): Promise<AgentInstallationStatus> {
