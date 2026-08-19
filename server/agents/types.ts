@@ -17,6 +17,8 @@ export type AgentLaunchInput = {
   model?: string | null;
   /** True for run-launched (unattended) steps so the adapter can avoid loading interactive-only surfaces (e.g. Claude Code's user-level skills). */
   unattended?: boolean;
+  /** Sampling temperature, for adapters that call a model API directly and can control it (currently just "minimal", #71). Ignored by CLI-wrapping adapters that have no such knob to pass through. */
+  temperature?: number;
 };
 
 export type AgentInputContext = {

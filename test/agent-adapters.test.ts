@@ -23,13 +23,19 @@ function attachment(path: string): ImageAttachment {
 }
 
 test("registry resolves every registered adapter and exposes metadata", () => {
-  assert.deepEqual(knownAgentIds(), ["shell", "codex", "claude", "hermes"]);
+  assert.deepEqual(knownAgentIds(), ["shell", "codex", "claude", "hermes", "null", "minimal"]);
   const adapters = listAgentAdapters();
-  assert.equal(adapters.length, 4);
+  assert.equal(adapters.length, 6);
   assert.equal(getAgentAdapter("codex").stability, "stable");
   assert.equal(getAgentAdapter("claude").stability, "stable");
   assert.equal(getAgentAdapter("shell").capabilities.modelSelection, false);
   assert.equal(getAgentAdapter("hermes").stability, "experimental");
+  // #71: both calibration probes are explicitly experimental, and neither
+  // has any code path that can surface an interactive prompt.
+  assert.equal(getAgentAdapter("null").stability, "experimental");
+  assert.equal(getAgentAdapter("null").capabilities.interactivePrompts, false);
+  assert.equal(getAgentAdapter("minimal").stability, "experimental");
+  assert.equal(getAgentAdapter("minimal").capabilities.interactivePrompts, false);
 });
 
 test("registry rejects unknown agent ids clearly", () => {
@@ -141,4 +147,74 @@ test("findBlockedReason only inspects the recent tail, not stale scrollback", ()
     ...Array.from({ length: 45 }, (_, index) => `line ${index}`)
   ].join("\n");
   assert.equal(findBlockedReason(output), null);
+});
+
+// #71: null-agent - does no real work, only declares the empty artifacts a
+// StepContract might require, then idles.
+test("null-agent launch command declares empty diff/changed_files artifacts, signals done, and stays alive", () => {
+  const nullAgent = getAgentAdapter("null");
+  const command = nullAgent.buildLaunchCommand();
+  assert.match(command, /mkdir -p "\$HR_STEP_DIR\/artifacts"/);
+  assert.match(command, /\$HR_STEP_DIR\/artifacts\/changes\.diff/);
+  assert.match(command, /\$HR_STEP_DIR\/artifacts\/changed_files\.json/);
+  assert.match(command, /"type":"diff"/);
+  assert.match(command, /"type":"changed_files"/);
+  assert.match(command, /echo "NULL_AGENT_DONE"/);
+  // Never exits on its own - a foreground process exiting closes its tmux
+  // pane before the poller can observe the final output.
+  assert.match(command, /while :; do sleep 3600; done/);
+});
+
+test("null-agent hasCompletedTask detects its own done marker in the recent tail only", () => {
+  const nullAgent = getAgentAdapter("null");
+  assert.equal(nullAgent.hasCompletedTask?.("some setup output\nNULL_AGENT_DONE\n"), true);
+  assert.equal(nullAgent.hasCompletedTask?.("no marker here"), false);
+  const stale = ["NULL_AGENT_DONE", ...Array.from({ length: 25 }, (_, i) => `line ${i}`)].join("\n");
+  assert.equal(nullAgent.hasCompletedTask?.(stale), false);
+});
+
+test("null-agent has no external dependency, so detectInstallation always reports available", async () => {
+  const status = await getAgentAdapter("null").detectInstallation?.(async () => ({ ok: true, stdout: "", stderr: "" }));
+  assert.equal(status?.available, true);
+});
+
+// #71: minimal-agent - a ReAct loop that calls a model API directly.
+test("minimal-agent launch command runs the standalone script with prompt/model/temperature, defaulting both", () => {
+  const minimal = getAgentAdapter("minimal");
+  const defaulted = minimal.buildLaunchCommand({ prompt: "implement fizzbuzz" });
+  assert.match(defaulted, /^node '.*minimal-agent\.mjs' --prompt 'implement fizzbuzz' --model 'deepseek-chat' --temperature '0'$/);
+
+  const overridden = minimal.buildLaunchCommand({ prompt: "fix Bob's bug", model: "deepseek-reasoner", temperature: 0.7 });
+  assert.match(overridden, /--prompt 'fix Bob'\\''s bug'/);
+  assert.match(overridden, /--model 'deepseek-reasoner'/);
+  assert.match(overridden, /--temperature '0\.7'/);
+});
+
+test("minimal-agent hasCompletedTask detects its own done marker in the recent tail only", () => {
+  const minimal = getAgentAdapter("minimal");
+  assert.equal(minimal.hasCompletedTask?.("$ ls\nfile.txt\nMINIMAL_AGENT_DONE status=done (3 iterations)\n"), true);
+  assert.equal(minimal.hasCompletedTask?.("still working"), false);
+});
+
+test("minimal-agent detectInstallation reflects whether an API key is configured", async () => {
+  const minimal = getAgentAdapter("minimal");
+  const originalDeepseek = process.env.DEEPSEEK_API_KEY;
+  const originalSummary = process.env.AGENT_SESSION_SUMMARY_API_KEY;
+  const originalMinimal = process.env.MINIMAL_AGENT_API_KEY;
+  delete process.env.DEEPSEEK_API_KEY;
+  delete process.env.AGENT_SESSION_SUMMARY_API_KEY;
+  delete process.env.MINIMAL_AGENT_API_KEY;
+  try {
+    const unavailable = await minimal.detectInstallation?.(async () => ({ ok: true, stdout: "", stderr: "" }));
+    assert.equal(unavailable?.available, false);
+    assert.match(unavailable?.detail || "", /No API key configured/);
+
+    process.env.MINIMAL_AGENT_API_KEY = "test-key";
+    const available = await minimal.detectInstallation?.(async () => ({ ok: true, stdout: "", stderr: "" }));
+    assert.equal(available?.available, true);
+  } finally {
+    if (originalDeepseek === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = originalDeepseek;
+    if (originalSummary === undefined) delete process.env.AGENT_SESSION_SUMMARY_API_KEY; else process.env.AGENT_SESSION_SUMMARY_API_KEY = originalSummary;
+    if (originalMinimal === undefined) delete process.env.MINIMAL_AGENT_API_KEY; else process.env.MINIMAL_AGENT_API_KEY = originalMinimal;
+  }
 });
