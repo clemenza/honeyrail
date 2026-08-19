@@ -23,9 +23,9 @@ function attachment(path: string): ImageAttachment {
 }
 
 test("registry resolves every registered adapter and exposes metadata", () => {
-  assert.deepEqual(knownAgentIds(), ["shell", "codex", "claude", "hermes", "null", "minimal"]);
+  assert.deepEqual(knownAgentIds(), ["shell", "codex", "claude", "hermes", "null", "minimal", "dsh"]);
   const adapters = listAgentAdapters();
-  assert.equal(adapters.length, 6);
+  assert.equal(adapters.length, 7);
   assert.equal(getAgentAdapter("codex").stability, "stable");
   assert.equal(getAgentAdapter("claude").stability, "stable");
   assert.equal(getAgentAdapter("shell").capabilities.modelSelection, false);
@@ -36,6 +36,10 @@ test("registry resolves every registered adapter and exposes metadata", () => {
   assert.equal(getAgentAdapter("null").capabilities.interactivePrompts, false);
   assert.equal(getAgentAdapter("minimal").stability, "experimental");
   assert.equal(getAgentAdapter("minimal").capabilities.interactivePrompts, false);
+  // #87/#88: developer-preview CLI, not a calibration probe, but still
+  // experimental and headless-only (no CLI it could ever prompt through).
+  assert.equal(getAgentAdapter("dsh").stability, "experimental");
+  assert.equal(getAgentAdapter("dsh").capabilities.interactivePrompts, false);
 });
 
 test("registry rejects unknown agent ids clearly", () => {
@@ -243,4 +247,71 @@ test("minimal-agent detectInstallation reflects whether an API key is configured
     if (originalSummary === undefined) delete process.env.AGENT_SESSION_SUMMARY_API_KEY; else process.env.AGENT_SESSION_SUMMARY_API_KEY = originalSummary;
     if (originalMinimal === undefined) delete process.env.MINIMAL_AGENT_API_KEY; else process.env.MINIMAL_AGENT_API_KEY = originalMinimal;
   }
+});
+
+// #87/#88: dsh - DSH (DeepSeek Harness) CLI, headless one-shot.
+test("dsh launch command patches cordis.patch.yml, signals done, and stays alive", () => {
+  const dsh = getAgentAdapter("dsh");
+  const command = dsh.buildLaunchCommand({ prompt: "implement fizzbuzz" });
+  assert.equal(
+    command,
+    "dsh --profile headless --patch cordis.patch.yml 'implement fizzbuzz'; echo HR_DSH_DONE; while :; do sleep 3600; done"
+  );
+  // No task text is still a valid one-shot invocation.
+  assert.equal(
+    dsh.buildLaunchCommand(),
+    "dsh --profile headless --patch cordis.patch.yml; echo HR_DSH_DONE; while :; do sleep 3600; done"
+  );
+  // dsh's headless mode exits on its own once the task is done (unlike
+  // codex/claude's idling TUI) - the trailing loop keeps the tmux pane (and
+  // the marker) alive long enough for the poller to observe it.
+  assert.match(command, /while :; do sleep 3600; done$/);
+});
+
+test("dsh launch command escapes shell-sensitive prompt content", () => {
+  const dsh = getAgentAdapter("dsh");
+  assert.match(dsh.buildLaunchCommand({ prompt: "fix Bob's bug" }), /'fix Bob'\\''s bug'/);
+});
+
+test("dsh hasCompletedTask detects its own done marker in the recent tail only, surviving tmux padding", () => {
+  const dsh = getAgentAdapter("dsh");
+  assert.equal(dsh.hasCompletedTask?.("some setup output\nHR_DSH_DONE\n"), true);
+  assert.equal(dsh.hasCompletedTask?.("still working"), false);
+  const padded = ["HR_DSH_DONE", ...Array.from({ length: 40 }, () => "")].join("\n");
+  assert.equal(dsh.hasCompletedTask?.(padded), true);
+});
+
+test("dsh findFatalError recognizes the missing-credential and boot-failure shapes found in #87's spike", () => {
+  const dsh = getAgentAdapter("dsh");
+  const missingKey = dsh.findFatalError?.(
+    'dsh: MISSING_CREDENTIAL: llm-deepseek: no API key for provider route "deepseek-official"; store DEEPSEEK_API_KEY through the credentials service (the web Models page writes it), or export DEEPSEEK_API_KEY in the launching environment'
+  );
+  assert.equal(missingKey?.code, "dsh_missing_credential");
+  assert.match(missingKey?.message || "", /DEEPSEEK_API_KEY/);
+
+  const bootFailure = dsh.findFatalError?.(
+    "Error: dsh: plugin tree failed to load: failed to import loader entry session-persistence-jsonl: The requested module 'node:zlib' does not provide an export named 'createZstdDecompress'"
+  );
+  assert.equal(bootFailure?.code, "dsh_boot_failure");
+  assert.match(bootFailure?.message || "", /plugin tree failed to load/);
+  assert.match(bootFailure?.message || "", /Node >= 24/);
+
+  assert.equal(dsh.findFatalError?.("ordinary task output, nothing fatal here"), null);
+});
+
+test("dsh detectInstallation resolves via the shared detectCli path", async () => {
+  const dsh = getAgentAdapter("dsh");
+  const calls: Array<{ cmd: string; args?: string[] }> = [];
+  const found = await dsh.detectInstallation?.(async (cmd, args) => {
+    calls.push({ cmd, args });
+    if (cmd === "sh") return { ok: true, stdout: "/usr/local/bin/dsh\n", stderr: "" };
+    return { ok: true, stdout: "0.1.0-rc.7\n", stderr: "" };
+  });
+  assert.equal(found?.available, true);
+  assert.equal(found?.version, "0.1.0-rc.7");
+  assert.equal(found?.path, "/usr/local/bin/dsh");
+  assert.deepEqual(calls[1], { cmd: "dsh", args: ["--version"] });
+
+  const missing = await dsh.detectInstallation?.(async () => ({ ok: false, stdout: "", stderr: "not found" }));
+  assert.equal(missing?.available, false);
 });
