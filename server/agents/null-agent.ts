@@ -1,5 +1,5 @@
 import type { AgentAdapter, AgentInstallationStatus } from "./types.js";
-import { formatGenericInput } from "./common.js";
+import { formatGenericInput, hasCompletedByTailMarker } from "./common.js";
 import { quoteShellArg } from "../utils.js";
 
 const DONE_MARKER = "NULL_AGENT_DONE";
@@ -23,7 +23,7 @@ const MANIFEST = JSON.stringify({
 });
 
 function buildLaunchCommand(): string {
-  return [
+  const script = [
     `mkdir -p "$HR_STEP_DIR/artifacts"`,
     `: > "$HR_STEP_DIR/artifacts/changes.diff"`,
     `printf '[]' > "$HR_STEP_DIR/artifacts/changed_files.json"`,
@@ -38,6 +38,15 @@ function buildLaunchCommand(): string {
     // identically to codex/claude/hermes.
     `while :; do sleep 3600; done`
   ].join(" && ");
+  // Wrapped in its own `sh -c` so $HR_STEP_DIR - which agent-task.ts sets by
+  // prefixing the *whole* returned command with `HR_STEP_DIR=<value> `- is
+  // expanded by a shell that actually has it in its environment. Verified
+  // the hard way: `VAR=value cmd1 && cmd2` only exports VAR into cmd1's
+  // environment, and `$VAR` inside that same command line is expanded
+  // *before* the assignment takes effect, so referencing $HR_STEP_DIR
+  // directly in a multi-command chain silently expands to empty and every
+  // path resolves to the filesystem root instead of the step directory.
+  return `sh -c ${quoteShellArg(script)}`;
 }
 
 /**
@@ -62,7 +71,7 @@ export const nullAgentAdapter: AgentAdapter = {
   formatInput: formatGenericInput,
 
   hasCompletedTask(output) {
-    return output.split("\n").slice(-20).some((line) => line.includes(DONE_MARKER));
+    return hasCompletedByTailMarker(output, DONE_MARKER);
   },
 
   async detectInstallation(): Promise<AgentInstallationStatus> {

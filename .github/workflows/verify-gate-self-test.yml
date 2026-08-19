@@ -1,0 +1,90 @@
+name: Verify-Gate Self-Test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  self-test:
+    name: Null-agent verify-gate self-test (#72)
+    runs-on: ubuntu-latest
+
+    env:
+      # A fixed local-only token for this ephemeral CI server instance, not
+      # a secret - the server never leaves the runner and nothing sensitive
+      # is protected by it here.
+      HONEYRAIL_TOKEN: verify-gate-self-test-ci-token
+      HONEYRAIL_DATA: /tmp/honeyrail-verify-gate/gateway.sqlite
+      HONEYRAIL_WORKTREE_ROOT: /tmp/honeyrail-verify-gate/worktrees
+      HONEYRAIL_ATTACHMENT_ROOT: /tmp/honeyrail-verify-gate/attachments
+      HONEYRAIL_SESSION_LOG_ROOT: /tmp/honeyrail-verify-gate/sessions
+      HONEYRAIL_LOG_FILE: /tmp/honeyrail-verify-gate/server.log
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Build
+        run: npm run build
+
+      - name: Start HoneyRail server
+        # Not scripts/start.sh: it wraps the server in its own tmux session
+        # via a hardcoded `zsh -lc ...` for local-dev convenience, and zsh
+        # isn't guaranteed present on the runner. The server process itself
+        # doesn't need to run inside tmux - only the agent sessions it
+        # spawns internally do (installed above) - so a plain background
+        # process polled via /api/health is simpler and more portable here.
+        run: |
+          NODE_ENV=production nohup npm start > "$HONEYRAIL_LOG_FILE" 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:4178/api/health >/dev/null 2>&1; then
+              echo "HoneyRail server is up."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "HoneyRail server did not become healthy in time. Recent log:" >&2
+          tail -60 "$HONEYRAIL_LOG_FILE" >&2 || true
+          exit 1
+
+      - name: Run verify-gate self-test
+        run: node --import tsx scripts/verify-gate-self-test.ts --seed-into /tmp/honeyrail-verify-gate/seed --out /tmp/honeyrail-verify-gate/report
+
+      - name: Stop HoneyRail server
+        if: always()
+        run: lsof -nP -iTCP:4178 -sTCP:LISTEN -t 2>/dev/null | xargs -r kill || true
+
+      - name: Upload server log and self-test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-gate-self-test-report
+          path: |
+            /tmp/honeyrail-verify-gate/server.log
+            /tmp/honeyrail-verify-gate/report/results.json
+          if-no-files-found: ignore

@@ -174,6 +174,24 @@ test("shipped implement-check-gate-approve recipe wires interaction/onBlocked de
   assert.equal(overriddenStep.onBlocked?.timeoutMs, 300_000);
 });
 
+// #72: the verify-gate self-test overrides this recipe's agent to "null"
+// and forces gateOnFail to "fail" so a null-agent run reaches a clean
+// terminal "failed" state (its default, "wait_approval", would otherwise
+// park the run waiting for a human instead of giving a definite verdict).
+test("shipped implement-check-gate-approve recipe accepts the 'null' calibration-agent override with gateOnFail forced to fail", async () => {
+  const registry = await loadRecipesFromDirectory(shippedRecipesDir);
+  const recipe = registry.get("implement-check-gate-approve")!;
+  const agentParam = recipe.parameters.find((param) => param.key === "agent")!;
+  assert.ok(agentParam.options?.includes("null"));
+  assert.equal(typeof agentParam.options![agentParam.options!.indexOf("null")], "string");
+
+  const materialized = materializeRecipe(recipe, { projectId: "proj_1", parameters: { agent: "null", gateOnFail: "fail" } });
+  const implementStep = materialized.steps.find((step) => step.id === "implement")!;
+  assert.equal(implementStep.input?.agent, "null");
+  const checkStep = materialized.steps.find((step) => step.id === "check")!;
+  assert.equal(checkStep.qualityGate?.onFail, "fail");
+});
+
 test("shipped implement-check-gate-approve recipe is deterministic and self-contained with zero parameters", async () => {
   const registry = await loadRecipesFromDirectory(shippedRecipesDir);
   const recipe = registry.get("implement-check-gate-approve")!;

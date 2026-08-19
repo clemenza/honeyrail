@@ -12,7 +12,10 @@ parameters:
   - key: agent
     label: Agent
     type: enum
-    options: [codex, claude, hermes, shell]
+    # "null" (#71, #72) is a calibration-probe baseline, not a real agent -
+    # included so the #72 verify-gate self-test can run this recipe with it
+    # and assert the check step correctly rejects a no-op agent.
+    options: [codex, claude, hermes, shell, "null"]
     default: codex
   - key: title
     label: Task title

@@ -163,6 +163,11 @@ test("null-agent launch command declares empty diff/changed_files artifacts, sig
   // Never exits on its own - a foreground process exiting closes its tmux
   // pane before the poller can observe the final output.
   assert.match(command, /while :; do sleep 3600; done/);
+  // Wrapped in its own `sh -c` so $HR_STEP_DIR (an env-var prefix
+  // agent-task.ts adds to the *whole* command) is actually visible when
+  // this multi-command chain expands it - see buildLaunchCommand's doc
+  // comment for the exact shell-semantics bug this avoids.
+  assert.match(command, /^sh -c '/);
 });
 
 test("null-agent hasCompletedTask detects its own done marker in the recent tail only", () => {
@@ -171,6 +176,18 @@ test("null-agent hasCompletedTask detects its own done marker in the recent tail
   assert.equal(nullAgent.hasCompletedTask?.("no marker here"), false);
   const stale = ["NULL_AGENT_DONE", ...Array.from({ length: 25 }, (_, i) => `line ${i}`)].join("\n");
   assert.equal(nullAgent.hasCompletedTask?.(stale), false);
+});
+
+// Regression test for a real bug caught during #72's end-to-end validation:
+// a short-lived pane (agent prints one line and then idles forever, never
+// printing again) gets padded by tmux with blank lines out to the full pane
+// height, so the marker can land on line 1 of a 24-line capture - nowhere
+// near the raw last-N-lines a naive tail check would look at, even though
+// it's unambiguously the last thing printed.
+test("null-agent hasCompletedTask detects the marker even when tmux pads dozens of blank lines after it", () => {
+  const nullAgent = getAgentAdapter("null");
+  const padded = ["NULL_AGENT_DONE", ...Array.from({ length: 40 }, () => "")].join("\n");
+  assert.equal(nullAgent.hasCompletedTask?.(padded), true);
 });
 
 test("null-agent has no external dependency, so detectInstallation always reports available", async () => {
@@ -194,6 +211,15 @@ test("minimal-agent hasCompletedTask detects its own done marker in the recent t
   const minimal = getAgentAdapter("minimal");
   assert.equal(minimal.hasCompletedTask?.("$ ls\nfile.txt\nMINIMAL_AGENT_DONE status=done (3 iterations)\n"), true);
   assert.equal(minimal.hasCompletedTask?.("still working"), false);
+});
+
+// Same real bug as null-agent's equivalent test above: minimal-agent prints
+// its done marker once and then idles forever too, so tmux pads the
+// capture with blank lines below it.
+test("minimal-agent hasCompletedTask detects the marker even when tmux pads dozens of blank lines after it", () => {
+  const minimal = getAgentAdapter("minimal");
+  const padded = ["$ echo done", "MINIMAL_AGENT_DONE status=done (1 iteration)", ...Array.from({ length: 40 }, () => "")].join("\n");
+  assert.equal(minimal.hasCompletedTask?.(padded), true);
 });
 
 test("minimal-agent detectInstallation reflects whether an API key is configured", async () => {
