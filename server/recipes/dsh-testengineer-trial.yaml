@@ -12,11 +12,15 @@ description: >
   so a matrix of trials always terminates. Segment aggregate metrics by
   variant via GET /api/evals/metrics?instructionLabel=<profileLabel> (the
   existing #25 A/B mechanism - profileLabel is exactly instructionLabel
-  under a name that fits this trial's vocabulary). `scoreCommand` has no
-  built-in default: the eval driver computes and injects the full score.py
-  invocation (worktree-relative `--worktree`, and a `--clean` path to the
-  matching tinytable-eval `clean/` reference) for whichever fixture this
-  trial cell targets.
+  under a name that fits this trial's vocabulary). `scoreCommand`'s default
+  assumes the registered project's repo is this honeyrail checkout itself
+  (so a worktree of it already contains examples/tinytable-eval/ - the
+  simplest way to launch this recipe by hand); a real eval driver targeting
+  a standalone, freshly `--seed-root`-copied mutant repo (#90) has no such
+  repo-relative path and must override it with the full score.py
+  invocation (worktree-relative `--worktree`, and an absolute `--clean`
+  path to the matching tinytable-eval `clean/` reference) for whichever
+  fixture this trial cell targets.
 category: evals
 contractLevel: L2
 parameters:
@@ -119,14 +123,15 @@ parameters:
     label: Score command
     type: string
     required: true
-    # No default: unlike the rest of this recipe's parameters, there is no
-    # static relative path that's correct here - the driver stages each
-    # fixture (and the shared clean/ reference it scores against) at a
-    # location it decides at run time, e.g.
-    # "python3 score.py --worktree . --clean /path/to/tinytable-eval/clean
-    # --out score.json". A wrong guessed default would fail for the wrong
-    # reason (no such file) instead of this parameter's own clear "missing
-    # required parameter" validation error.
+    # This default only works when the registered project's repo IS this
+    # honeyrail checkout (so a worktree of it contains examples/tinytable-eval/
+    # at repo-relative paths) - the natural way to launch this recipe by
+    # hand from the UI. A real eval driver targeting a standalone,
+    # freshly `--seed-root`-copied mutant repo (#90) has no such
+    # repo-relative path available and must override this with an
+    # absolute one, e.g. "python3 /path/to/score.py --worktree . --clean
+    # /path/to/tinytable-eval/clean --out score.json".
+    default: "python3 examples/tinytable-eval/score.py --worktree . --clean examples/tinytable-eval/clean --out score.json"
   - key: profilePath
     label: Profile/instruction file path
     type: string
