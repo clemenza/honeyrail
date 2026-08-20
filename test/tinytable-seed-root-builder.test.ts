@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { test, type TestContext } from "node:test";
 
 import { buildSeedRoot } from "../scripts/tinytable-seed-root-builder.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const REAL_SOURCE_ROOT = join(__dirname, "..", "examples", "tinytable-eval");
 
 async function tempDir(t: TestContext, prefix: string): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), prefix));
@@ -109,4 +113,31 @@ test("buildSeedRoot refuses a non-empty --out directory", async (t) => {
   const outDir = await tempDir(t, "honeyrail-seed-root-");
   await buildSeedRoot({ mutantId: "m01", outDir });
   await assert.rejects(() => buildSeedRoot({ mutantId: "m01", outDir }), /already exists and is not empty/);
+});
+
+// Regression: a compiled __pycache__/*.pyc left behind by an earlier local
+// `python3 selfcheck.py`/`score.py` run embeds its source file's literal
+// path - "mutants/m04/tinytable/__init__.py" - in its bytecode (co_filename),
+// which is exactly the kind of answer-key metadata this builder exists to
+// keep out of the seed-root, and it isn't caught by the text-content scrub
+// rules since it's a binary file. Exercised against a scratch copy of the
+// source tree so the test doesn't depend on (or leave behind) a real
+// __pycache__ under examples/tinytable-eval.
+test("buildSeedRoot excludes __pycache__ (and other non-fixture files) left behind by local test runs", async (t) => {
+  const scratchSource = await tempDir(t, "honeyrail-seed-root-source-");
+  await cp(REAL_SOURCE_ROOT, scratchSource, { recursive: true });
+
+  const pycacheDir = join(scratchSource, "mutants", "m04", "tinytable", "__pycache__");
+  await mkdir(pycacheDir, { recursive: true });
+  await writeFile(
+    join(pycacheDir, "__init__.cpython-311.pyc"),
+    Buffer.from(`fake bytecode embedding ${join(scratchSource, "mutants", "m04", "tinytable", "__init__.py")}`)
+  );
+
+  const outDir = await tempDir(t, "honeyrail-seed-root-");
+  const manifest = await buildSeedRoot({ mutantId: "m04", outDir, sourceRoot: scratchSource });
+
+  const files = await listAllFiles(outDir);
+  assert.ok(!files.some((f) => f.includes("__pycache__")), `__pycache__ leaked into seed-root: ${files.join(", ")}`);
+  assert.ok(!manifest.files.some((f) => f.path.includes("__pycache__")));
 });
