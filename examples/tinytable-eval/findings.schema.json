@@ -27,8 +27,8 @@
       "repro_test": {
         "type": "string",
         "minLength": 1,
-        "pattern": "^tests/agent/.+::.+$",
-        "description": "The pytest node id (relative to the repo root) of the test under tests/agent/ that reproduces this exact finding."
+        "pattern": "^sql-tests/agent/.+\\.test(:[0-9]+)?$",
+        "description": "The path (relative to the repo root) of the .test file under sql-tests/agent/ that reproduces this exact finding, optionally suffixed with ':<line>' naming the specific failing record."
       }
     }
   }

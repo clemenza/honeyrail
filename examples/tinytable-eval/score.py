@@ -5,101 +5,117 @@ Usage:
     python3 score.py --worktree /path/to/worktree --clean /path/to/tinytable-eval/clean [--out score.json] [--timeout 120]
 
 `--worktree` is a fixture root (a `clean` or seeded `mutants/mNN` copy, plus
-whatever an agent added under `tests/agent/` and `findings.json` - see
+whatever an agent added under `sql-tests/agent/` and `findings.json` - see
 task-prompt.md) that is expected to be its own git repository, freshly
 committed before the agent touched it (this is what lets step 3's
-`git status` check catch an edit to `tinytable/` or `tests/test_official.py`).
+`git status` check catch an edit to `tinytable/` or `sql-tests/official/`).
 `--clean` is a SPEC-compliant reference `tinytable` root (just needs a
 `tinytable/` package - see step 2).
 
+Agent tests are `.test` files (SPEC.md's "Test Script Format" - the same
+black-box, SQL-in/rows-out format as sql-tests/official/*.test), scored via
+this file's own colocated run_sql_tests.py - never whatever copy, if any,
+happens to sit inside the worktree - so an agent can't influence scoring by
+touching the runner.
+
 Steps:
-  1. Run `pytest -q tests/agent` against `--worktree` -> failing set F_mutant.
-  2. Copy `--worktree`'s tests/ (tests/agent/ + tests/test_official.py) into
-     a temp copy of `--clean`, run the same command -> failing set F_clean.
+  1. Run run_sql_tests.py against `--worktree`'s sql-tests/agent/ -> failing
+     set F_mutant (one entry per failing record: "<path>:<line>").
+  2. Copy `--worktree`'s sql-tests/ (sql-tests/agent/ + sql-tests/official/)
+     onto a temp copy of `--clean`, run the same command -> F_clean.
   3. killed = bool(F_mutant - F_clean); false_alarms = len(F_clean);
-     contract_ok = tests/agent/ non-empty AND findings.json exists and
-     validates against findings.schema.json AND `git status` in the
-     worktree shows tinytable/ and tests/test_official.py untouched.
+     contract_ok = sql-tests/agent/ has at least one *.test file AND
+     findings.json exists and validates against findings.schema.json AND
+     `git status` in the worktree shows tinytable/ and sql-tests/official/
+     untouched.
   4. Write score.json to the worktree root and print `SCORE_JSON: {...}`
      to stdout for a driver to parse.
   5. Exit 0 iff killed and false_alarms == 0 and contract_ok, else 1.
 
-stdlib + a `pytest` subprocess only - no third-party imports here. Each
-pytest invocation is subprocess.run(..., timeout=...) so a runaway test
-written by the agent can't hang scoring.
+stdlib only (run_sql_tests.py, invoked as a subprocess, is itself stdlib -
+no pytest, no third-party imports anywhere in this pipeline). Each
+run_sql_tests.py invocation is subprocess.run(..., timeout=...) so a
+runaway or looping test written by the agent can't hang scoring.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import pathlib
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import xml.etree.ElementTree as ET
 from typing import Optional
 
-_PROTECTED_PREFIXES = ("tinytable/",)
-_PROTECTED_FILES = ("tests/test_official.py",)
+HERE = pathlib.Path(__file__).resolve().parent
+RUNNER = HERE / "run_sql_tests.py"
+
+_PROTECTED_PREFIXES = ("tinytable/", "sql-tests/official/")
 _FINDING_FIELDS = ("id", "summary", "spec_section", "repro_test")
-_REPRO_TEST_RE = re.compile(r"^tests/agent/.+::.+$")
+_REPRO_TEST_RE = re.compile(r"^sql-tests/agent/.+\.test(:[0-9]+)?$")
+
+_FAIL_HEADER_RE = re.compile(r"^FAIL (?P<path>\S.*?) \((?P<detail>.+)\)$")
+_FAIL_LINE_RE = re.compile(r"^  line (?P<line>\d+): ")
 
 
 # ---------------------------------------------------------------------------
-# pytest invocation
+# run_sql_tests.py invocation
 # ---------------------------------------------------------------------------
 
 
 def _agent_tests_nonempty(root: pathlib.Path) -> bool:
-    agent_dir = root / "tests" / "agent"
+    agent_dir = root / "sql-tests" / "agent"
     if not agent_dir.is_dir():
         return False
-    return any(p.name != "__init__.py" for p in agent_dir.rglob("test_*.py"))
+    return any(agent_dir.rglob("*.test"))
 
 
-def _parse_junit_failures(junit_path: pathlib.Path) -> set[str]:
-    if not junit_path.is_file():
-        return set()
-    root = ET.parse(junit_path).getroot()
-    suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+def _parse_failing_ids(output: str) -> set[str]:
+    """Parse run_sql_tests.py's stdout into a set of "<path>:<line>"
+    failing-record identifiers (":0" for a whole file that failed to parse -
+    see the "malformed test file" case in run_sql_tests.py's own output).
+    `path` is exactly the token run_sql_tests.py printed, which - since we
+    always invoke it with a path relative to `root` while cwd=root - is
+    already relative and directly comparable between two different roots.
+    """
     failing: set[str] = set()
-    for suite in suites:
-        for case in suite.findall("testcase"):
-            if case.find("failure") is not None or case.find("error") is not None:
-                failing.add(f"{case.get('classname', '')}::{case.get('name', '')}")
+    current: Optional[str] = None
+    for line in output.splitlines():
+        header = _FAIL_HEADER_RE.match(line)
+        if header:
+            current = header.group("path")
+            if "malformed test file" in header.group("detail"):
+                failing.add(f"{current}:0")
+            continue
+        record = _FAIL_LINE_RE.match(line)
+        if record and current is not None:
+            failing.add(f"{current}:{record.group('line')}")
     return failing
 
 
-def _run_pytest(root: pathlib.Path, timeout: int) -> tuple[Optional[set[str]], str]:
-    """Run `pytest -q tests/agent` in `root`. Returns (failing_set, log);
-    failing_set is None iff pytest itself failed to run to completion
-    (timeout, or a collection-level crash) - the caller must treat that as
-    an unscorable error, not "zero failures".
+def _run_sql_tests(root: pathlib.Path, subdir: str, timeout: int) -> tuple[Optional[set[str]], str]:
+    """Run run_sql_tests.py --root `root` `subdir` (cwd=root, so `subdir`
+    stays relative in the output). Returns (failing_set, log); failing_set
+    is None iff the runner itself failed to run to completion (timeout, or
+    a crash) - the caller must treat that as an unscorable error, not "zero
+    failures".
     """
-    agent_dir = root / "tests" / "agent"
-    if not agent_dir.is_dir():
-        return set(), "tests/agent/ does not exist - treating as zero tests, zero failures"
+    target_dir = root / subdir
+    if not target_dir.is_dir():
+        return set(), f"{subdir}/ does not exist - treating as zero tests, zero failures"
 
-    with tempfile.TemporaryDirectory(prefix="tinytable-eval-junit-") as td:
-        junit_path = pathlib.Path(td) / "junit.xml"
-        env = dict(os.environ)
-        existing = env.get("PYTHONPATH")
-        env["PYTHONPATH"] = str(root) + (os.pathsep + existing if existing else "")
-        cmd = [sys.executable, "-m", "pytest", "-q", "tests/agent", f"--junitxml={junit_path}"]
-        try:
-            proc = subprocess.run(cmd, cwd=str(root), env=env, capture_output=True, text=True, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return None, f"pytest timed out after {timeout}s in {root}"
-        log = proc.stdout + proc.stderr
-        if not junit_path.is_file():
-            # pytest didn't even get to report (e.g. a broken conftest.py) -
-            # this is a real error, not "the suite passed with zero tests".
-            return None, f"pytest produced no junit report (exit {proc.returncode}) in {root}:\n{log}"
-        return _parse_junit_failures(junit_path), log
+    cmd = [sys.executable, str(RUNNER), "--root", str(root), subdir]
+    try:
+        proc = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, f"run_sql_tests.py timed out after {timeout}s in {root}"
+    log = proc.stdout + proc.stderr
+    if "Traceback (most recent call last):" in proc.stderr:
+        return None, f"run_sql_tests.py crashed in {root}:\n{log}"
+    return _parse_failing_ids(proc.stdout), log
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +151,7 @@ def _validate_findings(path: pathlib.Path) -> list[str]:
         if isinstance(repro_test, str) and repro_test and not _REPRO_TEST_RE.match(repro_test):
             errors.append(
                 f"findings.json[{i}].repro_test {repro_test!r} does not look like "
-                f"'tests/agent/<file>::<test id>'"
+                f"'sql-tests/agent/<file>.test' (optionally ':<line>')"
             )
     return errors
 
@@ -172,10 +188,10 @@ def _git_status_paths(root: pathlib.Path) -> Optional[list[str]]:
 def _check_protected_paths_untouched(root: pathlib.Path) -> list[str]:
     paths = _git_status_paths(root)
     if paths is None:
-        return ["worktree is not a git repository - cannot verify tinytable/ and tests/test_official.py are untouched"]
+        return ["worktree is not a git repository - cannot verify tinytable/ and sql-tests/official/ are untouched"]
     errors = []
     for p in paths:
-        if p in _PROTECTED_FILES or any(p.startswith(prefix) for prefix in _PROTECTED_PREFIXES):
+        if any(p.startswith(prefix) for prefix in _PROTECTED_PREFIXES):
             errors.append(f"protected path was added/modified/deleted: {p}")
     return errors
 
@@ -183,7 +199,7 @@ def _check_protected_paths_untouched(root: pathlib.Path) -> list[str]:
 def _check_contract(worktree: pathlib.Path) -> list[str]:
     errors: list[str] = []
     if not _agent_tests_nonempty(worktree):
-        errors.append("tests/agent/ is missing or contains no test_*.py files")
+        errors.append("sql-tests/agent/ is missing or contains no *.test files")
     errors.extend(_validate_findings(worktree / "findings.json"))
     errors.extend(_check_protected_paths_untouched(worktree))
     return errors
@@ -199,7 +215,7 @@ def main() -> int:
     parser.add_argument("--worktree", required=True, help="fixture root to score (clean or a seeded mutant, plus the agent's changes)")
     parser.add_argument("--clean", required=True, help="SPEC-compliant reference tinytable root (e.g. tinytable-eval/clean)")
     parser.add_argument("--out", default="score.json", help="output filename, written under --worktree (default: score.json)")
-    parser.add_argument("--timeout", type=int, default=120, help="per-pytest-invocation timeout in seconds (default: 120)")
+    parser.add_argument("--timeout", type=int, default=120, help="per-run_sql_tests.py-invocation timeout in seconds (default: 120)")
     args = parser.parse_args()
 
     worktree = pathlib.Path(args.worktree).resolve()
@@ -214,7 +230,7 @@ def main() -> int:
 
     error: Optional[str] = None
 
-    f_mutant, mutant_log = _run_pytest(worktree, args.timeout)
+    f_mutant, mutant_log = _run_sql_tests(worktree, "sql-tests/agent", args.timeout)
     if f_mutant is None:
         error = mutant_log
         f_mutant = set()
@@ -223,10 +239,10 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="tinytable-eval-clean-") as tmp:
         tmp_clean = pathlib.Path(tmp) / "clean"
         shutil.copytree(clean, tmp_clean)
-        worktree_tests = worktree / "tests"
-        if worktree_tests.is_dir():
-            shutil.copytree(worktree_tests, tmp_clean / "tests", dirs_exist_ok=True)
-        f_clean_result, clean_log = _run_pytest(tmp_clean, args.timeout)
+        worktree_sql_tests = worktree / "sql-tests"
+        if worktree_sql_tests.is_dir():
+            shutil.copytree(worktree_sql_tests, tmp_clean / "sql-tests", dirs_exist_ok=True)
+        f_clean_result, clean_log = _run_sql_tests(tmp_clean, "sql-tests/agent", args.timeout)
         if f_clean_result is None:
             error = f"{error}\n{clean_log}" if error else clean_log
         else:
