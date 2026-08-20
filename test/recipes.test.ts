@@ -194,15 +194,23 @@ test("shipped dsh-testengineer-trial recipe defaults agent to dsh and materializ
   assert.equal(scoreStep.qualityGate?.onFail, "fail");
 });
 
-// scoreCommand has no built-in default (see the recipe's own description):
-// it's fixture-specific, so a driver must always supply it.
-test("shipped dsh-testengineer-trial recipe requires scoreCommand - it has no default", async () => {
+// scoreCommand's default assumes the registered project's repo is this
+// honeyrail checkout itself (see the recipe's own description) - the
+// simplest way to launch it by hand from the UI wizard without every
+// required field blocking submission.
+test("shipped dsh-testengineer-trial recipe is self-contained with zero parameters, assuming the project repo is this honeyrail checkout", async () => {
   const registry = await loadRecipesFromDirectory(shippedRecipesDir);
   const recipe = registry.get("dsh-testengineer-trial")!;
-  assert.throws(
-    () => materializeRecipe(recipe, { projectId: "proj_1", parameters: {} }),
-    (error: unknown) => error instanceof RecipeValidationError && /scoreCommand/.test(error.message)
-  );
+
+  const materialized = materializeRecipe(recipe, { projectId: "proj_1", parameters: {} });
+  const testEngineerStep = materialized.steps.find((step) => step.id === "test-engineer")!;
+  assert.equal(testEngineerStep.input?.agent, "dsh");
+  assert.match(String(testEngineerStep.input?.prompt), /senior test engineer/);
+
+  const scoreStep = materialized.steps.find((step) => step.id === "score")!;
+  assert.deepEqual(scoreStep.input?.commands, [
+    "python3 examples/tinytable-eval/score.py --worktree . --clean examples/tinytable-eval/clean --out score.json"
+  ]);
 });
 
 test("shipped dsh-testengineer-trial recipe accepts a candidate profile override and a baseline-comparison agent", async () => {
