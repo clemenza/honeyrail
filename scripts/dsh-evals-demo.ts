@@ -181,10 +181,29 @@ async function gitInitCommit(repoPath: string): Promise<void> {
   );
 }
 
-type ScoreJson = { killed: boolean; false_alarms: number; contract_ok: boolean; passed: boolean };
+export type ScoreJson = { killed: boolean; false_alarms: number; contract_ok: boolean; passed: boolean };
 
-async function runScorePy(worktreePath: string): Promise<ScoreJson | { error: string }> {
-  const result = await runCommandSafe("python3", [
+// #114: score.py's own JSON output always includes a literal "error" key
+// (null on success - see examples/tinytable-eval/score.py's `result` dict),
+// so a plain `ScoreJson | { error: string }` union with an `"error" in x`
+// discriminant is unsound: `JSON.parse(raw) as ScoreJson` doesn't strip
+// score.py's extra fields at runtime, so that check is true for *every*
+// successfully-parsed score.json, not just the driver's own failure
+// sentinel - the actual score (killed/false_alarms/contract_ok) was being
+// silently discarded and every trial misreported as driver_error, whether
+// it actually passed or not. `ok` can't collide with anything score.py's
+// schema will ever name, unlike `error`.
+export type RunScorePyResult = { ok: true; score: ScoreJson } | { ok: false; error: string };
+
+// `run` defaults to the real subprocess call; overridable so tests can
+// exercise the read/parse/discriminate logic (the actual site of #114's
+// bug) against a pre-written score.json without needing python3 or a real
+// tinytable-eval fixture on disk.
+export async function runScorePy(
+  worktreePath: string,
+  run: typeof runCommandSafe = runCommandSafe
+): Promise<RunScorePyResult> {
+  const result = await run("python3", [
     scorePyPath,
     "--worktree", worktreePath,
     "--clean", cleanDir,
@@ -192,9 +211,9 @@ async function runScorePy(worktreePath: string): Promise<ScoreJson | { error: st
   ]);
   try {
     const raw = await readFile(join(worktreePath, "score.json"), "utf8");
-    return JSON.parse(raw) as ScoreJson;
+    return { ok: true, score: JSON.parse(raw) as ScoreJson };
   } catch {
-    return { error: `score.py produced no score.json (exit ${result.code}): ${(result.stderr || result.stdout).slice(-2000)}` };
+    return { ok: false, error: `score.py produced no score.json (exit ${result.code}): ${(result.stderr || result.stdout).slice(-2000)}` };
   }
 }
 
@@ -278,15 +297,15 @@ async function executeCell(
     console.error(`  ${trialId}: INTEGRITY FAILURE - protected fixture files changed: ${postMismatches.map(describeManifestMismatch).join("; ")}`);
   }
 
-  if ("error" in scoreOrError) {
+  if (!scoreOrError.ok) {
     return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk, wallTimeMs, blockedReason: blocked?.message, error: scoreOrError.error };
   }
 
   return {
     ...base,
-    killed: scoreOrError.killed,
-    falseAlarms: scoreOrError.false_alarms,
-    contractOk: scoreOrError.contract_ok,
+    killed: scoreOrError.score.killed,
+    falseAlarms: scoreOrError.score.false_alarms,
+    contractOk: scoreOrError.score.contract_ok,
     integrityOk,
     wallTimeMs,
     blockedReason: blocked?.message
@@ -394,7 +413,15 @@ async function main(): Promise<void> {
   console.log(`Report: ${reportPath}`);
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : error);
-  process.exit(1);
-});
+// #114: without this guard, merely *importing* this module (e.g. from a
+// test that wants to exercise runScorePy() in isolation) unconditionally
+// launched the full 48-run production matrix against real dsh/model-API
+// calls - discovered exactly that way while adding this file's own
+// regression test. Same pattern as scripts/tinytable-exam-room.ts.
+const isMain = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+if (isMain) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : error);
+    process.exit(1);
+  });
+}
