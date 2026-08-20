@@ -160,15 +160,36 @@ async function pathExists(path: string): Promise<boolean> {
   );
 }
 
-/** Recursively reads every file under `dir`, returning posix-relative paths sorted lexically. */
+/**
+ * Directories never worth descending into: interpreter/tool caches, not
+ * fixture content. Skipped outright rather than filtered post-hoc, since a
+ * compiled `.pyc`'s bytecode can embed its source file's literal path
+ * (`mutants/mNN/...`) in a way no text-content scrub rule would catch.
+ */
+const SKIP_DIR_NAMES = new Set(["__pycache__", ".pytest_cache", ".git"]);
+
+/** Extensions the tinytable-eval fixture legitimately contains - anything else (caches, editor swap files, OS cruft) is excluded rather than blindly copied. */
+const SAFE_EXTENSIONS = new Set([".py", ".test", ".md", ".json"]);
+
+/** Recursively reads every allowlisted-extension file under `dir`, returning posix-relative paths sorted lexically. */
 async function listFilesRecursive(dir: string, relBase = ""): Promise<string[]> {
   const entries = await readdir(join(dir, relBase), { withFileTypes: true });
   const files: string[] = [];
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
     const rel = relBase ? join(relBase, entry.name) : entry.name;
     if (entry.isDirectory()) {
+      if (SKIP_DIR_NAMES.has(entry.name)) continue;
       files.push(...(await listFilesRecursive(dir, rel)));
     } else if (entry.isFile()) {
+      const dot = entry.name.lastIndexOf(".");
+      const ext = dot >= 0 ? entry.name.slice(dot) : "";
+      if (!SAFE_EXTENSIONS.has(ext)) {
+        throw new Error(
+          `seed-root builder: unexpected file ${join(relBase, entry.name)} under ${dir} has extension ` +
+            `"${ext}" not in the known-safe allowlist (${[...SAFE_EXTENSIONS].join(", ")}) - ` +
+            "add it deliberately if it belongs in the fixture, don't let it through silently"
+        );
+      }
       files.push(rel);
     }
   }
