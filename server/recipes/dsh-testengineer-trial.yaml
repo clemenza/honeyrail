@@ -154,6 +154,19 @@ parameters:
     label: Model
     type: string
     default: ""
+  - key: expectedManifest
+    label: Expected fixture manifest (JSON)
+    type: string
+    default: ""
+    # Optional #106 preflight: when set, a JSON object of shape
+    # { files: [{ path, sha256 }, ...] } (e.g. the "files" from #104's
+    # buildSeedRoot() manifest) that the registered project's repo must
+    # already match - by file presence and content hash - before the agent
+    # is launched. Left empty by default so this recipe still runs
+    # unconfigured (dev smoke-testing the wiring); a real trial driver
+    # against a #104-built seed-root project should set this so a
+    # mismatched/wrong-project run fails immediately instead of quietly
+    # handing the agent a fixture it wasn't supposed to have (see #103).
 steps:
   - id: test-engineer
     name: Run test-engineer agent
@@ -164,6 +177,7 @@ steps:
       prompt: "{{ prompt }}"
       interaction: autonomous
       model: "{{ model }}"
+      expectedManifest: "{{ expectedManifest }}"
       instructionFile:
         path: "{{ profilePath }}"
         content: "{{ profileContent }}"

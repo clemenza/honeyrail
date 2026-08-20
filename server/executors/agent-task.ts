@@ -5,6 +5,7 @@ import { HARNESS_PROMPT_VERSION, withHarnessConventions, withUnattendedPreamble 
 import { getAgentAdapter, isKnownAgent } from "../agents/registry.js";
 import { publishSessionCreated, publishTaskFailed, publishTaskStarted } from "../domain-events.js";
 import { publishEvent } from "../events.js";
+import { describeManifestMismatch, findManifestMismatches, parseExpectedManifest } from "../evals/manifest-preflight.js";
 import {
   errorMessage,
   publishInitialAgentPrompt,
@@ -447,6 +448,30 @@ export class AgentTaskExecutor implements Executor {
     // Throws ConfigError on a malformed/unsafe declaration, so a run that
     // could only fail at injection time is rejected before any step starts.
     parseInstructionFile(ctx.step.input?.instructionFile);
+    // #106: a step can opt into declaring which files (+ hashes) its target
+    // fixture must already contain - e.g. #104's buildSeedRoot() manifest
+    // for dsh-testengineer-trial. This runs against the *project's*
+    // registered repo, not a worktree - start() always creates a fresh
+    // worktree by copying that repo, so checking it here catches a
+    // mismatched/wrong-project run before a worktree even exists, let alone
+    // before an agent is launched (the #103 AC1 gap: a run against the
+    // wrong project silently let the agent "discover" the fixture was
+    // missing and improvise instead of failing loudly).
+    let expectedManifest: ReturnType<typeof parseExpectedManifest>;
+    try {
+      expectedManifest = parseExpectedManifest(ctx.step.input?.expectedManifest);
+    } catch (error) {
+      throw new ConfigError(`agent-task step "${ctx.step.id}": ${(error as Error).message}`);
+    }
+    if (expectedManifest) {
+      const mismatches = await findManifestMismatches(ctx.project.repoPath, expectedManifest);
+      if (mismatches.length) {
+        throw new ConfigError(
+          `agent-task step "${ctx.step.id}": project "${ctx.project.name}"'s repo does not match the expected fixture manifest: ` +
+            mismatches.map(describeManifestMismatch).join("; ")
+        );
+      }
+    }
     const adapter = getAgentAdapter(agent);
     if (!adapter.detectInstallation) return;
     const status = await adapter.detectInstallation(ctx.runCommand);
