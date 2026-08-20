@@ -243,7 +243,19 @@ async function executeCell(
     seedRootDir,
     image: options.image,
     command: ["dsh", "--profile", "headless", "--patch", PROFILE_PATCH_FILENAME, prompt],
-    env: process.env.DEEPSEEK_API_KEY ? { DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY } : {},
+    env: {
+      ...(process.env.DEEPSEEK_API_KEY ? { DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY } : {}),
+      // #115: dsh's default `workspace-write` mode makes its own tool-bash
+      // build a nested sandbox for every command, which needs to mount a
+      // fresh /proc - blocked by Docker's default seccomp profile
+      // regardless of --cap-drop/--security-opt, so bash is completely
+      // unusable inside this container otherwise. The exam-room container
+      // itself (--cap-drop=ALL, --read-only, only the seed-root mounted -
+      // see scripts/tinytable-exam-room.ts) is already the real security
+      // boundary for a scored trial, so dsh's own redundant nested sandbox
+      // is unnecessary here, not just broken.
+      DSH_PERMISSION_MODE: process.env.DSH_PERMISSION_MODE ?? "danger-full-access"
+    },
     timeoutMs: options.trialTimeoutMinutes * 60_000
   });
   const wallTimeMs = Date.now() - startedAt;
