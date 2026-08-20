@@ -73,7 +73,12 @@ const demoRecipe: Recipe = {
 test("loadRecipesFromDirectory loads the shipped recipes without throwing", async () => {
   const registry = await loadRecipesFromDirectory(shippedRecipesDir);
   const ids = registry.list().map((recipe) => recipe.id).sort();
-  assert.deepEqual(ids, ["eval-instruction-ab-trial", "implement-check-gate-approve", "postgres-transaction-restart"]);
+  assert.deepEqual(ids, [
+    "dsh-testengineer-trial",
+    "eval-instruction-ab-trial",
+    "implement-check-gate-approve",
+    "postgres-transaction-restart"
+  ]);
 });
 
 test("shipped eval-instruction-ab-trial recipe materializes the instruction file into the agent-task step", async () => {
@@ -150,6 +155,89 @@ test("shipped eval-instruction-ab-trial recipe is self-contained with zero param
 
   const checkStep = materialized.steps.find((step) => step.id === "check")!;
   assert.deepEqual(checkStep.input?.commands, ["python -m pytest -q"]);
+});
+
+// #92: dsh-testengineer-trial wires the DSH adapter (#88) and score.py
+// (#91) into a single trial, modeled on eval-instruction-ab-trial above -
+// same instructionFile/onBlocked/produces shape, but the injected file is
+// `cordis.patch.yml` (the DSH adapter's Route A patch overlay - see
+// docs/dsh-adapter-notes.md) and the check step's command is score.py
+// rather than a fixed pytest invocation.
+test("shipped dsh-testengineer-trial recipe defaults agent to dsh and materializes cordis.patch.yml as the instruction file", async () => {
+  const registry = await loadRecipesFromDirectory(shippedRecipesDir);
+  const recipe = registry.get("dsh-testengineer-trial")!;
+  assert.equal(recipe.contractLevel, "L2");
+
+  const materialized = materializeRecipe(recipe, {
+    projectId: "proj_1",
+    parameters: { scoreCommand: "python3 score.py --worktree . --clean /fixtures/clean --out score.json" }
+  });
+
+  const testEngineerStep = materialized.steps.find((step) => step.id === "test-engineer")!;
+  assert.equal(testEngineerStep.input?.agent, "dsh");
+  assert.equal(typeof testEngineerStep.input?.agent, "string");
+  assert.equal(testEngineerStep.input?.interaction, "autonomous");
+  assert.deepEqual(testEngineerStep.input?.instructionFile, {
+    path: "cordis.patch.yml",
+    content: "[]\n",
+    label: "baseline"
+  });
+  assert.equal(testEngineerStep.onBlocked?.action, "auto_retry");
+  assert.deepEqual(testEngineerStep.produces, ["changed_files"]);
+  assert.match(String(testEngineerStep.input?.prompt), /senior test engineer/);
+  assert.match(String(testEngineerStep.input?.prompt), /sql-tests\/agent\//);
+
+  const scoreStep = materialized.steps.find((step) => step.id === "score")!;
+  assert.deepEqual(scoreStep.dependsOn, ["test-engineer"]);
+  assert.deepEqual(scoreStep.input?.commands, ["python3 score.py --worktree . --clean /fixtures/clean --out score.json"]);
+  assert.deepEqual(scoreStep.qualityGate?.evaluators, [{ type: "check" }]);
+  assert.equal(scoreStep.qualityGate?.onFail, "fail");
+});
+
+// scoreCommand has no built-in default (see the recipe's own description):
+// it's fixture-specific, so a driver must always supply it.
+test("shipped dsh-testengineer-trial recipe requires scoreCommand - it has no default", async () => {
+  const registry = await loadRecipesFromDirectory(shippedRecipesDir);
+  const recipe = registry.get("dsh-testengineer-trial")!;
+  assert.throws(
+    () => materializeRecipe(recipe, { projectId: "proj_1", parameters: {} }),
+    (error: unknown) => error instanceof RecipeValidationError && /scoreCommand/.test(error.message)
+  );
+});
+
+test("shipped dsh-testengineer-trial recipe accepts a candidate profile override and a baseline-comparison agent", async () => {
+  const registry = await loadRecipesFromDirectory(shippedRecipesDir);
+  const recipe = registry.get("dsh-testengineer-trial")!;
+
+  const materialized = materializeRecipe(recipe, {
+    projectId: "proj_1",
+    parameters: {
+      agent: "codex",
+      scoreCommand: "python3 score.py --worktree . --clean /fixtures/clean --out score.json",
+      profilePath: "AGENTS.md",
+      profileContent: "# candidate persona override\n",
+      profileLabel: "candidate"
+    }
+  });
+  const testEngineerStep = materialized.steps.find((step) => step.id === "test-engineer")!;
+  assert.equal(testEngineerStep.input?.agent, "codex");
+  assert.deepEqual(testEngineerStep.input?.instructionFile, {
+    path: "AGENTS.md",
+    content: "# candidate persona override\n",
+    label: "candidate"
+  });
+});
+
+test("shipped dsh-testengineer-trial recipe declares StepContract produces and passes L2 contract validation", async () => {
+  const registry = await loadRecipesFromDirectory(shippedRecipesDir);
+  const recipe = registry.get("dsh-testengineer-trial")!;
+  const executors = new ExecutorRegistry([new AgentTaskExecutor(), new CheckExecutor()]);
+
+  const materialized = materializeRecipe(recipe, {
+    projectId: "proj_1",
+    parameters: { scoreCommand: "python3 score.py --worktree . --clean /fixtures/clean --out score.json" }
+  });
+  assert.doesNotThrow(() => validateContractLevel(materialized.contractLevel!, materialized.steps, executors));
 });
 
 test("shipped implement-check-gate-approve recipe wires interaction/onBlocked defaults and overrides", async () => {

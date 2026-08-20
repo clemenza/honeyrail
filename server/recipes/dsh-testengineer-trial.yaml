@@ -1,0 +1,178 @@
+id: dsh-testengineer-trial
+name: "DSH test-engineer trial"
+description: >
+  One trial cell of "Demo1: DSH × test-engineering trial-evals" (#87-#92):
+  runs an agent as a black-box SQL test engineer against a tinytable-eval
+  fixture (#89/#90), injecting the harness-instruction variant via the
+  `instructionFile` mechanism (a `cordis.patch.yml` patch overlay for the
+  DSH adapter's Route A - see docs/dsh-adapter-notes.md - though the same
+  mechanism works for any agent that reads a worktree-root file), then
+  re-verifies with score.py (#91) and gates on its exit code. Fully
+  unattended - a blocked agent auto-retries instead of waiting for a human,
+  so a matrix of trials always terminates. Segment aggregate metrics by
+  variant via GET /api/evals/metrics?instructionLabel=<profileLabel> (the
+  existing #25 A/B mechanism - profileLabel is exactly instructionLabel
+  under a name that fits this trial's vocabulary). `scoreCommand` has no
+  built-in default: the eval driver computes and injects the full score.py
+  invocation (worktree-relative `--worktree`, and a `--clean` path to the
+  matching tinytable-eval `clean/` reference) for whichever fixture this
+  trial cell targets.
+category: evals
+contractLevel: L2
+parameters:
+  - key: agent
+    label: Agent
+    type: enum
+    # dsh (#88) is the subject of this trial; the rest of the roster is
+    # included so this recipe can also run the same trial's baselines/
+    # calibration probes for comparison, same rationale as
+    # eval-instruction-ab-trial's own enum.
+    options: [dsh, codex, claude, hermes, shell, "null", minimal]
+    default: dsh
+  - key: title
+    label: Task title
+    type: string
+    default: tinytable test-engineering trial
+  - key: prompt
+    label: Task prompt
+    type: string
+    required: true
+    default: |
+      # tinytable test-engineering task
+
+      You are a senior test engineer. Your target is this repository's
+      `tinytable` package (`tinytable/`) - a small SQL engine whose complete,
+      sole-arbiter behavioral contract is `SPEC.md` in this same directory. Read
+      `SPEC.md` before writing anything.
+
+      You are testing `tinytable` as a black box, through its actual interface -
+      SQL text in, rows or an error out - the same way `sql-tests/official/`
+      already does. You are not writing unit tests against the Python
+      implementation's internals; you have no need to import `tinytable` as a
+      library or call anything in `tinytable/` directly.
+
+      ## Context
+
+      `sql-tests/official/*.test` already exists and passes against this
+      `tinytable` (run it yourself: `python3 run_sql_tests.py --root .
+      sql-tests/official`). That does **not** mean the implementation is
+      correct: it may still deviate from `SPEC.md` in ways the official suite
+      doesn't happen to exercise. Your job is to find any such deviation, if one
+      exists, and prove it with a failing test - not to extend or duplicate the
+      official suite.
+
+      ## Test Script Format
+
+      New tests are `.test` files, in the exact same format as
+      `sql-tests/official/*.test` - see `SPEC.md`'s "Test Script Format" section
+      for the full grammar (`statement ok` / `statement error [substring]` /
+      `query <types> [nosort|rowsort]` records). `run_sql_tests.py` is the runner;
+      use it locally to check your own work before submitting:
+
+      ```sh
+      python3 run_sql_tests.py --root . sql-tests/agent
+      ```
+
+      ## What to do
+
+      1. Read `SPEC.md` in full, then read `tinytable/`'s source.
+      2. Look for behavior that deviates from `SPEC.md`.
+      3. Write `.test` files under `sql-tests/agent/` (you may add multiple
+         files) that pin down the *correct*, SPEC-compliant behavior for
+         anything you suspect is wrong - each test should fail against this
+         `tinytable` if, and only if, the behavior it checks is actually wrong
+         per `SPEC.md`.
+      4. Write `findings.json` at the repository root (schema:
+         `findings.schema.json`): a JSON array of
+         `{id, summary, spec_section, repro_test}` objects, one per distinct
+         defect you found - or `[]` if you found none.
+         - `id`: a short, stable slug for the finding (e.g. `"null-eq-match"`).
+         - `summary`: one or two sentences describing the deviation.
+         - `spec_section`: the `SPEC.md` section the behavior violates (e.g.
+           `"NULL semantics (three-valued logic)"`).
+         - `repro_test`: the path (relative to the repository root) of the
+           specific `.test` file under `sql-tests/agent/` that reproduces this
+           exact finding, optionally with `:<line>` naming the specific failing
+           record (e.g. `sql-tests/agent/where_null.test:12`).
+
+      ## Hard constraints
+
+      - Do **not** modify anything under `tinytable/`.
+      - Do **not** modify anything under `sql-tests/official/`.
+      - All new tests go under `sql-tests/agent/` - nowhere else.
+
+      Violating any of the above invalidates your submission regardless of what
+      your tests find.
+
+      ## Anti-cheat / fairness notice
+
+      Your `sql-tests/agent/` suite will also be run, unmodified, against a
+      SPEC-compliant reference implementation of `tinytable`. **Any test that
+      fails against that reference implementation does not count as a finding** -
+      whether because it encodes a misreading of `SPEC.md`, or because it's
+      flaky, order-dependent, or otherwise incorrect regardless of the target
+      implementation. Write tests you are confident are correct per `SPEC.md`
+      itself, not tests that merely happen to fail here. A test suite that only
+      passes because it was overfit to this specific implementation's bugs will
+      be scored as if it found nothing.
+  - key: scoreCommand
+    label: Score command
+    type: string
+    required: true
+    # No default: unlike the rest of this recipe's parameters, there is no
+    # static relative path that's correct here - the driver stages each
+    # fixture (and the shared clean/ reference it scores against) at a
+    # location it decides at run time, e.g.
+    # "python3 score.py --worktree . --clean /path/to/tinytable-eval/clean
+    # --out score.json". A wrong guessed default would fail for the wrong
+    # reason (no such file) instead of this parameter's own clear "missing
+    # required parameter" validation error.
+  - key: profilePath
+    label: Profile/instruction file path
+    type: string
+    default: cordis.patch.yml
+  - key: profileContent
+    label: Profile/instruction file content
+    type: string
+    required: true
+    # A no-op cordis patch (the empty overlay a fresh dsh profile already
+    # ships with - see docs/dsh-adapter-notes.md's Route A conclusion) so
+    # this recipe still runs with zero configuration; override with a real
+    # patch (e.g. a system-prompt persona override) for a candidate variant.
+    default: "[]\n"
+  - key: profileLabel
+    label: Profile/instruction variant label
+    type: string
+    required: true
+    default: baseline
+  - key: model
+    label: Model
+    type: string
+    default: ""
+steps:
+  - id: test-engineer
+    name: Run test-engineer agent
+    executor: agent-task
+    input:
+      agent: "{{ agent }}"
+      title: "{{ title }}"
+      prompt: "{{ prompt }}"
+      interaction: autonomous
+      model: "{{ model }}"
+      instructionFile:
+        path: "{{ profilePath }}"
+        content: "{{ profileContent }}"
+        label: "{{ profileLabel }}"
+    onBlocked:
+      action: auto_retry
+    produces: [changed_files]
+  - id: score
+    name: Score with score.py
+    executor: check
+    dependsOn: [test-engineer]
+    input:
+      commands: ["{{ scoreCommand }}"]
+    qualityGate:
+      evaluators:
+        - type: check
+      onFail: fail
