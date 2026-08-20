@@ -102,6 +102,25 @@ Documenting these plainly rather than claiming an unqualified guarantee:
   shim with a wrapper that adds the flag so callers can keep invoking plain
   `dsh ...`; worth folding upstream into the dsh adapter (#88) if other
   launch paths hit the same thing outside a container.
+- **dsh's own `tool-bash` sandbox needed to be turned off, not hardened
+  further (#115).** dsh's default `workspace-write` mode makes it build a
+  *second*, nested sandbox around every shell command it runs - and that
+  nested sandbox needs to mount a fresh `/proc`, which Docker's default
+  seccomp profile denies for any non-privileged container regardless of
+  `--cap-drop`/`--security-opt no-new-privileges` (reproduced directly:
+  `unshare --user --map-root-user --mount --pid --fork sh -c 'mount -t proc
+  proc /proc'` fails identically with or without `no-new-privileges`). The
+  practical effect before the fix: dsh's bash tool was completely unusable
+  inside this image - every real trial fell back to static-analysis-only
+  submissions instead of actually running `run_sql_tests.py` as the task
+  prompt instructs. Since this container's own isolation is already the
+  real security boundary for a scored trial, dsh's redundant inner sandbox
+  is not just broken here but unnecessary; `scripts/tinytable-exam-room.ts`
+  and `scripts/dsh-evals-demo.ts` now default `DSH_PERMISSION_MODE` to
+  `danger-full-access` for exactly that reason. (Fixing this also exposed
+  that the image had no Python interpreter at all - `run_sql_tests.py`/
+  `score.py` are stdlib-only per `SPEC.md`, so the Dockerfile now installs
+  bare `python3` via `apt-get`, no pip packages needed.)
 
 ## Manual verification (this session)
 

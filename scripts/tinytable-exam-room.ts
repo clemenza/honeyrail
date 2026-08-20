@@ -166,7 +166,17 @@ async function main(): Promise<void> {
     seedRootDir: options.seedRootDir,
     image: options.image,
     command: options.command,
-    env: process.env.DEEPSEEK_API_KEY ? { DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY } : {}
+    env: {
+      ...(process.env.DEEPSEEK_API_KEY ? { DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY } : {}),
+      // #115: dsh's own tool-bash sandbox needs to mount a fresh /proc,
+      // which Docker's default seccomp profile blocks regardless of
+      // --cap-drop/--security-opt - this container's own isolation is
+      // already the real security boundary, so tell dsh to skip its own
+      // (here, non-functional) nested one. Override by exporting
+      // DSH_PERMISSION_MODE before invoking this CLI if a caller genuinely
+      // needs dsh's own sandbox instead.
+      DSH_PERMISSION_MODE: process.env.DSH_PERMISSION_MODE ?? "danger-full-access"
+    }
   });
   process.stdout.write(result.stdout);
   process.stderr.write(result.stderr);

@@ -23,6 +23,14 @@
 
 FROM node:24-bookworm-slim
 
+# tinytable's own tooling (run_sql_tests.py, score.py) is stdlib-only Python
+# (see SPEC.md's Test Script Format section) - no pip packages needed, just
+# an interpreter, so the agent can actually run `python3 run_sql_tests.py`
+# against its own tests before submitting, per the task prompt's own
+# instructions (#115: without this, dsh's bash tool works but has nothing
+# useful to execute).
+RUN apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*
+
 # Pin the exact dsh build docs/dsh-adapter-notes.md's spike verified,
 # rather than trust `latest`/`next` dist-tags (the spike found 6 other
 # 0.0.1-rc.*/0.1.0-rc.* releases on npm - "expect breakage between
