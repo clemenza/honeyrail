@@ -1,0 +1,6 @@
+# baseline profile for scripts/dsh-evals-demo.ts (#93): a no-op patch - the
+# same empty overlay a fresh dsh profile already ships with (see
+# docs/dsh-adapter-notes.md's Route A conclusion). Injected via `dsh --patch`
+# so the "baseline" cell measures dsh's stock behavior on the tinytable
+# test-engineering task, unmodified.
+[]

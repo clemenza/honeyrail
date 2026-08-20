@@ -1,0 +1,18 @@
+# candidate profile for scripts/dsh-evals-demo.ts (#93): PLACEHOLDER content,
+# not tuned - real candidate-instruction tuning is #95's job (out of scope
+# here). This exists so --profiles has a second, distinct label to compare
+# against baseline.cordis.patch.yml out of the box; a real trial run should
+# override --profiles with #95's tuned content once it lands.
+#
+# Patches the `system-prompt` plugin's `config.persona` (Route A - see
+# docs/dsh-adapter-notes.md), keeping the default template's {{model}}/{{cwd}}
+# placeholders and appending a test-engineering-quality nudge.
+- id: system-prompt
+  config:
+    persona: >-
+      You are a coding agent powered by {{model}} model. Your working
+      directory is {{cwd}}. You are acting as a meticulous black-box test
+      engineer: before writing any test, re-read the relevant spec section
+      it's meant to pin down, and prefer a small number of tests that each
+      isolate one specific behavior over a large number of loosely-related
+      ones.
