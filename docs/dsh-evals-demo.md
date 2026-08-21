@@ -83,6 +83,21 @@ all:
      *mechanism* (kill matrix, transcript audit, hash-based integrity
      re-check, `invalidated` verdict) that would have caught it
      automatically had it existed at the time.
+   - **#108**: if the driver's own `findBlockedReason()` found a `BLOCKED:
+     <reason>` line in the container's output, that reason is passed to
+     `score.py --agent-blocked-reason`. An agent that hit a genuinely
+     broken/incomplete environment and correctly stopped per
+     `UNATTENDED_PREAMBLE` - rather than "self-repairing" the way #103's
+     agent did - has nothing to submit, and `score.py` now credits that:
+     an empty `sql-tests/agent/` and a missing `findings.json` are not
+     contract violations when a blocked reason is present. The protected-
+     path check is never waived, and whatever the agent *did* write anyway
+     is still validated normally - the credit only covers not having
+     submitted anything, never tampering. In the report, this shows up as
+     a `blocked` trial with `Contract OK = true` - visibly distinct from
+     an `invalidated` self-repair trial, which can carry `Contract OK =
+     true` from a stale `score.py` verdict but is always overridden to
+     `invalidated` by the integrity/transcript checks regardless.
 
 ## What this means for the original acceptance criteria
 
