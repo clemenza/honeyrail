@@ -87,6 +87,7 @@ export function RecipeWizard({ projects, onCreated, onClose }: {
   }, {});
 
   const chooseRecipe = (recipe: RecipeSummaryData) => {
+    if (recipe.launchDisabled) return;
     setSelectedRecipe(recipe);
     const defaults: Record<string, unknown> = {};
     for (const param of recipe.parameters) {
@@ -157,9 +158,20 @@ export function RecipeWizard({ projects, onCreated, onClose }: {
                   <h4>{category}</h4>
                   <div className="recipe-card-grid">
                     {categoryRecipes.map((recipe) => (
-                      <button type="button" className="recipe-card" key={recipe.id} onClick={() => chooseRecipe(recipe)}>
+                      <button
+                        type="button"
+                        className={recipe.launchDisabled ? "recipe-card recipe-card-disabled" : "recipe-card"}
+                        key={recipe.id}
+                        onClick={() => chooseRecipe(recipe)}
+                        disabled={recipe.launchDisabled}
+                        title={recipe.launchDisabled ? recipe.launchDisabledReason : undefined}
+                      >
                         <strong>{recipe.name}</strong>
-                        {recipe.description ? <p>{recipe.description}</p> : null}
+                        {recipe.launchDisabled ? (
+                          <p>{recipe.launchDisabledReason || "Not available as a New run - launched via a dedicated driver script instead."}</p>
+                        ) : recipe.description ? (
+                          <p>{recipe.description}</p>
+                        ) : null}
                       </button>
                     ))}
                   </div>

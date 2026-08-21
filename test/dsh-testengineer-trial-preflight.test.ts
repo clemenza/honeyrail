@@ -11,7 +11,7 @@ import { createApp } from "../server/api.js";
 import { createDefaultExecutorRegistry } from "../server/executors/index.js";
 import { EventBus } from "../server/events.js";
 import { OrchestrationService } from "../server/orchestration/service.js";
-import { loadRecipesFromDirectory } from "../server/recipes/registry.js";
+import { loadRecipesFromDirectory, materializeRecipe } from "../server/recipes/registry.js";
 import { JsonStore } from "../server/store.js";
 import { WorktreeManager } from "../server/worktrees.js";
 import { runCommandSafe } from "../server/utils.js";
@@ -110,22 +110,39 @@ async function withServer(t: TestContext, repoPath: string) {
   return { baseUrl, project, agentTurns: callCount };
 }
 
+// #109: POST /api/recipes/dsh-testengineer-trial/runs is blocked outright
+// (that route hands the agent shared filesystem access to the registered
+// project's real repo - see recipe-launch-guard.test.ts). This test isn't
+// exercising that HTTP wiring, though - it's exercising the #106 manifest
+// preflight mechanism itself (AgentTaskExecutor.preflight(), invoked from
+// OrchestrationService.createRun()), so it materializes the recipe in
+// process (same as materializeRecipe's other callers) and posts the result
+// to the generic POST /api/runs, exactly like dsh-testengineer-trial.test.ts
+// already does for the same reason.
 async function createDshTrialRun(
   baseUrl: string,
   projectId: string,
   expectedManifest: string,
   agentOverride?: string
 ) {
-  return fetch(`${baseUrl}/api/recipes/dsh-testengineer-trial/runs`, {
+  const registry = await loadRecipesFromDirectory(shippedRecipesDir);
+  const recipe = registry.get("dsh-testengineer-trial")!;
+  const materialized = materializeRecipe(recipe, {
+    projectId,
+    parameters: {
+      scoreCommand: "true",
+      expectedManifest,
+      ...(agentOverride ? { agent: agentOverride } : {})
+    }
+  });
+  return fetch(`${baseUrl}/api/runs`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       projectId,
-      parameters: {
-        scoreCommand: "true",
-        expectedManifest,
-        ...(agentOverride ? { agent: agentOverride } : {})
-      }
+      goal: materialized.goal,
+      contractLevel: materialized.contractLevel,
+      steps: materialized.steps
     })
   });
 }

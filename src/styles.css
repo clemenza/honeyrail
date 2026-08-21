@@ -2435,6 +2435,16 @@ textarea:focus {
   font-size: 12px;
 }
 
+.recipe-card-disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.recipe-card-disabled:hover {
+  border-color: var(--color-border-light);
+  background: var(--color-bg-subtle);
+}
+
 .path-jump {
   grid-template-columns: 1fr;
   align-items: end;

@@ -39,6 +39,12 @@ export function recipeRoutes(registry: RecipeRegistry, orchestration: Orchestrat
   router.post("/api/recipes/:id/runs", validate(recipeRunBody), asyncRoute(async (req, res) => {
     const recipe = registry.get(String(req.params.id));
     if (!recipe) throw httpError(404, "Recipe not found");
+    // #109: a run created here shares the registered project's real repo
+    // filesystem with the agent - the exact #103 failure mode for a recipe
+    // class whose only safe launch path is an isolated driver script.
+    if (recipe.launchDisabled) {
+      throw httpError(403, recipe.launchDisabledReason || `Recipe "${recipe.id}" cannot be launched as a HoneyRail run.`);
+    }
     let materialized;
     try {
       materialized = materializeRecipe(recipe, req.body);

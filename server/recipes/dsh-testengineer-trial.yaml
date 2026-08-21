@@ -23,6 +23,20 @@ description: >
   fixture this trial cell targets.
 category: evals
 contractLevel: L2
+# #109: this recipe hands the agent shared filesystem access to whatever
+# repo the registered project points at - the exact mechanism #103's agent
+# used to read examples/tinytable-eval's answer key straight off the host.
+# The only safe way to run a real, scored trial of this recipe is
+# scripts/dsh-evals-demo.ts (#93), which never creates a HoneyRail run at
+# all - it calls the seed-root builder (#104), exam-room container (#105),
+# and preflight check (#106) directly against an isolated seed-root copy.
+# See docs/dsh-adapter-notes.md's "Launch path guard (#109)" section.
+launchDisabled: true
+launchDisabledReason: >-
+  dsh-testengineer-trial must not be launched as a HoneyRail run - it would
+  share the registered project's real repo filesystem with the agent (see
+  #103). Run a scored trial via `node --import tsx scripts/dsh-evals-demo.ts`
+  instead; see docs/dsh-adapter-notes.md and docs/dsh-evals-demo.md.
 parameters:
   - key: agent
     label: Agent

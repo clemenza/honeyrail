@@ -35,6 +35,19 @@ export type Recipe = {
   contractLevel?: ContractLevel;
   /** Concurrency ceiling applied to every run created from this recipe - see Run.maxParallel (#78). Omit for unlimited parallelism. */
   maxParallel?: number;
+  /**
+   * #109: when true, POST /api/recipes/:id/runs (the "New run" wizard's
+   * launch path, which hands the agent shared filesystem access to a
+   * registered project's real repo) refuses to launch this recipe at all -
+   * see launchDisabledReason. GET/preview stay available so the recipe is
+   * still visible and inspectable; only creating a real Run through this
+   * shared-filesystem path is blocked. Exists for recipe classes (like
+   * dsh-testengineer-trial, #103) whose only safe launch path is a
+   * dedicated isolated driver, never a HoneyRail Run.
+   */
+  launchDisabled?: boolean;
+  /** Shown in the 403 from POST /api/recipes/:id/runs and in the "New run" UI when launchDisabled is true. */
+  launchDisabledReason?: string;
   parameters: RecipeParameter[];
   steps: RecipeStepTemplate[];
 };

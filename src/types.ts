@@ -273,6 +273,11 @@ export type RecipeSummaryData = {
   description?: string;
   category?: string;
   parameters: RecipeParameterData[];
+  // #109: true for a recipe class (e.g. dsh-testengineer-trial, #103) whose
+  // only safe launch path is a dedicated isolated driver script, never a
+  // HoneyRail run sharing a real project's repo filesystem with the agent.
+  launchDisabled?: boolean;
+  launchDisabledReason?: string;
 };
 
 export type RecipeDetailData = RecipeSummaryData & { steps: unknown[] };
