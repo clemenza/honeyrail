@@ -161,6 +161,50 @@ test("GET /api/evals/dsh-runs/trial returns null artifacts (not an error) when a
   assert.equal(body.containerLog, null);
 });
 
+// Regression: a state.json written by a driver from before #107 added
+// transcriptAuditHits/killMatrix has trial records with neither field at
+// all - classifyDshOutcome()'s unconditional `.transcriptAuditHits.length`
+// must not crash the reader just because an older directory is being
+// browsed. Writes the raw JSON directly (not via the trial() helper, which
+// always fills both fields) to reproduce the exact on-disk shape an old
+// driver run left behind.
+test("GET /api/evals/dsh-runs tolerates a state.json from before transcriptAuditHits/killMatrix existed", async (t) => {
+  const { baseUrl, tempDir } = await withServer(t);
+  const outDir = join(tempDir, "old-report");
+  await mkdir(outDir, { recursive: true });
+  await writeFile(
+    join(outDir, "state.json"),
+    JSON.stringify({
+      config: { image: "tinytable-exam-room:latest", smoke: true, dshVersion: "0.1.0-rc.7" },
+      profiles: [{ label: "baseline", sha256: "a".repeat(64) }],
+      fixtures: ["m01"],
+      trials: [
+        {
+          fixture: "m01",
+          profile: "baseline",
+          trial: 1,
+          trialId: "m01-baseline-1",
+          artifactsDir: join(outDir, "cells", "m01-baseline-1"),
+          killed: true,
+          falseAlarms: 0,
+          contractOk: true,
+          integrityOk: true,
+          wallTimeMs: 12_000
+          // no transcriptAuditHits, no killMatrix - the pre-#107 shape.
+        }
+      ]
+    })
+  );
+
+  const res = await fetch(`${baseUrl}/api/evals/dsh-runs?outDir=${encodeURIComponent(outDir)}`);
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.trials.length, 1);
+  assert.equal(body.trials[0].outcome, "passed");
+  assert.deepEqual(body.trials[0].transcriptAuditHits, []);
+  assert.equal(body.trials[0].killMatrix, null);
+});
+
 test("GET /api/evals/dsh-runs/trial 404s for an unknown trialId", async (t) => {
   const { baseUrl, tempDir } = await withServer(t);
   const outDir = join(tempDir, "report");

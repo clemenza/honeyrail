@@ -58,6 +58,26 @@ export function normalizeDshOutDir(inputPath: unknown): string {
   return resolve(raw.replace(/^~(?=$|\/)/, homedir()));
 }
 
+/**
+ * `state.json` outlives the driver code that wrote it: a directory from an
+ * older scripts/dsh-evals-demo.ts run (e.g. before #107 added
+ * transcriptAuditHits/killMatrix) is exactly what this read-only browser
+ * exists to browse, and `JSON.parse(raw) as DshEvalsState` doesn't make
+ * that true - a #114-shaped bug (trusting a parsed object to match a type
+ * assertion at runtime) would just resurface here as soon as anyone loaded
+ * an old directory, since classifyDshOutcome() unconditionally reads
+ * `trial.transcriptAuditHits.length`. Backfill the fields newer than any
+ * given trial record might be, rather than assume every persisted trial
+ * matches the current schema exactly.
+ */
+function normalizeTrial(raw: DshTrialRecord): DshTrialRecord {
+  return {
+    ...raw,
+    transcriptAuditHits: raw.transcriptAuditHits ?? [],
+    killMatrix: raw.killMatrix ?? null
+  };
+}
+
 async function readState(outDir: string): Promise<DshEvalsState> {
   const statePath = join(outDir, "state.json");
   let raw: string;
@@ -77,7 +97,7 @@ async function readState(outDir: string): Promise<DshEvalsState> {
   }
   const state = parsed as Partial<DshEvalsState>;
   if (!Array.isArray(state.trials)) throw httpError(500, `${statePath} is missing a "trials" array`);
-  return state as DshEvalsState;
+  return { ...state, trials: state.trials.map(normalizeTrial) } as DshEvalsState;
 }
 
 export async function summarizeDshEvalsState(outDir: string): Promise<DshEvalsStateSummary> {
