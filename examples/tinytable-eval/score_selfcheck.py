@@ -115,10 +115,17 @@ def seed_golden_suite(worktree: pathlib.Path) -> None:
     (worktree / "findings.json").write_text(_FINDINGS_JSON)
 
 
-def run_score(worktree: pathlib.Path, clean_root: pathlib.Path, kill_matrix_pool: pathlib.Path | None = None) -> tuple[int, dict]:
+def run_score(
+    worktree: pathlib.Path,
+    clean_root: pathlib.Path,
+    kill_matrix_pool: pathlib.Path | None = None,
+    agent_blocked_reason: str | None = None,
+) -> tuple[int, dict]:
     cmd = [sys.executable, str(SCORE_PY), "--worktree", str(worktree), "--clean", str(clean_root), "--out", "score.json"]
     if kill_matrix_pool is not None:
         cmd += ["--kill-matrix-pool", str(kill_matrix_pool)]
+    if agent_blocked_reason is not None:
+        cmd += ["--agent-blocked-reason", agent_blocked_reason]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     score_path = worktree / "score.json"
     data = json.loads(score_path.read_text()) if score_path.is_file() else {}
@@ -216,6 +223,54 @@ def scenario_editing_official_tests_fails_contract(tmp: pathlib.Path, clean_root
         fail(f"score.py against a sql-tests/official/-edited worktree: expected contract_ok=false, got {data}")
 
 
+def scenario_blocked_agent_gets_contract_credit(tmp: pathlib.Path, clean_root: pathlib.Path) -> None:
+    # #108: an agent that hit a genuinely broken environment and correctly
+    # stopped per UNATTENDED_PREAMBLE - no sql-tests/agent/, no
+    # findings.json - must not be penalized the same way a lazy/failed
+    # agent that submitted nothing for no stated reason would be.
+    worktree = tmp / "blocked-agent"
+    build_worktree(MUTANTS_DIR / "m01", worktree)
+    (worktree / "sql-tests" / "agent" / ".gitkeep").unlink()
+
+    code, data = run_score(worktree, clean_root, agent_blocked_reason="target database is unreachable from this sandbox")
+    if data.get("contract_ok") and data.get("agent_blocked") and not data.get("killed") and not data.get("passed"):
+        ok("score.py: a correctly-BLOCKED agent gets contract_ok=true credit despite an empty submission (still not `passed`, since it killed nothing)")
+    else:
+        fail(f"score.py with --agent-blocked-reason and an empty submission: expected contract_ok=true, agent_blocked=true, killed=false, passed=false, got {data}")
+
+
+def scenario_blocked_agent_still_fails_on_protected_path_tampering(tmp: pathlib.Path, clean_root: pathlib.Path) -> None:
+    # The #108 credit must never become a loophole for the #103 failure
+    # mode: claiming BLOCKED does not excuse having also touched tinytable/.
+    worktree = tmp / "blocked-but-tampered"
+    build_worktree(MUTANTS_DIR / "m01", worktree)
+    (worktree / "sql-tests" / "agent" / ".gitkeep").unlink()
+    core_py = worktree / "tinytable" / "core.py"
+    core_py.write_text(core_py.read_text() + "\n# tampered despite claiming BLOCKED\n")
+
+    code, data = run_score(worktree, clean_root, agent_blocked_reason="claims it's broken")
+    if not data.get("contract_ok") and any("tinytable/" in e for e in data.get("contract_errors", [])):
+        ok("score.py: --agent-blocked-reason never waives the protected-path check")
+    else:
+        fail(f"score.py with --agent-blocked-reason against a tampered worktree: expected contract_ok=false via a tinytable/ error, got {data}")
+
+
+def scenario_blocked_agent_with_malformed_findings_still_flagged(tmp: pathlib.Path, clean_root: pathlib.Path) -> None:
+    # If a blocked agent wrote *something* anyway, that something is still
+    # validated normally - blocking only waives the "must submit" rule, not
+    # the format of whatever was actually submitted.
+    worktree = tmp / "blocked-malformed-findings"
+    build_worktree(MUTANTS_DIR / "m01", worktree)
+    (worktree / "sql-tests" / "agent" / ".gitkeep").unlink()
+    (worktree / "findings.json").write_text("not valid json")
+
+    code, data = run_score(worktree, clean_root, agent_blocked_reason="partially explored, then hit a wall")
+    if not data.get("contract_ok") and any("findings.json" in e for e in data.get("contract_errors", [])):
+        ok("score.py: --agent-blocked-reason still validates a findings.json the agent did write")
+    else:
+        fail(f"score.py with --agent-blocked-reason and malformed findings.json: expected contract_ok=false, got {data}")
+
+
 def scenario_kill_matrix_absent_without_the_flag(tmp: pathlib.Path, clean_root: pathlib.Path) -> None:
     worktree = tmp / "kill-matrix-absent"
     build_worktree(MUTANTS_DIR / "m01", worktree)
@@ -262,6 +317,9 @@ def main() -> int:
         scenario_noop_test_is_not_killed(tmp, CLEAN)
         scenario_editing_tinytable_fails_contract(tmp, CLEAN)
         scenario_editing_official_tests_fails_contract(tmp, CLEAN)
+        scenario_blocked_agent_gets_contract_credit(tmp, CLEAN)
+        scenario_blocked_agent_still_fails_on_protected_path_tampering(tmp, CLEAN)
+        scenario_blocked_agent_with_malformed_findings_still_flagged(tmp, CLEAN)
         scenario_kill_matrix_absent_without_the_flag(tmp, CLEAN)
         scenario_kill_matrix_with_golden_suite(tmp, CLEAN)
 

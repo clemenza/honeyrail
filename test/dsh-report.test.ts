@@ -69,6 +69,36 @@ test("classifyDshOutcome: a BLOCKED: agent is its own bucket, distinct from a re
   );
 });
 
+// #108: a correctly-BLOCKED agent (score.py's --agent-blocked-reason credit
+// - see examples/tinytable-eval/score.py) reports contractOk=true for an
+// empty submission; a self-repairing agent that tampered with protected
+// files is "invalidated" instead, even though both left sql-tests/agent/
+// empty. The outcome bucket alone already tells them apart (blocked vs
+// invalidated) - this locks in that the *contract_ok credit itself* is
+// still visible per-trial, distinct from the "self-repair" case where
+// integrityOk=false forces invalidated regardless of contractOk.
+test("classifyDshOutcome: #108's contract_ok credit for a correctly-BLOCKED agent stays 'blocked', never conflated with #103's self-repair 'invalidated'", () => {
+  const blockedWithCredit = {
+    integrityOk: true,
+    transcriptAuditHits: [],
+    blockedReason: "target database is unreachable from this sandbox",
+    killed: false,
+    falseAlarms: 0,
+    contractOk: true
+  };
+  assert.equal(classifyDshOutcome(blockedWithCredit), "blocked");
+
+  const selfRepairedInstead = {
+    integrityOk: false,
+    transcriptAuditHits: [],
+    blockedReason: undefined,
+    killed: true,
+    falseAlarms: 0,
+    contractOk: true
+  };
+  assert.equal(classifyDshOutcome(selfRepairedInstead), "invalidated");
+});
+
 // #103/#93 core fix: a run that tampered with protected fixture content
 // must never be counted as a legitimate pass, no matter what score.py says.
 test("classifyDshOutcome: integrityOk=false always wins as 'invalidated', even over a clean score.py pass", () => {

@@ -201,6 +201,9 @@ export type ScoreJson = {
   passed: boolean;
   /** #107: null unless --kill-matrix-pool was passed. */
   kill_matrix: Record<string, boolean> | null;
+  /** #108: true iff --agent-blocked-reason was passed. */
+  agent_blocked: boolean;
+  agent_blocked_reason: string | null;
 };
 
 // #114: score.py's own JSON output always includes a literal "error" key
@@ -221,14 +224,21 @@ export type RunScorePyResult = { ok: true; score: ScoreJson } | { ok: false; err
 // tinytable-eval fixture on disk.
 export async function runScorePy(
   worktreePath: string,
-  run: typeof runCommandSafe = runCommandSafe
+  run: typeof runCommandSafe = runCommandSafe,
+  // #108: the driver's own findBlockedReason() detection, if any - see
+  // executeCell() below. Passed straight through to score.py's
+  // --agent-blocked-reason so a correctly-BLOCKED trial gets contract_ok
+  // credit for an empty submission instead of being penalized like a
+  // lazy/failed one.
+  agentBlockedReason?: string
 ): Promise<RunScorePyResult> {
   const result = await run("python3", [
     scorePyPath,
     "--worktree", worktreePath,
     "--clean", cleanDir,
     "--out", "score.json",
-    "--kill-matrix-pool", mutantsDir
+    "--kill-matrix-pool", mutantsDir,
+    ...(agentBlockedReason ? ["--agent-blocked-reason", agentBlockedReason] : [])
   ]);
   try {
     const raw = await readFile(join(worktreePath, "score.json"), "utf8");
@@ -338,7 +348,7 @@ async function executeCell(
   }
   const blocked = findBlockedReason(combinedOutput);
 
-  const scoreOrError = await runScorePy(seedRootDir);
+  const scoreOrError = await runScorePy(seedRootDir, runCommandSafe, blocked?.message);
   const postMismatches = await findManifestMismatches(seedRootDir, { files: manifest.files });
   const integrityOk = postMismatches.length === 0;
   if (!integrityOk) {

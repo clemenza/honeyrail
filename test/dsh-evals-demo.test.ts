@@ -77,6 +77,64 @@ test("runScorePy returns the real score for a genuine failure too (killed: false
   });
 });
 
+// #108: a BLOCKED reason the driver detected must reach score.py as
+// --agent-blocked-reason, so a correctly-BLOCKED trial gets contract_ok
+// credit for an empty submission instead of being scored like a lazy one.
+test("runScorePy passes an agentBlockedReason through to score.py as --agent-blocked-reason", async () => {
+  await withTempDir(async (dir) => {
+    const blockedScorePyOutput = {
+      worktree: dir,
+      clean: "/fake/tinytable-eval/clean",
+      killed: false,
+      killed_tests: [],
+      false_alarms: 0,
+      contract_ok: true,
+      contract_errors: [],
+      f_mutant: [],
+      f_clean: [],
+      kill_matrix: null,
+      agent_blocked: true,
+      agent_blocked_reason: "target database is unreachable from this sandbox",
+      error: null,
+      passed: false
+    };
+    await writeFile(join(dir, "score.json"), JSON.stringify(blockedScorePyOutput));
+
+    let receivedArgs: string[] = [];
+    const capturingRun = async (_cmd: string, args: string[] = []): Promise<SafeCommandOutput> => {
+      receivedArgs = args;
+      return { ok: true, stdout: "", stderr: "", code: 0 };
+    };
+    const result = await runScorePy(dir, capturingRun, "target database is unreachable from this sandbox");
+
+    const flagIndex = receivedArgs.indexOf("--agent-blocked-reason");
+    assert.ok(flagIndex >= 0, `expected --agent-blocked-reason in args, got ${JSON.stringify(receivedArgs)}`);
+    assert.equal(receivedArgs[flagIndex + 1], "target database is unreachable from this sandbox");
+
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.equal(result.score.contract_ok, true);
+      assert.equal(result.score.agent_blocked, true);
+      assert.equal(result.score.passed, false);
+    }
+  });
+});
+
+test("runScorePy omits --agent-blocked-reason when no blocked reason was detected", async () => {
+  await withTempDir(async (dir) => {
+    await writeFile(join(dir, "score.json"), JSON.stringify({ killed: true, false_alarms: 0, contract_ok: true, passed: true }));
+
+    let receivedArgs: string[] = [];
+    const capturingRun = async (_cmd: string, args: string[] = []): Promise<SafeCommandOutput> => {
+      receivedArgs = args;
+      return { ok: true, stdout: "", stderr: "", code: 0 };
+    };
+    await runScorePy(dir, capturingRun);
+
+    assert.ok(!receivedArgs.includes("--agent-blocked-reason"), `expected no --agent-blocked-reason, got ${JSON.stringify(receivedArgs)}`);
+  });
+});
+
 test("runScorePy reports a driver-level error when score.py produced no score.json at all", async () => {
   await withTempDir(async (dir) => {
     const failedRun = async (): Promise<SafeCommandOutput> => ({ ok: false, stdout: "", stderr: "Traceback: boom", code: 1 });

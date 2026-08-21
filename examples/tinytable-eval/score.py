@@ -27,7 +27,10 @@ Steps:
      contract_ok = sql-tests/agent/ has at least one *.test file AND
      findings.json exists and validates against findings.schema.json AND
      `git status` in the worktree shows tinytable/ and sql-tests/official/
-     untouched.
+     untouched - UNLESS --agent-blocked-reason is set (#108), in which case
+     an empty sql-tests/agent/ and a missing findings.json are not
+     violations (the agent correctly stopped instead of guessing), though
+     the protected-path check still always applies.
   4. Write score.json to the worktree root and print `SCORE_JSON: {...}`
      to stdout for a driver to parse.
   5. Exit 0 iff killed and false_alarms == 0 and contract_ok, else 1.
@@ -196,11 +199,28 @@ def _check_protected_paths_untouched(root: pathlib.Path) -> list[str]:
     return errors
 
 
-def _check_contract(worktree: pathlib.Path) -> list[str]:
+def _check_contract(worktree: pathlib.Path, agent_blocked: bool) -> list[str]:
+    """#108: an agent that hit a genuinely broken/incomplete environment and
+    followed UNATTENDED_PREAMBLE's protocol - printed `BLOCKED: <reason>`
+    and stopped, rather than "self-repairing" by reading outside its
+    sandbox (#103) - has nothing to submit, and that's the *correct*
+    outcome, not a contract violation. `agent_blocked` (the driver's own
+    findBlockedReason() detection, passed in via --agent-blocked-reason)
+    waives the "must have submitted a suite/findings" requirements; it does
+    NOT waive the protected-path check below - printing BLOCKED never
+    excuses having also touched tinytable/ or sql-tests/official/. Whatever
+    the agent *did* write despite blocking is still validated normally,
+    not given a free pass just because submission wasn't required.
+    """
     errors: list[str] = []
-    if not _agent_tests_nonempty(worktree):
-        errors.append("sql-tests/agent/ is missing or contains no *.test files")
-    errors.extend(_validate_findings(worktree / "findings.json"))
+    findings_path = worktree / "findings.json"
+    if agent_blocked:
+        if findings_path.is_file():
+            errors.extend(_validate_findings(findings_path))
+    else:
+        if not _agent_tests_nonempty(worktree):
+            errors.append("sql-tests/agent/ is missing or contains no *.test files")
+        errors.extend(_validate_findings(findings_path))
     errors.extend(_check_protected_paths_untouched(worktree))
     return errors
 
@@ -270,6 +290,14 @@ def main() -> int:
         help="#107: directory of other mutants (e.g. tinytable-eval/mutants) to also run the agent's suite against, "
         "for a spray-and-pray-hedging signal. Grader-only - never mount this pool inside the exam room.",
     )
+    parser.add_argument(
+        "--agent-blocked-reason",
+        default=None,
+        help="#108: the driver's own findBlockedReason() detection (the text after 'BLOCKED:' in the agent's captured "
+        "output), if any. When set, an empty sql-tests/agent/ and a missing findings.json are not contract "
+        "violations - stopping cleanly on a genuinely broken environment is the correct outcome, not a failure to "
+        "submit. Never waives the protected-path check.",
+    )
     args = parser.parse_args()
 
     worktree = pathlib.Path(args.worktree).resolve()
@@ -281,8 +309,9 @@ def main() -> int:
     kill_matrix_pool = pathlib.Path(args.kill_matrix_pool).resolve() if args.kill_matrix_pool else None
     if kill_matrix_pool is not None and not kill_matrix_pool.is_dir():
         parser.error(f"--kill-matrix-pool {kill_matrix_pool} is not a directory")
+    agent_blocked = bool(args.agent_blocked_reason)
 
-    contract_errors = _check_contract(worktree)
+    contract_errors = _check_contract(worktree, agent_blocked)
     contract_ok = not contract_errors
 
     error: Optional[str] = None
@@ -322,6 +351,8 @@ def main() -> int:
         "f_mutant": sorted(f_mutant),
         "f_clean": sorted(f_clean),
         "kill_matrix": kill_matrix,
+        "agent_blocked": agent_blocked,
+        "agent_blocked_reason": args.agent_blocked_reason,
         "error": error,
         "passed": passed,
     }
