@@ -2445,6 +2445,59 @@ textarea:focus {
   background: var(--color-bg-subtle);
 }
 
+.dsh-evals-table-scroll {
+  overflow-x: auto;
+  margin-bottom: var(--space-md);
+}
+
+.dsh-evals-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.dsh-evals-table th,
+.dsh-evals-table td {
+  padding: var(--space-xs) var(--space-sm);
+  border-bottom: 1px solid var(--color-border-light);
+  text-align: left;
+}
+
+.dsh-evals-table th {
+  color: var(--color-text-muted);
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.dsh-trial-modal-body {
+  display: grid;
+  gap: var(--space-md);
+}
+
+.dsh-trial-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm) var(--space-md);
+  align-items: center;
+  font-size: 13px;
+  color: var(--color-text-muted);
+}
+
+.dsh-trial-artifact {
+  max-height: 300px;
+  overflow: auto;
+  padding: var(--space-sm);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-subtle);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .path-jump {
   grid-template-columns: 1fr;
   align-items: end;

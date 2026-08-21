@@ -319,3 +319,66 @@ export type EvalMetricsData = {
   humanOverride: RateStatData;
   blockedStep: RateStatData;
 };
+
+// #118: read-only view onto a scripts/dsh-evals-demo.ts (#93) --out
+// directory - never a HoneyRail run (#103/#109), so these mirror
+// server/evals/dsh-report.ts's own types/summaries rather than RunData.
+export type DshTrialOutcomeData = "passed" | "task_failed" | "verify_failed" | "invalidated" | "blocked" | "driver_error";
+
+export type DshTrialRecordData = {
+  fixture: string;
+  profile: string;
+  trial: number;
+  trialId: string;
+  artifactsDir: string;
+  killed: boolean | null;
+  falseAlarms: number | null;
+  contractOk: boolean | null;
+  integrityOk: boolean;
+  transcriptAuditHits: string[];
+  killMatrix: Record<string, boolean> | null;
+  blockedReason?: string;
+  wallTimeMs?: number;
+  error?: string;
+  outcome: DshTrialOutcomeData;
+};
+
+export type DshProfileSummaryData = {
+  profile: string;
+  trials: number;
+  passed: number;
+  taskFailed: number;
+  verifyFailed: number;
+  invalidated: number;
+  blocked: number;
+  driverError: number;
+  passRate: number | null;
+  meanWallTimeMs: number | null;
+};
+
+export type DshFixtureCellSummaryData = {
+  fixture: string;
+  profile: string;
+  trials: number;
+  killRate: number | null;
+  falseAlarmRate: number | null;
+  contractComplianceRate: number | null;
+  medianWallTimeMs: number | null;
+  meanSprayAndPrayRate: number | null;
+};
+
+export type DshEvalsStateData = {
+  outDir: string;
+  config: { image: string; smoke: boolean; dshVersion: string };
+  profiles: Array<{ label: string; sha256: string }>;
+  fixtures: string[];
+  profileSummaries: DshProfileSummaryData[];
+  fixtureCells: DshFixtureCellSummaryData[];
+  trials: DshTrialRecordData[];
+};
+
+export type DshTrialArtifactsData = {
+  trial: DshTrialRecordData;
+  scoreJson: unknown | null;
+  containerLog: string | null;
+};
