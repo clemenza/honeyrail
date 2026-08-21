@@ -46,20 +46,43 @@ all:
    touched it" for its protected-path check to work - #104's builder
    deliberately doesn't do this, since it's an exam-room/launch concern,
    not a builder one).
-4. **Integrity check + grading** (grader zone) - after the container exits,
-   the *same* #106 manifest check runs again against the seed-root. Any
-   difference from the pre-run check means a protected file (`tinytable/`,
-   `sql-tests/official/`, `SPEC.md`, `run_sql_tests.py`,
-   `findings.schema.json`) was tampered with - the exact #103 failure mode,
-   including the specific `.gitignore`-hiding trick from that incident's
-   transcript, which this hash-based check catches even though it would
-   fool score.py's own `git status`-based check. A trial that fails this
-   is scored `invalidated` regardless of what `score.py` itself reports -
-   see `server/evals/dsh-report.ts`'s `classifyDshOutcome`. `score.py` then
-   runs on the host (the grader zone proper, never inside the container) to
-   produce the actual kill/false-alarm/contract verdict. This is #93's own
-   lightweight version of the check; #107 (not yet built) is the fuller
-   out-of-band grader this ties into once it lands.
+4. **Grader** (#107, zone 3) - after the container exits:
+   - The *same* #106 manifest check runs again against the seed-root. Any
+     difference from the pre-run check means a protected file (`tinytable/`,
+     `sql-tests/official/`, `SPEC.md`, `run_sql_tests.py`,
+     `findings.schema.json`) was tampered with - the exact #103 failure
+     mode, including the specific `.gitignore`-hiding trick from that
+     incident's transcript (reproduced exactly in
+     `test/dsh-grader-invalidated.test.ts`), which this hash-based check
+     catches even though it would fool `score.py`'s own `git status`-based
+     one.
+   - `server/evals/transcript-audit.ts`'s `auditTranscript()` scans the
+     container's captured stdout/stderr plus the agent's own artifacts
+     (`findings.json`, its `.test` files) for references to material
+     outside the exam room - `mutant`, `golden`, `score.py`, `honeyrail`,
+     a literal `/home/`or `/Users/` path. The container structurally
+     prevents actually *reading* any of that (there's nothing else mounted
+     to read), but a reference in what the agent wrote or said is still
+     worth flagging.
+   - Either forces the trial's outcome to `invalidated` regardless of what
+     `score.py` itself reports - see `server/evals/dsh-report.ts`'s
+     `classifyDshOutcome`.
+   - `score.py` then runs on the host (the grader zone proper, never inside
+     the container) with `--kill-matrix-pool examples/tinytable-eval/mutants`:
+     the agent's `sql-tests/agent/` suite, replayed against every *other*
+     mutant in the private pool, not just the one this trial was scored
+     against. A suite broad enough to kill most/all of the pool is
+     evidence of "spray and pray" hedging rather than a targeted test that
+     pins down the one deviation SPEC.md describes for this fixture - see
+     `sprayAndPrayRate()` and the report's "Kill matrix"/"Per-fixture
+     breakdown" sections.
+   - `run_mt185iaf_ykwl0c` (the specific run #103's postmortem names as
+     contaminated) isn't something this repo can mark discarded - it's
+     production data on whoever ran that trial's own HoneyRail deployment,
+     outside this codebase entirely. What #107 actually delivers is the
+     *mechanism* (kill matrix, transcript audit, hash-based integrity
+     re-check, `invalidated` verdict) that would have caught it
+     automatically had it existed at the time.
 
 ## What this means for the original acceptance criteria
 

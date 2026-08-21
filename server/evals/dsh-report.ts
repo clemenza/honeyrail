@@ -36,6 +36,22 @@ export type DshTrialRecord = {
    * real test-engineering ability.
    */
   integrityOk: boolean;
+  /**
+   * #107's transcript audit: hits from server/evals/transcript-audit.ts
+   * against the container's captured output and the agent's own artifacts
+   * (findings.json, its .test files). Any hit forces "invalidated" - the
+   * same reasoning as integrityOk, extended to cover what the agent *said*
+   * or *wrote* about material outside the exam room, not just whether it
+   * actually tampered with protected files.
+   */
+  transcriptAuditHits: string[];
+  /**
+   * #107's kill matrix: this trial's sql-tests/agent/ suite, replayed
+   * against every other mutant in the private pool (score.py's
+   * --kill-matrix-pool), keyed by mutant id. null when the driver didn't
+   * request it (e.g. the trial never reached scoring at all).
+   */
+  killMatrix: Record<string, boolean> | null;
   blockedReason?: string;
   wallTimeMs?: number;
   error?: string;
@@ -43,25 +59,42 @@ export type DshTrialRecord = {
 
 /**
  * Scores one cell. "invalidated" takes priority over everything else - see
- * DshTrialRecord.integrityOk. "blocked" is next: an agent that printed
- * BLOCKED: per UNATTENDED_PREAMBLE made no claim about the fixture at all.
- * Otherwise this reads score.py's own verdict: killed==false means the
- * agent's suite never caught the seeded defect (task_failed - the
- * black-box test-engineering task itself wasn't done); killed==true but
- * false_alarms>0 or contract_ok==false means it found *something* but
- * failed the scoring contract (verify_failed); killed && no false alarms
- * && contract_ok is a clean pass.
+ * DshTrialRecord.integrityOk/transcriptAuditHits. "blocked" is next: an
+ * agent that printed BLOCKED: per UNATTENDED_PREAMBLE made no claim about
+ * the fixture at all. Otherwise this reads score.py's own verdict:
+ * killed==false means the agent's suite never caught the seeded defect
+ * (task_failed - the black-box test-engineering task itself wasn't done);
+ * killed==true but false_alarms>0 or contract_ok==false means it found
+ * *something* but failed the scoring contract (verify_failed); killed &&
+ * no false alarms && contract_ok is a clean pass.
  */
 export function classifyDshOutcome(
-  cell: Pick<DshTrialRecord, "integrityOk" | "blockedReason" | "killed" | "falseAlarms" | "contractOk" | "error">
+  cell: Pick<
+    DshTrialRecord,
+    "integrityOk" | "transcriptAuditHits" | "blockedReason" | "killed" | "falseAlarms" | "contractOk" | "error"
+  >
 ): DshTrialOutcome {
   if (cell.error) return "driver_error";
-  if (!cell.integrityOk) return "invalidated";
+  if (!cell.integrityOk || cell.transcriptAuditHits.length > 0) return "invalidated";
   if (cell.blockedReason) return "blocked";
   if (cell.killed === null || cell.contractOk === null) return "driver_error";
   if (!cell.killed) return "task_failed";
   if ((cell.falseAlarms ?? 0) > 0 || !cell.contractOk) return "verify_failed";
   return "passed";
+}
+
+/**
+ * Fraction of the private pool (excluding this trial's own fixture) the
+ * agent's suite also killed - #107's "spray and pray" hedging signal. High
+ * values mean the suite rejects almost any implementation, not just the
+ * one seeded deviation SPEC.md describes for this fixture. null when no
+ * kill matrix was computed for this trial.
+ */
+export function sprayAndPrayRate(trial: Pick<DshTrialRecord, "fixture" | "killMatrix">): number | null {
+  if (!trial.killMatrix) return null;
+  const others = Object.entries(trial.killMatrix).filter(([mutantId]) => mutantId !== trial.fixture);
+  if (!others.length) return null;
+  return others.filter(([, killed]) => killed).length / others.length;
 }
 
 export type ProfileSummary = {
@@ -86,6 +119,8 @@ export type FixtureCellSummary = {
   falseAlarmRate: number | null;
   contractComplianceRate: number | null;
   medianWallTimeMs: number | null;
+  /** Mean of sprayAndPrayRate() (#107) across this cell's trials that have a kill matrix; null if none do. */
+  meanSprayAndPrayRate: number | null;
 };
 
 function median(values: number[]): number | null {
@@ -153,6 +188,7 @@ export function summarizeFixtureCells(trials: DshTrialRecord[]): FixtureCellSumm
       ? scorable.filter((r) => r.contractOk).length / scorable.length
       : null;
     const wallTimes = records.map((r) => r.wallTimeMs).filter((ms): ms is number => typeof ms === "number");
+    const sprayAndPrayRates = records.map((r) => sprayAndPrayRate(r)).filter((rate): rate is number => rate !== null);
     return {
       fixture,
       profile,
@@ -160,7 +196,10 @@ export function summarizeFixtureCells(trials: DshTrialRecord[]): FixtureCellSumm
       killRate,
       falseAlarmRate,
       contractComplianceRate,
-      medianWallTimeMs: median(wallTimes)
+      medianWallTimeMs: median(wallTimes),
+      meanSprayAndPrayRate: sprayAndPrayRates.length
+        ? sprayAndPrayRates.reduce((a, b) => a + b, 0) / sprayAndPrayRates.length
+        : null
     };
   });
 }
@@ -237,7 +276,7 @@ export function buildDshComparisonReport(input: DshComparisonReportInput): strin
   lines.push("## Summary");
   lines.push("");
   lines.push(
-    "Pass rate excludes `blocked`, `invalidated`, and `driver_error` trials from its denominator - none carry a pass/fail signal about the agent's test-engineering. `invalidated` means the post-run manifest re-check (#106) found tinytable/, sql-tests/official/, or another protected fixture file changed - the exact #103 failure mode - regardless of what score.py itself reported."
+    "Pass rate excludes `blocked`, `invalidated`, and `driver_error` trials from its denominator - none carry a pass/fail signal about the agent's test-engineering. `invalidated` (#107) means either the post-run manifest re-check (#106) found tinytable/, sql-tests/official/, or another protected fixture file changed, or the transcript audit found the agent's own output/artifacts referencing material outside the exam room - the #103 failure mode - regardless of what score.py itself reported."
   );
   lines.push("");
   lines.push(
@@ -252,14 +291,18 @@ export function buildDshComparisonReport(input: DshComparisonReportInput): strin
   lines.push("");
   lines.push("## Per-fixture breakdown");
   lines.push("");
-  lines.push("| Fixture | Profile | Trials | Kill rate | False-alarm rate | Contract compliance | Median wall time |");
-  lines.push("| --- | --- | --- | --- | --- | --- | --- |");
+  lines.push(
+    "Spray-and-pray rate (#107) is the mean fraction of the *other* mutants in the private pool this cell's suites also killed - high values suggest tests broad enough to reject almost any implementation, not ones that pin down the one deviation SPEC.md describes for this specific fixture."
+  );
+  lines.push("");
+  lines.push("| Fixture | Profile | Trials | Kill rate | False-alarm rate | Contract compliance | Spray-and-pray rate | Median wall time |");
+  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const fixture of input.fixtures) {
     for (const profile of profiles) {
       const cell = cells.find((item) => item.fixture === fixture && item.profile === profile);
       if (!cell) continue;
       lines.push(
-        `| \`${fixture}\` | \`${profile}\` | ${cell.trials} | ${percent(cell.killRate)} | ${percent(cell.falseAlarmRate)} | ${percent(cell.contractComplianceRate)} | ${seconds(cell.medianWallTimeMs)} |`
+        `| \`${fixture}\` | \`${profile}\` | ${cell.trials} | ${percent(cell.killRate)} | ${percent(cell.falseAlarmRate)} | ${percent(cell.contractComplianceRate)} | ${percent(cell.meanSprayAndPrayRate)} | ${seconds(cell.medianWallTimeMs)} |`
       );
     }
   }
@@ -268,20 +311,47 @@ export function buildDshComparisonReport(input: DshComparisonReportInput): strin
   lines.push("");
   lines.push(...pairedDeltaTable(cells, input.fixtures, profiles));
   lines.push("");
+  lines.push("## Kill matrix");
+  lines.push("");
+  lines.push(
+    "Raw per-mutant kill result (#107) for every trial that had one computed - `score.py --kill-matrix-pool`, run against the private pool independently of which mutant this trial was actually scored against. This is the data `Spray-and-pray rate` above summarizes."
+  );
+  lines.push("");
+  const poolMutantIds = [...new Set(input.trials.flatMap((t) => (t.killMatrix ? Object.keys(t.killMatrix) : [])))].sort();
+  if (poolMutantIds.length === 0) {
+    lines.push("No trial had a kill matrix computed.");
+  } else {
+    lines.push(`| Trial | ${poolMutantIds.map((id) => `\`${id}\``).join(" | ")} |`);
+    lines.push(`| --- | ${poolMutantIds.map(() => "---").join(" | ")} |`);
+    const withMatrix = [...input.trials]
+      .filter((t) => t.killMatrix)
+      .sort((a, b) => a.fixture.localeCompare(b.fixture) || a.profile.localeCompare(b.profile) || a.trial - b.trial);
+    for (const trial of withMatrix) {
+      const row = poolMutantIds.map((id) => {
+        const killed = trial.killMatrix![id];
+        if (killed === undefined) return "—";
+        const isOwnFixture = id === trial.fixture;
+        return killed ? (isOwnFixture ? "**killed**" : "killed") : "-";
+      });
+      lines.push(`| \`${trial.trialId}\` | ${row.join(" | ")} |`);
+    }
+  }
+  lines.push("");
   lines.push("## Per-trial evidence");
   lines.push("");
   lines.push(
     "Every aggregate above is computed from exactly these trials; each row's artifacts directory holds the seed-root (post-run), manifest.json, score.json, and the container's captured stdout/stderr."
   );
   lines.push("");
-  lines.push("| Fixture | Profile | Trial | Outcome | Killed | False alarms | Contract OK | Integrity OK | Wall time | Artifacts |");
-  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+  lines.push("| Fixture | Profile | Trial | Outcome | Killed | False alarms | Contract OK | Integrity OK | Transcript audit | Wall time | Artifacts |");
+  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
   const sorted = [...input.trials].sort(
     (a, b) => a.fixture.localeCompare(b.fixture) || a.profile.localeCompare(b.profile) || a.trial - b.trial
   );
   for (const trial of sorted) {
+    const auditCell = trial.transcriptAuditHits.length ? `${trial.transcriptAuditHits.length} hit(s): ${trial.transcriptAuditHits.join(", ")}` : "clean";
     lines.push(
-      `| \`${trial.fixture}\` | \`${trial.profile}\` | ${trial.trial} | ${classifyDshOutcome(trial)} | ${trial.killed === null ? "n/a" : trial.killed} | ${trial.falseAlarms ?? "n/a"} | ${trial.contractOk === null ? "n/a" : trial.contractOk} | ${trial.integrityOk} | ${seconds(trial.wallTimeMs)} | \`${trial.artifactsDir}\` |`
+      `| \`${trial.fixture}\` | \`${trial.profile}\` | ${trial.trial} | ${classifyDshOutcome(trial)} | ${trial.killed === null ? "n/a" : trial.killed} | ${trial.falseAlarms ?? "n/a"} | ${trial.contractOk === null ? "n/a" : trial.contractOk} | ${trial.integrityOk} | ${auditCell} | ${seconds(trial.wallTimeMs)} | \`${trial.artifactsDir}\` |`
     );
   }
   lines.push("");

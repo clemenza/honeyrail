@@ -17,9 +17,16 @@
  *   3. #105's runInExamRoom() runs dsh inside an isolated container with
  *      only that seed-root mounted.
  *   4. The same #106 check re-verifies the seed-root's protected files
- *      afterward - the actual #103 integrity check (ties into #107's fuller
- *      grader once that lands) - before score.py (run on the host, the
- *      grader zone) produces a verdict.
+ *      afterward - the actual #103 integrity check - and #107's transcript
+ *      audit (server/evals/transcript-audit.ts) scans the container's
+ *      captured output and the agent's artifacts for references to
+ *      material outside the exam room. Either forces outcome "invalidated"
+ *      regardless of what score.py itself reports.
+ *   5. score.py (run on the host, the grader zone) produces the real
+ *      kill/false-alarm/contract verdict, plus a #107 kill matrix - the
+ *      same sql-tests/agent/ suite replayed against every other mutant in
+ *      the private pool (never mounted into the exam room), quantifying
+ *      "spray and pray" hedging.
  *
  * Budget note: every cell launches a real dsh CLI session against a real
  * model API. The full default matrix is 8 fixtures x 2 profiles x 3 trials
@@ -52,6 +59,7 @@ import { findBlockedReason, withUnattendedPreamble } from "../server/agents/comm
 import { dshAdapter } from "../server/agents/dsh.js";
 import { buildDshComparisonReport, classifyDshOutcome, type DshComparisonReportInput, type DshTrialRecord } from "../server/evals/dsh-report.js";
 import { describeManifestMismatch, findManifestMismatches } from "../server/evals/manifest-preflight.js";
+import { auditTranscript } from "../server/evals/transcript-audit.js";
 import { runCommandSafe } from "../server/utils.js";
 import { buildSeedRoot, type SeedRootManifest } from "./tinytable-seed-root-builder.js";
 import { DEFAULT_IMAGE, runInExamRoom } from "./tinytable-exam-room.js";
@@ -62,6 +70,11 @@ const profilesDir = join(tinytableEvalDir, "profiles");
 const scorePyPath = join(tinytableEvalDir, "score.py");
 const cleanDir = join(tinytableEvalDir, "clean");
 const taskPromptPath = join(tinytableEvalDir, "task-prompt.md");
+// #107: the private mutant pool score.py's --kill-matrix-pool replays the
+// agent's suite against. Grader-only (host-side) - never mounted into the
+// exam room; #104's buildSeedRoot() only ever materializes one mutant's
+// tinytable/ into the seed-root the container actually sees.
+const mutantsDir = join(tinytableEvalDir, "mutants");
 
 const PROFILE_PATCH_FILENAME = "cordis.patch.yml";
 
@@ -181,7 +194,14 @@ async function gitInitCommit(repoPath: string): Promise<void> {
   );
 }
 
-export type ScoreJson = { killed: boolean; false_alarms: number; contract_ok: boolean; passed: boolean };
+export type ScoreJson = {
+  killed: boolean;
+  false_alarms: number;
+  contract_ok: boolean;
+  passed: boolean;
+  /** #107: null unless --kill-matrix-pool was passed. */
+  kill_matrix: Record<string, boolean> | null;
+};
 
 // #114: score.py's own JSON output always includes a literal "error" key
 // (null on success - see examples/tinytable-eval/score.py's `result` dict),
@@ -207,7 +227,8 @@ export async function runScorePy(
     scorePyPath,
     "--worktree", worktreePath,
     "--clean", cleanDir,
-    "--out", "score.json"
+    "--out", "score.json",
+    "--kill-matrix-pool", mutantsDir
   ]);
   try {
     const raw = await readFile(join(worktreePath, "score.json"), "utf8");
@@ -215,6 +236,20 @@ export async function runScorePy(
   } catch {
     return { ok: false, error: `score.py produced no score.json (exit ${result.code}): ${(result.stderr || result.stdout).slice(-2000)}` };
   }
+}
+
+/** #107 transcript audit: everything the agent produced or said, gathered for auditTranscript(). */
+async function gatherAuditableText(seedRootDir: string, containerLog: string): Promise<string> {
+  const parts = [containerLog];
+  const findingsPath = join(seedRootDir, "findings.json");
+  const agentTestsDir = join(seedRootDir, "sql-tests", "agent");
+  parts.push(await readFile(findingsPath, "utf8").catch(() => ""));
+  const testFiles = await readdir(agentTestsDir, { recursive: true }).catch(() => [] as string[]);
+  for (const name of testFiles) {
+    const content = await readFile(join(agentTestsDir, name), "utf8").catch(() => "");
+    if (content) parts.push(content);
+  }
+  return parts.join("\n");
 }
 
 async function executeCell(
@@ -238,7 +273,7 @@ async function executeCell(
     manifest = await buildSeedRoot({ mutantId: fixture, outDir: seedRootDir });
     await writeFile(join(artifactsDir, "manifest.json"), JSON.stringify(manifest, null, 2));
   } catch (error) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: false, error: (error as Error).message };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: false, transcriptAuditHits: [], killMatrix: null, error: (error as Error).message };
   }
 
   const preflightMismatches = await findManifestMismatches(seedRootDir, { files: manifest.files });
@@ -249,6 +284,8 @@ async function executeCell(
       falseAlarms: null,
       contractOk: null,
       integrityOk: false,
+      transcriptAuditHits: [],
+      killMatrix: null,
       error: `#106 preflight: freshly-built seed-root doesn't match its own manifest: ${preflightMismatches.map(describeManifestMismatch).join("; ")}`
     };
   }
@@ -281,12 +318,23 @@ async function executeCell(
   const combinedOutput = `${result.stdout}\n${result.stderr}`;
   await writeFile(join(artifactsDir, "container.log"), `--- stdout ---\n${result.stdout}\n--- stderr ---\n${result.stderr}\n`);
 
+  // #107 transcript audit: whatever the agent said (container output) and
+  // wrote (findings.json, its .test files, if it got that far) - run once,
+  // reused across every return path below, since it costs nothing beyond
+  // an in-memory regex pass and a run that fails early still deserves the
+  // same scrutiny as one that completes.
+  const auditableText = await gatherAuditableText(seedRootDir, combinedOutput);
+  const transcriptAuditHits = auditTranscript(auditableText).map((hit) => hit.pattern);
+  if (transcriptAuditHits.length) {
+    console.error(`  ${trialId}: TRANSCRIPT AUDIT HIT(S): ${transcriptAuditHits.join(", ")}`);
+  }
+
   if (result.timedOut) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, wallTimeMs, error: `trial timed out after ${options.trialTimeoutMinutes}m and was killed` };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killMatrix: null, wallTimeMs, error: `trial timed out after ${options.trialTimeoutMinutes}m and was killed` };
   }
   const fatal = dshAdapter.findFatalError?.(combinedOutput);
   if (fatal) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, wallTimeMs, error: `dsh fatal error (${fatal.code}): ${fatal.message}` };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killMatrix: null, wallTimeMs, error: `dsh fatal error (${fatal.code}): ${fatal.message}` };
   }
   const blocked = findBlockedReason(combinedOutput);
 
@@ -298,7 +346,7 @@ async function executeCell(
   }
 
   if (!scoreOrError.ok) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk, wallTimeMs, blockedReason: blocked?.message, error: scoreOrError.error };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk, transcriptAuditHits, killMatrix: null, wallTimeMs, blockedReason: blocked?.message, error: scoreOrError.error };
   }
 
   return {
@@ -307,6 +355,8 @@ async function executeCell(
     falseAlarms: scoreOrError.score.false_alarms,
     contractOk: scoreOrError.score.contract_ok,
     integrityOk,
+    transcriptAuditHits,
+    killMatrix: scoreOrError.score.kill_matrix,
     wallTimeMs,
     blockedReason: blocked?.message
   };

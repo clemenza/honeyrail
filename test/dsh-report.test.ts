@@ -27,6 +27,8 @@ function trial(overrides: Partial<DshTrialRecord>): DshTrialRecord {
     falseAlarms: 0,
     contractOk: true,
     integrityOk: true,
+    transcriptAuditHits: [],
+    killMatrix: null,
     wallTimeMs: 60_000,
     ...overrides
   };
@@ -48,21 +50,21 @@ function reportInput(trials: DshTrialRecord[]): DshComparisonReportInput {
 }
 
 test("classifyDshOutcome: clean pass requires killed, no false alarms, contract ok, and integrity ok", () => {
-  assert.equal(classifyDshOutcome({ integrityOk: true, killed: true, falseAlarms: 0, contractOk: true }), "passed");
+  assert.equal(classifyDshOutcome({ integrityOk: true, transcriptAuditHits: [], killed: true, falseAlarms: 0, contractOk: true }), "passed");
 });
 
 test("classifyDshOutcome: killed==false is task_failed - the agent never caught the seeded defect", () => {
-  assert.equal(classifyDshOutcome({ integrityOk: true, killed: false, falseAlarms: 0, contractOk: true }), "task_failed");
+  assert.equal(classifyDshOutcome({ integrityOk: true, transcriptAuditHits: [], killed: false, falseAlarms: 0, contractOk: true }), "task_failed");
 });
 
 test("classifyDshOutcome: killed but with false alarms or a broken contract is verify_failed", () => {
-  assert.equal(classifyDshOutcome({ integrityOk: true, killed: true, falseAlarms: 1, contractOk: true }), "verify_failed");
-  assert.equal(classifyDshOutcome({ integrityOk: true, killed: true, falseAlarms: 0, contractOk: false }), "verify_failed");
+  assert.equal(classifyDshOutcome({ integrityOk: true, transcriptAuditHits: [], killed: true, falseAlarms: 1, contractOk: true }), "verify_failed");
+  assert.equal(classifyDshOutcome({ integrityOk: true, transcriptAuditHits: [], killed: true, falseAlarms: 0, contractOk: false }), "verify_failed");
 });
 
 test("classifyDshOutcome: a BLOCKED: agent is its own bucket, distinct from a real failure", () => {
   assert.equal(
-    classifyDshOutcome({ integrityOk: true, blockedReason: "SPEC.md is missing", killed: null, falseAlarms: null, contractOk: null }),
+    classifyDshOutcome({ integrityOk: true, transcriptAuditHits: [], blockedReason: "SPEC.md is missing", killed: null, falseAlarms: null, contractOk: null }),
     "blocked"
   );
 });
@@ -71,18 +73,18 @@ test("classifyDshOutcome: a BLOCKED: agent is its own bucket, distinct from a re
 // must never be counted as a legitimate pass, no matter what score.py says.
 test("classifyDshOutcome: integrityOk=false always wins as 'invalidated', even over a clean score.py pass", () => {
   assert.equal(
-    classifyDshOutcome({ integrityOk: false, killed: true, falseAlarms: 0, contractOk: true }),
+    classifyDshOutcome({ integrityOk: false, transcriptAuditHits: [], killed: true, falseAlarms: 0, contractOk: true }),
     "invalidated"
   );
   assert.equal(
-    classifyDshOutcome({ integrityOk: false, blockedReason: "whatever", killed: null, falseAlarms: null, contractOk: null }),
+    classifyDshOutcome({ integrityOk: false, transcriptAuditHits: [], blockedReason: "whatever", killed: null, falseAlarms: null, contractOk: null }),
     "invalidated"
   );
 });
 
 test("classifyDshOutcome: a driver-side error (builder/container/score.py crash) is its own bucket", () => {
   assert.equal(
-    classifyDshOutcome({ integrityOk: true, killed: null, falseAlarms: null, contractOk: null, error: "docker not found" }),
+    classifyDshOutcome({ integrityOk: true, transcriptAuditHits: [], killed: null, falseAlarms: null, contractOk: null, error: "docker not found" }),
     "driver_error"
   );
 });
@@ -148,7 +150,39 @@ test("buildDshComparisonReport's summary table breaks counts out by every bucket
   assert.match(report, /\| `m01` \| `baseline` \| 2 \| 50% \|/);
   // m02/baseline has no scorable trial at all (invalidated) - kill rate n\/a.
   assert.match(report, /\| `m02` \| `baseline` \| 1 \| n\/a \|/);
-  assert.match(report, /invalidated.*means the post-run manifest re-check/s);
+  assert.match(report, /invalidated.*means either the post-run manifest re-check/s);
+});
+
+test("classifyDshOutcome: a transcript audit hit forces 'invalidated', same priority as an integrity mismatch", () => {
+  assert.equal(
+    classifyDshOutcome({
+      integrityOk: true,
+      transcriptAuditHits: ["mutant"],
+      killed: true,
+      falseAlarms: 0,
+      contractOk: true
+    }),
+    "invalidated"
+  );
+});
+
+test("sprayAndPrayRate and the kill matrix / spray-and-pray report columns", () => {
+  const report = buildDshComparisonReport(
+    reportInput([
+      trial({
+        fixture: "m01",
+        profile: "baseline",
+        trial: 1,
+        trialId: "m01-baseline-1",
+        killMatrix: { m01: true, m02: true, m03: false }
+      })
+    ])
+  );
+  // Spray-and-pray rate excludes the trial's own fixture (m01): of the
+  // other pool members (m02, m03), 1/2 were also killed.
+  assert.match(report, /\| `m01` \| `baseline` \| 1 \| 100% \| 0% \| 100% \| 50% \|/);
+  assert.match(report, /## Kill matrix/);
+  assert.match(report, /\| `m01-baseline-1` \| \*\*killed\*\* \| killed \| - \|/);
 });
 
 test("buildDshComparisonReport's paired delta table states a per-fixture kill-rate delta with no significance claim", () => {

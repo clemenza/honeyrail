@@ -206,6 +206,54 @@ def _check_contract(worktree: pathlib.Path) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# kill matrix (#107): the agent's suite run against a *private* pool of
+# other mutants, not just the one fixture it was actually tested against.
+# ---------------------------------------------------------------------------
+
+
+def _failing_set_against_root(root: pathlib.Path, worktree_sql_tests: pathlib.Path, timeout: int) -> tuple[Optional[set[str]], str]:
+    """Runs sql-tests/agent against a temp copy of `root` (a tinytable
+    install - clean, or one pool member's tinytable/) with `worktree`'s own
+    sql-tests/ overlaid on top - the same construction the existing F_clean
+    computation below uses, generalized so the kill matrix can reuse it
+    against each pool member instead of duplicating the temp-copy dance.
+    """
+    with tempfile.TemporaryDirectory(prefix="tinytable-eval-pool-") as tmp:
+        tmp_root = pathlib.Path(tmp) / "root"
+        shutil.copytree(root, tmp_root)
+        if worktree_sql_tests.is_dir():
+            shutil.copytree(worktree_sql_tests, tmp_root / "sql-tests", dirs_exist_ok=True)
+        return _run_sql_tests(tmp_root, "sql-tests/agent", timeout)
+
+
+def _compute_kill_matrix(
+    pool_dir: pathlib.Path, worktree_sql_tests: pathlib.Path, f_clean: set[str], timeout: int
+) -> tuple[dict[str, bool], list[str]]:
+    """For every immediate subdirectory of `pool_dir` that looks like a
+    mutant (has its own tinytable/), determines whether the agent's suite
+    kills it - same killed = bool(F_pool_member - F_clean) definition
+    main() uses for the trial's own mutant, just replayed against every
+    other member of the private pool. A wide kill matrix (most/all pool
+    members "killed" by tests that were only ever validated against one
+    specific fixture) is evidence of "spray and pray" hedging - tests broad
+    enough to reject almost any implementation, not ones that pin down the
+    one deviation SPEC.md actually describes - rather than genuine,
+    targeted test-engineering.
+    """
+    matrix: dict[str, bool] = {}
+    errors: list[str] = []
+    for member_dir in sorted(pool_dir.iterdir()):
+        if not member_dir.is_dir() or not (member_dir / "tinytable").is_dir():
+            continue
+        failing, log = _failing_set_against_root(member_dir, worktree_sql_tests, timeout)
+        if failing is None:
+            errors.append(f"kill matrix: {member_dir.name}: {log}")
+            continue
+        matrix[member_dir.name] = bool(failing - f_clean)
+    return matrix, errors
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -216,6 +264,12 @@ def main() -> int:
     parser.add_argument("--clean", required=True, help="SPEC-compliant reference tinytable root (e.g. tinytable-eval/clean)")
     parser.add_argument("--out", default="score.json", help="output filename, written under --worktree (default: score.json)")
     parser.add_argument("--timeout", type=int, default=120, help="per-run_sql_tests.py-invocation timeout in seconds (default: 120)")
+    parser.add_argument(
+        "--kill-matrix-pool",
+        default=None,
+        help="#107: directory of other mutants (e.g. tinytable-eval/mutants) to also run the agent's suite against, "
+        "for a spray-and-pray-hedging signal. Grader-only - never mount this pool inside the exam room.",
+    )
     args = parser.parse_args()
 
     worktree = pathlib.Path(args.worktree).resolve()
@@ -224,6 +278,9 @@ def main() -> int:
         parser.error(f"--worktree {worktree} is not a directory")
     if not (clean / "tinytable").is_dir():
         parser.error(f"--clean {clean} has no tinytable/ package")
+    kill_matrix_pool = pathlib.Path(args.kill_matrix_pool).resolve() if args.kill_matrix_pool else None
+    if kill_matrix_pool is not None and not kill_matrix_pool.is_dir():
+        parser.error(f"--kill-matrix-pool {kill_matrix_pool} is not a directory")
 
     contract_errors = _check_contract(worktree)
     contract_ok = not contract_errors
@@ -235,23 +292,24 @@ def main() -> int:
         error = mutant_log
         f_mutant = set()
 
-    f_clean: set[str] = set()
-    with tempfile.TemporaryDirectory(prefix="tinytable-eval-clean-") as tmp:
-        tmp_clean = pathlib.Path(tmp) / "clean"
-        shutil.copytree(clean, tmp_clean)
-        worktree_sql_tests = worktree / "sql-tests"
-        if worktree_sql_tests.is_dir():
-            shutil.copytree(worktree_sql_tests, tmp_clean / "sql-tests", dirs_exist_ok=True)
-        f_clean_result, clean_log = _run_sql_tests(tmp_clean, "sql-tests/agent", args.timeout)
-        if f_clean_result is None:
-            error = f"{error}\n{clean_log}" if error else clean_log
-        else:
-            f_clean = f_clean_result
+    worktree_sql_tests = worktree / "sql-tests"
+    f_clean_result, clean_log = _failing_set_against_root(clean, worktree_sql_tests, args.timeout)
+    if f_clean_result is None:
+        error = f"{error}\n{clean_log}" if error else clean_log
+        f_clean: set[str] = set()
+    else:
+        f_clean = f_clean_result
 
     killed_tests = sorted(f_mutant - f_clean)
     killed = bool(killed_tests)
     false_alarms = len(f_clean)
     passed = killed and false_alarms == 0 and contract_ok and error is None
+
+    kill_matrix: Optional[dict[str, bool]] = None
+    if kill_matrix_pool is not None:
+        kill_matrix, kill_matrix_errors = _compute_kill_matrix(kill_matrix_pool, worktree_sql_tests, f_clean, args.timeout)
+        if kill_matrix_errors:
+            error = f"{error}\n{chr(10).join(kill_matrix_errors)}" if error else "\n".join(kill_matrix_errors)
 
     result = {
         "worktree": str(worktree),
@@ -263,6 +321,7 @@ def main() -> int:
         "contract_errors": contract_errors,
         "f_mutant": sorted(f_mutant),
         "f_clean": sorted(f_clean),
+        "kill_matrix": kill_matrix,
         "error": error,
         "passed": passed,
     }
