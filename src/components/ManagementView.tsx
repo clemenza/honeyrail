@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { api } from "../api.js";
 import type { DiffData, EventData, GatewayState, ProjectData, RunData, SessionData, TaskData, WorktreeData, WorktreeItem } from "../types.js";
+import { DshEvalsBrowser } from "./DshEvalsBrowser.js";
 import { EvalsPanel } from "./EvalsPanel.js";
 import { StatusPill } from "./layout.js";
 import { ProjectForm, ProjectList } from "./ProjectPanel.js";
@@ -474,6 +475,7 @@ export function MainContent({ activeView, state, loaded, selectedProject, setSel
       <div className="content-grid">
         <div className="primary-column">
           <EvalsPanel projects={state.projects} />
+          <DshEvalsBrowser />
         </div>
         <div className="secondary-column">
           <EventFeed events={state.events} className="event-feed-hide-mobile" />
