@@ -82,6 +82,8 @@ const recipeSchema = z.object({
   category: z.string().optional(),
   contractLevel: z.enum(["L0", "L1", "L2", "L3"]).optional(),
   maxParallel: z.number().int().positive().optional(),
+  launchDisabled: z.boolean().optional(),
+  launchDisabledReason: z.string().optional(),
   parameters: z.array(recipeParameterSchema),
   steps: z.array(recipeStepTemplateSchema).min(1)
 });

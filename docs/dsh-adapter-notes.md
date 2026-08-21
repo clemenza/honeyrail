@@ -209,3 +209,64 @@ issue carries its own options). Two things came out of that run:
   already the pattern operators expect from the other CLI-wrapping adapters (codex/claude/hermes
   hit the same tmux-inheritance constraint for their own credentials, so this isn't dsh-specific,
   but it's easy to trip over the first time).
+
+## Launch path guard (#109) — closing out #103
+
+#103 (P0) found a live `dsh-testengineer-trial` run that had been launched, by hand, via the
+mobile "New run" wizard against a HoneyRail project whose repo was neither an isolated
+`--seed-root` copy nor the recipe's own fallback convenience path (`honeyrail` itself) — an
+unrelated project with no tinytable fixture at all. Rather than fail, the `dsh` agent read
+`examples/tinytable-eval/` straight off the shared host filesystem and reconstructed the fixture
+from the answer key. #103's three Acceptance Criteria, and how each is actually satisfied today:
+
+1. **"A run against a worktree missing the tinytable fixture fails fast with a clear error."**
+   Satisfied by #106: `AgentTaskExecutor.preflight()` checks an optional `expectedManifest`
+   recipe parameter (a #104 `buildSeedRoot()` manifest) against the registered project's repo
+   before any agent turn is spent — see `server/evals/manifest-preflight.ts` and
+   `test/dsh-testengineer-trial-preflight.test.ts`.
+2. **"Confirmed (and fixed if broken) that the sandbox mode this recipe uses cannot read files
+   outside the assigned worktree."** As literally written, this is not what shipped, and
+   claiming otherwise would be dishonest: `dsh`'s own `workspace-write` sandbox mode was never
+   actually fixed to restrict reads — #103's own investigation is the evidence it doesn't, and
+   nothing in this adapter changed that. What #105 shipped instead **makes the question moot**:
+   a scored trial (via #93's driver, see docs/dsh-evals-demo.md) never runs `dsh` in a shared
+   host filesystem at all. It runs inside a Docker container with only that trial's answer-free
+   seed-root bind-mounted — `--read-only`, `--cap-drop=ALL`, no other mount — so there is nothing
+   outside the worktree for a broken or bypassed in-process sandbox to read. Zone isolation
+   (container boundary) supersedes the in-process sandbox as the actual security boundary; the
+   Docker daemon's mount namespace is the confinement, not `dsh`'s own `sandbox-policy` plugin.
+   `DSH_PERMISSION_MODE=danger-full-access` is set for exam-room runs specifically *because* the
+   real boundary is the container, not `dsh`'s own permission mode (also required to avoid a
+   nested-sandbox `/proc` mount conflict under Docker's own seccomp — see
+   docs/tinytable-exam-room-isolation.md).
+3. **"docs/dsh-adapter-notes.md or docs/agent-adapters.md documents that dsh-testengineer-trial
+   must only be run against an isolated --seed-root copy, never against honeyrail itself or an
+   unrelated project, for a result to count as valid eval data."** This section is that
+   documentation, plus the mechanism below that goes further than docs alone.
+
+**#109 adds the last piece: making the driver the only path that can produce a scored result at
+all**, not just documenting that it should be. `dsh-testengineer-trial` is a recipe like any
+other in `server/recipes/` — `GET /api/recipes` still lists it, `POST /api/recipes/:id/preview`
+still works — but its YAML declares `launchDisabled: true`, and `POST
+/api/recipes/dsh-testengineer-trial/runs` (the "New run" wizard's launch path — the *exact*
+mechanism #103's incident used) refuses with `403` unconditionally, regardless of parameters. The
+"New run" UI (`src/components/RecipeWizard.tsx`) shows the recipe card as disabled with an
+explanation rather than hiding it outright, so a developer browsing the "evals" category isn't
+left wondering where it went. **A real, scored trial has exactly one entry point:**
+`node --import tsx scripts/dsh-evals-demo.ts` (#93) — which never calls `POST /api/recipes/*` or
+creates a HoneyRail Run at all; it calls the seed-root builder (#104), exam-room container (#105),
+and manifest preflight (#106) directly against a throwaway isolated copy, then grades out of band
+(#107/#108). See docs/dsh-evals-demo.md.
+
+This is deliberately narrower than blocking every code path that can materialize this recipe's
+steps: `POST /api/runs` (the generic, low-level "post a raw DAG" endpoint) still accepts
+`dsh-testengineer-trial`'s materialized steps directly, same as it accepts any other recipe's —
+that's how `test/dsh-testengineer-trial.test.ts` and
+`test/dsh-testengineer-trial-preflight.test.ts` exercise the recipe's wiring and the #106
+preflight mechanism themselves, entirely locally, with no live agent. That path was never the
+#103 incident vector (a human clicking through the mobile "New run" wizard) and isn't a
+"shared-filesystem transitional path" to a scored result on its own — nothing downstream of it
+grades, aggregates, or reports a trial as eval data outside `scripts/dsh-evals-demo.ts` itself.
+What's now structurally impossible is the specific thing #103 documents: launching this recipe
+as a real HoneyRail run, by hand or by API call, against whatever repo a project happens to point
+at.
