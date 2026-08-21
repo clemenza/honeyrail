@@ -115,11 +115,11 @@ def seed_golden_suite(worktree: pathlib.Path) -> None:
     (worktree / "findings.json").write_text(_FINDINGS_JSON)
 
 
-def run_score(worktree: pathlib.Path, clean_root: pathlib.Path) -> tuple[int, dict]:
-    proc = subprocess.run(
-        [sys.executable, str(SCORE_PY), "--worktree", str(worktree), "--clean", str(clean_root), "--out", "score.json"],
-        capture_output=True, text=True,
-    )
+def run_score(worktree: pathlib.Path, clean_root: pathlib.Path, kill_matrix_pool: pathlib.Path | None = None) -> tuple[int, dict]:
+    cmd = [sys.executable, str(SCORE_PY), "--worktree", str(worktree), "--clean", str(clean_root), "--out", "score.json"]
+    if kill_matrix_pool is not None:
+        cmd += ["--kill-matrix-pool", str(kill_matrix_pool)]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
     score_path = worktree / "score.json"
     data = json.loads(score_path.read_text()) if score_path.is_file() else {}
     if proc.returncode not in (0, 1):
@@ -216,6 +216,39 @@ def scenario_editing_official_tests_fails_contract(tmp: pathlib.Path, clean_root
         fail(f"score.py against a sql-tests/official/-edited worktree: expected contract_ok=false, got {data}")
 
 
+def scenario_kill_matrix_absent_without_the_flag(tmp: pathlib.Path, clean_root: pathlib.Path) -> None:
+    worktree = tmp / "kill-matrix-absent"
+    build_worktree(MUTANTS_DIR / "m01", worktree)
+    seed_golden_suite(worktree)
+
+    code, data = run_score(worktree, clean_root)
+    if code == 0 and data.get("kill_matrix") is None:
+        ok("score.py: kill_matrix is absent (null) when --kill-matrix-pool isn't passed")
+    else:
+        fail(f"score.py without --kill-matrix-pool: expected kill_matrix=null, got {data.get('kill_matrix')!r}")
+
+
+# #107: a suite comprehensive enough to correctly kill every seeded defect
+# (the golden suite) necessarily also kills every mutant in the pool when
+# run against each of them in turn - the kill matrix can't distinguish that
+# from indiscriminate over-broad hedging by itself (that's a judgment call
+# for whoever reads the report), but it must at least report the true,
+# consistent signal: every pool member killed=true, matching selfcheck.py's
+# own independent "golden/mNN.test kills mutants/mNN" check for each NN.
+def scenario_kill_matrix_with_golden_suite(tmp: pathlib.Path, clean_root: pathlib.Path) -> None:
+    worktree = tmp / "kill-matrix-golden"
+    build_worktree(MUTANTS_DIR / "m01", worktree)
+    seed_golden_suite(worktree)
+
+    code, data = run_score(worktree, clean_root, kill_matrix_pool=MUTANTS_DIR)
+    kill_matrix = data.get("kill_matrix") or {}
+    expected = {mid: True for mid in MUTANT_IDS}
+    if code == 0 and kill_matrix == expected:
+        ok(f"score.py: --kill-matrix-pool with the golden suite kills every pool member: {kill_matrix}")
+    else:
+        fail(f"score.py --kill-matrix-pool with the golden suite: expected {expected}, got {kill_matrix}")
+
+
 def main() -> int:
     if not MUTANTS_DIR.is_dir():
         print("mutants/ is missing - run this after issue #90's fixtures exist", file=sys.stderr)
@@ -229,6 +262,8 @@ def main() -> int:
         scenario_noop_test_is_not_killed(tmp, CLEAN)
         scenario_editing_tinytable_fails_contract(tmp, CLEAN)
         scenario_editing_official_tests_fails_contract(tmp, CLEAN)
+        scenario_kill_matrix_absent_without_the_flag(tmp, CLEAN)
+        scenario_kill_matrix_with_golden_suite(tmp, CLEAN)
 
     print()
     if _failures:
