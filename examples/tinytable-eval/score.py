@@ -188,12 +188,27 @@ def _git_status_paths(root: pathlib.Path) -> Optional[list[str]]:
     return paths
 
 
+def _is_python_bytecode_cache(path: str) -> bool:
+    """Python writes __pycache__/*.pyc the moment anything actually imports
+    tinytable's modules - an unavoidable, harmless side effect of the agent
+    (or this very script, via run_sql_tests.py) genuinely running the code,
+    which is the whole point of running it at all. A freshly seeded root
+    has no .gitignore of its own to make git status ignore this on its
+    own (unlike examples/tinytable-eval/ itself), so filter it here
+    instead of flagging it as tampering with a protected path.
+    """
+    parts = path.split("/")
+    return "__pycache__" in parts or path.endswith((".pyc", ".pyo"))
+
+
 def _check_protected_paths_untouched(root: pathlib.Path) -> list[str]:
     paths = _git_status_paths(root)
     if paths is None:
         return ["worktree is not a git repository - cannot verify tinytable/ and sql-tests/official/ are untouched"]
     errors = []
     for p in paths:
+        if _is_python_bytecode_cache(p):
+            continue
         if any(p.startswith(prefix) for prefix in _PROTECTED_PREFIXES):
             errors.append(f"protected path was added/modified/deleted: {p}")
     return errors
