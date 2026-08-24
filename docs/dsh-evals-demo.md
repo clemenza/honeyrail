@@ -30,8 +30,19 @@ pinned to a specific upstream commit:
 
 ```
 $ git -C vendor/tinytable-evals rev-parse HEAD
-78bcc980a5c388710a59a8db64c74471c3399a13
+12625186bee301babda2f943ec0672de4f1b46e6
 ```
+
+Re-pinned (from `78bcc98`) for upstream's #40: `trajectory.py` (structured
+JSONL trajectory logging - a stdlib-only writer/schema for `tool_call`/
+`shell_command`/`test_run`/`file_diff`/`agent_snapshot` events, now shipped
+into every seed-root by `build_seed_root.py`), `run_sql_tests.py
+--trajectory-log` (emits a `test_run` event per invocation), and
+`trajectory_schema.json`/`sample_trajectory.py`. This driver doesn't pass
+`--trajectory-log` through to `grade.py`'s own `run_sql_tests.py`
+invocations yet - server/evals/dsh-trajectory-bridge.ts derives
+`tool_call`/`shell_command` independently, from dsh's own session log, so
+only the `test_run` piece is still unconnected end to end.
 
 Before #126, `examples/tinytable-eval/{mutants,golden,score.py}` was a
 static copy frozen at the point #104 extracted it, and had already drifted
