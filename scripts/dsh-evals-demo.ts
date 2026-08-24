@@ -68,6 +68,7 @@ import { buildDshComparisonReport, classifyDshOutcome, type DshComparisonReportI
 import { describeManifestMismatch, findManifestMismatches } from "../server/evals/manifest-preflight.js";
 import { readSessionStats } from "../server/evals/dsh-session-stats.js";
 import { appendDerivedTrajectoryEvents } from "../server/evals/dsh-trajectory-bridge.js";
+import { logAgentSnapshot, logFileDiff } from "../server/evals/dsh-trajectory-filesystem-events.js";
 import { auditTranscript } from "../server/evals/transcript-audit.js";
 import { runCommandSafe } from "../server/utils.js";
 import { buildSeedRoot, type SeedRootManifest } from "./tinytable-seed-root-builder.js";
@@ -386,6 +387,13 @@ async function executeCell(
   // see server/evals/dsh-trajectory-bridge.ts for what this can and can't
   // verify. Best-effort, same reasoning as sessionStatsReport above.
   await appendDerivedTrajectoryEvents(dshHomeDir, seedRootDir).catch(() => null);
+
+  // The remaining two #40 event kinds this driver can produce on its own
+  // (see server/evals/dsh-trajectory-filesystem-events.ts) - gitInitCommit
+  // above is exactly the "HEAD" baseline_ref this diffs against. Also
+  // best-effort: neither should ever fail the trial.
+  await logFileDiff(seedRootDir).catch(() => undefined);
+  await logAgentSnapshot(seedRootDir).catch(() => undefined);
 
   // #107 transcript audit: whatever the agent said (container output) and
   // wrote (findings.json, its .test files, if it got that far) - run once,
