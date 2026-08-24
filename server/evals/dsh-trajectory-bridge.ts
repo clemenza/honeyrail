@@ -158,7 +158,7 @@ export function deriveTrajectoryEvents(events: DshRawEvent[]): DerivedTrajectory
 }
 
 /**
- * Reads `${dshHomeDir}/sessions/**\/*.jsonl`, derives tool_call/
+ * Reads `${dshHomeDir}/sessions/**\/*.jsonl`(`.zstd`), derives tool_call/
  * shell_command events from each session file independently (in the same
  * filename order `readRawSessionFiles` returns), and appends them all to
  * `${seedRootDir}/trajectory.jsonl` - the same path/schema

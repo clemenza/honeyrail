@@ -4,9 +4,9 @@
  * turn-count visibility: turn/step counts and LLM/tool/first-token/decode
  * wall times, computed from the raw event log
  * dsh's `@deepseek-ai/dsh-session-persistence-jsonl` plugin already writes
- * to `$DSH_HOME/sessions/<project>/<session>.jsonl` - a log this driver
- * never used to capture at all (see readSessionStats's own docstring and
- * scripts/tinytable-exam-room.ts's `dshHomeDir` option).
+ * to `$DSH_HOME/sessions/<project>/<session>.jsonl(.zstd)` - a log this
+ * driver never used to capture at all (see readSessionStats's own
+ * docstring and scripts/tinytable-exam-room.ts's `dshHomeDir` option).
  *
  * `foldSessionStats` below is a direct, dependency-free port of
  * `sessionStatsProjectionDefinition.apply`/`.view` from
@@ -48,6 +48,7 @@
 
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { zstdDecompressSync } from "node:zlib";
 
 export type DshRawEvent = {
   type: string;
@@ -190,10 +191,99 @@ export function parseSessionLog(text: string): DshRawEvent[] {
   return text.split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line) as DshRawEvent);
 }
 
+// `@deepseek-ai/dsh-session-persistence-jsonl`'s DEFAULT_COMPRESSION is
+// "zstd" (confirmed in its published lib/index.js), so a real session log is
+// `session.jsonl.zstd`, not `session.jsonl`, on every trial unless an
+// operator explicitly configures compression: "none" - this is the default
+// path, not an edge case. `.jsonl.zstd` is a *concatenated-frame* Zstandard
+// container (one frame per durable event batch the writer appended), not a
+// single stream: node:zlib's one-shot zstdDecompressSync only decodes the
+// first frame of a multi-frame buffer and silently drops the rest (verified
+// against a real dsh session log - a naive `zstdDecompressSync(wholeFile)`
+// recovered only the file's first line). Frame boundaries must be located
+// before decompressing each one independently, exactly as dsh's own
+// PublicZstdFrameDecoder does.
+//
+// scanZstdFrames below is a direct, dependency-free port of
+// `scanZstdFrames` from `@deepseek-ai/dsh-session-persistence-jsonl@0.1.0-rc.7`'s
+// published lib/index.js - same pin, same "ported verbatim, not
+// reimplemented from a guess" rationale as foldSessionStats above.
+const ZSTD_MAGIC = 0xfd2fb528;
+
+type ZstdFrameRange = { start: number; end: number };
+
+/**
+ * Locate complete Zstandard frames in `buffer` without decompressing their
+ * blocks. Throws on structurally invalid input; a torn/incomplete final
+ * frame (the log was read mid-write) is reported via `tornStart` rather
+ * than thrown on, and its bytes are simply excluded from `frames`.
+ */
+function scanZstdFrames(buffer: Buffer): { frames: ZstdFrameRange[]; tornStart?: number } {
+  const frames: ZstdFrameRange[] = [];
+  let offset = 0;
+  while (offset < buffer.length) {
+    const start = offset;
+    if (buffer.length - offset < 4) return { frames, tornStart: start };
+    if (buffer.readUInt32LE(offset) !== ZSTD_MAGIC) {
+      throw new Error(`corrupt Zstandard session log: invalid frame magic at byte ${offset}`);
+    }
+    offset += 4;
+    if (offset === buffer.length) return { frames, tornStart: start };
+    const descriptor = buffer.readUInt8(offset);
+    offset += 1;
+    if ((descriptor & 24) !== 0) {
+      throw new Error(`corrupt Zstandard session log: reserved frame-header bit at byte ${offset - 1}`);
+    }
+    const contentSizeFlag = descriptor >>> 6;
+    const singleSegment = (descriptor & 32) !== 0;
+    const checksum = (descriptor & 4) !== 0;
+    const dictionaryFlag = descriptor & 3;
+    const dictionaryBytes = dictionaryFlag === 3 ? 4 : dictionaryFlag;
+    const contentSizeBytes = contentSizeFlag === 0 ? (singleSegment ? 1 : 0) : 1 << contentSizeFlag;
+    const remainingHeaderBytes = (singleSegment ? 0 : 1) + dictionaryBytes + contentSizeBytes;
+    if (buffer.length - offset < remainingHeaderBytes) return { frames, tornStart: start };
+    offset += remainingHeaderBytes;
+    for (;;) {
+      if (buffer.length - offset < 3) return { frames, tornStart: start };
+      const blockHeader = buffer.readUIntLE(offset, 3);
+      offset += 3;
+      const lastBlock = (blockHeader & 1) !== 0;
+      const blockType = (blockHeader >>> 1) & 3;
+      const blockSize = blockHeader >>> 3;
+      if (blockType === 3) {
+        throw new Error(`corrupt Zstandard session log: reserved block type at byte ${offset - 3}`);
+      }
+      const payloadBytes = blockType === 1 ? 1 : blockSize;
+      if (buffer.length - offset < payloadBytes) return { frames, tornStart: start };
+      offset += payloadBytes;
+      if (lastBlock) break;
+    }
+    if (checksum) {
+      if (buffer.length - offset < 4) return { frames, tornStart: start };
+      offset += 4;
+    }
+    frames.push({ start, end: offset });
+  }
+  return { frames };
+}
+
+/**
+ * Decode a dsh session log's concatenated-frame Zstandard container into its
+ * plaintext JSONL. A structurally torn final frame is dropped, not thrown
+ * on - readSessionStats already treats a session as best-effort telemetry,
+ * not an integrity check, and a trial's log is sometimes read immediately
+ * after the writer's last append.
+ */
+export function decodeZstdSessionLog(buffer: Buffer): string {
+  const { frames } = scanZstdFrames(buffer);
+  const decoded = frames.map((frame) => zstdDecompressSync(buffer.subarray(frame.start, frame.end)));
+  return Buffer.concat(decoded).toString("utf8");
+}
+
 export type SessionStatsReport = {
   /** Sum of every session file's fold - what an --trial-timeout-minutes report should show. */
   aggregate: SessionStats;
-  /** One entry per `$DSH_HOME/sessions/**\/*.jsonl` file found, for provenance/debugging. */
+  /** One entry per `$DSH_HOME/sessions/**\/*.jsonl`(`.zstd`) file found, for provenance/debugging. */
   sessions: Array<{ file: string; stats: SessionStats }>;
 };
 
@@ -212,10 +302,10 @@ export type SessionStatsReport = {
  * exactly one session file, so this only matters if that ever changes.
  *
  * Returns null (not an all-zero report) when `${dshHomeDir}/sessions/`
- * doesn't exist or holds no `.jsonl` file - that's a distinct, worth-
- * flagging outcome (the mount didn't work, or this dsh version doesn't
- * ship the session-persistence plugin) from "a session ran and genuinely
- * did nothing yet".
+ * doesn't exist or holds no `.jsonl`/`.jsonl.zstd` file - that's a
+ * distinct, worth-flagging outcome (the mount didn't work, or this dsh
+ * version doesn't ship the session-persistence plugin) from "a session ran
+ * and genuinely did nothing yet".
  */
 export async function readSessionStats(dshHomeDir: string): Promise<SessionStatsReport | null> {
   const sessions = await readRawSessionFiles(dshHomeDir);
@@ -225,12 +315,17 @@ export async function readSessionStats(dshHomeDir: string): Promise<SessionStats
 }
 
 /**
- * Reads and parses every session JSONL file under `${dshHomeDir}/sessions/`,
+ * Reads and parses every session log file under `${dshHomeDir}/sessions/`,
  * sorted by filename for a deterministic (if in practice almost always
  * single-file) order - the shared file-discovery this module's
  * `readSessionStats` and server/evals/dsh-trajectory-bridge.ts's
  * tool_call/shell_command derivation both build on. Returns null under the
  * same "nothing captured" condition documented on `readSessionStats`.
+ *
+ * Matches both `.jsonl` (compression: "none") and `.jsonl.zstd`
+ * (compression: "zstd", the plugin's default - see decodeZstdSessionLog's
+ * docstring) - a filter that only matched `.jsonl` found zero files on
+ * every real trial, since dsh writes zstd by default.
  */
 export async function readRawSessionFiles(dshHomeDir: string): Promise<Array<{ file: string; events: DshRawEvent[] }> | null> {
   const sessionsDir = join(dshHomeDir, "sessions");
@@ -240,12 +335,14 @@ export async function readRawSessionFiles(dshHomeDir: string): Promise<Array<{ f
   } catch {
     return null;
   }
-  const files = entries.filter((entry) => entry.endsWith(".jsonl")).sort();
+  const files = entries.filter((entry) => entry.endsWith(".jsonl") || entry.endsWith(".jsonl.zstd")).sort();
   if (files.length === 0) return null;
 
   return Promise.all(
     files.map(async (file) => {
-      const text = await readFile(join(sessionsDir, file), "utf8");
+      const text = file.endsWith(".jsonl.zstd")
+        ? decodeZstdSessionLog(await readFile(join(sessionsDir, file)))
+        : await readFile(join(sessionsDir, file), "utf8");
       return { file, events: parseSessionLog(text) };
     })
   );

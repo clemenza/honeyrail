@@ -3,8 +3,15 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
+import { zstdCompressSync, zstdDecompressSync } from "node:zlib";
 
-import { foldSessionStats, parseSessionLog, readSessionStats, type DshRawEvent } from "../server/evals/dsh-session-stats.js";
+import {
+  decodeZstdSessionLog,
+  foldSessionStats,
+  parseSessionLog,
+  readSessionStats,
+  type DshRawEvent
+} from "../server/evals/dsh-session-stats.js";
 
 async function tempDir(t: TestContext, prefix: string): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), prefix));
@@ -130,4 +137,67 @@ test("readSessionStats: sums independently-folded per-session files, returns nul
   assert.equal(report!.aggregate.turns, 3);
   assert.equal(report!.aggregate.steps, 3);
   assert.equal(report!.aggregate.llmMs, 100 + 50 + 30);
+});
+
+// @deepseek-ai/dsh-session-persistence-jsonl's DEFAULT_COMPRESSION is
+// "zstd" - every real trial's session log is a *concatenated-frame*
+// Zstandard container (one frame per durable event batch appended), not a
+// single stream. node:zlib's one-shot zstdDecompressSync only decodes the
+// first frame of a multi-frame buffer and silently drops the rest, so a
+// naive `zstdDecompressSync(wholeFile)` would recover only the header line.
+test("decodeZstdSessionLog: recovers every appended frame, not just the first", () => {
+  const frameA = zstdCompressSync(Buffer.from('{"type":"session","id":"s1"}\n'));
+  const frameB = zstdCompressSync(Buffer.from('{"type":"step/start","time":0,"data":{"turn":1,"step":1}}\n'));
+  const frameC = zstdCompressSync(Buffer.from('{"type":"step/end","time":5,"data":{"turn":1}}\n'));
+  const concatenated = Buffer.concat([frameA, frameB, frameC]);
+
+  // Sanity check the exact failure mode this ports around: the naive
+  // one-shot call really does drop everything past the first frame.
+  assert.equal(zstdDecompressSync(concatenated).toString("utf8"), '{"type":"session","id":"s1"}\n');
+
+  const text = decodeZstdSessionLog(concatenated);
+  const events = parseSessionLog(text);
+  assert.equal(events.length, 3);
+  assert.deepEqual(
+    events.map((e) => e.type),
+    ["session", "step/start", "step/end"]
+  );
+});
+
+test("decodeZstdSessionLog: a torn/incomplete final frame is dropped, not thrown on", () => {
+  const frameA = zstdCompressSync(Buffer.from('{"type":"session","id":"s1"}\n'));
+  const frameB = zstdCompressSync(Buffer.from('{"type":"step/end","time":5,"data":{"turn":1}}\n'));
+  const torn = Buffer.concat([frameA, frameB.subarray(0, Math.floor(frameB.length / 2))]);
+
+  const text = decodeZstdSessionLog(torn);
+  const events = parseSessionLog(text);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].type, "session");
+});
+
+test("decodeZstdSessionLog: rejects a buffer that isn't a Zstandard frame at all", () => {
+  assert.throws(() => decodeZstdSessionLog(Buffer.from("not zstd")), /corrupt Zstandard session log/);
+});
+
+test("readSessionStats: reads a real .jsonl.zstd session log (dsh's default compression), matching a .jsonl sibling's stats", async (t) => {
+  const dshHomeDir = await tempDir(t, "honeyrail-dsh-home-zstd-");
+  const sessionsDir = join(dshHomeDir, "sessions", "proj");
+  await mkdir(sessionsDir, { recursive: true });
+
+  const events = [
+    { type: "step/start", time: 0, data: { turn: 1, step: 1 } },
+    { type: "assistant/message", time: 40, data: { turn: 1, step: 1 } },
+    { type: "step/end", time: 40, data: { turn: 1 } }
+  ];
+  // dsh's own writer appends one Zstandard frame per event batch - split
+  // across two frames here to also exercise multi-frame concatenation.
+  const frame1 = zstdCompressSync(Buffer.from(events.slice(0, 2).map((e) => JSON.stringify(e)).join("\n") + "\n"));
+  const frame2 = zstdCompressSync(Buffer.from(JSON.stringify(events[2]) + "\n"));
+  await writeFile(join(sessionsDir, "session.jsonl.zstd"), Buffer.concat([frame1, frame2]));
+
+  const report = await readSessionStats(dshHomeDir);
+  assert.ok(report, "a .jsonl.zstd-only sessions/ dir must not read back as null");
+  assert.equal(report!.sessions.length, 1);
+  assert.equal(report!.sessions[0]!.file, join("proj", "session.jsonl.zstd"));
+  assert.deepEqual(report!.aggregate, { turns: 1, steps: 1, llmMs: 40, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 });
 });
