@@ -31,7 +31,7 @@ export type DshTrialRecord = {
    * agent ran. False means tinytable/, sql-tests/official/, SPEC.md,
    * run_sql_tests.py, or findings.schema.json changed - the exact #103
    * failure mode (an agent tampering with/replacing protected content) -
-   * and always forces outcome "invalidated" regardless of what score.py
+   * and always forces outcome "invalidated" regardless of what grade.py
    * reported, since a tampered fixture proves nothing about the agent's
    * real test-engineering ability.
    */
@@ -46,12 +46,15 @@ export type DshTrialRecord = {
    */
   transcriptAuditHits: string[];
   /**
-   * #107's kill matrix: this trial's sql-tests/agent/ suite, replayed
-   * against every other mutant in the private pool (score.py's
-   * --kill-matrix-pool), keyed by mutant id. null when the driver didn't
-   * request it (e.g. the trial never reached scoring at all).
+   * #126 (vendor/tinytable-evals's grade.py, its own issue #21 "Grader
+   * v2"): fraction of --grader-runs probabilistic-scoring seeds that
+   * killed this fixture's mutant - a generalization of `killed` for
+   * nondeterministic bugs. null whenever `killed` is (the trial never
+   * reached scoring, or scoring errored).
    */
-  killMatrix: Record<string, boolean> | null;
+  killRate: number | null;
+  /** Killed tests split by whether they're an "invariant" (assert_stats/--check-admissibility) violation vs a plain "assertion". null alongside killRate. */
+  killedByKind: { assertion: number; invariant: number } | null;
   blockedReason?: string;
   wallTimeMs?: number;
   error?: string;
@@ -61,7 +64,7 @@ export type DshTrialRecord = {
  * Scores one cell. "invalidated" takes priority over everything else - see
  * DshTrialRecord.integrityOk/transcriptAuditHits. "blocked" is next: an
  * agent that printed BLOCKED: per UNATTENDED_PREAMBLE made no claim about
- * the fixture at all. Otherwise this reads score.py's own verdict:
+ * the fixture at all. Otherwise this reads grade.py's own verdict:
  * killed==false means the agent's suite never caught the seeded defect
  * (task_failed - the black-box test-engineering task itself wasn't done);
  * killed==true but false_alarms>0 or contract_ok==false means it found
@@ -81,20 +84,6 @@ export function classifyDshOutcome(
   if (!cell.killed) return "task_failed";
   if ((cell.falseAlarms ?? 0) > 0 || !cell.contractOk) return "verify_failed";
   return "passed";
-}
-
-/**
- * Fraction of the private pool (excluding this trial's own fixture) the
- * agent's suite also killed - #107's "spray and pray" hedging signal. High
- * values mean the suite rejects almost any implementation, not just the
- * one seeded deviation SPEC.md describes for this fixture. null when no
- * kill matrix was computed for this trial.
- */
-export function sprayAndPrayRate(trial: Pick<DshTrialRecord, "fixture" | "killMatrix">): number | null {
-  if (!trial.killMatrix) return null;
-  const others = Object.entries(trial.killMatrix).filter(([mutantId]) => mutantId !== trial.fixture);
-  if (!others.length) return null;
-  return others.filter(([, killed]) => killed).length / others.length;
 }
 
 export type ProfileSummary = {
@@ -119,8 +108,10 @@ export type FixtureCellSummary = {
   falseAlarmRate: number | null;
   contractComplianceRate: number | null;
   medianWallTimeMs: number | null;
-  /** Mean of sprayAndPrayRate() (#107) across this cell's trials that have a kill matrix; null if none do. */
-  meanSprayAndPrayRate: number | null;
+  /** Mean of scorable trials' probabilistic killRate (#126); null if none have one. */
+  meanKillRate: number | null;
+  /** Summed killedByKind across scorable trials that have one; null if none do. */
+  killedByKind: { assertion: number; invariant: number } | null;
 };
 
 function median(values: number[]): number | null {
@@ -170,11 +161,11 @@ export function summarizeFixtureCells(trials: DshTrialRecord[]): FixtureCellSumm
   }
   return [...byCell.entries()].map(([key, records]) => {
     const [fixture, profile] = key.split("\u0000");
-    // Scorable records: score.py's verdict is actually trustworthy for this
+    // Scorable records: grade.py's verdict is actually trustworthy for this
     // cell - i.e. classifyDshOutcome would call it "passed"/"task_failed"/
     // "verify_failed", not "blocked"/"invalidated"/"driver_error". An
     // invalidated trial (integrityOk=false) can still carry non-null
-    // killed/contractOk fields from a stale score.py run against tampered
+    // killed/contractOk fields from a stale grade.py run against tampered
     // content - those must not count toward kill rate/false-alarm rate/
     // contract compliance any more than a blocked or driver-errored trial
     // would.
@@ -188,7 +179,8 @@ export function summarizeFixtureCells(trials: DshTrialRecord[]): FixtureCellSumm
       ? scorable.filter((r) => r.contractOk).length / scorable.length
       : null;
     const wallTimes = records.map((r) => r.wallTimeMs).filter((ms): ms is number => typeof ms === "number");
-    const sprayAndPrayRates = records.map((r) => sprayAndPrayRate(r)).filter((rate): rate is number => rate !== null);
+    const probabilisticKillRates = scorable.map((r) => r.killRate).filter((rate): rate is number => rate !== null);
+    const kindTallies = scorable.map((r) => r.killedByKind).filter((k): k is { assertion: number; invariant: number } => k !== null);
     return {
       fixture,
       profile,
@@ -197,8 +189,11 @@ export function summarizeFixtureCells(trials: DshTrialRecord[]): FixtureCellSumm
       falseAlarmRate,
       contractComplianceRate,
       medianWallTimeMs: median(wallTimes),
-      meanSprayAndPrayRate: sprayAndPrayRates.length
-        ? sprayAndPrayRates.reduce((a, b) => a + b, 0) / sprayAndPrayRates.length
+      meanKillRate: probabilisticKillRates.length
+        ? probabilisticKillRates.reduce((a, b) => a + b, 0) / probabilisticKillRates.length
+        : null,
+      killedByKind: kindTallies.length
+        ? kindTallies.reduce((acc, k) => ({ assertion: acc.assertion + k.assertion, invariant: acc.invariant + k.invariant }), { assertion: 0, invariant: 0 })
         : null
     };
   });
@@ -276,7 +271,7 @@ export function buildDshComparisonReport(input: DshComparisonReportInput): strin
   lines.push("## Summary");
   lines.push("");
   lines.push(
-    "Pass rate excludes `blocked`, `invalidated`, and `driver_error` trials from its denominator - none carry a pass/fail signal about the agent's test-engineering. `invalidated` (#107) means either the post-run manifest re-check (#106) found tinytable/, sql-tests/official/, or another protected fixture file changed, or the transcript audit found the agent's own output/artifacts referencing material outside the exam room - the #103 failure mode - regardless of what score.py itself reported."
+    "Pass rate excludes `blocked`, `invalidated`, and `driver_error` trials from its denominator - none carry a pass/fail signal about the agent's test-engineering. `invalidated` (#107) means either the post-run manifest re-check (#106) found tinytable/, sql-tests/official/, or another protected fixture file changed, or the transcript audit found the agent's own output/artifacts referencing material outside the exam room - the #103 failure mode - regardless of what grade.py itself reported."
   );
   lines.push("");
   lines.push(
@@ -292,17 +287,18 @@ export function buildDshComparisonReport(input: DshComparisonReportInput): strin
   lines.push("## Per-fixture breakdown");
   lines.push("");
   lines.push(
-    "Spray-and-pray rate (#107) is the mean fraction of the *other* mutants in the private pool this cell's suites also killed - high values suggest tests broad enough to reject almost any implementation, not ones that pin down the one deviation SPEC.md describes for this specific fixture."
+    "Mean kill rate (#126) is the mean, across this cell's scorable trials, of vendor/tinytable-evals's grade.py `kill_rate` - the fraction of `--grader-runs` probabilistic-scoring seeds that killed the trial's own mutant (a generalization of the boolean `Kill rate` column for nondeterministic bugs; equal to it when `--grader-runs 1`, the default). Killed by kind sums how many killed tests were an \"invariant\" violation (`assert_stats`/`--check-admissibility`) vs a plain assertion, across the same trials."
   );
   lines.push("");
-  lines.push("| Fixture | Profile | Trials | Kill rate | False-alarm rate | Contract compliance | Spray-and-pray rate | Median wall time |");
-  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
+  lines.push("| Fixture | Profile | Trials | Kill rate | False-alarm rate | Contract compliance | Mean kill rate | Killed by kind (assertion/invariant) | Median wall time |");
+  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const fixture of input.fixtures) {
     for (const profile of profiles) {
       const cell = cells.find((item) => item.fixture === fixture && item.profile === profile);
       if (!cell) continue;
+      const killedByKind = cell.killedByKind ? `${cell.killedByKind.assertion}/${cell.killedByKind.invariant}` : "n/a";
       lines.push(
-        `| \`${fixture}\` | \`${profile}\` | ${cell.trials} | ${percent(cell.killRate)} | ${percent(cell.falseAlarmRate)} | ${percent(cell.contractComplianceRate)} | ${percent(cell.meanSprayAndPrayRate)} | ${seconds(cell.medianWallTimeMs)} |`
+        `| \`${fixture}\` | \`${profile}\` | ${cell.trials} | ${percent(cell.killRate)} | ${percent(cell.falseAlarmRate)} | ${percent(cell.contractComplianceRate)} | ${percent(cell.meanKillRate)} | ${killedByKind} | ${seconds(cell.medianWallTimeMs)} |`
       );
     }
   }
@@ -310,32 +306,6 @@ export function buildDshComparisonReport(input: DshComparisonReportInput): strin
   lines.push("## Paired delta by fixture");
   lines.push("");
   lines.push(...pairedDeltaTable(cells, input.fixtures, profiles));
-  lines.push("");
-  lines.push("## Kill matrix");
-  lines.push("");
-  lines.push(
-    "Raw per-mutant kill result (#107) for every trial that had one computed - `score.py --kill-matrix-pool`, run against the private pool independently of which mutant this trial was actually scored against. This is the data `Spray-and-pray rate` above summarizes."
-  );
-  lines.push("");
-  const poolMutantIds = [...new Set(input.trials.flatMap((t) => (t.killMatrix ? Object.keys(t.killMatrix) : [])))].sort();
-  if (poolMutantIds.length === 0) {
-    lines.push("No trial had a kill matrix computed.");
-  } else {
-    lines.push(`| Trial | ${poolMutantIds.map((id) => `\`${id}\``).join(" | ")} |`);
-    lines.push(`| --- | ${poolMutantIds.map(() => "---").join(" | ")} |`);
-    const withMatrix = [...input.trials]
-      .filter((t) => t.killMatrix)
-      .sort((a, b) => a.fixture.localeCompare(b.fixture) || a.profile.localeCompare(b.profile) || a.trial - b.trial);
-    for (const trial of withMatrix) {
-      const row = poolMutantIds.map((id) => {
-        const killed = trial.killMatrix![id];
-        if (killed === undefined) return "—";
-        const isOwnFixture = id === trial.fixture;
-        return killed ? (isOwnFixture ? "**killed**" : "killed") : "-";
-      });
-      lines.push(`| \`${trial.trialId}\` | ${row.join(" | ")} |`);
-    }
-  }
   lines.push("");
   lines.push("## Per-trial evidence");
   lines.push("");

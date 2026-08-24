@@ -28,7 +28,8 @@ function trial(overrides: Partial<DshTrialRecord> & Pick<DshTrialRecord, "trialI
     contractOk: true,
     integrityOk: true,
     transcriptAuditHits: [],
-    killMatrix: null,
+    killRate: null,
+    killedByKind: null,
     wallTimeMs: 12_000,
     ...overrides
   };
@@ -162,13 +163,14 @@ test("GET /api/evals/dsh-runs/trial returns null artifacts (not an error) when a
 });
 
 // Regression: a state.json written by a driver from before #107 added
-// transcriptAuditHits/killMatrix has trial records with neither field at
-// all - classifyDshOutcome()'s unconditional `.transcriptAuditHits.length`
-// must not crash the reader just because an older directory is being
-// browsed. Writes the raw JSON directly (not via the trial() helper, which
-// always fills both fields) to reproduce the exact on-disk shape an old
-// driver run left behind.
-test("GET /api/evals/dsh-runs tolerates a state.json from before transcriptAuditHits/killMatrix existed", async (t) => {
+// transcriptAuditHits (or before #126 replaced killMatrix with
+// killRate/killedByKind) has trial records missing those fields entirely -
+// classifyDshOutcome()'s unconditional `.transcriptAuditHits.length` must
+// not crash the reader just because an older directory is being browsed.
+// Writes the raw JSON directly (not via the trial() helper, which always
+// fills every field) to reproduce the exact on-disk shape an old driver
+// run left behind.
+test("GET /api/evals/dsh-runs tolerates a state.json from before transcriptAuditHits/killRate existed", async (t) => {
   const { baseUrl, tempDir } = await withServer(t);
   const outDir = join(tempDir, "old-report");
   await mkdir(outDir, { recursive: true });
@@ -190,7 +192,7 @@ test("GET /api/evals/dsh-runs tolerates a state.json from before transcriptAudit
           contractOk: true,
           integrityOk: true,
           wallTimeMs: 12_000
-          // no transcriptAuditHits, no killMatrix - the pre-#107 shape.
+          // no transcriptAuditHits, no killRate/killedByKind - the pre-#107/#126 shape.
         }
       ]
     })
@@ -202,7 +204,8 @@ test("GET /api/evals/dsh-runs tolerates a state.json from before transcriptAudit
   assert.equal(body.trials.length, 1);
   assert.equal(body.trials[0].outcome, "passed");
   assert.deepEqual(body.trials[0].transcriptAuditHits, []);
-  assert.equal(body.trials[0].killMatrix, null);
+  assert.equal(body.trials[0].killRate, null);
+  assert.equal(body.trials[0].killedByKind, null);
 });
 
 test("GET /api/evals/dsh-runs/trial 404s for an unknown trialId", async (t) => {

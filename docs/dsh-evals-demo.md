@@ -8,11 +8,57 @@ fixture matrix (#87-#93): `fixtures x profiles x trials` scored
 ## Usage
 
 ```sh
+git submodule update --init vendor/tinytable-evals              # once, or after a fresh clone
 docker build -t tinytable-exam-room:latest docker/tinytable-exam-room  # once
 DEEPSEEK_API_KEY=... node --import tsx scripts/dsh-evals-demo.ts --smoke
 node --import tsx scripts/dsh-evals-demo.ts                            # full 48-run matrix
 node --import tsx scripts/dsh-evals-demo.ts --report-only --out ./dsh-evals-report
 ```
+
+Fixtures are now integer seeds into `vendor/tinytable-evals`'s mutation
+operator library (default `0..7`), not mutant ids - `--fixtures 0,3,5`
+selects a subset. `--grader-runs <n>`/`--kill-rate-threshold <t>` pass
+through to `grade.py`'s own probabilistic multi-seed scoring (#21 upstream;
+default `--grader-runs 1` reproduces the original single-run behavior
+exactly).
+
+## Pinned upstream commit (#126)
+
+The builder/grader/`task-prompt.md` this driver drives are no longer an
+in-repo copy - they come from `vendor/tinytable-evals`, a git submodule
+pinned to a specific upstream commit:
+
+```
+$ git -C vendor/tinytable-evals rev-parse HEAD
+78bcc980a5c388710a59a8db64c74471c3399a13
+```
+
+Before #126, `examples/tinytable-eval/{mutants,golden,score.py}` was a
+static copy frozen at the point #104 extracted it, and had already drifted
+substantially from `clemenza/tinytable-evals`'s own evolution (dynamic
+per-seed mutation instead of 8 static mutants, a deterministic scheduler/
+simulation substrate, a conflict-serializability admissibility checker,
+probabilistic multi-seed kill-rate scoring) by the time this migration
+landed - see the issue for the full list. `examples/tinytable-eval/` now
+holds only `profiles/` (the `cordis.patch.yml` baseline/candidate
+instruction variants, which are a honeyrail-side eval concern, not tinytable
+answer material); everything about the engine, its mutation operators, and
+its grading pipeline comes from the pinned submodule instead.
+
+**Re-pinning:** bump the pin whenever a `tinytable-evals` milestone issue
+closes (its README documents forthcoming WAL/crash-recovery and MVCC engine
+work), or periodically (e.g. every few weeks) if nothing forces it sooner.
+To re-pin:
+
+```sh
+cd vendor/tinytable-evals && git fetch && git checkout <new-commit> && cd -
+git add vendor/tinytable-evals
+```
+
+Then re-run this driver's own tests (`test/tinytable-seed-root-builder.test.ts`,
+`test/dsh-evals-demo.test.ts`) and a `--smoke` run before committing the
+bump - a re-pin can change `build_seed_root.py`'s seed-root layout or
+`grade.py`'s `score.json` shape, same as it did for this migration itself.
 
 ## Why a scored cell never becomes a HoneyRail Run
 
@@ -32,30 +78,40 @@ So each cell instead calls the three zone components built for #104/#105/#106
 directly, with no HoneyRail Run, Step, worktree, or tmux session involved at
 all:
 
-1. **Builder** (#104) - `buildSeedRoot()` materializes an answer-free
-   seed-root for the chosen mutant, plus a manifest (file list + SHA-256
-   hashes) that never enters the seed-root itself.
+1. **Builder** (#104, migrated to `vendor/tinytable-evals`'s own
+   `build_seed_root.py` by #126) - `buildSeedRoot()` shells out to
+   `build_seed_root.py --seed N --out DIR`, which deterministically picks a
+   mutation operator for `N`, applies it to a fresh copy of the vendored
+   `clean/tinytable`, and assembles an answer-free, git-initialized
+   seed-root. `buildSeedRoot()` then walks that output itself to build a
+   manifest (file list + SHA-256 hashes) that never enters the seed-root -
+   the chosen operator id (the actual answer) is passed only as
+   `build_seed_root.py`'s `SEED_ROOT_JSON:` stdout line, parsed by the
+   builder and written to the manifest, never to `DIR`.
 2. **Preflight** (#106) - `findManifestMismatches()` checks the freshly-built
    seed-root against its own manifest before launch (defense in depth - the
    builder should already guarantee this holds).
 3. **Exam room** (#105) - `runInExamRoom()` runs `dsh --profile headless
    --patch cordis.patch.yml <prompt>` inside an isolated container with only
-   that seed-root bind-mounted. Before launch, the driver `git init`s the
-   seed-root itself (score.py's own docstring requires the worktree to
-   already be "its own git repository, freshly committed before the agent
-   touched it" for its protected-path check to work - #104's builder
-   deliberately doesn't do this, since it's an exam-room/launch concern,
-   not a builder one).
-4. **Grader** (#107, zone 3) - after the container exits:
+   that seed-root bind-mounted. `build_seed_root.py` already git-inits and
+   commits the seed-root itself before the driver ever sees it; the driver
+   re-does a `git init`/`add`/`commit` anyway as defense in depth (a no-op
+   against an already-clean tree) and to keep itself independent of exactly
+   which builder produced the worktree - `grade.py`'s own docstring still
+   requires the worktree to already be "its own git repository, freshly
+   seeded before the agent touched it" for its protected-path check to
+   work.
+4. **Grader** (#107, zone 3; migrated to `vendor/tinytable-evals`'s own
+   `grade.py` by #126) - after the container exits:
    - The *same* #106 manifest check runs again against the seed-root. Any
      difference from the pre-run check means a protected file (`tinytable/`,
-     `sql-tests/official/`, `SPEC.md`, `run_sql_tests.py`,
-     `findings.schema.json`) was tampered with - the exact #103 failure
-     mode, including the specific `.gitignore`-hiding trick from that
-     incident's transcript (reproduced exactly in
-     `test/dsh-grader-invalidated.test.ts`), which this hash-based check
-     catches even though it would fool `score.py`'s own `git status`-based
-     one.
+     `sql-tests/official/`, `SPEC.md`, `run_sql_tests.py`, `scheduler.py`,
+     `substrate.py`, `admissibility.py`, `findings.schema.json`) was
+     tampered with - the exact #103 failure mode, including the specific
+     `.gitignore`-hiding trick from that incident's transcript (reproduced
+     exactly in `test/dsh-grader-invalidated.test.ts`), which this
+     hash-based check catches even though it would fool `grade.py`'s own
+     `git status`-based one.
    - `server/evals/transcript-audit.ts`'s `auditTranscript()` scans the
      container's captured stdout/stderr plus the agent's own artifacts
      (`findings.json`, its `.test` files) for references to material
@@ -65,39 +121,47 @@ all:
      to read), but a reference in what the agent wrote or said is still
      worth flagging.
    - Either forces the trial's outcome to `invalidated` regardless of what
-     `score.py` itself reports - see `server/evals/dsh-report.ts`'s
+     `grade.py` itself reports - see `server/evals/dsh-report.ts`'s
      `classifyDshOutcome`.
-   - `score.py` then runs on the host (the grader zone proper, never inside
-     the container) with `--kill-matrix-pool examples/tinytable-eval/mutants`:
-     the agent's `sql-tests/agent/` suite, replayed against every *other*
-     mutant in the private pool, not just the one this trial was scored
-     against. A suite broad enough to kill most/all of the pool is
-     evidence of "spray and pray" hedging rather than a targeted test that
-     pins down the one deviation SPEC.md describes for this fixture - see
-     `sprayAndPrayRate()` and the report's "Kill matrix"/"Per-fixture
-     breakdown" sections.
+   - `grade.py` then runs on the host (the grader zone proper, never inside
+     the container), scoring `--grader-runs` seeds (default 1) of the
+     agent's `sql-tests/agent/` suite against the seed-root's own mutant vs
+     a fresh copy of the vendored `clean/`, and reports `kill_rate`
+     (fraction of those seeds that killed it), `killed_by_kind`
+     (`assertion` vs `invariant` - an `assert_stats`/`--check-admissibility`
+     violation), and a `per_run` breakdown - upstream issue #21's
+     "Grader v2" probabilistic scoring, in place of the single-run
+     all-or-nothing `killed` this driver used to be the only consumer of
+     (still reported, now derived from `kill_rate >= --kill-rate-threshold`,
+     default 1.0 so `--grader-runs 1` is unchanged behavior).
    - `run_mt185iaf_ykwl0c` (the specific run #103's postmortem names as
      contaminated) isn't something this repo can mark discarded - it's
      production data on whoever ran that trial's own HoneyRail deployment,
      outside this codebase entirely. What #107 actually delivers is the
-     *mechanism* (kill matrix, transcript audit, hash-based integrity
-     re-check, `invalidated` verdict) that would have caught it
-     automatically had it existed at the time.
-   - **#108**: if the driver's own `findBlockedReason()` found a `BLOCKED:
-     <reason>` line in the container's output, that reason is passed to
-     `score.py --agent-blocked-reason`. An agent that hit a genuinely
-     broken/incomplete environment and correctly stopped per
-     `UNATTENDED_PREAMBLE` - rather than "self-repairing" the way #103's
-     agent did - has nothing to submit, and `score.py` now credits that:
-     an empty `sql-tests/agent/` and a missing `findings.json` are not
-     contract violations when a blocked reason is present. The protected-
-     path check is never waived, and whatever the agent *did* write anyway
-     is still validated normally - the credit only covers not having
-     submitted anything, never tampering. In the report, this shows up as
-     a `blocked` trial with `Contract OK = true` - visibly distinct from
-     an `invalidated` self-repair trial, which can carry `Contract OK =
-     true` from a stale `score.py` verdict but is always overridden to
-     `invalidated` by the integrity/transcript checks regardless.
+     *mechanism* (transcript audit, hash-based integrity re-check,
+     `invalidated` verdict) that would have caught it automatically had it
+     existed at the time.
+   - **Dropped by #126: the private-mutant-pool kill matrix / "spray and
+     pray" signal.** The old `score.py --kill-matrix-pool
+     examples/tinytable-eval/mutants` replayed the agent's suite against
+     every *other* static mutant in the repo to flag tests broad enough to
+     reject almost any implementation. `vendor/tinytable-evals` has no
+     persisted mutant pool to replay against - mutants are generated
+     on-the-fly from a seed and never committed - so this signal has no
+     upstream equivalent today. `DshTrialRecord.killMatrix` and
+     `sprayAndPrayRate()` were removed; the per-fixture report table now
+     shows `killed_by_kind` (assertion vs. invariant) instead.
+   - **Dropped by #126: #108's `--agent-blocked-reason` contract waiver.**
+     `grade.py` has no equivalent flag to the old `score.py`'s - a
+     correctly-`BLOCKED:` trial's `contract_ok` may now read `false` for
+     its empty submission instead of getting credit for stopping cleanly.
+     This is cosmetic, not a classification regression:
+     `classifyDshOutcome` already returns `"blocked"` before ever
+     consulting `killed`/`contractOk` whenever `blockedReason` is set, so
+     a blocked trial is still reported as `blocked`, distinct from an
+     `invalidated` self-repair trial, exactly as before - only the raw
+     `Contract OK` value shown for it in the per-trial evidence table
+     changed.
 
 ## What this means for the original acceptance criteria
 
@@ -120,7 +184,7 @@ all:
   candidate-instruction content is #95's job.
 - Cells run sequentially (mirrors `scripts/evals-ab-demo.ts`'s own
   rationale, adapted: bounds host resource usage from concurrent docker
-  containers + `score.py` processes). Each cell is fully isolated from the
+  containers + `grade.py` processes). Each cell is fully isolated from the
   others, so parallelizing is safe to add later; #78 (server-side
   `maxParallel`) doesn't apply here since there's no Run to attach it to.
 - `state.json` is written after every cell, so a `--report-only` rerun (or

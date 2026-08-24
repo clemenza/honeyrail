@@ -1,0 +1,3 @@
+[submodule "vendor/tinytable-evals"]
+	path = vendor/tinytable-evals
+	url = https://github.com/clemenza/tinytable-evals

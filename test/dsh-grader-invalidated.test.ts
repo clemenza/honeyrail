@@ -31,8 +31,11 @@ async function gitInitCommit(repoPath: string) {
 }
 
 test("#107: fixture replacement hidden via .gitignore is still caught as invalidated by the hash-based manifest re-check", async (t) => {
-  const seedRootDir = await tempDir(t, "honeyrail-103-repro-");
-  const manifest = await buildSeedRoot({ mutantId: "m01", outDir: seedRootDir });
+  // build_seed_root.py requires --out to not exist at all (not merely be
+  // empty), so seedRootDir must be a not-yet-created subpath of a fresh
+  // temp dir, not tempDir()'s own (already mkdtemp-created) directory.
+  const seedRootDir = join(await tempDir(t, "honeyrail-103-repro-"), "seed-root");
+  const manifest = await buildSeedRoot({ seed: 0, outDir: seedRootDir });
   await gitInitCommit(seedRootDir);
 
   // The #103 agent's exact move, replayed precisely: per its transcript, it

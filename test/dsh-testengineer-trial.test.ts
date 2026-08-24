@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -15,45 +15,54 @@ import { loadRecipesFromDirectory, materializeRecipe } from "../server/recipes/r
 import { JsonStore } from "../server/store.js";
 import { WorktreeManager } from "../server/worktrees.js";
 import { runCommandSafe } from "../server/utils.js";
+import { buildSeedRoot } from "../scripts/tinytable-seed-root-builder.js";
 
-// #92: dsh-testengineer-trial.yaml wires the DSH adapter (#88) and score.py
-// (#91) into a single trial's "score" step. A live agent=dsh run needs a
-// real dsh install + DEEPSEEK_API_KEY (neither available in CI - see
-// docs/dsh-adapter-notes.md's own precedent of live-verifying the adapter
-// itself in a separate manual spike, and orchestration-e2e.test.ts's own
-// note that AgentTaskExecutor isn't exercised with a real tmux-backed CLI
-// in automated e2e tests). What *is* fully testable here, end to end
-// through the real OrchestrationService/WorktreeManager/CheckExecutor (no
-// mocks) and the real score.py, is the half of the acceptance criteria
-// that doesn't require a live agent: "the score step's quality gate
-// correctly reflects score.py's exit code" - exercised on the actual
-// materialized "score" step from the shipped recipe, against a real
-// tinytable-eval mutant fixture, standing in for what a completed
-// test-engineer step would have left in the worktree.
+// #92: dsh-testengineer-trial.yaml wires the DSH adapter (#88) and (#126:
+// vendor/tinytable-evals's) grade.py into a single trial's "score" step. A
+// live agent=dsh run needs a real dsh install + DEEPSEEK_API_KEY (neither
+// available in CI - see docs/dsh-adapter-notes.md's own precedent of
+// live-verifying the adapter itself in a separate manual spike, and
+// orchestration-e2e.test.ts's own note that AgentTaskExecutor isn't
+// exercised with a real tmux-backed CLI in automated e2e tests). What *is*
+// fully testable here, end to end through the real
+// OrchestrationService/WorktreeManager/CheckExecutor (no mocks) and the
+// real grade.py, is the half of the acceptance criteria that doesn't
+// require a live agent: "the score step's quality gate correctly reflects
+// the grader's exit code" - exercised on the actual materialized "score"
+// step from the shipped recipe, against a real vendor/tinytable-evals
+// seed-root, standing in for what a completed test-engineer step would
+// have left in the worktree.
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..");
 const shippedRecipesDir = join(repoRoot, "server", "recipes");
-const tinytableEvalDir = join(repoRoot, "examples", "tinytable-eval");
-const scorePy = join(tinytableEvalDir, "score.py");
-const cleanRoot = join(tinytableEvalDir, "clean");
-const mutantM01 = join(tinytableEvalDir, "mutants", "m01");
-const goldenM01 = join(tinytableEvalDir, "golden", "m01.test");
+const gradePy = join(repoRoot, "vendor", "tinytable-evals", "grade.py");
+
+// The seed pinned for this test - #126's vendor/tinytable-evals at its
+// current pin (see docs/dsh-evals-demo.md's "Pinned upstream commit"
+// section) deterministically maps seed 0 to the "limit-offset-order-
+// swapped" operator (LIMIT applied before OFFSET instead of after). The
+// "killed" test below hand-writes a `.test` file targeting exactly that
+// behavioral guarantee, rather than depending on any static answer-key
+// fixture (none exists any more - see #126). Re-pinning vendor/tinytable-
+// evals to a commit whose OPERATORS list changed can change what seed 0
+// maps to; if this test starts failing after a re-pin, that's the expected
+// signal to re-derive which operator seed 0 now selects and update the
+// `.test` file below to target it (see docs/dsh-evals-demo.md's re-pin
+// process).
+const KILL_SEED = 0;
 
 function scoreCommand() {
-  return `python3 ${scorePy} --worktree . --clean ${cleanRoot} --out score.json`;
+  return `python3 ${gradePy} --artifacts . --out score.json`;
 }
 
 async function initFixtureRepo(repoPath: string) {
-  await mkdir(repoPath, { recursive: true });
-  await cp(join(mutantM01, "tinytable"), join(repoPath, "tinytable"), { recursive: true });
-  await cp(join(mutantM01, "sql-tests", "official"), join(repoPath, "sql-tests", "official"), { recursive: true });
-  await runCommandSafe("git", ["init"], { cwd: repoPath });
+  await buildSeedRoot({ seed: KILL_SEED, outDir: repoPath });
+  // build_seed_root.py's own `git init` doesn't pin a branch name, so it
+  // takes whatever this machine's git init.defaultBranch is - force "main"
+  // to match the project's own defaultBranch below, same as the old
+  // fixture setup did explicitly.
   await runCommandSafe("git", ["checkout", "-B", "main"], { cwd: repoPath });
-  await runCommandSafe("git", ["config", "user.email", "e2e@example.com"], { cwd: repoPath });
-  await runCommandSafe("git", ["config", "user.name", "E2E"], { cwd: repoPath });
-  await runCommandSafe("git", ["add", "-A"], { cwd: repoPath });
-  await runCommandSafe("git", ["commit", "-m", "seed"], { cwd: repoPath });
 }
 
 async function withServer(t: TestContext) {
@@ -97,7 +106,7 @@ async function withServer(t: TestContext) {
   await new Promise<void>((res) => server.listen(0, "127.0.0.1", () => res()));
   const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const project = await store.createProject({
-    name: "tinytable-m01",
+    name: "tinytable-seed0",
     repoPath,
     defaultBranch: "main",
     defaultAgent: "dsh",
@@ -145,29 +154,60 @@ async function materializedScoreStep(projectId: string) {
   return materialized.steps.find((step) => step.id === "score")!;
 }
 
+// Kills exactly KILL_SEED's "limit-offset-order-swapped" operator: correct
+// LIMIT/OFFSET semantics apply OFFSET before LIMIT (skip 3, then take 2 of
+// what's left -> rows 4,5), the mutant applies LIMIT first (take 2 -> rows
+// 1,2 - only 2 elements - then offset 3 of those -> empty). Verified
+// directly against both a seed-0 seed-root and vendor/tinytable-evals's
+// own clean/ while writing this test (clean: passes; seed-0 mutant: fails
+// with actual=[] vs expected=[4,5]).
+const KILLING_TEST = `statement ok
+CREATE TABLE t (x INTEGER)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+statement ok
+INSERT INTO t VALUES (2)
+
+statement ok
+INSERT INTO t VALUES (3)
+
+statement ok
+INSERT INTO t VALUES (4)
+
+statement ok
+INSERT INTO t VALUES (5)
+
+query I nosort
+SELECT x FROM t ORDER BY x LIMIT 2 OFFSET 3
+----
+4
+5
+`;
+
 test("dsh-testengineer-trial's score step: quality gate passes when sql-tests/agent/ kills the seeded mutant", async (t) => {
   const { baseUrl, store, service, worktrees, project } = await withServer(t);
   const scoreStep = await materializedScoreStep(project.id);
 
-  const created = await worktrees.create({ project, title: "m01-killed", agent: "dsh" });
+  const created = await worktrees.create({ project, title: "seed0-killed", agent: "dsh" });
   const worktree = await store.createWorktree({ ...created, agent: "dsh" } as any);
 
   // Stands in for what a completed "test-engineer" step would have left in
   // the worktree: a real .test file that kills this fixture's seeded
-  // defect (golden/m01.test - see #90), plus findings.json, as uncommitted
-  // worktree edits (agents don't commit on their own - see
-  // WorktreeManager.diff's own comment).
+  // defect, plus findings.json, as uncommitted worktree edits (agents
+  // don't commit on their own - see WorktreeManager.diff's own comment).
   await mkdir(join(worktree.path, "sql-tests", "agent"), { recursive: true });
-  await cp(goldenM01, join(worktree.path, "sql-tests", "agent", "m01.test"));
+  await writeFile(join(worktree.path, "sql-tests", "agent", "limit_offset_kill.test"), KILLING_TEST);
   await writeFile(
     join(worktree.path, "findings.json"),
     JSON.stringify(
       [
         {
-          id: "m01",
-          summary: "`x = NULL` incorrectly matches a NULL row instead of never matching.",
-          spec_section: "NULL semantics (three-valued logic)",
-          repro_test: "sql-tests/agent/m01.test"
+          id: "limit-offset-order",
+          summary: "LIMIT/OFFSET applied in the wrong order: OFFSET must be applied before LIMIT, not after.",
+          spec_section: "LIMIT n / OFFSET n",
+          repro_test: "sql-tests/agent/limit_offset_kill.test"
         }
       ],
       null,
@@ -202,9 +242,9 @@ test("dsh-testengineer-trial's score step: quality gate fails when sql-tests/age
   const { baseUrl, store, service, worktrees, project } = await withServer(t);
   const scoreStep = await materializedScoreStep(project.id);
 
-  const created = await worktrees.create({ project, title: "m01-empty", agent: "dsh" });
+  const created = await worktrees.create({ project, title: "seed0-empty", agent: "dsh" });
   const worktree = await store.createWorktree({ ...created, agent: "dsh" } as any);
-  // No sql-tests/agent/, no findings.json - simulates a no-op/blocked agent.
+  // No sql-tests/agent/*.test, no findings.json - simulates a no-op/blocked agent.
 
   const createRes = await fetch(`${baseUrl}/api/runs`, {
     method: "POST",

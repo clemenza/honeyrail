@@ -1,14 +1,11 @@
 import assert from "node:assert/strict";
-import { cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test, type TestContext } from "node:test";
 
 import { buildSeedRoot } from "../scripts/tinytable-seed-root-builder.js";
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const REAL_SOURCE_ROOT = join(__dirname, "..", "examples", "tinytable-eval");
+import type { SafeCommandOutput } from "../server/utils.js";
 
 async function tempDir(t: TestContext, prefix: string): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), prefix));
@@ -16,128 +13,117 @@ async function tempDir(t: TestContext, prefix: string): Promise<string> {
   return dir;
 }
 
-async function listAllFiles(root: string, relBase = ""): Promise<string[]> {
-  const entries = await readdir(join(root, relBase), { withFileTypes: true });
-  const files: string[] = [];
-  for (const entry of entries) {
-    const rel = relBase ? `${relBase}/${entry.name}` : entry.name;
-    if (entry.isDirectory()) {
-      files.push(...(await listAllFiles(root, rel)));
-    } else {
-      files.push(rel);
-    }
-  }
-  return files.sort();
+/**
+ * build_seed_root.py's own contract is `if out.exists(): raise
+ * FileExistsError` - --out must not exist at all, not merely be empty (a
+ * stricter requirement than the old in-repo builder's). Returns a path
+ * under a fresh temp parent that mkdtemp itself never created, so
+ * buildSeedRoot() can create it.
+ */
+async function freshOutDir(t: TestContext, prefix: string): Promise<string> {
+  const parent = await tempDir(t, prefix);
+  return join(parent, "out");
 }
 
-const FORBIDDEN = [/golden/i, /\bmutants?\b/i, /score\.py/i, /selfcheck/i, /tinytable-eval/i];
+// #126: this builder is now a thin wrapper around vendor/tinytable-evals's
+// own build_seed_root.py - these tests exercise it against the real,
+// pinned checkout (python3 + the submodule must be present, same as any
+// other test that shells out to a real tool - see e.g.
+// test/tinytable-exam-room.test.ts's own docker dependency).
 
-test("buildSeedRoot materializes only the allowlisted paths for a mutant", async (t) => {
-  const outDir = await tempDir(t, "honeyrail-seed-root-");
+test("buildSeedRoot materializes a git-initialized worktree with the expected top-level entries for a seed", async (t) => {
+  const outDir = await freshOutDir(t, "honeyrail-seed-root-");
+  const manifest = await buildSeedRoot({ seed: 2, outDir });
 
-  const manifest = await buildSeedRoot({ mutantId: "m02", outDir });
-
-  const files = await listAllFiles(outDir);
-  assert.deepEqual(files, [
+  const topLevel = (await readdir(outDir)).sort();
+  assert.deepEqual(topLevel, [
+    ".git",
+    ".gitignore",
     "SPEC.md",
+    "admissibility.py",
     "findings.schema.json",
     "run_sql_tests.py",
-    "sql-tests/official/aggregates.test",
-    "sql-tests/official/index.test",
-    "sql-tests/official/insert_update_delete.test",
-    "sql-tests/official/limit_offset.test",
-    "sql-tests/official/order_by.test",
-    "sql-tests/official/transactions.test",
-    "sql-tests/official/types.test",
-    "sql-tests/official/unique.test",
-    "sql-tests/official/where_comparisons.test",
-    "sql-tests/official/where_logic.test",
-    "tinytable/__init__.py",
-    "tinytable/core.py",
-    "tinytable/sql.py"
+    "scheduler.py",
+    "sql-tests",
+    "substrate.py",
+    "task-prompt.md",
+    "tinytable"
   ]);
-  assert.equal(manifest.fixtureId, "m02");
-  assert.equal(manifest.files.length, files.length);
+  assert.equal(manifest.seed, 2);
+  assert.ok(manifest.operatorId.length > 0);
+  // .git is real VCS bookkeeping build_seed_root.py itself created - never
+  // part of the manifest #106's preflight/integrity check hashes.
+  assert.ok(!manifest.files.some((f) => f.path.startsWith(".git/") || f.path === ".git"));
+  assert.ok(manifest.files.some((f) => f.path === "tinytable/core.py"));
+  assert.ok(manifest.files.some((f) => f.path === "sql-tests/official/aggregates.test"));
 });
 
-test("buildSeedRoot scrubs known answer-key metadata out of file contents", async (t) => {
-  const outDir = await tempDir(t, "honeyrail-seed-root-");
-  await buildSeedRoot({ mutantId: "m02", outDir });
+test("buildSeedRoot's manifest carries valid sha256 hashes and rejects a malformed --seed", async (t) => {
+  const outDir = await freshOutDir(t, "honeyrail-seed-root-");
+  const manifest = await buildSeedRoot({ seed: 5, outDir });
 
-  const files = await listAllFiles(outDir);
-  for (const relPath of files) {
-    const content = await readFile(join(outDir, relPath), "utf8");
-    for (const pattern of FORBIDDEN) {
-      assert.equal(pattern.test(content), false, `${relPath} still matches ${pattern} after scrubbing`);
-    }
-  }
-});
-
-test("buildSeedRoot's manifest never contains a raw fixture path that names the mutant, and rejects an unknown mutant id", async (t) => {
-  const outDir = await tempDir(t, "honeyrail-seed-root-");
-  const manifest = await buildSeedRoot({ mutantId: "m05", outDir });
-
-  assert.equal(manifest.fixtureId, "m05");
   assert.ok(manifest.seedRootSha256.match(/^[0-9a-f]{64}$/));
-  assert.ok(manifest.sourceContentSha256.match(/^[0-9a-f]{64}$/));
   for (const file of manifest.files) {
-    assert.ok(file.sha256.match(/^[0-9a-f]{64}$/));
+    assert.ok(file.sha256.match(/^[0-9a-f]{64}$/), `${file.path} has a malformed sha256`);
   }
 
-  const badOutDir = await tempDir(t, "honeyrail-seed-root-");
-  await assert.rejects(() => buildSeedRoot({ mutantId: "m99", outDir: badOutDir }), /unknown --mutant/);
+  const badOutDir = await freshOutDir(t, "honeyrail-seed-root-");
+  await assert.rejects(() => buildSeedRoot({ seed: -1, outDir: badOutDir }), /non-negative integer/);
 });
 
-test("buildSeedRoot is reproducible: same mutant id produces byte-identical files and manifest", async (t) => {
-  const outDirA = await tempDir(t, "honeyrail-seed-root-a-");
-  const outDirB = await tempDir(t, "honeyrail-seed-root-b-");
+test("buildSeedRoot is reproducible: same seed produces byte-identical files and manifest", async (t) => {
+  const outDirA = await freshOutDir(t, "honeyrail-seed-root-a-");
+  const outDirB = await freshOutDir(t, "honeyrail-seed-root-b-");
 
-  const manifestA = await buildSeedRoot({ mutantId: "m07", outDir: outDirA });
-  const manifestB = await buildSeedRoot({ mutantId: "m07", outDir: outDirB });
+  const manifestA = await buildSeedRoot({ seed: 7, outDir: outDirA });
+  const manifestB = await buildSeedRoot({ seed: 7, outDir: outDirB });
 
+  assert.equal(manifestA.operatorId, manifestB.operatorId);
   assert.equal(manifestA.seedRootSha256, manifestB.seedRootSha256);
-  assert.equal(manifestA.sourceContentSha256, manifestB.sourceContentSha256);
   assert.deepEqual(manifestA.files, manifestB.files);
-
-  const filesA = await listAllFiles(outDirA);
-  const filesB = await listAllFiles(outDirB);
-  assert.deepEqual(filesA, filesB);
-  for (const relPath of filesA) {
-    const contentA = await readFile(join(outDirA, relPath), "utf8");
-    const contentB = await readFile(join(outDirB, relPath), "utf8");
-    assert.equal(contentA, contentB, `${relPath} differs between two builds of the same mutant`);
-  }
 });
 
-test("buildSeedRoot refuses a non-empty --out directory", async (t) => {
-  const outDir = await tempDir(t, "honeyrail-seed-root-");
-  await buildSeedRoot({ mutantId: "m01", outDir });
-  await assert.rejects(() => buildSeedRoot({ mutantId: "m01", outDir }), /already exists and is not empty/);
+test("buildSeedRoot refuses an --out directory that already exists", async (t) => {
+  const outDir = await freshOutDir(t, "honeyrail-seed-root-");
+  await buildSeedRoot({ seed: 1, outDir });
+  await assert.rejects(() => buildSeedRoot({ seed: 1, outDir }), /already exists/);
 });
 
-// Regression: a compiled __pycache__/*.pyc left behind by an earlier local
-// `python3 selfcheck.py`/`score.py` run embeds its source file's literal
-// path - "mutants/m04/tinytable/__init__.py" - in its bytecode (co_filename),
-// which is exactly the kind of answer-key metadata this builder exists to
-// keep out of the seed-root, and it isn't caught by the text-content scrub
-// rules since it's a binary file. Exercised against a scratch copy of the
-// source tree so the test doesn't depend on (or leave behind) a real
-// __pycache__ under examples/tinytable-eval.
-test("buildSeedRoot excludes __pycache__ (and other non-fixture files) left behind by local test runs", async (t) => {
-  const scratchSource = await tempDir(t, "honeyrail-seed-root-source-");
-  await cp(REAL_SOURCE_ROOT, scratchSource, { recursive: true });
+// A different seed can (and, per mutate.select_operator, usually does) pick
+// a different operator - not asserted deterministically here since that
+// mapping is upstream's to define, but two different seeds' seed-roots
+// must never collide on seedRootSha256 for the operators this suite
+// actually exercises.
+test("buildSeedRoot: different seeds materialize different content", async (t) => {
+  const outDirA = await freshOutDir(t, "honeyrail-seed-root-a-");
+  const outDirB = await freshOutDir(t, "honeyrail-seed-root-b-");
 
-  const pycacheDir = join(scratchSource, "mutants", "m04", "tinytable", "__pycache__");
-  await mkdir(pycacheDir, { recursive: true });
-  await writeFile(
-    join(pycacheDir, "__init__.cpython-311.pyc"),
-    Buffer.from(`fake bytecode embedding ${join(scratchSource, "mutants", "m04", "tinytable", "__init__.py")}`)
-  );
+  const manifestA = await buildSeedRoot({ seed: 0, outDir: outDirA });
+  const manifestB = await buildSeedRoot({ seed: 1, outDir: outDirB });
 
-  const outDir = await tempDir(t, "honeyrail-seed-root-");
-  const manifest = await buildSeedRoot({ mutantId: "m04", outDir, sourceRoot: scratchSource });
+  assert.notEqual(manifestA.seedRootSha256, manifestB.seedRootSha256);
+});
 
-  const files = await listAllFiles(outDir);
-  assert.ok(!files.some((f) => f.includes("__pycache__")), `__pycache__ leaked into seed-root: ${files.join(", ")}`);
-  assert.ok(!manifest.files.some((f) => f.path.includes("__pycache__")));
+// Defense in depth: build_seed_root.py's own contract is that the chosen
+// operator id is only ever printed to stdout as SEED_ROOT_JSON, never
+// written into DIR - this proves buildSeedRoot() would actually catch a
+// regression of that contract, without needing to break the real upstream
+// tool to exercise it.
+test("buildSeedRoot rejects a seed-root that leaks its own operator id or SEED_ROOT_JSON marker into file contents", async (t) => {
+  const outDir = await tempDir(t, "honeyrail-seed-root-leak-");
+  await writeFile(join(outDir, "leaky.txt"), "this file mentions leaky-operator-id by name");
+
+  const fakeRun = async (): Promise<SafeCommandOutput> => ({
+    ok: true,
+    stdout: `SEED_ROOT_JSON: ${JSON.stringify({ seed: 0, out: outDir, operator_id: "leaky-operator-id", created_utc: "2026-01-01T00:00:00Z" })}`,
+    stderr: "",
+    code: 0
+  });
+
+  await assert.rejects(() => buildSeedRoot({ seed: 0, outDir }, fakeRun), /seed-root leak/);
+});
+
+test("buildSeedRoot surfaces build_seed_root.py's own stderr on failure", async (t) => {
+  const fakeRun = async (): Promise<SafeCommandOutput> => ({ ok: false, stdout: "", stderr: "boom: something went wrong", code: 1 });
+  await assert.rejects(() => buildSeedRoot({ seed: 0, outDir: "/nonexistent" }, fakeRun), /boom: something went wrong/);
 });

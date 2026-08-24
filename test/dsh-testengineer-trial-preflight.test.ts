@@ -154,8 +154,11 @@ test("dsh-testengineer-trial preflight: rejects a run against a project missing 
   await writeFile(join(repoPath, "README.md"), "unrelated repo\n");
   await gitInit(repoPath);
 
-  const seedRootDir = await tempDir(t, "honeyrail-preflight-seed-");
-  const manifest = await buildSeedRoot({ mutantId: "m01", outDir: seedRootDir });
+  // build_seed_root.py requires --out to not exist at all (not merely be
+  // empty), so seedRootDir must be a not-yet-created subpath of a fresh
+  // temp dir, not tempDir()'s own (already mkdtemp-created) directory.
+  const seedRootDir = join(await tempDir(t, "honeyrail-preflight-seed-"), "seed-root");
+  const manifest = await buildSeedRoot({ seed: 0, outDir: seedRootDir });
 
   const { baseUrl, project, agentTurns } = await withServer(t, repoPath);
 
@@ -174,8 +177,8 @@ test("dsh-testengineer-trial preflight: rejects a run against a project missing 
 });
 
 test("dsh-testengineer-trial preflight: a project whose repo matches the manifest behaves identically to no manifest at all (#106 AC2)", async (t) => {
-  const seedRootDir = await tempDir(t, "honeyrail-preflight-seed2-");
-  const manifest = await buildSeedRoot({ mutantId: "m01", outDir: seedRootDir });
+  const seedRootDir = join(await tempDir(t, "honeyrail-preflight-seed2-"), "seed-root");
+  const manifest = await buildSeedRoot({ seed: 0, outDir: seedRootDir });
   const repoPath = await tempDir(t, "honeyrail-preflight-good-repo-");
   await cp(seedRootDir, repoPath, { recursive: true });
   await gitInit(repoPath);
