@@ -133,6 +133,30 @@ test("runScorePy omits --runs and --kill-rate-threshold when they're the default
   });
 });
 
+// clemenza/tinytable-evals#51: grade.py's own step-1 run_sql_tests.py
+// invocations are the one remaining #40 gap this driver could close
+// without deriving anything - grade.py just needed the flag threaded
+// through, same as --runs/--kill-rate-threshold above.
+test("runScorePy passes --trajectory-log through to grade.py when given, omits it when not", async () => {
+  await withTempDir(async (dir) => {
+    await writeFile(join(dir, "score.json"), JSON.stringify({ killed: true, false_alarms: 0, contract_ok: true, passed: true }));
+
+    let receivedArgs: string[] = [];
+    const capturingRun = async (_cmd: string, args: string[] = []): Promise<SafeCommandOutput> => {
+      receivedArgs = args;
+      return { ok: true, stdout: "", stderr: "", code: 0 };
+    };
+    await runScorePy(dir, capturingRun, { trajectoryLog: "trajectory.jsonl" });
+    const index = receivedArgs.indexOf("--trajectory-log");
+    assert.ok(index >= 0, `expected --trajectory-log in args, got ${JSON.stringify(receivedArgs)}`);
+    assert.equal(receivedArgs[index + 1], "trajectory.jsonl");
+
+    receivedArgs = [];
+    await runScorePy(dir, capturingRun, {});
+    assert.ok(!receivedArgs.includes("--trajectory-log"), `expected no --trajectory-log, got ${JSON.stringify(receivedArgs)}`);
+  });
+});
+
 test("runScorePy reports a driver-level error when grade.py produced no score.json at all", async () => {
   await withTempDir(async (dir) => {
     const failedRun = async (): Promise<SafeCommandOutput> => ({ ok: false, stdout: "", stderr: "Traceback: boom", code: 1 });

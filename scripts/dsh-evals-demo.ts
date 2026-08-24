@@ -252,7 +252,7 @@ export type ScoreJson = {
 // will ever name, unlike `error`.
 export type RunScorePyResult = { ok: true; score: ScoreJson } | { ok: false; error: string };
 
-export type GraderOptions = { runs?: number; killRateThreshold?: number };
+export type GraderOptions = { runs?: number; killRateThreshold?: number; trajectoryLog?: string };
 
 // `run` defaults to the real subprocess call; overridable so tests can
 // exercise the read/parse/discriminate logic (the actual site of #114's
@@ -270,7 +270,13 @@ export async function runScorePy(
     ...(graderOptions.runs && graderOptions.runs !== 1 ? ["--runs", String(graderOptions.runs)] : []),
     ...(graderOptions.killRateThreshold !== undefined && graderOptions.killRateThreshold !== 1
       ? ["--kill-rate-threshold", String(graderOptions.killRateThreshold)]
-      : [])
+      : []),
+    // #40 (grade.py's own side, clemenza/tinytable-evals#51): relative to
+    // --artifacts (worktreePath) unless absolute, same convention grade.py
+    // already uses for --out - so a plain "trajectory.jsonl" lands
+    // directly in the seed-root, the same file run_sql_tests.py
+    // --trajectory-log and sample_trajectory.py already write to.
+    ...(graderOptions.trajectoryLog ? ["--trajectory-log", graderOptions.trajectoryLog] : [])
   ]);
   try {
     const raw = await readFile(join(worktreePath, "score.json"), "utf8");
@@ -410,7 +416,11 @@ async function executeCell(
   // (server/evals/dsh-report.ts) already returns "blocked" before ever
   // consulting killed/contractOk whenever blockedReason is set - see
   // docs/dsh-evals-demo.md.
-  const scoreOrError = await runScorePy(seedRootDir, runCommandSafe, { runs: options.graderRuns, killRateThreshold: options.killRateThreshold });
+  const scoreOrError = await runScorePy(seedRootDir, runCommandSafe, {
+    runs: options.graderRuns,
+    killRateThreshold: options.killRateThreshold,
+    trajectoryLog: "trajectory.jsonl"
+  });
   const postMismatches = await findManifestMismatches(seedRootDir, { files: manifest.files });
   const integrityOk = postMismatches.length === 0;
   if (!integrityOk) {

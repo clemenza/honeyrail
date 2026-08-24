@@ -30,19 +30,27 @@ pinned to a specific upstream commit:
 
 ```
 $ git -C vendor/tinytable-evals rev-parse HEAD
-12625186bee301babda2f943ec0672de4f1b46e6
+2a1a00f229dca1fa34eb7fb2fff244aa3434ed71
 ```
 
-Re-pinned (from `78bcc98`) for upstream's #40: `trajectory.py` (structured
-JSONL trajectory logging - a stdlib-only writer/schema for `tool_call`/
-`shell_command`/`test_run`/`file_diff`/`agent_snapshot` events, now shipped
-into every seed-root by `build_seed_root.py`), `run_sql_tests.py
---trajectory-log` (emits a `test_run` event per invocation), and
-`trajectory_schema.json`/`sample_trajectory.py`. This driver doesn't pass
-`--trajectory-log` through to `grade.py`'s own `run_sql_tests.py`
-invocations yet - server/evals/dsh-trajectory-bridge.ts derives
-`tool_call`/`shell_command` independently, from dsh's own session log, so
-only the `test_run` piece is still unconnected end to end.
+Re-pinned twice for upstream's #40 (from `78bcc98`):
+
+- `1262518` (upstream #50): `trajectory.py` (structured JSONL trajectory
+  logging - a stdlib-only writer/schema for `tool_call`/`shell_command`/
+  `test_run`/`file_diff`/`agent_snapshot` events, now shipped into every
+  seed-root by `build_seed_root.py`), `run_sql_tests.py --trajectory-log`
+  (emits a `test_run` event per invocation), and `trajectory_schema.json`/
+  `sample_trajectory.py`.
+- `2a1a00f` (upstream #51): `grade.py --trajectory-log`, threaded through
+  to its own step-1 `run_sql_tests.py` runs against `--artifacts` - the
+  one `run_sql_tests.py` invocation site #50 didn't cover. This driver's
+  `runScorePy()` (`scripts/dsh-evals-demo.ts`) now passes
+  `trajectoryLog: "trajectory.jsonl"` on every call, so a real trial's
+  `test_run` events land in the seed-root's `trajectory.jsonl` alongside
+  the `tool_call`/`shell_command` events server/evals/dsh-trajectory-
+  bridge.ts already derives from dsh's own session log - #40's full event
+  set is now produced end to end by a real trial, not just
+  `sample_trajectory.py`'s scripted demo.
 
 Before #126, `examples/tinytable-eval/{mutants,golden,score.py}` was a
 static copy frozen at the point #104 extracted it, and had already drifted
