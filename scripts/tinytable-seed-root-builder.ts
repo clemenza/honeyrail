@@ -1,322 +1,162 @@
 /**
- * evals: seed-root builder with answer-free materialization and grader-side
- * manifest (#104). Builder zone of the three-zone eval isolation design
+ * evals: seed-root builder (#104, migrated to the vendored `tinytable-evals`
+ * builder by #126). Builder zone of the three-zone eval isolation design
  * described in #104/#105/#106/#109 (a response to the #103 postmortem: an
- * agent escaped its sandbox and read `examples/tinytable-eval`'s answer key -
- * mutants, golden tests, score.py - straight off the shared filesystem).
+ * agent escaped its sandbox and read `examples/tinytable-eval`'s answer key
+ * - mutants, golden tests, score.py - straight off the shared filesystem).
  *
- * Given a chosen mutant, this materializes a "seed-root": a plain directory
- * containing only what a test-engineering agent should ever see (the buggy
- * `tinytable/` package, the official SQL test suite, SPEC.md, the test
- * runner, and the findings schema) with every trace of which mutant it is,
- * that mutants/golden tests/score.py exist at all, or that any of this came
- * from `examples/tinytable-eval` scrubbed out of file contents. It also
- * writes a manifest - the fixture id plus a per-file SHA-256 listing - to a
- * separate, caller-chosen location that must sit outside the seed-root, so
- * the answer never enters the exam room.
+ * Before #126, this file *was* the builder: it copied an allowlist of files
+ * out of a static `examples/tinytable-eval/mutants/mNN` directory and
+ * scrubbed known answer-key leaks out of their text. `vendor/tinytable-evals`
+ * (pinned per #126 - see docs/dsh-evals-demo.md's "Pinned upstream commit"
+ * section) replaced that static pool with a *generative* one: given a
+ * `--seed`, its own `build_seed_root.py` deterministically picks a mutation
+ * operator, applies it to a fresh copy of its `clean/tinytable`, and
+ * assembles a self-contained, git-initialized worktree - answer-free by
+ * construction, since no specific mutant instance is ever committed
+ * anywhere and the chosen operator id is only ever printed to stdout for a
+ * calling driver to record privately.
  *
- * This is builder-zone-only: it does not launch an agent, does not git-init
- * the seed-root, and does not enforce container isolation - see #105 (exam
- * room) and #106 (preflight) for the rest of the three-zone design, and #93
- * for the driver that chains all of it together.
+ * This file is now a thin honeyrail-side wrapper around that CLI: it shells
+ * out to `python3 <source>/build_seed_root.py --seed N --out DIR`, parses
+ * its `SEED_ROOT_JSON:` stdout line, and builds a separate, caller-chosen
+ * manifest (a per-file SHA-256 listing) for #106's preflight/integrity
+ * check - which must sit outside the seed-root, so the answer never enters
+ * the exam room.
+ *
+ * This is builder-zone-only: it does not launch an agent, does not enforce
+ * container isolation - see #105 (exam room) and #106 (preflight) for the
+ * rest of the three-zone design, and #93 for the driver that chains all of
+ * it together.
  *
  * Usage:
  *   node --import tsx scripts/tinytable-seed-root-builder.ts \
- *     --mutant m03 --out ./seed-root --manifest-out ./manifests/m03.json
+ *     --seed 3 --out ./seed-root --manifest-out ./manifests/3.json
  *
  * Options:
- *   --mutant <id>         Mutant to materialize (m01..m08, per what exists
- *                          under <source>/mutants/)
- *   --out <dir>            Seed-root destination (must not exist, or must be
- *                          empty)
- *   --manifest-out <path>  Manifest JSON destination - must not be inside
- *                          --out (the manifest carries the answer)
- *   --source <dir>         Override the tinytable-eval source tree (default:
- *                          examples/tinytable-eval next to this repo)
+ *   --seed <n>              Seed selecting which mutation operator
+ *                            build_seed_root.py applies (deterministic -
+ *                            same seed, same upstream commit -> same
+ *                            operator, always)
+ *   --out <dir>              Seed-root destination (must not exist)
+ *   --manifest-out <path>    Manifest JSON destination - must not be inside
+ *                            --out (the manifest carries the answer:
+ *                            build_seed_root.py's chosen operator id)
+ *   --source <dir>           Override the tinytable-evals checkout (default:
+ *                            vendor/tinytable-evals next to this repo)
  */
 
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { runCommandSafe, type SafeCommandOutput } from "../server/utils.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DEFAULT_SOURCE_ROOT = resolve(__dirname, "..", "examples", "tinytable-eval");
+const DEFAULT_SOURCE_ROOT = resolve(__dirname, "..", "vendor", "tinytable-evals");
 
-const BUILDER_VERSION = "1";
+const BUILDER_VERSION = "2";
 
-/**
- * Files/dirs an agent is allowed to see, and where each lands in the
- * seed-root. Deliberately an allowlist, not a directory walk of
- * `examples/tinytable-eval` - a new file added there later (another mutant,
- * a new answer-key artifact) is excluded by default instead of leaking in.
- */
-const STATIC_ALLOWLIST: Array<{ src: string; dest: string }> = [
-  { src: "SPEC.md", dest: "SPEC.md" },
-  { src: "run_sql_tests.py", dest: "run_sql_tests.py" },
-  { src: "findings.schema.json", dest: "findings.schema.json" }
-];
-
-function mutantAllowlist(mutantId: string): Array<{ src: string; dest: string }> {
-  return [
-    { src: `mutants/${mutantId}/tinytable`, dest: "tinytable" },
-    { src: `mutants/${mutantId}/sql-tests/official`, dest: "sql-tests/official" }
-  ];
-}
-
-/**
- * Known metadata leaks in the source fixture's own text - usage examples
- * and prose that name a specific mutant id, mention `golden/` tests, the
- * `score.py` grader, or the `clean/` reference dir by name. Every rule here
- * is a literal, order-independent substring replacement so scrubbing stays
- * fully deterministic; `assertNoLeaks` below is the actual safety net in
- * case source wording drifts and a rule stops matching.
- */
-const SCRUB_RULES: Array<{ search: string; replace: string }> = [
-  {
-    search: "    python3 run_sql_tests.py --root path/to/mutant path/to/golden/m03.test\n",
-    replace: ""
-  },
-  {
-    search: "mirrors score.py's own external,",
-    replace: "mirrors the eval harness's own external,"
-  },
-  {
-    search:
-      'This document is the **sole arbiter of correct behavior**. `clean/` is a\n' +
-      'reference implementation of everything below; a "defect" is any observable\n' +
-      "deviation from this spec, nothing more and nothing less. Every SQL example\n" +
-      "in this document is a literal, verified statement sequence, true of\n" +
-      '`clean/tinytable` today - see "Test Script Format" below for how tests\n' +
-      "(official and, later, golden) pin these down as runnable `.test` files.",
-    replace:
-      'This document is the **sole arbiter of correct behavior**; a "defect" is any\n' +
-      "observable deviation from this spec, nothing more and nothing less. Every SQL\n" +
-      "example in this document is a literal, verified statement sequence, true of a\n" +
-      'SPEC-compliant `tinytable` today - see "Test Script Format" below for how\n' +
-      "tests pin these down as runnable `.test` files."
-  },
-  {
-    search: "Official and (later) golden tests are `.test` files: a small,",
-    replace: "Tests are `.test` files: a small,"
-  },
-  { search: "the seeded defect (see golden/ once it exists).", replace: "the seeded defect." },
-  { search: "the two seeded defects (see golden/ once it exists).", replace: "the two seeded defects." },
-  { search: "the one seeded defect - see golden/ once it\n# exists).", replace: "the one seeded defect)." },
-  {
-    search: '"$id": "https://github.com/clemenza/honeyrail/examples/tinytable-eval/findings.schema.json",',
-    replace: '"$id": "https://example.invalid/tinytable/findings.schema.json",'
-  },
-  { search: '"title": "tinytable-eval findings.json",', replace: '"title": "tinytable findings.json",' },
-  {
-    search:
-      '"description": "Output contract for the tinytable-eval task-prompt.md: a JSON array of defects found in tinytable relative to SPEC.md, or an empty array if none were found.",',
-    replace:
-      '"description": "Output contract for the tinytable test-engineering task: a JSON array of defects found in tinytable relative to SPEC.md, or an empty array if none were found.",'
-  }
-];
-
-function scrubText(text: string): string {
-  let result = text;
-  for (const rule of SCRUB_RULES) {
-    result = result.split(rule.search).join(rule.replace);
-  }
-  return result;
-}
-
-/** Case-insensitive patterns that must not survive into the seed-root. */
-const FORBIDDEN_PATTERNS: RegExp[] = [
-  /golden/i,
-  /\bmutants?\b/i,
-  /score\.py/i,
-  /selfcheck/i,
-  /tinytable-eval/i,
-  /\bm0[1-8]\b/i
-];
-
-function assertNoLeaks(relPath: string, content: string): void {
-  for (const pattern of FORBIDDEN_PATTERNS) {
-    if (pattern.test(content) || pattern.test(relPath)) {
-      throw new Error(
-        `seed-root leak: ${relPath} matches forbidden pattern ${pattern} after scrubbing - ` +
-          "update SCRUB_RULES in scripts/tinytable-seed-root-builder.ts before this can ship"
-      );
-    }
-  }
-}
+/** Directories never worth including in the manifest - VCS bookkeeping the builder itself created, not fixture content. */
+const SKIP_DIR_NAMES = new Set([".git"]);
 
 function toPosixPath(relPath: string): string {
   return relPath.split(sep).join("/");
 }
 
-function sha256(content: string): string {
-  return createHash("sha256").update(content, "utf8").digest("hex");
+function sha256(content: Buffer): string {
+  return createHash("sha256").update(content).digest("hex");
 }
 
-async function pathExists(path: string): Promise<boolean> {
-  return lstat(path).then(
-    () => true,
-    () => false
-  );
-}
-
-/**
- * Directories never worth descending into: interpreter/tool caches, not
- * fixture content. Skipped outright rather than filtered post-hoc, since a
- * compiled `.pyc`'s bytecode can embed its source file's literal path
- * (`mutants/mNN/...`) in a way no text-content scrub rule would catch.
- */
-const SKIP_DIR_NAMES = new Set(["__pycache__", ".pytest_cache", ".git"]);
-
-/** Extensions the tinytable-eval fixture legitimately contains - anything else (caches, editor swap files, OS cruft) is excluded rather than blindly copied. */
-const SAFE_EXTENSIONS = new Set([".py", ".test", ".md", ".json"]);
-
-/** Recursively reads every allowlisted-extension file under `dir`, returning posix-relative paths sorted lexically. */
+/** Recursively lists every file under `dir`, returning posix-relative paths sorted lexically. */
 async function listFilesRecursive(dir: string, relBase = ""): Promise<string[]> {
   const entries = await readdir(join(dir, relBase), { withFileTypes: true });
   const files: string[] = [];
-  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+  for (const entry of entries) {
     const rel = relBase ? join(relBase, entry.name) : entry.name;
     if (entry.isDirectory()) {
       if (SKIP_DIR_NAMES.has(entry.name)) continue;
       files.push(...(await listFilesRecursive(dir, rel)));
     } else if (entry.isFile()) {
-      const dot = entry.name.lastIndexOf(".");
-      const ext = dot >= 0 ? entry.name.slice(dot) : "";
-      if (!SAFE_EXTENSIONS.has(ext)) {
-        throw new Error(
-          `seed-root builder: unexpected file ${join(relBase, entry.name)} under ${dir} has extension ` +
-            `"${ext}" not in the known-safe allowlist (${[...SAFE_EXTENSIONS].join(", ")}) - ` +
-            "add it deliberately if it belongs in the fixture, don't let it through silently"
-        );
-      }
       files.push(rel);
     }
   }
   return files.sort();
 }
 
-/**
- * Copies one allowlist entry (a file or a directory) from `sourceRoot` into
- * `destRoot`, scrubbing every text file's contents on the way. Returns the
- * scrubbed content of each file written, keyed by its posix path relative to
- * `destRoot`, so the caller can hash it without re-reading from disk.
- */
-async function copyAllowlistEntry(
-  sourceRoot: string,
-  destRoot: string,
-  entry: { src: string; dest: string }
-): Promise<Map<string, string>> {
-  const written = new Map<string, string>();
-  const srcPath = join(sourceRoot, entry.src);
-  const stat = await lstat(srcPath).catch(() => {
-    throw new Error(`seed-root builder: missing expected source path ${srcPath}`);
-  });
-
-  if (stat.isDirectory()) {
-    const files = await listFilesRecursive(srcPath);
-    for (const relFile of files) {
-      const raw = await readFile(join(srcPath, relFile), "utf8");
-      const scrubbed = scrubText(raw);
-      const destRel = toPosixPath(join(entry.dest, relFile));
-      const destPath = join(destRoot, destRel);
-      await mkdir(dirname(destPath), { recursive: true });
-      await writeFile(destPath, scrubbed);
-      written.set(destRel, scrubbed);
-    }
-    return written;
-  }
-
-  const raw = await readFile(srcPath, "utf8");
-  const scrubbed = scrubText(raw);
-  const destPath = join(destRoot, entry.dest);
-  await mkdir(dirname(destPath), { recursive: true });
-  await writeFile(destPath, scrubbed);
-  written.set(toPosixPath(entry.dest), scrubbed);
-  return written;
-}
-
 export type SeedRootManifest = {
   builderVersion: string;
-  /** THE ANSWER - which mutant this seed-root came from. Grader-side only; never write this into the seed-root. */
-  fixtureId: string;
-  /** Hash of the pre-scrub source bytes for this mutant's allowlisted files - ties the manifest to an exact upstream fixture revision without embedding a filesystem path. */
-  sourceContentSha256: string;
+  /** The seed passed to build_seed_root.py. */
+  seed: number;
+  /** THE ANSWER - build_seed_root.py's own operator id for this seed. Grader-side only; never written into the seed-root. */
+  operatorId: string;
   files: Array<{ path: string; sha256: string }>;
   /** Hash over the sorted files[] listing - a single fixture-identity/integrity hash for #106's preflight check. */
   seedRootSha256: string;
 };
 
 export type BuildSeedRootOptions = {
-  mutantId: string;
+  seed: number;
   outDir: string;
   sourceRoot?: string;
 };
 
-export async function buildSeedRoot(options: BuildSeedRootOptions): Promise<SeedRootManifest> {
+type SeedRootJson = { seed: number; out: string; operator_id: string; created_utc: string };
+
+function parseSeedRootJson(stdout: string): SeedRootJson {
+  const line = stdout.split("\n").find((l) => l.startsWith("SEED_ROOT_JSON: "));
+  if (!line) {
+    throw new Error(`build_seed_root.py did not print a SEED_ROOT_JSON line; stdout was:\n${stdout}`);
+  }
+  return JSON.parse(line.slice("SEED_ROOT_JSON: ".length)) as SeedRootJson;
+}
+
+export async function buildSeedRoot(
+  options: BuildSeedRootOptions,
+  run: typeof runCommandSafe = runCommandSafe
+): Promise<SeedRootManifest> {
+  if (!Number.isInteger(options.seed) || options.seed < 0) {
+    throw new Error(`--seed must be a non-negative integer, got ${options.seed}`);
+  }
   const sourceRoot = resolve(options.sourceRoot ?? DEFAULT_SOURCE_ROOT);
   const outDir = resolve(options.outDir);
 
-  const mutantsDir = join(sourceRoot, "mutants");
-  const knownMutants = (await readdir(mutantsDir, { withFileTypes: true }).catch(() => []))
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
-    .sort();
-  if (!knownMutants.includes(options.mutantId)) {
-    throw new Error(
-      `unknown --mutant "${options.mutantId}" - expected one of: ${knownMutants.join(", ") || "(none found under " + mutantsDir + ")"}`
-    );
+  const result: SafeCommandOutput = await run("python3", [
+    join(sourceRoot, "build_seed_root.py"),
+    "--seed", String(options.seed),
+    "--out", outDir
+  ]);
+  if (!result.ok) {
+    throw new Error(`build_seed_root.py failed (exit ${result.code}): ${(result.stderr || result.stdout).trim()}`);
   }
+  const seedRootJson = parseSeedRootJson(result.stdout);
 
-  if (await pathExists(outDir)) {
-    const existing = await readdir(outDir);
-    if (existing.length > 0) {
-      throw new Error(`--out ${outDir} already exists and is not empty`);
-    }
-  }
-  await mkdir(outDir, { recursive: true });
-
-  const allowlist = [...STATIC_ALLOWLIST, ...mutantAllowlist(options.mutantId)];
-
-  const sourceHash = createHash("sha256");
-  const allContent = new Map<string, string>();
-  for (const entry of allowlist) {
-    const written = await copyAllowlistEntry(sourceRoot, outDir, entry);
-    for (const [path, content] of written) {
-      allContent.set(path, content);
-    }
-  }
-  // Pre-scrub source bytes, hashed in a fixed (sorted-by-dest-path) order so
-  // sourceContentSha256 is reproducible regardless of directory-listing order.
-  for (const entry of allowlist) {
-    const srcPath = join(sourceRoot, entry.src);
-    const stat = await lstat(srcPath);
-    if (stat.isDirectory()) {
-      const files = await listFilesRecursive(srcPath);
-      for (const relFile of files) {
-        sourceHash.update(toPosixPath(join(entry.dest, relFile)));
-        sourceHash.update(await readFile(join(srcPath, relFile), "utf8"));
+  const relFiles = await listFilesRecursive(outDir);
+  const files = await Promise.all(
+    relFiles.map(async (relFile) => {
+      const content = await readFile(join(outDir, relFile));
+      const path = toPosixPath(relFile);
+      // Defense in depth - build_seed_root.py already guarantees the
+      // operator id is only ever printed to stdout, never written into
+      // DIR, but a future upstream regression here would otherwise leak
+      // the answer straight into the exam room silently.
+      if (content.includes(seedRootJson.operator_id) || content.includes("SEED_ROOT_JSON")) {
+        throw new Error(
+          `seed-root leak: ${path} contains the seed's operator id or "SEED_ROOT_JSON" - this would leak the answer into ` +
+            "the exam room; check vendor/tinytable-evals's build_seed_root.py before this can ship"
+        );
       }
-    } else {
-      sourceHash.update(toPosixPath(entry.dest));
-      sourceHash.update(await readFile(srcPath, "utf8"));
-    }
-  }
-
-  const files = [...allContent.entries()]
-    .map(([path, content]) => ({ path, sha256: sha256(content) }))
-    .sort((a, b) => a.path.localeCompare(b.path));
-
-  for (const { path } of files) {
-    assertNoLeaks(path, allContent.get(path) ?? "");
-  }
+      return { path, sha256: sha256(content) };
+    })
+  );
+  files.sort((a, b) => a.path.localeCompare(b.path));
 
   const seedRootSha256 = createHash("sha256").update(JSON.stringify(files)).digest("hex");
 
   return {
     builderVersion: BUILDER_VERSION,
-    fixtureId: options.mutantId,
-    sourceContentSha256: sourceHash.digest("hex"),
+    seed: options.seed,
+    operatorId: seedRootJson.operator_id,
     files,
     seedRootSha256
   };
@@ -326,10 +166,10 @@ export async function buildSeedRoot(options: BuildSeedRootOptions): Promise<Seed
 // CLI
 // ---------------------------------------------------------------------------
 
-type CliOptions = { mutantId: string; outDir: string; manifestOut: string; sourceRoot?: string };
+type CliOptions = { seed: number; outDir: string; manifestOut: string; sourceRoot?: string };
 
 function parseArgs(argv: string[]): CliOptions {
-  let mutantId: string | undefined;
+  let seed: number | undefined;
   let outDir: string | undefined;
   let manifestOut: string | undefined;
   let sourceRoot: string | undefined;
@@ -342,7 +182,7 @@ function parseArgs(argv: string[]): CliOptions {
       return value;
     };
     switch (arg) {
-      case "--mutant": mutantId = next(); break;
+      case "--seed": seed = Number(next()); break;
       case "--out": outDir = next(); break;
       case "--manifest-out": manifestOut = next(); break;
       case "--source": sourceRoot = next(); break;
@@ -355,19 +195,19 @@ function parseArgs(argv: string[]): CliOptions {
         throw new Error(`Unknown option: ${arg}`);
     }
   }
-  if (!mutantId) throw new Error("--mutant <id> is required");
+  if (seed === undefined || !Number.isInteger(seed)) throw new Error("--seed <n> is required and must be an integer");
   if (!outDir) throw new Error("--out <dir> is required");
   if (!manifestOut) throw new Error("--manifest-out <path> is required");
 
   const resolvedOut = resolve(outDir);
   const resolvedManifest = resolve(manifestOut);
   if (resolvedManifest === resolvedOut || resolvedManifest.startsWith(resolvedOut + sep)) {
-    // The manifest carries fixtureId - the answer - and must never end up
+    // The manifest carries operatorId - the answer - and must never end up
     // inside the seed-root an agent will see.
     throw new Error(`--manifest-out ${resolvedManifest} must not be inside --out ${resolvedOut}`);
   }
 
-  return { mutantId, outDir, manifestOut, sourceRoot };
+  return { seed, outDir, manifestOut, sourceRoot };
 }
 
 async function main(): Promise<void> {
@@ -376,7 +216,7 @@ async function main(): Promise<void> {
   const manifestPath = resolve(options.manifestOut);
   await mkdir(dirname(manifestPath), { recursive: true });
   await writeFile(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
-  console.log(`Seed-root for ${manifest.fixtureId} materialized at ${resolve(options.outDir)} (${manifest.files.length} files).`);
+  console.log(`Seed-root for seed ${manifest.seed} materialized at ${resolve(options.outDir)} (${manifest.files.length} files).`);
   console.log(`Manifest written to ${manifestPath} (seedRootSha256=${manifest.seedRootSha256.slice(0, 12)}...).`);
 }
 

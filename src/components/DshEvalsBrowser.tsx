@@ -184,7 +184,7 @@ export function DshEvalsBrowser() {
               <thead>
                 <tr>
                   <th>Fixture</th><th>Profile</th><th>Trials</th><th>Kill rate</th><th>False-alarm rate</th>
-                  <th>Contract compliance</th><th>Spray-and-pray rate</th><th>Median wall time</th>
+                  <th>Contract compliance</th><th>Mean kill rate</th><th>Killed by kind (assertion/invariant)</th><th>Median wall time</th>
                 </tr>
               </thead>
               <tbody>
@@ -196,7 +196,8 @@ export function DshEvalsBrowser() {
                     <td>{pct(cell.killRate)}</td>
                     <td>{pct(cell.falseAlarmRate)}</td>
                     <td>{pct(cell.contractComplianceRate)}</td>
-                    <td>{pct(cell.meanSprayAndPrayRate)}</td>
+                    <td>{pct(cell.meanKillRate)}</td>
+                    <td>{cell.killedByKind ? `${cell.killedByKind.assertion}/${cell.killedByKind.invariant}` : "n/a"}</td>
                     <td>{secs(cell.medianWallTimeMs)}</td>
                   </tr>
                 ))}

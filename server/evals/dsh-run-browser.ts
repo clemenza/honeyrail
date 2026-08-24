@@ -61,20 +61,24 @@ export function normalizeDshOutDir(inputPath: unknown): string {
 /**
  * `state.json` outlives the driver code that wrote it: a directory from an
  * older scripts/dsh-evals-demo.ts run (e.g. before #107 added
- * transcriptAuditHits/killMatrix) is exactly what this read-only browser
- * exists to browse, and `JSON.parse(raw) as DshEvalsState` doesn't make
- * that true - a #114-shaped bug (trusting a parsed object to match a type
- * assertion at runtime) would just resurface here as soon as anyone loaded
- * an old directory, since classifyDshOutcome() unconditionally reads
+ * transcriptAuditHits, or before #126 replaced killMatrix with
+ * killRate/killedByKind) is exactly what this read-only browser exists to
+ * browse, and `JSON.parse(raw) as DshEvalsState` doesn't make that true - a
+ * #114-shaped bug (trusting a parsed object to match a type assertion at
+ * runtime) would just resurface here as soon as anyone loaded an old
+ * directory, since classifyDshOutcome() unconditionally reads
  * `trial.transcriptAuditHits.length`. Backfill the fields newer than any
  * given trial record might be, rather than assume every persisted trial
- * matches the current schema exactly.
+ * matches the current schema exactly. A pre-#126 trial's killMatrix (the
+ * dropped private-mutant-pool signal) has no replacement value to backfill
+ * from - it's simply not carried forward, same as any other retired field.
  */
 function normalizeTrial(raw: DshTrialRecord): DshTrialRecord {
   return {
     ...raw,
     transcriptAuditHits: raw.transcriptAuditHits ?? [],
-    killMatrix: raw.killMatrix ?? null
+    killRate: raw.killRate ?? null,
+    killedByKind: raw.killedByKind ?? null
   };
 }
 

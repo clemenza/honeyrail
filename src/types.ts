@@ -336,7 +336,8 @@ export type DshTrialRecordData = {
   contractOk: boolean | null;
   integrityOk: boolean;
   transcriptAuditHits: string[];
-  killMatrix: Record<string, boolean> | null;
+  killRate: number | null;
+  killedByKind: { assertion: number; invariant: number } | null;
   blockedReason?: string;
   wallTimeMs?: number;
   error?: string;
@@ -364,7 +365,8 @@ export type DshFixtureCellSummaryData = {
   falseAlarmRate: number | null;
   contractComplianceRate: number | null;
   medianWallTimeMs: number | null;
-  meanSprayAndPrayRate: number | null;
+  meanKillRate: number | null;
+  killedByKind: { assertion: number; invariant: number } | null;
 };
 
 export type DshEvalsStateData = {

@@ -10,7 +10,8 @@
  * honeyrail project or a HoneyRail Run - it goes straight through the
  * three-zone design:
  *   1. #104's buildSeedRoot() materializes an answer-free seed-root for the
- *      chosen mutant.
+ *      chosen fixture (#126: now a seed into vendor/tinytable-evals's own
+ *      generative mutation-operator library, not a static mutant id).
  *   2. #106's findManifestMismatches() preflight-checks that seed-root
  *      against its own manifest before launch (defense in depth - the
  *      builder should already guarantee this).
@@ -21,12 +22,16 @@
  *      audit (server/evals/transcript-audit.ts) scans the container's
  *      captured output and the agent's artifacts for references to
  *      material outside the exam room. Either forces outcome "invalidated"
- *      regardless of what score.py itself reports.
- *   5. score.py (run on the host, the grader zone) produces the real
- *      kill/false-alarm/contract verdict, plus a #107 kill matrix - the
- *      same sql-tests/agent/ suite replayed against every other mutant in
- *      the private pool (never mounted into the exam room), quantifying
- *      "spray and pray" hedging.
+ *      regardless of what grade.py itself reports.
+ *   5. vendor/tinytable-evals's grade.py (run on the host, the grader zone)
+ *      produces the real kill/false-alarm/contract verdict - #126 migrated
+ *      this driver onto its probabilistic, multi-run kill-rate scoring
+ *      (killRate/killedByKind) in place of the single-run score.py this
+ *      repo used to hold a stale copy of. The private-mutant-pool kill
+ *      matrix / "spray and pray" hedging signal (#107) has no equivalent
+ *      here: vendor/tinytable-evals generates mutants on demand from a seed
+ *      and never persists a pool to replay a suite against - see
+ *      docs/dsh-evals-demo.md.
  *
  * Budget note: every cell launches a real dsh CLI session against a real
  * model API. The full default matrix is 8 fixtures x 2 profiles x 3 trials
@@ -41,9 +46,11 @@
  * Options:
  *   --out <dir>                 Output directory for state.json + comparison-report.md (default ./dsh-evals-report)
  *   --image <tag>                Exam-room image (default tinytable-exam-room:latest - see docker/tinytable-exam-room/Dockerfile)
- *   --fixtures <id,id>            Subset of mutant ids (default: every mutants/mNN under examples/tinytable-eval)
+ *   --fixtures <seed,seed>        Subset of fixture seeds (default: 0..7 - see vendor/tinytable-evals's mutate.OPERATORS)
  *   --profiles <label=path,...>   cordis.patch.yml variants (default baseline/candidate fixtures under examples/tinytable-eval/profiles)
  *   --trials <n>                  Trials per (fixture, profile) cell (default 3)
+ *   --grader-runs <n>             vendor/tinytable-evals grade.py --runs: probabilistic-kill sampling per trial (default 1)
+ *   --kill-rate-threshold <t>     grade.py --kill-rate-threshold (default 1.0 - every grader run must kill)
  *   --trial-timeout-minutes <n>   Per-trial container timeout before killing it (default 15)
  *   --smoke                       2 fixtures x 2 profiles x 1 trial - cheap end-to-end validation
  *   --dry-run                     Print the matrix and budget note, launch nothing
@@ -67,24 +74,27 @@ import { DEFAULT_IMAGE, runInExamRoom } from "./tinytable-exam-room.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const tinytableEvalDir = resolve(__dirname, "..", "examples", "tinytable-eval");
 const profilesDir = join(tinytableEvalDir, "profiles");
-const scorePyPath = join(tinytableEvalDir, "score.py");
-const cleanDir = join(tinytableEvalDir, "clean");
-const taskPromptPath = join(tinytableEvalDir, "task-prompt.md");
-// #107: the private mutant pool score.py's --kill-matrix-pool replays the
-// agent's suite against. Grader-only (host-side) - never mounted into the
-// exam room; #104's buildSeedRoot() only ever materializes one mutant's
-// tinytable/ into the seed-root the container actually sees.
-const mutantsDir = join(tinytableEvalDir, "mutants");
+// #126: the builder/grader/task-prompt now come from the pinned vendored
+// checkout, not a static in-repo copy - see docs/dsh-evals-demo.md's
+// "Pinned upstream commit" section for the pin and its re-pin process.
+const vendorDir = resolve(__dirname, "..", "vendor", "tinytable-evals");
+const gradePyPath = join(vendorDir, "grade.py");
+const taskPromptPath = join(vendorDir, "task-prompt.md");
 
 const PROFILE_PATCH_FILENAME = "cordis.patch.yml";
+
+/** Default fixture seeds - 8, matching this driver's original 8-mutant default matrix/budget note. */
+const DEFAULT_FIXTURE_SEEDS = [0, 1, 2, 3, 4, 5, 6, 7];
 
 type ProfileSpec = { label: string; content: string; sha256: string };
 type CliOptions = {
   out: string;
   image: string;
-  fixtureIds?: string[];
+  fixtureSeeds?: number[];
   profileArgs?: string[];
   trials: number;
+  graderRuns: number;
+  killRateThreshold: number;
   trialTimeoutMinutes: number;
   smoke: boolean;
   dryRun: boolean;
@@ -96,6 +106,8 @@ function parseArgs(argv: string[]): CliOptions {
     out: "./dsh-evals-report",
     image: DEFAULT_IMAGE,
     trials: 3,
+    graderRuns: 1,
+    killRateThreshold: 1.0,
     trialTimeoutMinutes: 15,
     smoke: false,
     dryRun: false,
@@ -112,9 +124,17 @@ function parseArgs(argv: string[]): CliOptions {
     switch (arg) {
       case "--out": options.out = next(); break;
       case "--image": options.image = next(); break;
-      case "--fixtures": options.fixtureIds = next().split(",").map((id) => id.trim()).filter(Boolean); break;
+      case "--fixtures":
+        options.fixtureSeeds = next().split(",").map((id) => id.trim()).filter(Boolean).map((id) => {
+          const seed = Number(id);
+          if (!Number.isInteger(seed) || seed < 0) throw new Error(`--fixtures entries must be non-negative integer seeds, got "${id}"`);
+          return seed;
+        });
+        break;
       case "--profiles": options.profileArgs = next().split(",").map((pair) => pair.trim()).filter(Boolean); break;
       case "--trials": options.trials = Number(next()); break;
+      case "--grader-runs": options.graderRuns = Number(next()); break;
+      case "--kill-rate-threshold": options.killRateThreshold = Number(next()); break;
       case "--trial-timeout-minutes": options.trialTimeoutMinutes = Number(next()); break;
       case "--smoke": options.smoke = true; break;
       case "--dry-run": options.dryRun = true; break;
@@ -129,27 +149,20 @@ function parseArgs(argv: string[]): CliOptions {
     }
   }
   if (!Number.isInteger(options.trials) || options.trials < 1) throw new Error("--trials must be a positive integer");
+  if (!Number.isInteger(options.graderRuns) || options.graderRuns < 1) throw new Error("--grader-runs must be a positive integer");
+  if (!Number.isFinite(options.killRateThreshold) || options.killRateThreshold < 0 || options.killRateThreshold > 1) {
+    throw new Error("--kill-rate-threshold must be between 0 and 1");
+  }
   if (!Number.isFinite(options.trialTimeoutMinutes) || options.trialTimeoutMinutes < 1) {
     throw new Error("--trial-timeout-minutes must be >= 1");
   }
   return options;
 }
 
-async function loadFixtures(options: CliOptions): Promise<string[]> {
-  const mutantsDir = join(tinytableEvalDir, "mutants");
-  const allFixtures = (await readdir(mutantsDir, { withFileTypes: true }))
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
-    .sort();
-  let fixtures = allFixtures;
-  if (options.fixtureIds?.length) {
-    fixtures = options.fixtureIds.map((id) => {
-      if (!allFixtures.includes(id)) throw new Error(`Unknown fixture id "${id}" (known: ${allFixtures.join(", ")})`);
-      return id;
-    });
-  }
-  if (options.smoke) fixtures = fixtures.slice(0, 2);
-  return fixtures;
+function loadFixtureSeeds(options: CliOptions): number[] {
+  let seeds = options.fixtureSeeds?.length ? options.fixtureSeeds : DEFAULT_FIXTURE_SEEDS;
+  if (options.smoke) seeds = seeds.slice(0, 2);
+  return seeds;
 }
 
 async function loadProfiles(options: CliOptions): Promise<ProfileSpec[]> {
@@ -174,13 +187,18 @@ async function loadProfiles(options: CliOptions): Promise<ProfileSpec[]> {
 }
 
 async function gitInitCommit(repoPath: string): Promise<void> {
-  // score.py's own docstring requires the worktree to already be "its own
-  // git repository, freshly committed before the agent touched it" - its
-  // protected-path check (step 3, `_check_protected_paths_untouched`) runs
+  // grade.py's own docstring requires --artifacts to already be "its own
+  // git repository, freshly seeded before the agent touched it" - its
+  // protected-path check (step 4, `_check_protected_paths_untouched`) runs
   // `git status` and reports "not a git repository" (failing contract_ok)
   // otherwise. #104's buildSeedRoot() deliberately doesn't do this (it's a
-  // builder-zone concern, not the exam room's), so the driver does it here,
-  // right before handing the seed-root to the container.
+  // builder-zone concern, not the exam room's) - #126 note: unlike the old
+  // in-repo builder, vendor/tinytable-evals's build_seed_root.py *does*
+  // already git-init and commit the seed-root itself before this driver
+  // even runs, so this re-init is technically redundant against a
+  // #126-built seed-root; kept anyway as defense in depth (it's a no-op
+  // git init against an already-clean tree) and to keep this driver
+  // independent of exactly which builder produced the worktree.
   await runCommandSafe("git", ["init", "-q", "-b", "main"], { cwd: repoPath });
   await runCommandSafe(
     "git",
@@ -195,56 +213,68 @@ async function gitInitCommit(repoPath: string): Promise<void> {
 }
 
 export type ScoreJson = {
+  artifacts: string;
+  clean: string;
+  runs: number;
+  /** #126 (vendor/tinytable-evals's grade.py, its own issue #21 "Grader v2"): fraction of --runs grader seeds that killed the mutant. */
+  kill_rate: number;
+  kill_rate_threshold: number;
   killed: boolean;
+  killed_tests: string[];
+  /** Killed tests split by whether they're an "invariant" (assert_stats/--check-admissibility) violation vs a plain "assertion". */
+  killed_by_kind: { assertion: number; invariant: number };
   false_alarms: number;
   contract_ok: boolean;
+  contract_errors: string[];
+  f_mutant: string[];
+  f_clean: string[];
+  per_run: Array<{
+    seed: number;
+    killed: boolean;
+    killed_tests: string[];
+    killed_by_kind: { assertion: number; invariant: number };
+    false_alarms: number;
+    f_mutant: string[];
+    f_clean: string[];
+  }>;
+  error: string | null;
   passed: boolean;
-  /** #107: null unless --kill-matrix-pool was passed. */
-  kill_matrix: Record<string, boolean> | null;
-  /** #108: true iff --agent-blocked-reason was passed. */
-  agent_blocked: boolean;
-  agent_blocked_reason: string | null;
 };
 
-// #114: score.py's own JSON output always includes a literal "error" key
-// (null on success - see examples/tinytable-eval/score.py's `result` dict),
-// so a plain `ScoreJson | { error: string }` union with an `"error" in x`
-// discriminant is unsound: `JSON.parse(raw) as ScoreJson` doesn't strip
-// score.py's extra fields at runtime, so that check is true for *every*
-// successfully-parsed score.json, not just the driver's own failure
-// sentinel - the actual score (killed/false_alarms/contract_ok) was being
-// silently discarded and every trial misreported as driver_error, whether
-// it actually passed or not. `ok` can't collide with anything score.py's
-// schema will ever name, unlike `error`.
+// #114: grade.py's own JSON output always includes a literal "error" key
+// (null on success), so a plain `ScoreJson | { error: string }` union with
+// an `"error" in x` discriminant is unsound: `JSON.parse(raw) as ScoreJson`
+// doesn't strip grade.py's extra fields at runtime, so that check is true
+// for *every* successfully-parsed score.json, not just the driver's own
+// failure sentinel. `ok` can't collide with anything grade.py's schema
+// will ever name, unlike `error`.
 export type RunScorePyResult = { ok: true; score: ScoreJson } | { ok: false; error: string };
+
+export type GraderOptions = { runs?: number; killRateThreshold?: number };
 
 // `run` defaults to the real subprocess call; overridable so tests can
 // exercise the read/parse/discriminate logic (the actual site of #114's
 // bug) against a pre-written score.json without needing python3 or a real
-// tinytable-eval fixture on disk.
+// tinytable-evals checkout on disk.
 export async function runScorePy(
   worktreePath: string,
   run: typeof runCommandSafe = runCommandSafe,
-  // #108: the driver's own findBlockedReason() detection, if any - see
-  // executeCell() below. Passed straight through to score.py's
-  // --agent-blocked-reason so a correctly-BLOCKED trial gets contract_ok
-  // credit for an empty submission instead of being penalized like a
-  // lazy/failed one.
-  agentBlockedReason?: string
+  graderOptions: GraderOptions = {}
 ): Promise<RunScorePyResult> {
   const result = await run("python3", [
-    scorePyPath,
-    "--worktree", worktreePath,
-    "--clean", cleanDir,
+    gradePyPath,
+    "--artifacts", worktreePath,
     "--out", "score.json",
-    "--kill-matrix-pool", mutantsDir,
-    ...(agentBlockedReason ? ["--agent-blocked-reason", agentBlockedReason] : [])
+    ...(graderOptions.runs && graderOptions.runs !== 1 ? ["--runs", String(graderOptions.runs)] : []),
+    ...(graderOptions.killRateThreshold !== undefined && graderOptions.killRateThreshold !== 1
+      ? ["--kill-rate-threshold", String(graderOptions.killRateThreshold)]
+      : [])
   ]);
   try {
     const raw = await readFile(join(worktreePath, "score.json"), "utf8");
     return { ok: true, score: JSON.parse(raw) as ScoreJson };
   } catch {
-    return { ok: false, error: `score.py produced no score.json (exit ${result.code}): ${(result.stderr || result.stdout).slice(-2000)}` };
+    return { ok: false, error: `grade.py produced no score.json (exit ${result.code}): ${(result.stderr || result.stdout).slice(-2000)}` };
   }
 }
 
@@ -265,11 +295,12 @@ async function gatherAuditableText(seedRootDir: string, containerLog: string): P
 async function executeCell(
   options: CliOptions,
   taskPrompt: string,
-  fixture: string,
+  fixtureSeed: number,
   profile: ProfileSpec,
   trial: number,
   cellsDir: string
 ): Promise<DshTrialRecord> {
+  const fixture = String(fixtureSeed);
   const trialId = `${fixture}-${profile.label}-${trial}`;
   const artifactsDir = join(cellsDir, trialId);
   const seedRootDir = join(artifactsDir, "seed-root");
@@ -280,10 +311,10 @@ async function executeCell(
   let manifest: SeedRootManifest;
   try {
     await mkdir(artifactsDir, { recursive: true });
-    manifest = await buildSeedRoot({ mutantId: fixture, outDir: seedRootDir });
+    manifest = await buildSeedRoot({ seed: fixtureSeed, outDir: seedRootDir });
     await writeFile(join(artifactsDir, "manifest.json"), JSON.stringify(manifest, null, 2));
   } catch (error) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: false, transcriptAuditHits: [], killMatrix: null, error: (error as Error).message };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: false, transcriptAuditHits: [], killRate: null, killedByKind: null, error: (error as Error).message };
   }
 
   const preflightMismatches = await findManifestMismatches(seedRootDir, { files: manifest.files });
@@ -295,7 +326,8 @@ async function executeCell(
       contractOk: null,
       integrityOk: false,
       transcriptAuditHits: [],
-      killMatrix: null,
+      killRate: null,
+      killedByKind: null,
       error: `#106 preflight: freshly-built seed-root doesn't match its own manifest: ${preflightMismatches.map(describeManifestMismatch).join("; ")}`
     };
   }
@@ -340,15 +372,22 @@ async function executeCell(
   }
 
   if (result.timedOut) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killMatrix: null, wallTimeMs, error: `trial timed out after ${options.trialTimeoutMinutes}m and was killed` };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, error: `trial timed out after ${options.trialTimeoutMinutes}m and was killed` };
   }
   const fatal = dshAdapter.findFatalError?.(combinedOutput);
   if (fatal) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killMatrix: null, wallTimeMs, error: `dsh fatal error (${fatal.code}): ${fatal.message}` };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, error: `dsh fatal error (${fatal.code}): ${fatal.message}` };
   }
   const blocked = findBlockedReason(combinedOutput);
 
-  const scoreOrError = await runScorePy(seedRootDir, runCommandSafe, blocked?.message);
+  // #126: vendor/tinytable-evals's grade.py has no --agent-blocked-reason
+  // equivalent to the old score.py's #108 waiver, so a correctly-BLOCKED
+  // trial's contract_ok may now read false here for an empty submission.
+  // That's cosmetic, not a classification regression: classifyDshOutcome
+  // (server/evals/dsh-report.ts) already returns "blocked" before ever
+  // consulting killed/contractOk whenever blockedReason is set - see
+  // docs/dsh-evals-demo.md.
+  const scoreOrError = await runScorePy(seedRootDir, runCommandSafe, { runs: options.graderRuns, killRateThreshold: options.killRateThreshold });
   const postMismatches = await findManifestMismatches(seedRootDir, { files: manifest.files });
   const integrityOk = postMismatches.length === 0;
   if (!integrityOk) {
@@ -356,7 +395,7 @@ async function executeCell(
   }
 
   if (!scoreOrError.ok) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk, transcriptAuditHits, killMatrix: null, wallTimeMs, blockedReason: blocked?.message, error: scoreOrError.error };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, blockedReason: blocked?.message, error: scoreOrError.error };
   }
 
   return {
@@ -366,14 +405,15 @@ async function executeCell(
     contractOk: scoreOrError.score.contract_ok,
     integrityOk,
     transcriptAuditHits,
-    killMatrix: scoreOrError.score.kill_matrix,
+    killRate: scoreOrError.score.kill_rate,
+    killedByKind: scoreOrError.score.killed_by_kind,
     wallTimeMs,
     blockedReason: blocked?.message
   };
 }
 
 type StateFile = {
-  config: { image: string; smoke: boolean; dshVersion: string };
+  config: { image: string; smoke: boolean; dshVersion: string; graderRuns: number; killRateThreshold: number };
   profiles: Array<{ label: string; sha256: string }>;
   fixtures: string[];
   trials: DshTrialRecord[];
@@ -414,18 +454,18 @@ async function main(): Promise<void> {
     return;
   }
 
-  const fixtures = await loadFixtures(options);
+  const fixtureSeeds = loadFixtureSeeds(options);
   const profiles = await loadProfiles(options);
   const trialsPerCell = options.smoke ? 1 : options.trials;
-  const totalRuns = fixtures.length * profiles.length * trialsPerCell;
+  const totalRuns = fixtureSeeds.length * profiles.length * trialsPerCell;
 
-  console.log(`Matrix: ${fixtures.length} fixtures x ${profiles.length} profiles x ${trialsPerCell} trials = ${totalRuns} dsh runs.`);
+  console.log(`Matrix: ${fixtureSeeds.length} fixtures x ${profiles.length} profiles x ${trialsPerCell} trials = ${totalRuns} dsh runs.`);
   console.log(`Budget note: each run launches a real dsh CLI session against a real model API (typically a few cents to tens of cents and 1-10 minutes each). Use --smoke to validate cheaply first.`);
   if (options.dryRun) {
-    for (const fixture of fixtures) {
+    for (const fixtureSeed of fixtureSeeds) {
       for (const profile of profiles) {
         for (let trial = 1; trial <= trialsPerCell; trial += 1) {
-          console.log(`  would run: ${fixture}/${profile.label}/trial-${trial}`);
+          console.log(`  would run: seed-${fixtureSeed}/${profile.label}/trial-${trial}`);
         }
       }
     }
@@ -445,22 +485,22 @@ async function main(): Promise<void> {
   await mkdir(cellsDir, { recursive: true });
 
   const state: StateFile = {
-    config: { image: options.image, smoke: options.smoke, dshVersion },
+    config: { image: options.image, smoke: options.smoke, dshVersion, graderRuns: options.graderRuns, killRateThreshold: options.killRateThreshold },
     profiles: profiles.map(({ label, sha256 }) => ({ label, sha256 })),
-    fixtures,
+    fixtures: fixtureSeeds.map(String),
     trials: []
   };
 
   // Sequential on purpose, mirroring scripts/evals-ab-demo.ts (#25): keeps
-  // driver-side resource usage (docker containers, host CPU for score.py)
+  // driver-side resource usage (docker containers, host CPU for grade.py)
   // bounded and cell logs easy to follow; parallelizing across containers
   // is safe to add later since each cell is fully isolated from the others.
-  for (const fixture of fixtures) {
+  for (const fixtureSeed of fixtureSeeds) {
     for (const profile of profiles) {
       for (let trial = 1; trial <= trialsPerCell; trial += 1) {
-        const label = `${fixture}/${profile.label}/trial-${trial}`;
+        const label = `seed-${fixtureSeed}/${profile.label}/trial-${trial}`;
         console.log(`Cell ${label} (${state.trials.length + 1}/${totalRuns}):`);
-        const record = await executeCell(options, taskPrompt, fixture, profile, trial, cellsDir);
+        const record = await executeCell(options, taskPrompt, fixtureSeed, profile, trial, cellsDir);
         state.trials.push(record);
         console.log(`  ${label} finished: outcome=${classifyDshOutcome(record)} killed=${record.killed} falseAlarms=${record.falseAlarms} contractOk=${record.contractOk} integrityOk=${record.integrityOk}${record.blockedReason ? ` blocked="${record.blockedReason}"` : ""}${record.error ? ` error="${record.error}"` : ""}`);
         await writeFile(statePath, JSON.stringify(state, null, 2));

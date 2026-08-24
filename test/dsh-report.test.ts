@@ -28,7 +28,8 @@ function trial(overrides: Partial<DshTrialRecord>): DshTrialRecord {
     contractOk: true,
     integrityOk: true,
     transcriptAuditHits: [],
-    killMatrix: null,
+    killRate: null,
+    killedByKind: null,
     wallTimeMs: 60_000,
     ...overrides
   };
@@ -196,23 +197,26 @@ test("classifyDshOutcome: a transcript audit hit forces 'invalidated', same prio
   );
 });
 
-test("sprayAndPrayRate and the kill matrix / spray-and-pray report columns", () => {
+// #126: the private-mutant-pool kill matrix / "spray and pray" signal was
+// dropped (vendor/tinytable-evals generates mutants on demand from a seed
+// and never persists a pool to replay a suite against). It's replaced by
+// grade.py's own probabilistic killRate/killedByKind (upstream issue #21).
+test("summarizeFixtureCells / buildDshComparisonReport surface mean kill rate and killed-by-kind", () => {
+  const cells = summarizeFixtureCells([
+    trial({ fixture: "m01", profile: "baseline", trial: 1, killed: true, falseAlarms: 0, contractOk: true, killRate: 1, killedByKind: { assertion: 2, invariant: 1 } }),
+    trial({ fixture: "m01", profile: "baseline", trial: 2, killed: true, falseAlarms: 0, contractOk: true, killRate: 0.5, killedByKind: { assertion: 1, invariant: 0 } })
+  ]);
+  const cell = cells.find((c) => c.fixture === "m01" && c.profile === "baseline")!;
+  assert.equal(cell.meanKillRate, 0.75);
+  assert.deepEqual(cell.killedByKind, { assertion: 3, invariant: 1 });
+
   const report = buildDshComparisonReport(
     reportInput([
-      trial({
-        fixture: "m01",
-        profile: "baseline",
-        trial: 1,
-        trialId: "m01-baseline-1",
-        killMatrix: { m01: true, m02: true, m03: false }
-      })
+      trial({ fixture: "m01", profile: "baseline", trial: 1, trialId: "m01-baseline-1", killed: true, falseAlarms: 0, contractOk: true, killRate: 1, killedByKind: { assertion: 1, invariant: 1 } })
     ])
   );
-  // Spray-and-pray rate excludes the trial's own fixture (m01): of the
-  // other pool members (m02, m03), 1/2 were also killed.
-  assert.match(report, /\| `m01` \| `baseline` \| 1 \| 100% \| 0% \| 100% \| 50% \|/);
-  assert.match(report, /## Kill matrix/);
-  assert.match(report, /\| `m01-baseline-1` \| \*\*killed\*\* \| killed \| - \|/);
+  assert.match(report, /\| `m01` \| `baseline` \| 1 \| 100% \| 0% \| 100% \| 100% \| 1\/1 \|/);
+  assert.doesNotMatch(report, /## Kill matrix/);
 });
 
 test("buildDshComparisonReport's paired delta table states a per-fixture kill-rate delta with no significance claim", () => {
