@@ -11,6 +11,8 @@
  * the container's captured stdout/stderr) the driver wrote to disk.
  */
 
+import type { SessionStats } from "./dsh-session-stats.js";
+
 export type DshTrialOutcome = "passed" | "task_failed" | "verify_failed" | "invalidated" | "blocked" | "driver_error";
 
 export type DshTrialRecord = {
@@ -57,6 +59,16 @@ export type DshTrialRecord = {
   killedByKind: { assertion: number; invariant: number } | null;
   blockedReason?: string;
   wallTimeMs?: number;
+  /**
+   * Turn/step/wall-time telemetry folded from dsh's own session-
+   * persistence JSONL log (server/evals/dsh-session-stats.ts) - null when
+   * the trial never launched a dsh session, or that session wrote nothing
+   * readable (a version without the session-stats plugin, or a launch
+   * that failed before any event landed). Summed across every session
+   * file the trial's dshHomeDir held, since a normal trial writes exactly
+   * one.
+   */
+  sessionStats?: SessionStats | null;
   error?: string;
 };
 
@@ -313,15 +325,19 @@ export function buildDshComparisonReport(input: DshComparisonReportInput): strin
     "Every aggregate above is computed from exactly these trials; each row's artifacts directory holds the seed-root (post-run), manifest.json, score.json, and the container's captured stdout/stderr."
   );
   lines.push("");
-  lines.push("| Fixture | Profile | Trial | Outcome | Killed | False alarms | Contract OK | Integrity OK | Transcript audit | Wall time | Artifacts |");
-  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+  lines.push(
+    "Turns/LLM time come from dsh's own session-persistence JSONL log, folded by server/evals/dsh-session-stats.ts (a direct port of dsh's `sessionStats` projection) - \"n/a\" means the trial's session captured no readable telemetry, not that it took zero turns."
+  );
+  lines.push("");
+  lines.push("| Fixture | Profile | Trial | Outcome | Killed | False alarms | Contract OK | Integrity OK | Transcript audit | Turns | LLM time | Wall time | Artifacts |");
+  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
   const sorted = [...input.trials].sort(
     (a, b) => a.fixture.localeCompare(b.fixture) || a.profile.localeCompare(b.profile) || a.trial - b.trial
   );
   for (const trial of sorted) {
     const auditCell = trial.transcriptAuditHits.length ? `${trial.transcriptAuditHits.length} hit(s): ${trial.transcriptAuditHits.join(", ")}` : "clean";
     lines.push(
-      `| \`${trial.fixture}\` | \`${trial.profile}\` | ${trial.trial} | ${classifyDshOutcome(trial)} | ${trial.killed === null ? "n/a" : trial.killed} | ${trial.falseAlarms ?? "n/a"} | ${trial.contractOk === null ? "n/a" : trial.contractOk} | ${trial.integrityOk} | ${auditCell} | ${seconds(trial.wallTimeMs)} | \`${trial.artifactsDir}\` |`
+      `| \`${trial.fixture}\` | \`${trial.profile}\` | ${trial.trial} | ${classifyDshOutcome(trial)} | ${trial.killed === null ? "n/a" : trial.killed} | ${trial.falseAlarms ?? "n/a"} | ${trial.contractOk === null ? "n/a" : trial.contractOk} | ${trial.integrityOk} | ${auditCell} | ${trial.sessionStats?.turns ?? "n/a"} | ${seconds(trial.sessionStats?.llmMs)} | ${seconds(trial.wallTimeMs)} | \`${trial.artifactsDir}\` |`
     );
   }
   lines.push("");

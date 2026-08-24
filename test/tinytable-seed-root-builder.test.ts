@@ -47,7 +47,8 @@ test("buildSeedRoot materializes a git-initialized worktree with the expected to
     "sql-tests",
     "substrate.py",
     "task-prompt.md",
-    "tinytable"
+    "tinytable",
+    "trajectory.py"
   ]);
   assert.equal(manifest.seed, 2);
   assert.ok(manifest.operatorId.length > 0);

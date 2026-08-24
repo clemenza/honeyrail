@@ -66,6 +66,9 @@ import { findBlockedReason, withUnattendedPreamble } from "../server/agents/comm
 import { dshAdapter } from "../server/agents/dsh.js";
 import { buildDshComparisonReport, classifyDshOutcome, type DshComparisonReportInput, type DshTrialRecord } from "../server/evals/dsh-report.js";
 import { describeManifestMismatch, findManifestMismatches } from "../server/evals/manifest-preflight.js";
+import { readSessionStats } from "../server/evals/dsh-session-stats.js";
+import { appendDerivedTrajectoryEvents } from "../server/evals/dsh-trajectory-bridge.js";
+import { logAgentSnapshot, logFileDiff } from "../server/evals/dsh-trajectory-filesystem-events.js";
 import { auditTranscript } from "../server/evals/transcript-audit.js";
 import { runCommandSafe } from "../server/utils.js";
 import { buildSeedRoot, type SeedRootManifest } from "./tinytable-seed-root-builder.js";
@@ -250,7 +253,7 @@ export type ScoreJson = {
 // will ever name, unlike `error`.
 export type RunScorePyResult = { ok: true; score: ScoreJson } | { ok: false; error: string };
 
-export type GraderOptions = { runs?: number; killRateThreshold?: number };
+export type GraderOptions = { runs?: number; killRateThreshold?: number; trajectoryLog?: string };
 
 // `run` defaults to the real subprocess call; overridable so tests can
 // exercise the read/parse/discriminate logic (the actual site of #114's
@@ -268,7 +271,13 @@ export async function runScorePy(
     ...(graderOptions.runs && graderOptions.runs !== 1 ? ["--runs", String(graderOptions.runs)] : []),
     ...(graderOptions.killRateThreshold !== undefined && graderOptions.killRateThreshold !== 1
       ? ["--kill-rate-threshold", String(graderOptions.killRateThreshold)]
-      : [])
+      : []),
+    // #40 (grade.py's own side, clemenza/tinytable-evals#51): relative to
+    // --artifacts (worktreePath) unless absolute, same convention grade.py
+    // already uses for --out - so a plain "trajectory.jsonl" lands
+    // directly in the seed-root, the same file run_sql_tests.py
+    // --trajectory-log and sample_trajectory.py already write to.
+    ...(graderOptions.trajectoryLog ? ["--trajectory-log", graderOptions.trajectoryLog] : [])
   ]);
   try {
     const raw = await readFile(join(worktreePath, "score.json"), "utf8");
@@ -336,10 +345,12 @@ async function executeCell(
   await writeFile(join(seedRootDir, PROFILE_PATCH_FILENAME), profile.content);
 
   const prompt = withUnattendedPreamble(taskPrompt);
+  const dshHomeDir = join(artifactsDir, "dsh-home");
   const startedAt = Date.now();
   const result = await runInExamRoom({
     seedRootDir,
     image: options.image,
+    dshHomeDir,
     command: ["dsh", "--profile", "headless", "--patch", PROFILE_PATCH_FILENAME, prompt],
     env: {
       ...(process.env.DEEPSEEK_API_KEY ? { DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY } : {}),
@@ -360,6 +371,30 @@ async function executeCell(
   const combinedOutput = `${result.stdout}\n${result.stderr}`;
   await writeFile(join(artifactsDir, "container.log"), `--- stdout ---\n${result.stdout}\n--- stderr ---\n${result.stderr}\n`);
 
+  // Turn/step/wall-time telemetry from dsh's own session-persistence JSONL
+  // log, now that dshHomeDir gave it somewhere durable to write - see
+  // server/evals/dsh-session-stats.ts. Best-effort: null (nothing written,
+  // or this dsh version doesn't ship the plugin) must never fail the
+  // trial, only omit sessionStats from its record.
+  const sessionStatsReport = await readSessionStats(dshHomeDir).catch(() => null);
+  if (sessionStatsReport) {
+    await writeFile(join(artifactsDir, "session-stats.json"), JSON.stringify(sessionStatsReport, null, 2));
+  }
+
+  // Same source, derived instead of folded: per-tool-call (and, for dsh's
+  // built-in bash tool, per-shell-command) trajectory events, appended into
+  // the seed-root in vendor/tinytable-evals's #40 trajectory.jsonl schema -
+  // see server/evals/dsh-trajectory-bridge.ts for what this can and can't
+  // verify. Best-effort, same reasoning as sessionStatsReport above.
+  await appendDerivedTrajectoryEvents(dshHomeDir, seedRootDir).catch(() => null);
+
+  // The remaining two #40 event kinds this driver can produce on its own
+  // (see server/evals/dsh-trajectory-filesystem-events.ts) - gitInitCommit
+  // above is exactly the "HEAD" baseline_ref this diffs against. Also
+  // best-effort: neither should ever fail the trial.
+  await logFileDiff(seedRootDir).catch(() => undefined);
+  await logAgentSnapshot(seedRootDir).catch(() => undefined);
+
   // #107 transcript audit: whatever the agent said (container output) and
   // wrote (findings.json, its .test files, if it got that far) - run once,
   // reused across every return path below, since it costs nothing beyond
@@ -371,12 +406,14 @@ async function executeCell(
     console.error(`  ${trialId}: TRANSCRIPT AUDIT HIT(S): ${transcriptAuditHits.join(", ")}`);
   }
 
+  const sessionStats = sessionStatsReport?.aggregate ?? null;
+
   if (result.timedOut) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, error: `trial timed out after ${options.trialTimeoutMinutes}m and was killed` };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, sessionStats, error: `trial timed out after ${options.trialTimeoutMinutes}m and was killed` };
   }
   const fatal = dshAdapter.findFatalError?.(combinedOutput);
   if (fatal) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, error: `dsh fatal error (${fatal.code}): ${fatal.message}` };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, sessionStats, error: `dsh fatal error (${fatal.code}): ${fatal.message}` };
   }
   const blocked = findBlockedReason(combinedOutput);
 
@@ -387,7 +424,11 @@ async function executeCell(
   // (server/evals/dsh-report.ts) already returns "blocked" before ever
   // consulting killed/contractOk whenever blockedReason is set - see
   // docs/dsh-evals-demo.md.
-  const scoreOrError = await runScorePy(seedRootDir, runCommandSafe, { runs: options.graderRuns, killRateThreshold: options.killRateThreshold });
+  const scoreOrError = await runScorePy(seedRootDir, runCommandSafe, {
+    runs: options.graderRuns,
+    killRateThreshold: options.killRateThreshold,
+    trajectoryLog: "trajectory.jsonl"
+  });
   const postMismatches = await findManifestMismatches(seedRootDir, { files: manifest.files });
   const integrityOk = postMismatches.length === 0;
   if (!integrityOk) {
@@ -395,7 +436,7 @@ async function executeCell(
   }
 
   if (!scoreOrError.ok) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, blockedReason: blocked?.message, error: scoreOrError.error };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, sessionStats, blockedReason: blocked?.message, error: scoreOrError.error };
   }
 
   return {
@@ -408,6 +449,7 @@ async function executeCell(
     killRate: scoreOrError.score.kill_rate,
     killedByKind: scoreOrError.score.killed_by_kind,
     wallTimeMs,
+    sessionStats,
     blockedReason: blocked?.message
   };
 }

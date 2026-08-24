@@ -30,8 +30,37 @@ pinned to a specific upstream commit:
 
 ```
 $ git -C vendor/tinytable-evals rev-parse HEAD
-78bcc980a5c388710a59a8db64c74471c3399a13
+19f521d99846608dc9a7febf1e702ab6e8d398e8
 ```
+
+Re-pinned three times for upstream's #40 (from `78bcc98`):
+
+- `1262518` (upstream #50): `trajectory.py` (structured JSONL trajectory
+  logging - a stdlib-only writer/schema for `tool_call`/`shell_command`/
+  `test_run`/`file_diff`/`agent_snapshot` events, now shipped into every
+  seed-root by `build_seed_root.py`), `run_sql_tests.py --trajectory-log`
+  (emits a `test_run` event per invocation), and `trajectory_schema.json`/
+  `sample_trajectory.py`.
+- `2a1a00f` (upstream #51): `grade.py --trajectory-log`, threaded through
+  to its own step-1 `run_sql_tests.py` runs against `--artifacts` - the
+  one `run_sql_tests.py` invocation site #50 didn't cover. This driver's
+  `runScorePy()` (`scripts/dsh-evals-demo.ts`) now passes
+  `trajectoryLog: "trajectory.jsonl"` on every call, so a real trial's
+  `test_run` events land in the seed-root's `trajectory.jsonl` alongside
+  the `tool_call`/`shell_command` events server/evals/dsh-trajectory-
+  bridge.ts already derives from dsh's own session log - #40's full event
+  set is now produced end to end by a real trial, not just
+  `sample_trajectory.py`'s scripted demo.
+- `19f521d` (upstream #52): fixes a bug found while porting
+  `trajectory.py`'s `git_diff()` to server/evals/dsh-trajectory-
+  filesystem-events.ts's `gitDiff()` - a plain `git diff <ref>` never
+  mentions an untracked path, and every agent-added `sql-tests/agent/
+  *.test` file starts out untracked, so it was silently missing from
+  every `file_diff` event's `diff`/`files_changed` entirely (not just
+  mislabeled). Both implementations now run `git add --intent-to-add
+  --all` first; this driver's own fix landed in the same commit as
+  `gitDiff()` itself (see that file's own history) rather than needing a
+  separate re-pin.
 
 Before #126, `examples/tinytable-eval/{mutants,golden,score.py}` was a
 static copy frozen at the point #104 extracted it, and had already drifted

@@ -23,7 +23,14 @@ integration that are not part of this issue.
 - **Runner**: `scripts/tinytable-exam-room.ts`'s `runInExamRoom()` launches a
   command inside that image via `docker run`, bind-mounting *only* the
   caller-supplied seed-root directory (normally #104's `buildSeedRoot()`
-  output) at `/workspace`. No other host path is ever mounted in.
+  output) at `/workspace`. No other host path is ever mounted in, unless the
+  caller opts into `dshHomeDir` - a second, write-only mount at `/dsh-home`
+  (`$DSH_HOME` pointed at it) that lets dsh's own session-persistence JSONL
+  log survive the container's `--rm` instead of being lost with the
+  ephemeral tmpfs `$HOME` (see server/evals/dsh-session-stats.ts, and
+  `scripts/tinytable-exam-room.ts`'s module docstring for why this doesn't
+  weaken the guarantee below: it carries no fixture/answer material, and
+  nothing about it is a path the agent can read *out* through).
 - **Container hardening** (`buildDockerArgs()`): `--read-only` root
   filesystem (dsh's writes go to `$HOME=/tmp`, a tmpfs, and to `/workspace`,
   both exempted), `--cap-drop=ALL`, `--security-opt no-new-privileges`,

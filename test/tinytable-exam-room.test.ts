@@ -52,6 +52,21 @@ test("buildDockerArgs passes env vars via -e and never bakes them into the image
   assert.deepEqual(args.slice(imageIndex), [DEFAULT_IMAGE, "dsh"]);
 });
 
+test("buildDockerArgs mounts nothing beyond the seed-root when dshHomeDir is omitted", () => {
+  const args = buildDockerArgs({ seedRootDir: "/seed", command: ["true"] }, "test-container");
+  const mountFlags = args.filter((_, i) => args[i - 1] === "-v");
+  assert.deepEqual(mountFlags, ["/seed:/workspace:rw"]);
+  assert.ok(!args.includes("DSH_HOME=/dsh-home"));
+});
+
+test("buildDockerArgs adds a second, write-only mount for dshHomeDir, with $DSH_HOME pointed at it", () => {
+  const args = buildDockerArgs({ seedRootDir: "/seed", command: ["true"], dshHomeDir: "/some/dsh-home" }, "test-container");
+  const mountFlags = args.filter((_, i) => args[i - 1] === "-v");
+  assert.deepEqual(mountFlags, ["/seed:/workspace:rw", "/some/dsh-home:/dsh-home:rw"]);
+  assert.ok(args.includes("DSH_HOME=/dsh-home"));
+  assert.equal(args[args.indexOf("DSH_HOME=/dsh-home") - 1], "-e");
+});
+
 test("buildDockerArgs supports overriding image, network, memory, and pids limit", () => {
   const args = buildDockerArgs(
     { seedRootDir: "/seed", command: ["true"], image: "custom:tag", network: "none", memory: "1g", pidsLimit: 64 },
@@ -127,4 +142,29 @@ test("runInExamRoom: a scored-trial write (e.g. findings.json) lands back on the
   assert.equal(result.exitCode, 0);
   const written = await import("node:fs/promises").then((fs) => fs.readFile(join(seedRootDir, "findings.json"), "utf8"));
   assert.equal(written.trim(), "[]");
+});
+
+test("runInExamRoom: dshHomeDir is created if missing, mounted at /dsh-home as $DSH_HOME, and survives the container's --rm", async (t) => {
+  if (!(await examRoomImageAvailable())) {
+    t.skip(`${DEFAULT_IMAGE} not built locally - see docker/tinytable-exam-room/Dockerfile`);
+    return;
+  }
+
+  const seedRootDir = await tempDir(t, "honeyrail-exam-room-");
+  const scratch = await tempDir(t, "honeyrail-exam-room-dsh-home-parent-");
+  const dshHomeDir = join(scratch, "dsh-home"); // deliberately not pre-created
+
+  const result = await runInExamRoom({
+    seedRootDir,
+    dshHomeDir,
+    command: ["sh", "-c", 'echo "$DSH_HOME" && mkdir -p "$DSH_HOME/sessions/proj" && echo hi > "$DSH_HOME/sessions/proj/s.jsonl"'],
+    timeoutMs: 30_000
+  });
+
+  assert.equal(result.exitCode, 0, `stdout=${result.stdout}\nstderr=${result.stderr}`);
+  assert.ok(result.stdout.includes("/dsh-home"));
+  const written = await import("node:fs/promises").then((fs) =>
+    fs.readFile(join(dshHomeDir, "sessions", "proj", "s.jsonl"), "utf8")
+  );
+  assert.equal(written.trim(), "hi");
 });
