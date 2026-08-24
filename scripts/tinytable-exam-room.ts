@@ -14,6 +14,17 @@
  * `workspace-write`) does or doesn't restrict; see #103, which proved that
  * one doesn't restrict reads at all.
  *
+ * The one opt-in exception is `dshHomeDir`: a second, host-supplied
+ * directory mounted at `/dsh-home` (with `$DSH_HOME` pointed at it) purely
+ * so dsh's own `@deepseek-ai/dsh-session-persistence-jsonl` plugin's event
+ * log - `turns`/`steps`/wall-time telemetry the driver wants back, see
+ * server/evals/dsh-session-stats.ts - survives the container's `--rm`
+ * instead of being written into the ephemeral `/tmp` tmpfs and destroyed
+ * with it. This carries no fixture/answer material - it doesn't weaken the
+ * #105 guarantee above - and nothing about it is readable by the agent as
+ * a path *back out*; it is this driver's own write-only telemetry sink,
+ * read only after the container has already exited.
+ *
  * This deliberately does not go through HoneyRail's own worktree/tmux/
  * session-monitor machinery (see #93's amendment and docs/security-model.md
  * - "do not treat the gateway as a sandbox"): it's a standalone execution
@@ -21,11 +32,12 @@
  *
  * Usage:
  *   node --import tsx scripts/tinytable-exam-room.ts \
- *     --seed-root ./seed-root -- dsh --profile headless "<prompt>"
+ *     --seed-root ./seed-root [--dsh-home ./dsh-home] -- dsh --profile headless "<prompt>"
  */
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { mkdir } from "node:fs/promises";
 import { userInfo } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,7 +49,7 @@ const DEFAULT_PIDS_LIMIT = 256;
 const DEFAULT_TMP_SIZE = "256m";
 
 export type ExamRoomOptions = {
-  /** Host directory to bind-mount at /workspace, read-write. The only host path ever exposed to the container. */
+  /** Host directory to bind-mount at /workspace, read-write. The only host path ever exposed to the container, unless dshHomeDir is also given. */
   seedRootDir: string;
   /** Argv to run inside the container, cwd=/workspace. */
   command: string[];
@@ -49,6 +61,16 @@ export type ExamRoomOptions = {
   pidsLimit?: number;
   /** "bridge" (default) gives the agent outbound network for its model API calls, in its own network namespace - it cannot reach the host's loopback services. "none" disables networking entirely. */
   network?: "none" | "bridge";
+  /**
+   * Host directory to bind-mount at /dsh-home, read-write, with $DSH_HOME
+   * pointed at it - so dsh's session-persistence JSONL log (turns/steps/
+   * wall-time telemetry, see server/evals/dsh-session-stats.ts) survives
+   * the container's --rm instead of being lost with the ephemeral /tmp
+   * $HOME. Created if it doesn't already exist. Opt-in and write-only from
+   * the driver's perspective (see the module docstring); omitted, this
+   * mounts nothing and behaves exactly as before.
+   */
+  dshHomeDir?: string;
 };
 
 export type ExamRoomResult = {
@@ -89,6 +111,9 @@ export function buildDockerArgs(options: ExamRoomOptions, containerName: string)
     "-v", `${seedRootDir}:/workspace:rw`,
     "-w", "/workspace"
   ];
+  if (options.dshHomeDir) {
+    args.push("-v", `${resolve(options.dshHomeDir)}:/dsh-home:rw`, "-e", "DSH_HOME=/dsh-home");
+  }
   for (const [key, value] of Object.entries(options.env ?? {})) {
     args.push("-e", `${key}=${value}`);
   }
@@ -97,6 +122,9 @@ export function buildDockerArgs(options: ExamRoomOptions, containerName: string)
 }
 
 export async function runInExamRoom(options: ExamRoomOptions): Promise<ExamRoomResult> {
+  if (options.dshHomeDir) {
+    await mkdir(options.dshHomeDir, { recursive: true });
+  }
   const containerName = `tinytable-exam-room-${randomUUID()}`;
   const args = buildDockerArgs(options, containerName);
 
@@ -129,9 +157,10 @@ export async function runInExamRoom(options: ExamRoomOptions): Promise<ExamRoomR
 // CLI
 // ---------------------------------------------------------------------------
 
-function parseArgs(argv: string[]): { seedRootDir: string; image?: string; command: string[] } {
+function parseArgs(argv: string[]): { seedRootDir: string; image?: string; dshHomeDir?: string; command: string[] } {
   let seedRootDir: string | undefined;
   let image: string | undefined;
+  let dshHomeDir: string | undefined;
   let i = 0;
   for (; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -145,6 +174,7 @@ function parseArgs(argv: string[]): { seedRootDir: string; image?: string; comma
     switch (arg) {
       case "--seed-root": seedRootDir = next(); break;
       case "--image": image = next(); break;
+      case "--dsh-home": dshHomeDir = next(); break;
       case "--help":
       case "-h":
         console.log("See the header comment of scripts/tinytable-exam-room.ts for usage.");
@@ -157,7 +187,7 @@ function parseArgs(argv: string[]): { seedRootDir: string; image?: string; comma
   const command = argv.slice(i);
   if (!seedRootDir) throw new Error("--seed-root <dir> is required");
   if (command.length === 0) throw new Error("no command given - pass it after --");
-  return { seedRootDir, image, command };
+  return { seedRootDir, image, dshHomeDir, command };
 }
 
 async function main(): Promise<void> {
@@ -165,6 +195,7 @@ async function main(): Promise<void> {
   const result = await runInExamRoom({
     seedRootDir: options.seedRootDir,
     image: options.image,
+    dshHomeDir: options.dshHomeDir,
     command: options.command,
     env: {
       ...(process.env.DEEPSEEK_API_KEY ? { DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY } : {}),

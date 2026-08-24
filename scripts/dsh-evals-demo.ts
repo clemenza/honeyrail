@@ -66,6 +66,7 @@ import { findBlockedReason, withUnattendedPreamble } from "../server/agents/comm
 import { dshAdapter } from "../server/agents/dsh.js";
 import { buildDshComparisonReport, classifyDshOutcome, type DshComparisonReportInput, type DshTrialRecord } from "../server/evals/dsh-report.js";
 import { describeManifestMismatch, findManifestMismatches } from "../server/evals/manifest-preflight.js";
+import { readSessionStats } from "../server/evals/dsh-session-stats.js";
 import { auditTranscript } from "../server/evals/transcript-audit.js";
 import { runCommandSafe } from "../server/utils.js";
 import { buildSeedRoot, type SeedRootManifest } from "./tinytable-seed-root-builder.js";
@@ -336,10 +337,12 @@ async function executeCell(
   await writeFile(join(seedRootDir, PROFILE_PATCH_FILENAME), profile.content);
 
   const prompt = withUnattendedPreamble(taskPrompt);
+  const dshHomeDir = join(artifactsDir, "dsh-home");
   const startedAt = Date.now();
   const result = await runInExamRoom({
     seedRootDir,
     image: options.image,
+    dshHomeDir,
     command: ["dsh", "--profile", "headless", "--patch", PROFILE_PATCH_FILENAME, prompt],
     env: {
       ...(process.env.DEEPSEEK_API_KEY ? { DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY } : {}),
@@ -360,6 +363,16 @@ async function executeCell(
   const combinedOutput = `${result.stdout}\n${result.stderr}`;
   await writeFile(join(artifactsDir, "container.log"), `--- stdout ---\n${result.stdout}\n--- stderr ---\n${result.stderr}\n`);
 
+  // Turn/step/wall-time telemetry from dsh's own session-persistence JSONL
+  // log, now that dshHomeDir gave it somewhere durable to write - see
+  // server/evals/dsh-session-stats.ts. Best-effort: null (nothing written,
+  // or this dsh version doesn't ship the plugin) must never fail the
+  // trial, only omit sessionStats from its record.
+  const sessionStatsReport = await readSessionStats(dshHomeDir).catch(() => null);
+  if (sessionStatsReport) {
+    await writeFile(join(artifactsDir, "session-stats.json"), JSON.stringify(sessionStatsReport, null, 2));
+  }
+
   // #107 transcript audit: whatever the agent said (container output) and
   // wrote (findings.json, its .test files, if it got that far) - run once,
   // reused across every return path below, since it costs nothing beyond
@@ -371,12 +384,14 @@ async function executeCell(
     console.error(`  ${trialId}: TRANSCRIPT AUDIT HIT(S): ${transcriptAuditHits.join(", ")}`);
   }
 
+  const sessionStats = sessionStatsReport?.aggregate ?? null;
+
   if (result.timedOut) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, error: `trial timed out after ${options.trialTimeoutMinutes}m and was killed` };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, sessionStats, error: `trial timed out after ${options.trialTimeoutMinutes}m and was killed` };
   }
   const fatal = dshAdapter.findFatalError?.(combinedOutput);
   if (fatal) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, error: `dsh fatal error (${fatal.code}): ${fatal.message}` };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, sessionStats, error: `dsh fatal error (${fatal.code}): ${fatal.message}` };
   }
   const blocked = findBlockedReason(combinedOutput);
 
@@ -395,7 +410,7 @@ async function executeCell(
   }
 
   if (!scoreOrError.ok) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, blockedReason: blocked?.message, error: scoreOrError.error };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, sessionStats, blockedReason: blocked?.message, error: scoreOrError.error };
   }
 
   return {
@@ -408,6 +423,7 @@ async function executeCell(
     killRate: scoreOrError.score.kill_rate,
     killedByKind: scoreOrError.score.killed_by_kind,
     wallTimeMs,
+    sessionStats,
     blockedReason: blocked?.message
   };
 }
