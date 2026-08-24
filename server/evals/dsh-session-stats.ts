@@ -218,6 +218,21 @@ export type SessionStatsReport = {
  * did nothing yet".
  */
 export async function readSessionStats(dshHomeDir: string): Promise<SessionStatsReport | null> {
+  const sessions = await readRawSessionFiles(dshHomeDir);
+  if (sessions === null) return null;
+  const folded = sessions.map(({ file, events }) => ({ file, stats: foldSessionStats(events) }));
+  return { aggregate: sumStats(folded.map((s) => s.stats)), sessions: folded };
+}
+
+/**
+ * Reads and parses every session JSONL file under `${dshHomeDir}/sessions/`,
+ * sorted by filename for a deterministic (if in practice almost always
+ * single-file) order - the shared file-discovery this module's
+ * `readSessionStats` and server/evals/dsh-trajectory-bridge.ts's
+ * tool_call/shell_command derivation both build on. Returns null under the
+ * same "nothing captured" condition documented on `readSessionStats`.
+ */
+export async function readRawSessionFiles(dshHomeDir: string): Promise<Array<{ file: string; events: DshRawEvent[] }> | null> {
   const sessionsDir = join(dshHomeDir, "sessions");
   let entries: string[];
   try {
@@ -228,11 +243,10 @@ export async function readSessionStats(dshHomeDir: string): Promise<SessionStats
   const files = entries.filter((entry) => entry.endsWith(".jsonl")).sort();
   if (files.length === 0) return null;
 
-  const sessions = await Promise.all(
+  return Promise.all(
     files.map(async (file) => {
       const text = await readFile(join(sessionsDir, file), "utf8");
-      return { file, stats: foldSessionStats(parseSessionLog(text)) };
+      return { file, events: parseSessionLog(text) };
     })
   );
-  return { aggregate: sumStats(sessions.map((s) => s.stats)), sessions };
 }

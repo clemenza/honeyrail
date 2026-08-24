@@ -67,6 +67,7 @@ import { dshAdapter } from "../server/agents/dsh.js";
 import { buildDshComparisonReport, classifyDshOutcome, type DshComparisonReportInput, type DshTrialRecord } from "../server/evals/dsh-report.js";
 import { describeManifestMismatch, findManifestMismatches } from "../server/evals/manifest-preflight.js";
 import { readSessionStats } from "../server/evals/dsh-session-stats.js";
+import { appendDerivedTrajectoryEvents } from "../server/evals/dsh-trajectory-bridge.js";
 import { auditTranscript } from "../server/evals/transcript-audit.js";
 import { runCommandSafe } from "../server/utils.js";
 import { buildSeedRoot, type SeedRootManifest } from "./tinytable-seed-root-builder.js";
@@ -372,6 +373,13 @@ async function executeCell(
   if (sessionStatsReport) {
     await writeFile(join(artifactsDir, "session-stats.json"), JSON.stringify(sessionStatsReport, null, 2));
   }
+
+  // Same source, derived instead of folded: per-tool-call (and, for dsh's
+  // built-in bash tool, per-shell-command) trajectory events, appended into
+  // the seed-root in vendor/tinytable-evals's #40 trajectory.jsonl schema -
+  // see server/evals/dsh-trajectory-bridge.ts for what this can and can't
+  // verify. Best-effort, same reasoning as sessionStatsReport above.
+  await appendDerivedTrajectoryEvents(dshHomeDir, seedRootDir).catch(() => null);
 
   // #107 transcript audit: whatever the agent said (container output) and
   // wrote (findings.json, its .test files, if it got that far) - run once,
