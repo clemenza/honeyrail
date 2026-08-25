@@ -157,6 +157,31 @@ test("runScorePy passes --trajectory-log through to grade.py when given, omits i
   });
 });
 
+// #57 (clemenza/tinytable-evals#59), opt-in: --pg-adjudicate is a plain
+// boolean flag (no value), unlike --runs/--kill-rate-threshold/
+// --trajectory-log above - just present or absent.
+test("runScorePy passes --pg-adjudicate through to grade.py when requested, omits it when not", async () => {
+  await withTempDir(async (dir) => {
+    await writeFile(join(dir, "score.json"), JSON.stringify({ killed: true, false_alarms: 0, contract_ok: true, passed: true }));
+
+    let receivedArgs: string[] = [];
+    const capturingRun = async (_cmd: string, args: string[] = []): Promise<SafeCommandOutput> => {
+      receivedArgs = args;
+      return { ok: true, stdout: "", stderr: "", code: 0 };
+    };
+    await runScorePy(dir, capturingRun, { pgAdjudicate: true });
+    assert.ok(receivedArgs.includes("--pg-adjudicate"), `expected --pg-adjudicate in args, got ${JSON.stringify(receivedArgs)}`);
+
+    receivedArgs = [];
+    await runScorePy(dir, capturingRun, { pgAdjudicate: false });
+    assert.ok(!receivedArgs.includes("--pg-adjudicate"), `expected no --pg-adjudicate, got ${JSON.stringify(receivedArgs)}`);
+
+    receivedArgs = [];
+    await runScorePy(dir, capturingRun, {});
+    assert.ok(!receivedArgs.includes("--pg-adjudicate"), `expected no --pg-adjudicate when omitted, got ${JSON.stringify(receivedArgs)}`);
+  });
+});
+
 test("runScorePy reports a driver-level error when grade.py produced no score.json at all", async () => {
   await withTempDir(async (dir) => {
     const failedRun = async (): Promise<SafeCommandOutput> => ({ ok: false, stdout: "", stderr: "Traceback: boom", code: 1 });

@@ -69,6 +69,15 @@ export type DshTrialRecord = {
    * one.
    */
   sessionStats?: SessionStats | null;
+  /**
+   * #57, opt-in via --pg-adjudicate (off by default): summed across
+   * --grader-runs seeds' F_mutant & F_clean disputes, settled by a
+   * PostgreSQL oracle into reference_bug (a real clean/ bug - see
+   * clemenza/honeyrail#130/#134 - not counted against the agent) vs
+   * false_alarm vs unknown. null when --pg-adjudicate wasn't passed, or
+   * scoring never reached that step.
+   */
+  pgAdjudicationTally?: { reference_bug: number; false_alarm: number; unknown: number } | null;
   error?: string;
 };
 
