@@ -78,7 +78,8 @@ function normalizeTrial(raw: DshTrialRecord): DshTrialRecord {
     ...raw,
     transcriptAuditHits: raw.transcriptAuditHits ?? [],
     killRate: raw.killRate ?? null,
-    killedByKind: raw.killedByKind ?? null
+    killedByKind: raw.killedByKind ?? null,
+    pgAdjudicationTally: raw.pgAdjudicationTally ?? null
   };
 }
 

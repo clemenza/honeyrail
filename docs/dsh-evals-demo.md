@@ -22,6 +22,27 @@ through to `grade.py`'s own probabilistic multi-seed scoring (#21 upstream;
 default `--grader-runs 1` reproduces the original single-run behavior
 exactly).
 
+`--pg-adjudicate` (upstream issue #57, off by default) passes
+`--pg-adjudicate` through to `grade.py`: any agent test record that fails
+against *both* the trial's mutant and the untouched `clean/` reference -
+previously always scored a blanket `false_alarm` - gets a PostgreSQL oracle
+to settle whether that's a genuine mistake or actually a bug in `clean/`
+itself (a `reference_bug`, not counted against the agent - see
+`clemenza/honeyrail#130`/`#134`, TRUTH_MODEL.md). Requires a reachable
+PostgreSQL server and `psycopg2` - same setup as `tinytable-evals`'s
+`oracle.py --backend postgres`:
+
+```sh
+docker compose -f vendor/tinytable-evals/docker-compose.postgres.yml up -d
+pip install psycopg2-binary
+export PGHOST=localhost PGPORT=5432 PGUSER=postgres PGPASSWORD=postgres PGDATABASE=postgres
+node --import tsx scripts/dsh-evals-demo.ts --pg-adjudicate ...
+```
+
+Omitted, `grade.py`'s original stdlib-only, zero-setup fast path is
+unchanged - nothing about this flag is load-bearing for the rest of the
+driver.
+
 ## Pinned upstream commit (#126)
 
 The builder/grader/`task-prompt.md` this driver drives are no longer an
@@ -30,10 +51,26 @@ pinned to a specific upstream commit:
 
 ```
 $ git -C vendor/tinytable-evals rev-parse HEAD
-19f521d99846608dc9a7febf1e702ab6e8d398e8
+2a397bd0d327cf16d47904788e88348319eb64f0
 ```
 
-Re-pinned three times for upstream's #40 (from `78bcc98`):
+Re-pinned for upstream's #55-58/#22 (a PostgreSQL-backed "truth model" -
+`clean/` is a cheap reference, never assumed infallible, per
+TRUTH_MODEL.md) - `2a397bd` (upstream #59): `oracle.py --backend postgres`,
+`adjudicate.py` + `grade.py --pg-adjudicate` (this driver's `runScorePy()`
+now threads a `pgAdjudicate` option through when `--pg-adjudicate` is
+passed - off by default, see above), and a CI differential check of
+`clean/tinytable` against real PostgreSQL. Building the truth model out
+found and fixed a real bug in `clean/tinytable` along the way:
+`core.Predicate` was two-valued, so `NOT` over a NULL comparison wrongly
+became `TRUE` instead of staying unknown, contradicting `SPEC.md`'s own
+"NULL semantics (three-valued logic)" section - independently discovered
+first via `clemenza/honeyrail#130`/`#134`'s trial analysis (agents kept
+reporting this exact behavior as a defect, always scored a blanket false
+alarm since `clean/` shared the same bug) before upstream's own #55-58
+investigation converged on the identical root cause and fixed it.
+
+Re-pinned three times before that for upstream's #40 (from `78bcc98`):
 
 - `1262518` (upstream #50): `trajectory.py` (structured JSONL trajectory
   logging - a stdlib-only writer/schema for `tool_call`/`shell_command`/

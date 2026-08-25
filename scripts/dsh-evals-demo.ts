@@ -52,6 +52,12 @@
  *   --grader-runs <n>             vendor/tinytable-evals grade.py --runs: probabilistic-kill sampling per trial (default 1)
  *   --kill-rate-threshold <t>     grade.py --kill-rate-threshold (default 1.0 - every grader run must kill)
  *   --trial-timeout-minutes <n>   Per-trial container timeout before killing it (default 15)
+ *   --pg-adjudicate               grade.py --pg-adjudicate (issue #57, off by default): ask a PostgreSQL
+ *                                 oracle to settle F_mutant & F_clean disputes as reference_bug (a real
+ *                                 clean/ bug, not counted against the agent) vs false_alarm vs unknown -
+ *                                 requires psycopg2 and a reachable server (docker compose -f
+ *                                 vendor/tinytable-evals/docker-compose.postgres.yml up -d; PGHOST etc.
+ *                                 env vars, same setup as tinytable-evals's oracle.py --backend postgres)
  *   --smoke                       2 fixtures x 2 profiles x 1 trial - cheap end-to-end validation
  *   --dry-run                     Print the matrix and budget note, launch nothing
  *   --report-only                 Skip execution; rebuild the report from state.json
@@ -99,6 +105,7 @@ type CliOptions = {
   graderRuns: number;
   killRateThreshold: number;
   trialTimeoutMinutes: number;
+  pgAdjudicate: boolean;
   smoke: boolean;
   dryRun: boolean;
   reportOnly: boolean;
@@ -112,6 +119,7 @@ function parseArgs(argv: string[]): CliOptions {
     graderRuns: 1,
     killRateThreshold: 1.0,
     trialTimeoutMinutes: 15,
+    pgAdjudicate: false,
     smoke: false,
     dryRun: false,
     reportOnly: false
@@ -139,6 +147,7 @@ function parseArgs(argv: string[]): CliOptions {
       case "--grader-runs": options.graderRuns = Number(next()); break;
       case "--kill-rate-threshold": options.killRateThreshold = Number(next()); break;
       case "--trial-timeout-minutes": options.trialTimeoutMinutes = Number(next()); break;
+      case "--pg-adjudicate": options.pgAdjudicate = true; break;
       case "--smoke": options.smoke = true; break;
       case "--dry-run": options.dryRun = true; break;
       case "--report-only": options.reportOnly = true; break;
@@ -227,6 +236,10 @@ export type ScoreJson = {
   /** Killed tests split by whether they're an "invariant" (assert_stats/--check-admissibility) violation vs a plain "assertion". */
   killed_by_kind: { assertion: number; invariant: number };
   false_alarms: number;
+  /** #57, opt-in via --pg-adjudicate: whether this run asked a PostgreSQL oracle to adjudicate F_mutant & F_clean disputes. */
+  pg_adjudicate: boolean;
+  /** Summed across --runs seeds; null when pg_adjudicate is false. */
+  pg_adjudication_tally: { reference_bug: number; false_alarm: number; unknown: number } | null;
   contract_ok: boolean;
   contract_errors: string[];
   f_mutant: string[];
@@ -239,6 +252,9 @@ export type ScoreJson = {
     false_alarms: number;
     f_mutant: string[];
     f_clean: string[];
+    /** "<path>:<line>" -> verdict, only for ids in this run's F_mutant & F_clean; empty object when pg_adjudicate is false. */
+    pg_adjudicated: Record<string, { outcome: "reference_bug" | "false_alarm" | "unknown"; detail?: string }>;
+    pg_adjudication_tally: { reference_bug: number; false_alarm: number; unknown: number } | null;
   }>;
   error: string | null;
   passed: boolean;
@@ -253,7 +269,7 @@ export type ScoreJson = {
 // will ever name, unlike `error`.
 export type RunScorePyResult = { ok: true; score: ScoreJson } | { ok: false; error: string };
 
-export type GraderOptions = { runs?: number; killRateThreshold?: number; trajectoryLog?: string };
+export type GraderOptions = { runs?: number; killRateThreshold?: number; trajectoryLog?: string; pgAdjudicate?: boolean };
 
 // `run` defaults to the real subprocess call; overridable so tests can
 // exercise the read/parse/discriminate logic (the actual site of #114's
@@ -277,7 +293,11 @@ export async function runScorePy(
     // already uses for --out - so a plain "trajectory.jsonl" lands
     // directly in the seed-root, the same file run_sql_tests.py
     // --trajectory-log and sample_trajectory.py already write to.
-    ...(graderOptions.trajectoryLog ? ["--trajectory-log", graderOptions.trajectoryLog] : [])
+    ...(graderOptions.trajectoryLog ? ["--trajectory-log", graderOptions.trajectoryLog] : []),
+    // #57, opt-in: needs psycopg2 and a reachable PostgreSQL server (see
+    // this file's own header comment) - grade.py degrades to its original
+    // blanket false-alarm treatment whenever this is omitted.
+    ...(graderOptions.pgAdjudicate ? ["--pg-adjudicate"] : [])
   ]);
   try {
     const raw = await readFile(join(worktreePath, "score.json"), "utf8");
@@ -427,7 +447,8 @@ async function executeCell(
   const scoreOrError = await runScorePy(seedRootDir, runCommandSafe, {
     runs: options.graderRuns,
     killRateThreshold: options.killRateThreshold,
-    trajectoryLog: "trajectory.jsonl"
+    trajectoryLog: "trajectory.jsonl",
+    pgAdjudicate: options.pgAdjudicate
   });
   const postMismatches = await findManifestMismatches(seedRootDir, { files: manifest.files });
   const integrityOk = postMismatches.length === 0;
@@ -450,6 +471,7 @@ async function executeCell(
     killedByKind: scoreOrError.score.killed_by_kind,
     wallTimeMs,
     sessionStats,
+    pgAdjudicationTally: scoreOrError.score.pg_adjudication_tally,
     blockedReason: blocked?.message
   };
 }
