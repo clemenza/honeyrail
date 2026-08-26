@@ -234,7 +234,8 @@ all:
 - "`--smoke` completes end-to-end, report generated, every number in it
   traceable back to a run" - still holds, reinterpreted for the new
   architecture: every report number traces back to a trial's artifacts
-  directory (seed-root, manifest.json, score.json, container.log) rather
+  directory (seed-root, manifest.json, score.json, container.log,
+  transcript.ndjson) rather
   than a `/api/runs/:id` URL, since no HoneyRail run exists to link to.
 - "`GET /api/evals/metrics?instructionLabel=` segments the two profile
   groups correctly" - no longer applicable as literally written: that
@@ -255,3 +256,12 @@ all:
   `maxParallel`) doesn't apply here since there's no Run to attach it to.
 - `state.json` is written after every cell, so a `--report-only` rerun (or
   a crash mid-matrix) never loses completed cells.
+- **#140: `container.log` is empty for a trial that hits
+  `--trial-timeout-minutes` and gets killed.** `dsh --profile headless`
+  only prints its human-readable output once, at the end of the run, so a
+  mid-loop kill leaves nothing captured there (#134, #136 documented 6/115
+  trials this way). Each cell's `transcript.ndjson` doesn't have this gap:
+  it's a verbatim, one-line-per-event dump of dsh's own session-persistence
+  log (`server/evals/dsh-transcript.ts`), which that plugin already
+  appends to disk as the trial runs - so whatever ran before the kill is
+  still there to read back, even when `container.log` is empty.

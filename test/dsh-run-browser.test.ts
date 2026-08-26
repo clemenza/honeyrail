@@ -129,6 +129,7 @@ test("GET /api/evals/dsh-runs/trial returns a trial's score.json and container.l
   await mkdir(join(artifactsDir, "seed-root"), { recursive: true });
   await writeFile(join(artifactsDir, "seed-root", "score.json"), JSON.stringify({ killed: true, false_alarms: 0, contract_ok: true, passed: true }));
   await writeFile(join(artifactsDir, "container.log"), "--- stdout ---\nhello\n--- stderr ---\n\n");
+  await writeFile(join(artifactsDir, "transcript.ndjson"), JSON.stringify({ seq: 1, ts: "2026-08-24T00:00:00.000Z", session: "s.jsonl", type: "tool/call", data: {} }) + "\n");
 
   const res = await fetch(`${baseUrl}/api/evals/dsh-runs/trial?outDir=${encodeURIComponent(outDir)}&trialId=m01-baseline-1`);
   assert.equal(res.status, 200);
@@ -137,6 +138,37 @@ test("GET /api/evals/dsh-runs/trial returns a trial's score.json and container.l
   assert.equal(body.trial.outcome, "passed");
   assert.equal(body.scoreJson.killed, true);
   assert.match(body.containerLog, /hello/);
+  assert.match(body.transcript, /tool\/call/);
+});
+
+// #140: a timed-out trial has no container.log content (dsh's headless
+// stdout only prints once, at the end - lost on a mid-run kill) but its
+// transcript.ndjson still has whatever dsh's session-persistence log
+// captured before the kill - this is the whole point of the artifact.
+test("GET /api/evals/dsh-runs/trial returns transcript.ndjson even when container.log is empty (the timeout case)", async (t) => {
+  const { baseUrl, tempDir } = await withServer(t);
+  const outDir = join(tempDir, "report");
+  const artifactsDir = join(outDir, "cells", "m01-baseline-1");
+  await writeState(outDir, [
+    trial({ trialId: "m01-baseline-1", artifactsDir, killed: null, falseAlarms: null, contractOk: null, error: "trial timed out after 15m and was killed" })
+  ]);
+
+  await mkdir(artifactsDir, { recursive: true });
+  await writeFile(join(artifactsDir, "container.log"), "--- stdout ---\n\n--- stderr ---\n\n");
+  await writeFile(
+    join(artifactsDir, "transcript.ndjson"),
+    [
+      JSON.stringify({ seq: 1, ts: "2026-08-24T00:00:00.000Z", session: "s.jsonl", type: "step/start", data: { turn: 1, step: 1 } }),
+      JSON.stringify({ seq: 2, ts: "2026-08-24T00:00:05.000Z", session: "s.jsonl", type: "tool/call", data: { turn: 1, step: 1, callId: "a", name: "bash" } })
+    ].join("\n") + "\n"
+  );
+
+  const res = await fetch(`${baseUrl}/api/evals/dsh-runs/trial?outDir=${encodeURIComponent(outDir)}&trialId=m01-baseline-1`);
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  const lines = body.transcript.trim().split("\n").map((line: string) => JSON.parse(line));
+  assert.equal(lines.length, 2);
+  assert.equal(lines[1].type, "tool/call");
 });
 
 test("GET /api/evals/dsh-runs/trial returns null artifacts (not an error) when a trial errored before writing them", async (t) => {
@@ -160,6 +192,7 @@ test("GET /api/evals/dsh-runs/trial returns null artifacts (not an error) when a
   assert.equal(body.trial.outcome, "driver_error");
   assert.equal(body.scoreJson, null);
   assert.equal(body.containerLog, null);
+  assert.equal(body.transcript, null);
 });
 
 // Regression: a state.json written by a driver from before #107 added
