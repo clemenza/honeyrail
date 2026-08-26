@@ -49,6 +49,8 @@ export type DshTrialArtifacts = {
   trial: DshTrialRecordWithOutcome;
   scoreJson: unknown | null;
   containerLog: string | null;
+  /** #140: dsh's raw session-event log, written by server/evals/dsh-transcript.ts - non-empty even for a trial that timed out, unlike containerLog. */
+  transcript: string | null;
 };
 
 /** Same `~`/relative-path handling as project-helpers.ts's normalizeProjectPath - this is an operator pointing the console at their own local driver output, same trust level as registering a project's repoPath. */
@@ -128,11 +130,13 @@ export async function readDshTrialArtifacts(outDir: string, trialId: string): Pr
   // trialId to traverse out of trial.artifactsDir with.
   const scoreJsonPath = join(trial.artifactsDir, "seed-root", "score.json");
   const containerLogPath = join(trial.artifactsDir, "container.log");
+  const transcriptPath = join(trial.artifactsDir, "transcript.ndjson");
 
   const scoreJson = await readFile(scoreJsonPath, "utf8")
     .then((text) => JSON.parse(text) as unknown)
     .catch(() => null);
   const containerLog = await readFile(containerLogPath, "utf8").catch(() => null);
+  const transcript = await readFile(transcriptPath, "utf8").catch(() => null);
 
-  return { trial: { ...trial, outcome: classifyDshOutcome(trial) }, scoreJson, containerLog };
+  return { trial: { ...trial, outcome: classifyDshOutcome(trial) }, scoreJson, containerLog, transcript };
 }

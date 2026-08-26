@@ -383,4 +383,6 @@ export type DshTrialArtifactsData = {
   trial: DshTrialRecordData;
   scoreJson: unknown | null;
   containerLog: string | null;
+  /** #140: dsh's raw session-event log, one JSON line per event - see server/evals/dsh-transcript.ts. Non-null (and non-empty) even for a trial container.log has nothing for, since it timed out mid-run. */
+  transcript: string | null;
 };

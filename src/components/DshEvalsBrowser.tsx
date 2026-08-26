@@ -89,6 +89,14 @@ function TrialArtifactsModal({ outDir, trial, onClose }: { outDir: string; trial
               ) : (
                 <div className="table-empty">No container.log for this trial.</div>
               )}
+              <h3>transcript.ndjson</h3>
+              {artifacts.transcript ? (
+                <pre className="dsh-trial-artifact">{artifacts.transcript}</pre>
+              ) : (
+                <div className="table-empty">
+                  No transcript.ndjson for this trial (dsh's session-persistence log wasn't captured - see server/evals/dsh-transcript.ts).
+                </div>
+              )}
             </>
           ) : null}
         </div>

@@ -74,6 +74,7 @@ import { buildDshComparisonReport, classifyDshOutcome, type DshComparisonReportI
 import { describeManifestMismatch, findManifestMismatches } from "../server/evals/manifest-preflight.js";
 import { readSessionStats } from "../server/evals/dsh-session-stats.js";
 import { appendDerivedTrajectoryEvents } from "../server/evals/dsh-trajectory-bridge.js";
+import { writeTranscript } from "../server/evals/dsh-transcript.js";
 import { logAgentSnapshot, logFileDiff } from "../server/evals/dsh-trajectory-filesystem-events.js";
 import { auditTranscript } from "../server/evals/transcript-audit.js";
 import { runCommandSafe } from "../server/utils.js";
@@ -407,6 +408,14 @@ async function executeCell(
   // see server/evals/dsh-trajectory-bridge.ts for what this can and can't
   // verify. Best-effort, same reasoning as sessionStatsReport above.
   await appendDerivedTrajectoryEvents(dshHomeDir, seedRootDir).catch(() => null);
+
+  // #140: a per-trial transcript.ndjson, sourced from the same durable
+  // session log as sessionStatsReport/appendDerivedTrajectoryEvents above -
+  // unlike container.log (built from the container's stdout/stderr, empty
+  // on a mid-run timeout kill since headless dsh only prints once at the
+  // end), this is non-empty even for a killed trial. Best-effort, same
+  // reasoning as those two.
+  await writeTranscript(dshHomeDir, join(artifactsDir, "transcript.ndjson")).catch(() => null);
 
   // The remaining two #40 event kinds this driver can produce on its own
   // (see server/evals/dsh-trajectory-filesystem-events.ts) - gitInitCommit
