@@ -36,7 +36,29 @@
 import { writeFile } from "node:fs/promises";
 import { readRawSessionFiles, type DshRawEvent } from "./dsh-session-stats.js";
 
-export type TranscriptLine = { seq: number; ts: string; session: string; type: string; data: Record<string, unknown> };
+export type TranscriptLine = { seq: number; ts: string | null; session: string; type: string; data: Record<string, unknown> };
+
+// `DshRawEvent.time` is declared as always-present because
+// dsh-session-stats.ts's foldSessionStats only ever switches on event kinds
+// that do carry it - that invariant doesn't hold across the *full* raw
+// stream this module reads unfiltered. The leading `session` event (no
+// `seq`/`time` at all, just `createdAt`) and dsh's un-coalesced streaming
+// envelopes (`reasoning-chunks`/`tool-call-chunks`/`text-chunks`, which use
+// `seq0`/`time0` instead of `seq`/`time` - confirmed against a real session
+// log while investigating clemenza/honeyrail#145's timeout retries) have no
+// `.time` at all, so `new Date(event.time).toISOString()` threw
+// `RangeError: Invalid time value` on the first line of every real session
+// - silently swallowed by executeCell's `.catch(() => null)`, so
+// transcript.ndjson was never actually written by any trial since #140
+// landed. Falls back through the other timestamp-shaped fields a raw event
+// might carry; `null` (not a fabricated guess) when none of them parse.
+function eventTimestamp(event: DshRawEvent): string | null {
+  const raw = event as unknown as { time0?: unknown; createdAt?: unknown };
+  for (const candidate of [event.time, raw.time0, raw.createdAt]) {
+    if (typeof candidate === "number" && Number.isFinite(candidate)) return new Date(candidate).toISOString();
+  }
+  return null;
+}
 
 /** Pure: flattens every session's raw events (in readRawSessionFiles's file order) into one ordered, replayable line list. */
 export function buildTranscriptLines(sessions: Array<{ file: string; events: DshRawEvent[] }>): TranscriptLine[] {
@@ -45,7 +67,7 @@ export function buildTranscriptLines(sessions: Array<{ file: string; events: Dsh
   for (const { file, events } of sessions) {
     for (const event of events) {
       seq += 1;
-      lines.push({ seq, ts: new Date(event.time).toISOString(), session: file, type: event.type, data: event.data ?? {} });
+      lines.push({ seq, ts: eventTimestamp(event), session: file, type: event.type, data: event.data ?? {} });
     }
   }
   return lines;
