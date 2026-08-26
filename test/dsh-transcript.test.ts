@@ -31,6 +31,37 @@ test("buildTranscriptLines: an event with no data becomes an empty object, never
   assert.deepEqual(lines[0].data, {});
 });
 
+test("buildTranscriptLines: a leading `session` event (createdAt, no time/seq at all) doesn't throw - falls back to createdAt", () => {
+  // The exact shape of a real session log's first line (confirmed against
+  // clemenza/honeyrail#145's timeout-retry artifacts) - no `time` field at
+  // all, unlike every other event kind.
+  const events = [{ type: "session", version: 0, id: "session-abc", createdAt: 1787743598992, cwd: "/workspace", delegationDepth: 0 }] as unknown as DshRawEvent[];
+  const lines = buildTranscriptLines([{ file: "s.jsonl", events }]);
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].ts, new Date(1787743598992).toISOString());
+  assert.equal(lines[0].type, "session");
+});
+
+test("buildTranscriptLines: streaming-chunk events (reasoning-chunks/tool-call-chunks/text-chunks: seq0/time0, not seq/time) don't throw - falls back to time0", () => {
+  const events = [
+    { type: "reasoning-chunks", seq0: 13, time0: 1787743599437, data: { turn: 1, step: 1 } },
+    { type: "tool-call-chunks", seq0: 28, time0: 1787743599661, data: { turn: 1, step: 1 } },
+    { type: "text-chunks", seq0: 40, time0: 1787743599700, data: { turn: 1, step: 1 } }
+  ] as unknown as DshRawEvent[];
+  const lines = buildTranscriptLines([{ file: "s.jsonl", events }]);
+  assert.equal(lines.length, 3);
+  assert.equal(lines[0].ts, new Date(1787743599437).toISOString());
+  assert.equal(lines[1].ts, new Date(1787743599661).toISOString());
+  assert.equal(lines[2].ts, new Date(1787743599700).toISOString());
+});
+
+test("buildTranscriptLines: an event with no time/time0/createdAt at all gets ts: null, not a thrown RangeError", () => {
+  const events = [{ type: "mystery/event", data: {} }] as unknown as DshRawEvent[];
+  const lines = buildTranscriptLines([{ file: "s.jsonl", events }]);
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].ts, null);
+});
+
 test("buildTranscriptLines: seq keeps incrementing across multiple session files, in readRawSessionFiles's sorted order", () => {
   const lines = buildTranscriptLines([
     { file: "a.jsonl", events: [{ type: "step/start", time: 0, data: {} }] },
@@ -75,6 +106,31 @@ test("writeTranscript: writes one ndjson line per raw session event, non-empty e
   assert.equal(lines[0].type, "turn/start");
   assert.equal(lines[2].type, "tool/call");
   assert.equal(lines[2].data.name, "bash");
+});
+
+test("writeTranscript: a real session log's leading `session` event (no time field) doesn't abort the whole write", async (t) => {
+  const dshHomeDir = await tempDir(t, "honeyrail-dsh-home-");
+  const artifactsDir = await tempDir(t, "honeyrail-artifacts-");
+  const transcriptPath = join(artifactsDir, "transcript.ndjson");
+
+  const sessionsDir = join(dshHomeDir, "sessions", "proj");
+  await mkdir(sessionsDir, { recursive: true });
+  // Every real session log starts with this exact shape (no `time`, just
+  // `createdAt`) - before this fix, buildTranscriptLines threw on this very
+  // first line, and executeCell's `.catch(() => null)` silently swallowed
+  // it, so transcript.ndjson was never written by any real trial.
+  const realisticSession = [
+    { type: "session", version: 0, id: "session-abc", createdAt: 1000, cwd: "/workspace", delegationDepth: 0 },
+    { type: "turn/start", seq: 1, time: 1010, data: { turn: 1 } }
+  ] as unknown as DshRawEvent[];
+  await writeFile(join(sessionsDir, "s.jsonl"), realisticSession.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+  const count = await writeTranscript(dshHomeDir, transcriptPath);
+  assert.equal(count, 2);
+  const lines = (await readFile(transcriptPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(lines[0].type, "session");
+  assert.equal(lines[0].ts, new Date(1000).toISOString());
+  assert.equal(lines[1].type, "turn/start");
 });
 
 test("writeTranscript: returns 0 (not null) when sessions/ exists but every session file is empty", async (t) => {

@@ -51,8 +51,47 @@ pinned to a specific upstream commit:
 
 ```
 $ git -C vendor/tinytable-evals rev-parse HEAD
-2a397bd0d327cf16d47904788e88348319eb64f0
+a97fa71744e5509f9ce7696d03666f10dc6e5d4e
 ```
+
+Re-pinned for upstream's #64/#69 ("Gen2" operators - a controlled
+compositional-difficulty experiment): `a97fa71` adds 12 second-generation
+mutation operators to `mutate.py`, split into three families (`S`:
+single-table compositional control, `M`: multi-table via existing FK
+semantics with no JOIN, `T`: transaction x multi-table via
+`SAVEPOINT`/`ROLLBACK TO`) - see that repo's `docs/gen2-operators.md`.
+Adding operators changes `select_operator(seed)`'s mapping (the pool grew
+from 22 to 34), which is why `test/dsh-testengineer-trial.test.ts`'s
+`KILL_SEED = 0` fixture needed updating in the same commit as this re-pin
+(seed 0 now selects `order-by-desc-breaks-stability` instead of
+`limit-offset-order-swapped`).
+
+Upstream's own PR #69 left Gen2's empirical calibration (its issue #64's
+AC 6-8: per-family kill rate, whether Gen2 breaks the 100% ceiling, the
+JOIN-gate decision) explicitly undone, since `tinytable-evals` can't run a
+real dsh agent - only this driver can. A rough, cost-controlled n=1
+calibration run (one baseline trial per Gen2 operator, selected via the
+exact seeds that `select_operator` maps to each of the 12 operators) found:
+
+| family | operators | killed | timed out (15m) |
+| --- | --- | --- | --- |
+| S (control) | 4 | 3 | 1 |
+| M | 5 | 4 | 1 |
+| T | 3 | 2 | 1 |
+| **total** | **12** | **9** | **3** |
+
+Every trial that finished within budget killed its mutant (9/9, no false
+misses) - at n=1 this doesn't show AC7's "at least half below the 100%
+ceiling" via kill rate alone, and the one timeout per family doesn't
+support AC8's decision rule (M/T *materially* lower than S) either, since
+difficulty showed up evenly across all three families rather than
+concentrated in M/T. The real signal is the timeout rate itself: 3/12
+(25%) of Gen2 trials exhausted the 15-minute budget entirely, well above
+Gen1's ~5% (6/115, `clemenza/honeyrail#140`) - Gen2 does appear harder,
+just not in the S-vs-M/T shape #64 hypothesized. This is a single-seed
+pass, not #64's own protocol (5 trials/operator, PG-adjudicated); treat it
+as a rough go/no-go signal, not the calibration data #64's AC6/AC7/AC8
+still need.
 
 Re-pinned for upstream's #55-58/#22 (a PostgreSQL-backed "truth model" -
 `clean/` is a cheap reference, never assumed infallible, per

@@ -40,16 +40,18 @@ const gradePy = join(repoRoot, "vendor", "tinytable-evals", "grade.py");
 
 // The seed pinned for this test - #126's vendor/tinytable-evals at its
 // current pin (see docs/dsh-evals-demo.md's "Pinned upstream commit"
-// section) deterministically maps seed 0 to the "limit-offset-order-
-// swapped" operator (LIMIT applied before OFFSET instead of after). The
-// "killed" test below hand-writes a `.test` file targeting exactly that
-// behavioral guarantee, rather than depending on any static answer-key
-// fixture (none exists any more - see #126). Re-pinning vendor/tinytable-
-// evals to a commit whose OPERATORS list changed can change what seed 0
-// maps to; if this test starts failing after a re-pin, that's the expected
-// signal to re-derive which operator seed 0 now selects and update the
-// `.test` file below to target it (see docs/dsh-evals-demo.md's re-pin
-// process).
+// section) deterministically maps seed 0 to the "order-by-desc-breaks-
+// stability" operator (Gen2, #64/#69: `ORDER BY col DESC` sorts ascending
+// then reverses the whole list instead of sorting with `reverse=True`,
+// which flips the relative order of tied rows instead of preserving it).
+// The "killed" test below hand-writes a `.test` file targeting exactly
+// that behavioral guarantee, rather than depending on any static
+// answer-key fixture (none exists any more - see #126). Re-pinning
+// vendor/tinytable-evals to a commit whose OPERATORS list changed can
+// change what seed 0 maps to; if this test starts failing after a
+// re-pin, that's the expected signal to re-derive which operator seed 0
+// now selects and update the `.test` file below to target it (see
+// docs/dsh-evals-demo.md's re-pin process).
 const KILL_SEED = 0;
 
 function scoreCommand() {
@@ -154,36 +156,44 @@ async function materializedScoreStep(projectId: string) {
   return materialized.steps.find((step) => step.id === "score")!;
 }
 
-// Kills exactly KILL_SEED's "limit-offset-order-swapped" operator: correct
-// LIMIT/OFFSET semantics apply OFFSET before LIMIT (skip 3, then take 2 of
-// what's left -> rows 4,5), the mutant applies LIMIT first (take 2 -> rows
-// 1,2 - only 2 elements - then offset 3 of those -> empty). Verified
-// directly against both a seed-0 seed-root and vendor/tinytable-evals's
-// own clean/ while writing this test (clean: passes; seed-0 mutant: fails
-// with actual=[] vs expected=[4,5]).
+// Kills exactly KILL_SEED's "order-by-desc-breaks-stability" operator:
+// correct `ORDER BY col DESC` preserves the original relative order of
+// rows tied on `col` (Python's `list.sort(reverse=True)` is stable), the
+// mutant instead sorts ascending and then `.reverse()`s the whole result,
+// which also flips tied rows' relative order. Three rows share grp=1
+// (seq 1,2,3) and one row has grp=2 (seq 1); grp DESC puts grp=2 first
+// either way, so the divergence is isolated to whether the grp=1 trio
+// comes out as seq 1,2,3 (correct, insertion order preserved) or 3,2,1
+// (mutant, order reversed). Verified directly against both a seed-0
+// seed-root and vendor/tinytable-evals's own clean/ while writing this
+// test (clean: passes; seed-0 mutant: fails with actual=[2,1,1,3,1,2,1,1]
+// vs expected=[2,1,1,1,1,2,1,3]).
 const KILLING_TEST = `statement ok
-CREATE TABLE t (x INTEGER)
+CREATE TABLE t (grp INTEGER, seq INTEGER)
 
 statement ok
-INSERT INTO t VALUES (1)
+INSERT INTO t VALUES (1, 1)
 
 statement ok
-INSERT INTO t VALUES (2)
+INSERT INTO t VALUES (1, 2)
 
 statement ok
-INSERT INTO t VALUES (3)
+INSERT INTO t VALUES (1, 3)
 
 statement ok
-INSERT INTO t VALUES (4)
+INSERT INTO t VALUES (2, 1)
 
-statement ok
-INSERT INTO t VALUES (5)
-
-query I nosort
-SELECT x FROM t ORDER BY x LIMIT 2 OFFSET 3
+query II nosort
+SELECT grp, seq FROM t ORDER BY grp DESC
 ----
-4
-5
+2
+1
+1
+1
+1
+2
+1
+3
 `;
 
 test("dsh-testengineer-trial's score step: quality gate passes when sql-tests/agent/ kills the seeded mutant", async (t) => {
@@ -198,16 +208,16 @@ test("dsh-testengineer-trial's score step: quality gate passes when sql-tests/ag
   // defect, plus findings.json, as uncommitted worktree edits (agents
   // don't commit on their own - see WorktreeManager.diff's own comment).
   await mkdir(join(worktree.path, "sql-tests", "agent"), { recursive: true });
-  await writeFile(join(worktree.path, "sql-tests", "agent", "limit_offset_kill.test"), KILLING_TEST);
+  await writeFile(join(worktree.path, "sql-tests", "agent", "order_by_desc_kill.test"), KILLING_TEST);
   await writeFile(
     join(worktree.path, "findings.json"),
     JSON.stringify(
       [
         {
-          id: "limit-offset-order",
-          summary: "LIMIT/OFFSET applied in the wrong order: OFFSET must be applied before LIMIT, not after.",
-          spec_section: "LIMIT n / OFFSET n",
-          repro_test: "sql-tests/agent/limit_offset_kill.test"
+          id: "order-by-desc-breaks-stability",
+          summary: "ORDER BY col DESC does not preserve the original relative order of rows tied on col.",
+          spec_section: "ORDER BY col [ASC|DESC] [NULLS FIRST|LAST]",
+          repro_test: "sql-tests/agent/order_by_desc_kill.test"
         }
       ],
       null,
