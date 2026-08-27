@@ -32,7 +32,12 @@ test("deriveTrajectoryEvents: a generic tool call becomes exactly one tool_call 
   });
 });
 
-test("deriveTrajectoryEvents: a bash tool call with a canonicalBashResult-shaped meta yields both tool_call and shell_command", () => {
+test("deriveTrajectoryEvents: a bash tool call with a real dsh 0.1.0-rc.7 tool-result envelope yields both tool_call and shell_command", () => {
+  // Real shape, confirmed against real trial data (clemenza/honeyrail#154):
+  // no `meta` field, `message.content[0]` is `{type: "tool-result",
+  // toolCallId, content: [{type:"text", text}], isError}` - the same
+  // generic envelope every other tool uses, one combined text blob (no
+  // stdout/stderr split, no usable exit-code signal).
   const events: DshRawEvent[] = [
     {
       type: "tool/call", time: 2000,
@@ -42,11 +47,10 @@ test("deriveTrajectoryEvents: a bash tool call with a canonicalBashResult-shaped
       type: "tool/result", time: 2400,
       data: {
         turn: 1, step: 1,
-        message: { source: { callId: "c2" }, content: [{ type: "text", text: "ok" }] },
-        meta: {
-          exitCode: 0, signal: null, timedOut: false, aborted: false, timeoutMs: 120000,
-          stdout: { text: "all 17 file(s) passed\n", truncated: false },
-          stderr: { text: "", truncated: false }
+        message: {
+          source: { callId: "c2" },
+          content: [{ type: "tool-result", toolCallId: "c2", content: [{ type: "text", text: "all 17 file(s) passed\n" }], isError: false }],
+          role: "user"
         }
       }
     }
@@ -61,18 +65,18 @@ test("deriveTrajectoryEvents: a bash tool call with a canonicalBashResult-shaped
     kind: "shell_command",
     command: "python3 run_sql_tests.py --root . sql-tests/official",
     cwd: "/workspace",
-    exit_code: 0,
+    exit_code: null,
     stdout: "all 17 file(s) passed\n",
-    stderr: "",
+    stderr: null,
     duration_ms: 400
   });
 });
 
-test("deriveTrajectoryEvents: a bash call whose result doesn't match the expected meta shape still yields tool_call, degrades gracefully (no shell_command)", () => {
+test("deriveTrajectoryEvents: a bash call whose result doesn't match the real tool-result shape still yields tool_call, degrades gracefully (no shell_command)", () => {
   const events: DshRawEvent[] = [
     { type: "tool/call", time: 3000, data: { turn: 1, step: 1, callId: "c3", name: "bash", arguments: '{"command":"ls","description":"list files"}' } },
-    // no `meta` at all, or a shape that doesn't match canonicalBashResult() - e.g. a background-job acknowledgement
-    { type: "tool/result", time: 3010, data: { turn: 1, step: 1, message: { source: { callId: "c3" }, content: "started" }, meta: { kind: "background", jobId: "j1" } } }
+    // content[0].type isn't "tool-result" - some other envelope shape entirely (e.g. a background-job acknowledgement)
+    { type: "tool/result", time: 3010, data: { turn: 1, step: 1, message: { source: { callId: "c3" }, content: [{ type: "background-ack", jobId: "j1" }] } } }
   ];
   const derived = deriveTrajectoryEvents(events);
   assert.equal(derived.length, 1);

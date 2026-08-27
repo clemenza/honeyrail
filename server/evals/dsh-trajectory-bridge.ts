@@ -37,20 +37,30 @@
  * `bash` (dsh's built-in shell tool)'s tool name (`"bash"`, hardcoded) and
  * its argument shape (`command`, `description`, optional `timeoutMs`/
  * `workdir`/`run_in_background`) come from `@deepseek-ai/dsh-tool-
- * bash@0.1.0-rc.7`'s published `lib/index.js`. Its *result* shape
- * (`{exitCode, stdout: {text, ...}, stderr: {text, ...}, ...}`, via
- * `canonicalBashResult()`) is confirmed from the same source, but exactly
- * where that lands in the persisted `tool/result` event - `data.meta` is
- * the closest documented fit (the event type's own doc comment gives
- * `dsh-tool-fs`'s result-time diff as exactly this pattern) - was not
- * traced end to end through the tool-execution plumbing. `extractBashResult`
- * below is written defensively: it only emits a `shell_command` event when
- * it actually finds an object shaped like `canonicalBashResult()`'s output;
- * otherwise it emits nothing extra for that call rather than guessing at a
- * different location or fabricating a shape. The `tool_call` event for the
- * same call - built only from the always-verified `tool/call`/`tool/result`
- * envelope fields - is emitted unconditionally, so a bash call is never
- * dropped from the trajectory even when `shell_command` derivation misses.
+ * bash@0.1.0-rc.7`'s published `lib/index.js`.
+ *
+ * Its *result* shape was originally guessed at (`data.meta.{exitCode,
+ * stdout: {text}, stderr: {text}}`, the closest documented fit at the
+ * time) rather than traced end to end - wrong, per clemenza/honeyrail#154:
+ * confirmed against real trial data that dsh 0.1.0-rc.7 never populates
+ * `meta` at all. A bash `tool/result`'s actual shape is the same generic
+ * envelope every other tool (`read`, `write`, `grep`, ...) uses:
+ * `message.content[0]` is `{type: "tool-result", toolCallId, content:
+ * [{type: "text", text}], isError}` - one combined text blob, no
+ * stdout/stderr split. `isError` was checked across 423 real bash results
+ * (clemenza/honeyrail#150's clean re-run) and was `false` on every single
+ * one, including commands that plausibly exited nonzero (a failing
+ * `run_sql_tests.py` invocation) - it isn't the shell command's own exit
+ * code, most likely only a tool-invocation-level failure flag, so no
+ * `exit_code` is emitted (`null`) rather than a fabricated one.
+ * `extractBashResult` below is written defensively: it only emits a
+ * `shell_command` event when it actually finds an object shaped like this
+ * real envelope; otherwise it emits nothing extra for that call rather
+ * than guessing at a different location or fabricating a shape. The
+ * `tool_call` event for the same call - built only from the
+ * always-verified `tool/call`/`tool/result` envelope fields - is emitted
+ * unconditionally, so a bash call is never dropped from the trajectory
+ * even when `shell_command` derivation misses.
  */
 
 import { appendFile } from "node:fs/promises";
@@ -71,23 +81,24 @@ function parseArguments(raw: unknown): unknown {
   }
 }
 
-function isTextStream(value: unknown): value is { text: string } {
-  return typeof value === "object" && value !== null && typeof (value as Record<string, unknown>).text === "string";
+function isTextBlock(value: unknown): value is { type: "text"; text: string } {
+  return typeof value === "object" && value !== null && (value as Record<string, unknown>).type === "text" && typeof (value as Record<string, unknown>).text === "string";
 }
 
-/** True iff `value` is shaped like dsh-tool-bash's `canonicalBashResult()` output - see this module's docstring. */
-function looksLikeBashResult(value: unknown): value is { exitCode: number; stdout: { text: string }; stderr: { text: string } } {
+/** True iff `value` is shaped like a real dsh 0.1.0-rc.7 tool-result content block - see this module's docstring. */
+function looksLikeToolResultBlock(value: unknown): value is { type: "tool-result"; content: unknown[] } {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
-  return typeof v.exitCode === "number" && isTextStream(v.stdout) && isTextStream(v.stderr);
+  return v.type === "tool-result" && Array.isArray(v.content);
 }
 
-function extractBashResult(resultData: Record<string, unknown>): { exitCode: number; stdout: string; stderr: string } | null {
-  const meta = resultData.meta;
-  if (looksLikeBashResult(meta)) {
-    return { exitCode: meta.exitCode, stdout: meta.stdout.text, stderr: meta.stderr.text };
-  }
-  return null;
+function extractBashResult(message: Record<string, unknown> | undefined): { exitCode: null; stdout: string; stderr: null } | null {
+  const content = message?.content;
+  if (!Array.isArray(content) || content.length === 0) return null;
+  const first = content[0];
+  if (!looksLikeToolResultBlock(first)) return null;
+  const text = first.content.filter(isTextBlock).map((block) => block.text).join("\n");
+  return { exitCode: null, stdout: text, stderr: null };
 }
 
 /**
@@ -138,7 +149,7 @@ export function deriveTrajectoryEvents(events: DshRawEvent[]): DerivedTrajectory
     });
 
     if (call.name === BASH_TOOL_NAME) {
-      const bashResult = extractBashResult(data);
+      const bashResult = extractBashResult(message);
       if (bashResult !== null) {
         const input = call.input as Record<string, unknown> | null;
         seq += 1;

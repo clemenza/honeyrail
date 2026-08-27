@@ -137,55 +137,23 @@ function scanPatterns(text: string, patterns: Array<{ name: string; re: RegExp }
   return hits;
 }
 
-/**
- * A bash tool_call's real `tool/result` envelope, confirmed against real
- * trial data (clemenza/honeyrail#150's clean re-run): dsh 0.1.0-rc.7 never
- * populates `data.meta.{exitCode,stdout,stderr}` -
- * server/evals/dsh-trajectory-bridge.ts's `looksLikeBashResult()` (whose
- * own docstring already flagged this shape as unverified) never matches on
- * a real trial, so `shell_command` derivation silently never fires - every
- * real trajectory.jsonl produced so far has zero `shell_command` events,
- * only `tool_call`. The actual shape is the same generic one every other
- * tool uses - `deriveTrajectoryEvents` sets a tool_call's `output` directly
- * to the raw `tool/result` envelope's `data.message` (not a further-nested
- * wrapper), so this reads `.content[0].content[].text` off `output`
- * itself: no separate stdout/stderr, no reliable exit-code signal
- * (`isError` was never observed `true` even on commands that plausibly
- * exited nonzero, so it's not trusted here either). Reading this real
- * shape directly means this module isn't blocked on fixing the shared
- * derivation - see clemenza/honeyrail#154 for that separate, deeper fix.
- */
-function extractBashOutputText(toolCallOutput: unknown): string {
-  const content = (toolCallOutput as { content?: unknown } | null)?.content;
-  if (!Array.isArray(content)) return "";
-  const first = content[0] as { content?: unknown } | undefined;
-  const innerContent = first?.content;
-  if (!Array.isArray(innerContent)) return "";
-  return innerContent
-    .filter((c): c is { type: string; text: string } => !!c && typeof c === "object" && (c as { type?: unknown }).type === "text" && typeof (c as { text?: unknown }).text === "string")
-    .map((c) => c.text)
-    .join("\n");
-}
-
 /** Runs the given pattern set over every command/output/text surface a trial's transcript exposes - independent of whether the trial was killed (#148 AC3: leak scan runs on every trial). */
 export function scanForPatterns(lines: TranscriptLine[], derived: DerivedTrajectoryEvent[], patterns: Array<{ name: string; re: RegExp }>): LeakHit[] {
   const hits: LeakHit[] = [];
   for (const event of derived) {
     const tMs = tsMillis(event.ts);
     if (event.kind === "shell_command") {
-      // Dead in practice against real data (see extractBashOutputText's
-      // docstring) - kept so this still works if the shared derivation
-      // this reads from is ever fixed.
       const command = typeof event.command === "string" ? event.command : "";
       hits.push(...scanPatterns(command, patterns, tMs, event.ts, "command"));
       const output = `${typeof event.stdout === "string" ? event.stdout : ""}\n${typeof event.stderr === "string" ? event.stderr : ""}`;
       hits.push(...scanPatterns(output, patterns, tMs, event.ts, "output"));
     } else if (event.kind === "tool_call") {
       hits.push(...scanPatterns(JSON.stringify(event.input ?? {}), patterns, tMs, event.ts, "command"));
-      if (event.name === "bash") {
-        hits.push(...scanPatterns(extractBashOutputText(event.output), patterns, tMs, event.ts, "output"));
-        continue;
-      }
+      // A bash tool_call's output is scanned via its sibling shell_command
+      // event above instead (clemenza/honeyrail#154 fixed that derivation
+      // to actually fire on real data) - scanning both here would double-
+      // count every hit.
+      if (event.name === "bash") continue;
       // A `read` of one of these ships-in-every-seed-root, sanctioned,
       // universally-read files legitimately contains pattern-matching text
       // that isn't a reference to anything actually leaked: .gitignore's own
@@ -221,14 +189,17 @@ const SOURCE_FILE_RE = /tinytable\/(sql|core)\.py\b/;
 
 export type StepEvidence = { tMs: number | null; ts: string | null; step: number | null };
 
-/** First `read` tool call, or bash command, referencing `tinytable/sql.py`/`core.py` - the two files every operator, Gen1 or Gen2, ever mutates. */
+/** First `read` tool call (or bash command referencing) `tinytable/sql.py`/`core.py` - the two files every operator, Gen1 or Gen2, ever mutates. */
 export function findFirstSourceRead(derived: DerivedTrajectoryEvent[]): StepEvidence | null {
   for (const event of derived) {
-    if (event.kind !== "tool_call") continue;
-    const input = event.input as { file_path?: unknown; command?: unknown } | null;
-    const filePath = typeof input?.file_path === "string" ? input.file_path : "";
-    const command = event.name === "bash" && typeof input?.command === "string" ? input.command : "";
-    if (SOURCE_FILE_RE.test(filePath) || SOURCE_FILE_RE.test(command)) return { tMs: tsMillis(event.ts), ts: event.ts, step: null };
+    if (event.kind === "tool_call") {
+      const input = event.input as { file_path?: unknown } | null;
+      const filePath = typeof input?.file_path === "string" ? input.file_path : "";
+      if (SOURCE_FILE_RE.test(filePath)) return { tMs: tsMillis(event.ts), ts: event.ts, step: null };
+    } else if (event.kind === "shell_command") {
+      const command = typeof event.command === "string" ? event.command : "";
+      if (SOURCE_FILE_RE.test(command)) return { tMs: tsMillis(event.ts), ts: event.ts, step: null };
+    }
   }
   return null;
 }
@@ -243,7 +214,7 @@ const AGENT_TEST_FILE_RE = /sql-tests\/agent\b/;
 const FAILURE_MARKER_RE = /\bFAIL\b|\bfailure\(s\)|AssertionError|expected[^\n]{0,80}actual|assert(?:ion)? (?:error|failed)/i;
 
 /**
- * First bash tool call that (a) invokes `run_sql_tests.py` against
+ * First shell_command that (a) invokes `run_sql_tests.py` against
  * `sql-tests/agent/` (a specific `.test` file or the whole directory) -
  * inherently the agent's own work, since nothing else populates that
  * directory - and (b) whose own output shows a failure, in
@@ -252,11 +223,10 @@ const FAILURE_MARKER_RE = /\bFAIL\b|\bfailure\(s\)|AssertionError|expected[^\n]{
  */
 export function findFirstOwnFailingTest(derived: DerivedTrajectoryEvent[]): StepEvidence | null {
   for (const event of derived) {
-    if (event.kind !== "tool_call" || event.name !== "bash") continue;
-    const input = event.input as { command?: unknown } | null;
-    const command = typeof input?.command === "string" ? input.command : "";
+    if (event.kind !== "shell_command") continue;
+    const command = typeof event.command === "string" ? event.command : "";
     if (!command.includes("run_sql_tests.py") || !AGENT_TEST_FILE_RE.test(command)) continue;
-    const output = extractBashOutputText(event.output);
+    const output = `${typeof event.stdout === "string" ? event.stdout : ""}\n${typeof event.stderr === "string" ? event.stderr : ""}`;
     if (FAILURE_MARKER_RE.test(output)) {
       return { tMs: tsMillis(event.ts), ts: event.ts, step: null };
     }
