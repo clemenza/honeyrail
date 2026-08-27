@@ -262,6 +262,10 @@ Goal
   -> final report
 ```
 
+## Eval Harness Demo
+
+The DSH x tinytable-evals mutation-testing demo (agent-as-test-engineer, kill-rate scoring) is documented in [docs/dsh-evals-demo.md](docs/dsh-evals-demo.md).
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
