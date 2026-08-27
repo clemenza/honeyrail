@@ -51,8 +51,28 @@ pinned to a specific upstream commit:
 
 ```
 $ git -C vendor/tinytable-evals rev-parse HEAD
-a97fa71744e5509f9ce7696d03666f10dc6e5d4e
+a9be811756589903ba7f281bb763ee4d55b392ac
 ```
+
+Re-pinned for upstream's #70/#71 and #72: `#71` fixes a real leak
+`build_mutant_tinytable()`'s `shutil.copytree()` had - if `clean/tinytable/
+__pycache__/` happened to be populated at seed-root build time (readily
+triggered by any direct `python3 run_sql_tests.py --root clean` against
+the canonical checkout), the resulting seed-root shipped a `.pyc`
+compiled from the *pre-mutation* source, decompilable back into the
+answer key. Found via a real trial in this repo (`#146`) that noticed and
+nearly exploited exactly this. `#72` adds a 13th Gen2 operator
+(`fk-referenced-side-ignores-column-identity`, family `M`) in direct
+response to `#145`/`#146`'s finding that no Gen2 operator broke the 100%
+kill-rate ceiling at n=1 - see `docs/gen2-operators.md`'s "Round 2"
+section upstream.
+
+Adding an operator changes `select_operator(seed)`'s mapping regardless of
+which family it lands in (pool grew from 34 to 35), which is why
+`test/dsh-testengineer-trial.test.ts`'s `KILL_SEED = 0` fixture needed
+updating again in the same commit as this re-pin (seed 0 now selects
+`not-null-check-skipped-on-update` instead of
+`order-by-desc-breaks-stability`).
 
 Re-pinned for upstream's #64/#69 ("Gen2" operators - a controlled
 compositional-difficulty experiment): `a97fa71` adds 12 second-generation
