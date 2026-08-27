@@ -40,18 +40,18 @@ const gradePy = join(repoRoot, "vendor", "tinytable-evals", "grade.py");
 
 // The seed pinned for this test - #126's vendor/tinytable-evals at its
 // current pin (see docs/dsh-evals-demo.md's "Pinned upstream commit"
-// section) deterministically maps seed 0 to the "order-by-desc-breaks-
-// stability" operator (Gen2, #64/#69: `ORDER BY col DESC` sorts ascending
-// then reverses the whole list instead of sorting with `reverse=True`,
-// which flips the relative order of tied rows instead of preserving it).
-// The "killed" test below hand-writes a `.test` file targeting exactly
-// that behavioral guarantee, rather than depending on any static
-// answer-key fixture (none exists any more - see #126). Re-pinning
-// vendor/tinytable-evals to a commit whose OPERATORS list changed can
-// change what seed 0 maps to; if this test starts failing after a
-// re-pin, that's the expected signal to re-derive which operator seed 0
-// now selects and update the `.test` file below to target it (see
-// docs/dsh-evals-demo.md's re-pin process).
+// section) deterministically maps seed 0 to the "not-null-check-skipped-
+// on-update" operator: UPDATE stops re-validating a NOT NULL column
+// (INSERT still does), so `UPDATE t SET col = NULL` silently succeeds
+// instead of being rejected. The "killed" test below hand-writes a
+// `.test` file targeting exactly that behavioral guarantee, rather than
+// depending on any static answer-key fixture (none exists any more - see
+// #126). Re-pinning vendor/tinytable-evals to a commit whose OPERATORS
+// list changed (including just adding a new operator - the pool size
+// alone shifts every seed's mapping) can change what seed 0 maps to; if
+// this test starts failing after a re-pin, that's the expected signal to
+// re-derive which operator seed 0 now selects and update the `.test`
+// file below to target it (see docs/dsh-evals-demo.md's re-pin process).
 const KILL_SEED = 0;
 
 function scoreCommand() {
@@ -156,44 +156,21 @@ async function materializedScoreStep(projectId: string) {
   return materialized.steps.find((step) => step.id === "score")!;
 }
 
-// Kills exactly KILL_SEED's "order-by-desc-breaks-stability" operator:
-// correct `ORDER BY col DESC` preserves the original relative order of
-// rows tied on `col` (Python's `list.sort(reverse=True)` is stable), the
-// mutant instead sorts ascending and then `.reverse()`s the whole result,
-// which also flips tied rows' relative order. Three rows share grp=1
-// (seq 1,2,3) and one row has grp=2 (seq 1); grp DESC puts grp=2 first
-// either way, so the divergence is isolated to whether the grp=1 trio
-// comes out as seq 1,2,3 (correct, insertion order preserved) or 3,2,1
-// (mutant, order reversed). Verified directly against both a seed-0
-// seed-root and vendor/tinytable-evals's own clean/ while writing this
-// test (clean: passes; seed-0 mutant: fails with actual=[2,1,1,3,1,2,1,1]
-// vs expected=[2,1,1,1,1,2,1,3]).
+// Kills exactly KILL_SEED's "not-null-check-skipped-on-update" operator:
+// correct behavior re-validates every NOT NULL column on UPDATE, same as
+// INSERT; the mutant drops that re-validation, so an UPDATE that sets a
+// NOT NULL column to NULL wrongly succeeds instead of raising. Verified
+// directly against both a seed-0 seed-root and vendor/tinytable-evals's
+// own clean/ while writing this test (clean: passes; seed-0 mutant:
+// fails - "expected to raise but succeeded").
 const KILLING_TEST = `statement ok
-CREATE TABLE t (grp INTEGER, seq INTEGER)
+CREATE TABLE t (id INTEGER, email TEXT NOT NULL)
 
 statement ok
-INSERT INTO t VALUES (1, 1)
+INSERT INTO t VALUES (1, 'a@x.com')
 
-statement ok
-INSERT INTO t VALUES (1, 2)
-
-statement ok
-INSERT INTO t VALUES (1, 3)
-
-statement ok
-INSERT INTO t VALUES (2, 1)
-
-query II nosort
-SELECT grp, seq FROM t ORDER BY grp DESC
-----
-2
-1
-1
-1
-1
-2
-1
-3
+statement error declared NOT NULL
+UPDATE t SET email = NULL WHERE id = 1
 `;
 
 test("dsh-testengineer-trial's score step: quality gate passes when sql-tests/agent/ kills the seeded mutant", async (t) => {
@@ -208,16 +185,16 @@ test("dsh-testengineer-trial's score step: quality gate passes when sql-tests/ag
   // defect, plus findings.json, as uncommitted worktree edits (agents
   // don't commit on their own - see WorktreeManager.diff's own comment).
   await mkdir(join(worktree.path, "sql-tests", "agent"), { recursive: true });
-  await writeFile(join(worktree.path, "sql-tests", "agent", "order_by_desc_kill.test"), KILLING_TEST);
+  await writeFile(join(worktree.path, "sql-tests", "agent", "not_null_update_kill.test"), KILLING_TEST);
   await writeFile(
     join(worktree.path, "findings.json"),
     JSON.stringify(
       [
         {
-          id: "order-by-desc-breaks-stability",
-          summary: "ORDER BY col DESC does not preserve the original relative order of rows tied on col.",
-          spec_section: "ORDER BY col [ASC|DESC] [NULLS FIRST|LAST]",
-          repro_test: "sql-tests/agent/order_by_desc_kill.test"
+          id: "not-null-check-skipped-on-update",
+          summary: "UPDATE does not re-validate NOT NULL columns, unlike INSERT - setting one to NULL wrongly succeeds.",
+          spec_section: "Constraints: NOT NULL, CHECK, FOREIGN KEY",
+          repro_test: "sql-tests/agent/not_null_update_kill.test"
         }
       ],
       null,
