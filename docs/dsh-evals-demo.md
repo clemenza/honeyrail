@@ -324,3 +324,20 @@ all:
   log (`server/evals/dsh-transcript.ts`), which that plugin already
   appends to disk as the trial runs - so whatever ran before the kill is
   still there to read back, even when `container.log` is empty.
+- **#148: `killed: true` cells carry a `killAttribution` field**
+  (`server/evals/kill-attribution.ts`) classifying *how* the agent found
+  the seeded defect from that same `transcript.ndjson` - `test-driven` (its
+  own test failed before it explained why), `code-review` (it read
+  `tinytable/sql.py`/`core.py` and named the bug before any of its own
+  tests failed), `black-box-reasoning` (neither), or an invalidating
+  `leak`/`oracle-exploit` channel (evidence of reading something outside
+  the seed-root - `#146`'s `__pycache__` finding is exactly this). Answers
+  whether the ceiling effect `tinytable-evals#38` tracks means "operators
+  aren't hard enough" or "the agent just reads a 40KB source file and the
+  bug jumps out" - indistinguishable from kill/false-alarm data alone.
+  `null` when the trial wasn't killed or had no transcript to classify
+  from. `scripts/audit-kill-attribution.ts` re-runs this same classifier
+  over every local `dsh-evals-report-*` directory's existing
+  `transcript.ndjson` files (no new trials) and writes a per-trial/per-
+  family channel-share report, for auditing runs from before this field
+  existed.
