@@ -78,6 +78,18 @@ export type DshTrialRecord = {
    * scoring never reached that step.
    */
   pgAdjudicationTally?: { reference_bug: number; false_alarm: number; unknown: number } | null;
+  /**
+   * #148: how a *killed* trial actually found the seeded defect - see
+   * server/evals/kill-attribution.ts's own docstring for the full channel
+   * definitions (test-driven / code-review / black-box-reasoning / leak /
+   * oracle-exploit / unattributable) and why this matters (the ceiling
+   * effect tinytable-evals#38 tracks could mean "operators aren't hard
+   * enough" or could mean "the agent just reads the 40KB source file and
+   * spots the diff" - indistinguishable from kill/false-alarm data alone).
+   * null when the trial wasn't killed, had no transcript.ndjson to
+   * classify from, or scoring never reached that point.
+   */
+  killAttribution?: { channel: string; claimMatchedBy: string | null; tClaim: string | null; tFirstOwnFailingTest: string | null; tFirstSourceRead: string | null; leakHitCount: number; oracleHitCount: number } | null;
   error?: string;
 };
 

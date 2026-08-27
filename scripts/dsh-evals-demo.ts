@@ -75,6 +75,7 @@ import { describeManifestMismatch, findManifestMismatches } from "../server/eval
 import { readSessionStats } from "../server/evals/dsh-session-stats.js";
 import { appendDerivedTrajectoryEvents } from "../server/evals/dsh-trajectory-bridge.js";
 import { writeTranscript } from "../server/evals/dsh-transcript.js";
+import { classifyKillAttribution, loadOperatorMetadata, parseTranscript, type OperatorMeta } from "../server/evals/kill-attribution.js";
 import { logAgentSnapshot, logFileDiff } from "../server/evals/dsh-trajectory-filesystem-events.js";
 import { auditTranscript } from "../server/evals/transcript-audit.js";
 import { runCommandSafe } from "../server/utils.js";
@@ -328,7 +329,8 @@ async function executeCell(
   fixtureSeed: number,
   profile: ProfileSpec,
   trial: number,
-  cellsDir: string
+  cellsDir: string,
+  operators: Map<string, OperatorMeta>
 ): Promise<DshTrialRecord> {
   const fixture = String(fixtureSeed);
   const trialId = `${fixture}-${profile.label}-${trial}`;
@@ -469,6 +471,31 @@ async function executeCell(
     return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, sessionStats, blockedReason: blocked?.message, error: scoreOrError.error };
   }
 
+  // #148: classify a killed trial's discovery channel (test-driven / code-
+  // review / black-box-reasoning / leak / oracle-exploit) from the
+  // transcript.ndjson just written above, so every future run carries
+  // attribution by default instead of needing a separate audit pass
+  // (scripts/audit-kill-attribution.ts) over old data. Best-effort, same
+  // reasoning as sessionStats/trajectory above: must never fail a trial.
+  let killAttribution: DshTrialRecord["killAttribution"] = null;
+  if (scoreOrError.score.killed) {
+    try {
+      const transcriptText = await readFile(join(artifactsDir, "transcript.ndjson"), "utf8");
+      const attr = classifyKillAttribution(parseTranscript(transcriptText), operators.get(manifest.operatorId) ?? null);
+      killAttribution = {
+        channel: attr.channel,
+        claimMatchedBy: attr.claim?.matchedBy ?? null,
+        tClaim: attr.claim?.ts ?? null,
+        tFirstOwnFailingTest: attr.firstOwnFailingTest?.ts ?? null,
+        tFirstSourceRead: attr.firstSourceRead?.ts ?? null,
+        leakHitCount: attr.leakHits.length,
+        oracleHitCount: attr.oracleHits.length
+      };
+    } catch {
+      // transcript.ndjson missing/unwritable - leave killAttribution null.
+    }
+  }
+
   return {
     ...base,
     killed: scoreOrError.score.killed,
@@ -481,6 +508,7 @@ async function executeCell(
     wallTimeMs,
     sessionStats,
     pgAdjudicationTally: scoreOrError.score.pg_adjudication_tally,
+    killAttribution,
     blockedReason: blocked?.message
   };
 }
@@ -556,6 +584,7 @@ async function main(): Promise<void> {
   const taskPrompt = await readFile(taskPromptPath, "utf8");
   const cellsDir = join(outDir, "cells");
   await mkdir(cellsDir, { recursive: true });
+  const operators = await loadOperatorMetadata(vendorDir);
 
   const state: StateFile = {
     config: { image: options.image, smoke: options.smoke, dshVersion, graderRuns: options.graderRuns, killRateThreshold: options.killRateThreshold },
@@ -573,7 +602,7 @@ async function main(): Promise<void> {
       for (let trial = 1; trial <= trialsPerCell; trial += 1) {
         const label = `seed-${fixtureSeed}/${profile.label}/trial-${trial}`;
         console.log(`Cell ${label} (${state.trials.length + 1}/${totalRuns}):`);
-        const record = await executeCell(options, taskPrompt, fixtureSeed, profile, trial, cellsDir);
+        const record = await executeCell(options, taskPrompt, fixtureSeed, profile, trial, cellsDir, operators);
         state.trials.push(record);
         console.log(`  ${label} finished: outcome=${classifyDshOutcome(record)} killed=${record.killed} falseAlarms=${record.falseAlarms} contractOk=${record.contractOk} integrityOk=${record.integrityOk}${record.blockedReason ? ` blocked="${record.blockedReason}"` : ""}${record.error ? ` error="${record.error}"` : ""}`);
         await writeFile(statePath, JSON.stringify(state, null, 2));
