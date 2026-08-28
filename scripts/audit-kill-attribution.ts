@@ -72,7 +72,7 @@ function globToRegExp(pattern: string): RegExp {
 }
 
 type StateFileTrial = { fixture: string; profile: string; trialId: string; artifactsDir: string; killed: boolean | null };
-type StateFile = { trials: StateFileTrial[] };
+type StateFile = { config?: { blackBox?: boolean }; trials: StateFileTrial[] };
 
 async function findReportDirs(root: string, pattern: RegExp): Promise<string[]> {
   const entries = await readdir(root, { withFileTypes: true });
@@ -102,7 +102,7 @@ type TrialAudit = {
   attribution: AttributionResult | null; // null when not killed, or no transcript
 };
 
-async function auditTrial(reportDir: string, trial: StateFileTrial, operators: Map<string, OperatorMeta>): Promise<TrialAudit> {
+async function auditTrial(reportDir: string, trial: StateFileTrial, operators: Map<string, OperatorMeta>, blackBoxMode: boolean): Promise<TrialAudit> {
   const manifest = await readJson<{ operatorId?: string; seed?: number }>(join(trial.artifactsDir, "manifest.json"));
   const operatorId = manifest?.operatorId ?? null;
   const operator = operatorId ? operators.get(operatorId) ?? null : null;
@@ -119,7 +119,9 @@ async function auditTrial(reportDir: string, trial: StateFileTrial, operators: M
   // transcript leak-scanned. `channel` (test-driven/code-review/...) is
   // only meaningful for killed trials; the report layer below only reads
   // it for those, but leakHits/oracleHits are used for every trial.
-  const attribution = classifyKillAttribution(lines, operator);
+  // `blackBoxMode` (#164) comes from this report's own state.json config -
+  // it's a matrix-wide run setting, not a per-trial one.
+  const attribution = classifyKillAttribution(lines, operator, blackBoxMode);
   return { ...base, hasTranscript: true, attribution };
 }
 
@@ -146,7 +148,7 @@ function buildReport(audits: TrialAudit[]): string {
   lines.push("");
   lines.push("| channel | count | share |");
   lines.push("| --- | --- | --- |");
-  const channelOrder: Channel[] = ["test-driven", "code-review", "black-box-reasoning", "leak", "oracle-exploit", "unattributable"];
+  const channelOrder: Channel[] = ["test-driven", "code-review", "bytecode-review", "black-box-reasoning", "leak", "oracle-exploit", "unattributable"];
   for (const ch of channelOrder) {
     const count = channelCounts.get(ch) ?? 0;
     const share = killed.length > 0 ? `${((count / killed.length) * 100).toFixed(0)}%` : "n/a";
@@ -182,6 +184,15 @@ function buildReport(audits: TrialAudit[]): string {
       lines.push(`- **code-review share is ${(codeReviewShare * 100).toFixed(0)}% (>= 30%)** - per #148, black-box mode (source hidden, API/CLI only) becomes P0 ahead of any further operator work and ahead of tinytable-evals#64's full calibration protocol.`);
     } else {
       lines.push(`- code-review share is ${(codeReviewShare * 100).toFixed(0)}% (< 30%) - the ceiling looks real under white-box conditions in this sample; proceed with multi-mutant scoring and keep white-box, per #148's decision rule.`);
+    }
+    const bytecodeReviewShare = (channelCounts.get("bytecode-review") ?? 0) / killed.length;
+    if (bytecodeReviewShare > 0) {
+      // #164: under --black-box, code-review is structurally unreachable
+      // (no .py exists to read) - bytecode-review is the signal that
+      // matters instead: did hiding source actually force black-box
+      // behavior, or just move the same localize-then-confirm workflow
+      // onto disassembly?
+      lines.push(`- **bytecode-review share is ${(bytecodeReviewShare * 100).toFixed(0)}%** (#164: the \`--black-box\`-mode analog of code-review - the agent disassembled the compiled \`.pyc\` and localized the defect the same way a source read would, instead of genuine black-box behavioral coverage). A high share here means hiding source did not force black-box behavior; consider whether black-box mode needs a real process boundary (an oracle service the agent can't \`import\`/\`dis.dis()\` into) rather than just a missing file.`);
     }
   } else {
     lines.push("- No killed trials with transcript data to evaluate the code-review threshold against.");
@@ -243,8 +254,9 @@ async function main(): Promise<void> {
       console.error(`  skipping ${reportDir}: no readable state.json`);
       continue;
     }
+    const blackBoxMode = state.config?.blackBox ?? false;
     for (const trial of state.trials) {
-      audits.push(await auditTrial(reportDir, trial, operators));
+      audits.push(await auditTrial(reportDir, trial, operators, blackBoxMode));
     }
   }
 

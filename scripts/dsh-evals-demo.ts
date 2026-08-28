@@ -507,13 +507,14 @@ async function executeCell(
   if (scoreOrError.score.killed) {
     try {
       const transcriptText = await readFile(join(artifactsDir, "transcript.ndjson"), "utf8");
-      const attr = classifyKillAttribution(parseTranscript(transcriptText), operators.get(manifest.operatorId) ?? null);
+      const attr = classifyKillAttribution(parseTranscript(transcriptText), operators.get(manifest.operatorId) ?? null, options.blackBox);
       killAttribution = {
         channel: attr.channel,
         claimMatchedBy: attr.claim?.matchedBy ?? null,
         tClaim: attr.claim?.ts ?? null,
         tFirstOwnFailingTest: attr.firstOwnFailingTest?.ts ?? null,
         tFirstSourceRead: attr.firstSourceRead?.ts ?? null,
+        tFirstBytecodeIntrospection: attr.firstBytecodeIntrospection?.ts ?? null,
         leakHitCount: attr.leakHits.length,
         oracleHitCount: attr.oracleHits.length
       };

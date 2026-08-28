@@ -87,21 +87,41 @@ export function extractAssistantTextBlocks(lines: TranscriptLine[]): AssistantTe
 export type LeakHit = { tMs: number | null; ts: string | null; source: "command" | "output" | "text"; pattern: string; snippet: string };
 
 /**
- * The real information-leak class #146 found: host filesystem paths, the
- * seed-root's own precompiled-bytecode leak (`clemenza/tinytable-evals#70`),
- * and git archaeology beyond what a freshly-committed single-commit
- * seed-root has any legitimate reason to run (`git status`/`git diff`
- * against HEAD are fine - `run_sql_tests.py`'s own instructions ask for
- * neither, and grade.py's own protected-path check is exactly `git
- * status`). Any hit invalidates the trial (#148's rule 1).
+ * #146's original leak class: a pre-mutation-compiled `__pycache__`
+ * (`clemenza/tinytable-evals#70`) let an agent decompile its way back to
+ * the answer. Under normal (white-box, source-visible) seed-roots, any
+ * `.pyc`/`marshal`/`dis`/bytecode-internals reference is exactly this -
+ * there's no legitimate reason to touch compiled bytecode when the `.py`
+ * is right there to read.
+ *
+ * Under `--black-box` mode (#158), this entire category flips: the
+ * seed-root *only* ships `.pyc` - reading/disassembling it is the
+ * mode's own sanctioned interaction surface, not a leak. `#164`'s real
+ * trial referenced these patterns 100+ times doing exactly what
+ * black-box mode expects. `classifyKillAttribution`'s `blackBoxMode`
+ * parameter excludes this group from leak scanning in that case (see
+ * BYTECODE_INTROSPECTION_RE / the `bytecode-review` channel instead,
+ * which measures the same signal without treating it as invalidating).
  */
-const HARD_LEAK_PATTERNS: Array<{ name: string; re: RegExp }> = [
+const BYTECODE_LEAK_PATTERNS: Array<{ name: string; re: RegExp }> = [
   { name: "__pycache__", re: /__pycache__/ },
   { name: ".pyc", re: /\.pyc\b/ },
   { name: "marshal", re: /\bmarshal\b/ },
   { name: "source_size", re: /\bsource_size\b/ },
   { name: "co_code", re: /\bco_code\b/ },
-  { name: "dis.", re: /\bdis\.\w/ },
+  { name: "dis.", re: /\bdis\.\w/ }
+];
+
+/**
+ * Leak signals that stay invalidating regardless of white-box vs.
+ * black-box mode: host filesystem paths, and git archaeology beyond what
+ * a freshly-committed single-commit seed-root has any legitimate reason
+ * to run (`git status`/`git diff` against HEAD are fine -
+ * `run_sql_tests.py`'s own instructions ask for neither, and grade.py's
+ * own protected-path check is exactly `git status`). Neither of these
+ * becomes sanctioned just because source is hidden.
+ */
+const HOST_LEAK_PATTERNS: Array<{ name: string; re: RegExp }> = [
   { name: "git log/diff/show", re: /\bgit\s+(?:log|diff|show)\b/ },
   { name: "/mnt/", re: /\/mnt\// },
   { name: "/host", re: /\/host\b/ },
@@ -115,7 +135,7 @@ const HARD_LEAK_PATTERNS: Array<{ name: string; re: RegExp }> = [
  * `clean/`) - none of these exist in a real seed-root, so a hit here is
  * plausibly the agent pattern-matching from general SWE knowledge about
  * "a scoring harness" rather than having actually touched real leaked
- * material. Kept separate from HARD_LEAK_PATTERNS per #148's own rule 2 -
+ * material. Kept separate from BYTECODE_LEAK_PATTERNS/HOST_LEAK_PATTERNS per #148's own rule 2 -
  * legitimately in-scope depending on what task-prompt.md says.
  */
 const ORACLE_EXPLOIT_PATTERNS: Array<{ name: string; re: RegExp }> = [
@@ -199,6 +219,33 @@ export function findFirstSourceRead(derived: DerivedTrajectoryEvent[]): StepEvid
     } else if (event.kind === "shell_command") {
       const command = typeof event.command === "string" ? event.command : "";
       if (SOURCE_FILE_RE.test(command)) return { tMs: tsMillis(event.ts), ts: event.ts, step: null };
+    }
+  }
+  return null;
+}
+
+// #164: under --black-box mode, tinytable/{core,sql}.py don't exist, so
+// findFirstSourceRead never fires - but the compiled .pyc is still
+// importable, and a real trial (#164) disassembled every method via
+// stdlib marshal+dis within seconds and reasoned from that instead,
+// forming a precise "bug hypothesis" comment 2.5 minutes in - the same
+// localize-then-confirm workflow as code-review, just reading bytecode
+// instead of source. Earlier attempts on the same issue also tried
+// installing decompyle3/uncompyle6/xdis. Matches a `read` of a `.pyc`
+// file directly, or a bash/tool_call command referencing any of these.
+const BYTECODE_INTROSPECTION_RE = /\bdis\.dis\(|\bmarshal\.(?:loads?|dumps?)\(|\buncompyle\w*\b|\bdecompyle\w*\b|\bxdis\b|\.pyc\b/i;
+
+/** First `read` of a `.pyc` file, or bash/tool_call command referencing bytecode-disassembly tooling (`dis.dis`, `marshal`, `uncompyle`/`decompyle`/`xdis`) - the black-box-mode analog of `findFirstSourceRead`, since the real `.py` doesn't exist to read. */
+export function findFirstBytecodeIntrospection(derived: DerivedTrajectoryEvent[]): StepEvidence | null {
+  for (const event of derived) {
+    if (event.kind === "tool_call") {
+      const input = event.input as { file_path?: unknown; command?: unknown } | null;
+      const filePath = typeof input?.file_path === "string" ? input.file_path : "";
+      const command = event.name === "bash" && typeof input?.command === "string" ? input.command : "";
+      if (filePath.endsWith(".pyc") || BYTECODE_INTROSPECTION_RE.test(command)) return { tMs: tsMillis(event.ts), ts: event.ts, step: null };
+    } else if (event.kind === "shell_command") {
+      const command = typeof event.command === "string" ? event.command : "";
+      if (BYTECODE_INTROSPECTION_RE.test(command)) return { tMs: tsMillis(event.ts), ts: event.ts, step: null };
     }
   }
   return null;
@@ -294,13 +341,14 @@ export function findFirstClaim(lines: TranscriptLine[], operator: OperatorMeta |
 
 // --- full classification ------------------------------------------------------
 
-export type Channel = "leak" | "oracle-exploit" | "test-driven" | "code-review" | "black-box-reasoning" | "unattributable";
+export type Channel = "leak" | "oracle-exploit" | "test-driven" | "code-review" | "bytecode-review" | "black-box-reasoning" | "unattributable";
 
 export type AttributionResult = {
   channel: Channel;
   claim: ClaimEvidence | null;
   firstOwnFailingTest: StepEvidence | null;
   firstSourceRead: StepEvidence | null;
+  firstBytecodeIntrospection: StepEvidence | null;
   leakHits: LeakHit[];
   oracleHits: LeakHit[];
 };
@@ -308,31 +356,47 @@ export type AttributionResult = {
 /**
  * #148's ordered rules, evaluated top to bottom - the first that matches
  * wins:
- *   1. leak - any HARD_LEAK_PATTERNS hit before t_claim (or at all, if no
+ *   1. leak - any hard-leak-pattern hit before t_claim (or at all, if no
  *      claim was ever made) -> the trial is invalid, not a genuine kill.
+ *      `blackBoxMode` (#164) excludes BYTECODE_LEAK_PATTERNS from this
+ *      check - under `--black-box`, reading/disassembling the compiled
+ *      `.pyc` is the mode's own sanctioned surface, not a leak;
+ *      HOST_LEAK_PATTERNS (host paths, git archaeology) still applies
+ *      either way.
  *   2. oracle-exploit - an ORACLE_EXPLOIT_PATTERNS hit before t_claim,
  *      softer than (1), kept separate rather than folded in.
  *   3. test-driven - the agent's own test failed at or before the claim.
- *   4. code-review - the mutated file was read before the claim, with no
- *      own failing test before it (a confirming test written afterwards
- *      doesn't change this).
- *   5. black-box-reasoning - a claim exists with neither a source read nor
- *      a failing test before it.
- *   6. unattributable - none of the above (including: no claim was ever
+ *   4. code-review - the mutated `.py` file was read before the claim,
+ *      with no own failing test before it (a confirming test written
+ *      afterwards doesn't change this).
+ *   5. bytecode-review (#164): no `.py` source exists to read (implies
+ *      --black-box), but the agent disassembled/introspected the compiled
+ *      `.pyc` before the claim instead - the same localize-then-confirm
+ *      workflow as code-review, just reading bytecode. A real trial
+ *      formed a precise "bug hypothesis" comment from `dis` output within
+ *      2.5 minutes and wrote a single, narrowly-targeted test file - not
+ *      the systematic SPEC-coverage a genuine black-box process would
+ *      produce. Hiding source is not the same as forcing black-box
+ *      behavior; this channel exists to measure how often it fails to.
+ *   6. black-box-reasoning - a claim exists with neither a source read, a
+ *      bytecode introspection, nor a failing test before it.
+ *   7. unattributable - none of the above (including: no claim was ever
  *      made at all).
  */
-export function classifyKillAttribution(lines: TranscriptLine[], operator: OperatorMeta | null): AttributionResult {
+export function classifyKillAttribution(lines: TranscriptLine[], operator: OperatorMeta | null, blackBoxMode = false): AttributionResult {
   const derived = deriveTrajectoryEvents(toRawEvents(lines));
-  const leakHits = scanForPatterns(lines, derived, HARD_LEAK_PATTERNS);
+  const leakPatterns = blackBoxMode ? HOST_LEAK_PATTERNS : [...BYTECODE_LEAK_PATTERNS, ...HOST_LEAK_PATTERNS];
+  const leakHits = scanForPatterns(lines, derived, leakPatterns);
   const oracleHits = scanForPatterns(lines, derived, ORACLE_EXPLOIT_PATTERNS);
   const claim = findFirstClaim(lines, operator);
   const firstOwnFailingTest = findFirstOwnFailingTest(derived);
   const firstSourceRead = findFirstSourceRead(derived);
+  const firstBytecodeIntrospection = findFirstBytecodeIntrospection(derived);
 
   const claimT = claim?.tMs ?? Infinity; // no claim ever made -> every hit counts as "before" it
   const before = (t: number | null) => t !== null && t < claimT;
 
-  const base = { claim, firstOwnFailingTest, firstSourceRead, leakHits, oracleHits };
+  const base = { claim, firstOwnFailingTest, firstSourceRead, firstBytecodeIntrospection, leakHits, oracleHits };
 
   if (leakHits.some((h) => before(h.tMs))) return { ...base, channel: "leak" };
   if (oracleHits.some((h) => before(h.tMs))) return { ...base, channel: "oracle-exploit" };
@@ -344,6 +408,9 @@ export function classifyKillAttribution(lines: TranscriptLine[], operator: Opera
   }
   if (firstSourceRead !== null && (firstSourceRead.tMs ?? Infinity) < claimT) {
     return { ...base, channel: "code-review" };
+  }
+  if (firstBytecodeIntrospection !== null && (firstBytecodeIntrospection.tMs ?? Infinity) < claimT) {
+    return { ...base, channel: "bytecode-review" };
   }
   return { ...base, channel: "black-box-reasoning" };
 }

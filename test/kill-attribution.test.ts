@@ -5,6 +5,7 @@ import {
   classifyKillAttribution,
   extractAssistantTextBlocks,
   extractOperatorTokens,
+  findFirstBytecodeIntrospection,
   findFirstClaim,
   findFirstOwnFailingTest,
   findFirstSourceRead,
@@ -351,4 +352,111 @@ test("classifyKillAttribution: a leak hit AFTER the claim does not retroactively
   ];
   const result = classifyKillAttribution(lines, null);
   assert.equal(result.channel, "test-driven");
+});
+
+// --- bytecode introspection / #164 black-box gap ------------------------------
+
+test("findFirstBytecodeIntrospection: a `read` of a compiled .pyc file is detected", () => {
+  const lines: TranscriptLine[] = [
+    toolCall(1, "2026-01-01T00:00:00.000Z", 1, 1, "c1", "read", { file_path: "/workspace/tinytable/__pycache__/sql.cpython-311.pyc" }),
+    toolResultText(2, "2026-01-01T00:00:00.050Z", 1, 1, "c1", "binary garbage")
+  ];
+  const derived = deriveTrajectoryEvents(lines.map(toRaw));
+  assert.notEqual(findFirstBytecodeIntrospection(derived), null);
+});
+
+test("findFirstBytecodeIntrospection: a bash one-liner using dis.dis()/marshal.loads() to introspect a live import is detected", () => {
+  const lines: TranscriptLine[] = [
+    toolCall(1, "2026-01-01T00:00:00.000Z", 1, 1, "c1", "bash", { command: "python3 -c \"import tinytable.sql, dis; dis.dis(tinytable.sql._check_check_constraints)\"" }),
+    bashResult(2, "2026-01-01T00:00:00.100Z", 1, 1, "c1", { exitCode: 0, stdout: "  10 LOAD_FAST ...\n" })
+  ];
+  const derived = deriveTrajectoryEvents(lines.map(toRaw));
+  assert.notEqual(findFirstBytecodeIntrospection(derived), null);
+});
+
+test("findFirstBytecodeIntrospection: attempting to install a decompiler (uncompyle6/decompyle3/xdis) is detected", () => {
+  const lines: TranscriptLine[] = [
+    toolCall(1, "2026-01-01T00:00:00.000Z", 1, 1, "c1", "bash", { command: "pip install uncompyle6" }),
+    bashResult(2, "2026-01-01T00:00:00.100Z", 1, 1, "c1", { exitCode: 1, stdout: "ERROR: No matching distribution\n" })
+  ];
+  const derived = deriveTrajectoryEvents(lines.map(toRaw));
+  assert.notEqual(findFirstBytecodeIntrospection(derived), null);
+});
+
+test("findFirstBytecodeIntrospection: returns null when the agent never touches bytecode at all", () => {
+  const lines: TranscriptLine[] = [
+    toolCall(1, "2026-01-01T00:00:00.000Z", 1, 1, "c1", "bash", { command: "python3 run_sql_tests.py --root . sql-tests/agent" }),
+    bashResult(2, "2026-01-01T00:00:00.100Z", 1, 1, "c1", { exitCode: 0, stdout: "ok\n" })
+  ];
+  const derived = deriveTrajectoryEvents(lines.map(toRaw));
+  assert.equal(findFirstBytecodeIntrospection(derived), null);
+});
+
+test("classifyKillAttribution: bytecode-review - under blackBoxMode, disassembling the .pyc before the claim is not a leak, but is its own channel", () => {
+  // #164's real trial shape: no tinytable/sql.py exists to read (black-box
+  // mode deleted it), but the agent imports the module and calls dis.dis()
+  // to localize the mutated function before ever writing a test.
+  const lines: TranscriptLine[] = [
+    toolCall(1, "2026-01-01T00:00:00.000Z", 1, 1, "c1", "bash", { command: "python3 -c \"import tinytable.sql as m, dis; dis.dis(m._check_check_constraints)\"" }),
+    bashResult(2, "2026-01-01T00:00:00.100Z", 1, 1, "c1", { exitCode: 0, stdout: "  10 LOAD_FAST self\n  12 LOAD_ATTR columns\n" }),
+    assistantMessage(3, "2026-01-01T00:00:01.000Z", 1, 2, [{ type: "reasoning", text: "Bug hypothesis: UPDATE validates CHECK against only the changed columns." }]),
+    toolCall(4, "2026-01-01T00:00:02.000Z", 1, 3, "c2", "write", { file_path: "/workspace/sql-tests/agent/check.test", content: "..." }),
+    toolResultText(5, "2026-01-01T00:00:02.050Z", 1, 3, "c2", "ok"),
+    toolCall(6, "2026-01-01T00:00:03.000Z", 1, 4, "c3", "bash", { command: "python3 run_sql_tests.py --root . sql-tests/agent/check.test" }),
+    bashResult(7, "2026-01-01T00:00:03.100Z", 1, 4, "c3", { exitCode: 1, stdout: "FAIL sql-tests/agent/check.test (1 failure(s))\n" })
+  ];
+  const result = classifyKillAttribution(lines, null, true);
+  assert.equal(result.channel, "bytecode-review");
+  assert.notEqual(result.firstBytecodeIntrospection, null);
+  assert.equal(result.firstSourceRead, null);
+});
+
+test("classifyKillAttribution: the same .pyc/dis.dis()-before-claim trajectory is classified as 'leak' in default (white-box) mode", () => {
+  // Same transcript as the bytecode-review test above, but without
+  // blackBoxMode - under white-box mode the .py source is right there to
+  // read, so touching bytecode at all has no legitimate purpose and is
+  // still a hard leak signal (the pre-#164 behavior, preserved for
+  // white-box trials).
+  const lines: TranscriptLine[] = [
+    toolCall(1, "2026-01-01T00:00:00.000Z", 1, 1, "c1", "bash", { command: "python3 -c \"import tinytable.sql as m, dis; dis.dis(m._check_check_constraints)\"" }),
+    bashResult(2, "2026-01-01T00:00:00.100Z", 1, 1, "c1", { exitCode: 0, stdout: "  10 LOAD_FAST self\n  12 LOAD_ATTR columns\n" }),
+    assistantMessage(3, "2026-01-01T00:00:01.000Z", 1, 2, [{ type: "reasoning", text: "Bug hypothesis: UPDATE validates CHECK against only the changed columns." }])
+  ];
+  const result = classifyKillAttribution(lines, null, false);
+  assert.equal(result.channel, "leak");
+
+  const resultDefaultArg = classifyKillAttribution(lines, null);
+  assert.equal(resultDefaultArg.channel, "leak");
+});
+
+test("classifyKillAttribution: blackBoxMode does not sanction HOST_LEAK_PATTERNS - a /Users/ host-path reference before the claim still invalidates the trial", () => {
+  const lines: TranscriptLine[] = [
+    toolCall(1, "2026-01-01T00:00:00.000Z", 1, 1, "c1", "bash", { command: "cat /Users/someone/tinytable/sql.py" }),
+    bashResult(2, "2026-01-01T00:00:00.100Z", 1, 1, "c1", { exitCode: 0, stdout: "... source ...\n" }),
+    assistantMessage(3, "2026-01-01T00:00:01.000Z", 1, 2, [{ type: "reasoning", text: "Confirmed a bug in UPDATE's NOT NULL handling." }])
+  ];
+  const result = classifyKillAttribution(lines, null, true);
+  assert.equal(result.channel, "leak");
+});
+
+test("classifyKillAttribution: bytecode-review still loses to test-driven if the agent's own test failed at or before the claim, even under blackBoxMode", () => {
+  const lines: TranscriptLine[] = [
+    toolCall(1, "2026-01-01T00:00:00.000Z", 1, 1, "c1", "write", { file_path: "/workspace/sql-tests/agent/nn.test", content: "..." }),
+    toolResultText(2, "2026-01-01T00:00:00.050Z", 1, 1, "c1", "ok"),
+    toolCall(3, "2026-01-01T00:00:01.000Z", 1, 2, "c2", "bash", { command: "python3 run_sql_tests.py --root . sql-tests/agent/nn.test" }),
+    bashResult(4, "2026-01-01T00:00:01.100Z", 1, 2, "c2", { exitCode: 1, stdout: "FAIL sql-tests/agent/nn.test (1 failure(s))\n" }),
+    toolCall(5, "2026-01-01T00:00:02.000Z", 1, 3, "c3", "bash", { command: "python3 -c \"import tinytable.sql as m, dis; dis.dis(m._check_not_null)\"" }),
+    bashResult(6, "2026-01-01T00:00:02.100Z", 1, 3, "c3", { exitCode: 0, stdout: "  10 LOAD_FAST self\n" }),
+    assistantMessage(7, "2026-01-01T00:00:03.000Z", 1, 4, [{ type: "reasoning", text: "My test failed - this confirms a bug: UPDATE isn't re-checking NOT NULL." }])
+  ];
+  const result = classifyKillAttribution(lines, null, true);
+  assert.equal(result.channel, "test-driven");
+});
+
+test("classifyKillAttribution: black-box-reasoning still applies under blackBoxMode when the agent neither reads bytecode nor has a failing own test before the claim", () => {
+  const lines: TranscriptLine[] = [
+    assistantMessage(1, "2026-01-01T00:00:00.000Z", 1, 1, [{ type: "reasoning", text: "Based on the behavior I'm seeing via ad-hoc queries, I suspect this is a bug in how UPDATE handles constraints." }])
+  ];
+  const result = classifyKillAttribution(lines, null, true);
+  assert.equal(result.channel, "black-box-reasoning");
 });

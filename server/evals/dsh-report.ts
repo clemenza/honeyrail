@@ -101,15 +101,28 @@ export type DshTrialRecord = {
   /**
    * #148: how a *killed* trial actually found the seeded defect - see
    * server/evals/kill-attribution.ts's own docstring for the full channel
-   * definitions (test-driven / code-review / black-box-reasoning / leak /
-   * oracle-exploit / unattributable) and why this matters (the ceiling
-   * effect tinytable-evals#38 tracks could mean "operators aren't hard
-   * enough" or could mean "the agent just reads the 40KB source file and
-   * spots the diff" - indistinguishable from kill/false-alarm data alone).
-   * null when the trial wasn't killed, had no transcript.ndjson to
-   * classify from, or scoring never reached that point.
+   * definitions (test-driven / code-review / bytecode-review /
+   * black-box-reasoning / leak / oracle-exploit / unattributable) and why
+   * this matters (the ceiling effect tinytable-evals#38 tracks could mean
+   * "operators aren't hard enough" or could mean "the agent just reads the
+   * 40KB source file and spots the diff" - indistinguishable from
+   * kill/false-alarm data alone). `bytecode-review` (#164) is the
+   * `--black-box`-mode analog of `code-review`: no `.py` source exists to
+   * read, but the agent disassembled the compiled `.pyc` instead and
+   * localized the defect the same way. null when the trial wasn't killed,
+   * had no transcript.ndjson to classify from, or scoring never reached
+   * that point.
    */
-  killAttribution?: { channel: string; claimMatchedBy: string | null; tClaim: string | null; tFirstOwnFailingTest: string | null; tFirstSourceRead: string | null; leakHitCount: number; oracleHitCount: number } | null;
+  killAttribution?: {
+    channel: string;
+    claimMatchedBy: string | null;
+    tClaim: string | null;
+    tFirstOwnFailingTest: string | null;
+    tFirstSourceRead: string | null;
+    tFirstBytecodeIntrospection: string | null;
+    leakHitCount: number;
+    oracleHitCount: number;
+  } | null;
   /**
    * #139: total F_mutant records (score.json's own field) - every record
    * the agent's own `sql-tests/agent/` suite asserted as failing against
