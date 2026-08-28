@@ -184,11 +184,43 @@ test("buildDshComparisonReport's summary table breaks counts out by every bucket
   assert.match(report, /invalidated.*means either the post-run manifest re-check/s);
 });
 
-test("classifyDshOutcome: a transcript audit hit forces 'invalidated', same priority as an integrity mismatch", () => {
+test("classifyDshOutcome: a high-confidence transcript audit hit forces 'invalidated', same priority as an integrity mismatch", () => {
   assert.equal(
     classifyDshOutcome({
       integrityOk: true,
-      transcriptAuditHits: ["mutant"],
+      transcriptAuditHits: [
+        { pattern: "mutant", excerpt: "found it under examples/tinytable-eval/mutants/m01", confidence: "high" }
+      ],
+      killed: true,
+      falseAlarms: 0,
+      contractOk: true
+    }),
+    "invalidated"
+  );
+});
+
+// #131: a "low" confidence hit (ordinary mutation-testing vocabulary the
+// agent used narrating its own methodology, not evidence of an actual
+// reference outside the exam room) must not mask a trial's real signal -
+// the exact #130 Run B scenario this issue was split out of: 0 genuine
+// kills, 9/9 false alarms, previously fully discarded as "invalidated"
+// because of a single bare "mutant" keyword hit.
+test("classifyDshOutcome: a low-confidence transcript audit hit does not invalidate - #130 Run B's real signal survives", () => {
+  const runBShaped = {
+    integrityOk: true,
+    transcriptAuditHits: [{ pattern: "mutant", excerpt: "not overfit to the mutant", confidence: "low" as const }],
+    killed: false,
+    falseAlarms: 9,
+    contractOk: true
+  };
+  assert.equal(classifyDshOutcome(runBShaped), "task_failed");
+});
+
+test("classifyDshOutcome: integrityOk=false still wins as 'invalidated' even when the only transcript hits are low-confidence", () => {
+  assert.equal(
+    classifyDshOutcome({
+      integrityOk: false,
+      transcriptAuditHits: [{ pattern: "mutant", excerpt: "not overfit to the mutant", confidence: "low" }],
       killed: true,
       falseAlarms: 0,
       contractOk: true

@@ -241,6 +241,46 @@ test("GET /api/evals/dsh-runs tolerates a state.json from before transcriptAudit
   assert.equal(body.trials[0].killedByKind, null);
 });
 
+// #131: a state.json written before the low/high confidence split existed
+// carries transcriptAuditHits as bare pattern-name strings (e.g. "mutant"),
+// not { pattern, excerpt, confidence } objects. Browsing that directory must
+// neither crash nor silently reclassify its outcome - old data normalizes
+// every such entry to "high" confidence, the same verdict it always had.
+test("GET /api/evals/dsh-runs normalizes a pre-#131 transcriptAuditHits string[] to high-confidence hit objects", async (t) => {
+  const { baseUrl, tempDir } = await withServer(t);
+  const outDir = join(tempDir, "old-string-hits-report");
+  await mkdir(outDir, { recursive: true });
+  await writeFile(
+    join(outDir, "state.json"),
+    JSON.stringify({
+      config: { image: "tinytable-exam-room:latest", smoke: true, dshVersion: "0.1.0-rc.7" },
+      profiles: [{ label: "baseline", sha256: "a".repeat(64) }],
+      fixtures: ["m01"],
+      trials: [
+        {
+          fixture: "m01",
+          profile: "baseline",
+          trial: 1,
+          trialId: "m01-baseline-1",
+          artifactsDir: join(outDir, "cells", "m01-baseline-1"),
+          killed: true,
+          falseAlarms: 0,
+          contractOk: true,
+          integrityOk: true,
+          wallTimeMs: 12_000,
+          transcriptAuditHits: ["mutant"] // pre-#131 shape: a bare pattern name.
+        }
+      ]
+    })
+  );
+
+  const res = await fetch(`${baseUrl}/api/evals/dsh-runs?outDir=${encodeURIComponent(outDir)}`);
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.deepEqual(body.trials[0].transcriptAuditHits, [{ pattern: "mutant", excerpt: "", confidence: "high" }]);
+  assert.equal(body.trials[0].outcome, "invalidated");
+});
+
 test("GET /api/evals/dsh-runs/trial 404s for an unknown trialId", async (t) => {
   const { baseUrl, tempDir } = await withServer(t);
   const outDir = join(tempDir, "report");

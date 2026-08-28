@@ -325,6 +325,8 @@ export type EvalMetricsData = {
 // server/evals/dsh-report.ts's own types/summaries rather than RunData.
 export type DshTrialOutcomeData = "passed" | "task_failed" | "verify_failed" | "invalidated" | "blocked" | "driver_error";
 
+export type DshTranscriptAuditHitData = { pattern: string; excerpt: string; confidence: "high" | "low" };
+
 export type DshTrialRecordData = {
   fixture: string;
   profile: string;
@@ -335,7 +337,7 @@ export type DshTrialRecordData = {
   falseAlarms: number | null;
   contractOk: boolean | null;
   integrityOk: boolean;
-  transcriptAuditHits: string[];
+  transcriptAuditHits: DshTranscriptAuditHitData[];
   killRate: number | null;
   killedByKind: { assertion: number; invariant: number } | null;
   blockedReason?: string;
