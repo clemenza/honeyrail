@@ -438,9 +438,10 @@ async function executeCell(
   // an in-memory regex pass and a run that fails early still deserves the
   // same scrutiny as one that completes.
   const auditableText = await gatherAuditableText(seedRootDir, combinedOutput);
-  const transcriptAuditHits = auditTranscript(auditableText).map((hit) => hit.pattern);
+  const transcriptAuditHits = auditTranscript(auditableText);
   if (transcriptAuditHits.length) {
-    console.error(`  ${trialId}: TRANSCRIPT AUDIT HIT(S): ${transcriptAuditHits.join(", ")}`);
+    const summary = transcriptAuditHits.map((hit) => `${hit.pattern}(${hit.confidence})`).join(", ");
+    console.error(`  ${trialId}: TRANSCRIPT AUDIT HIT(S): ${summary}`);
   }
 
   const sessionStats = sessionStatsReport?.aggregate ?? null;

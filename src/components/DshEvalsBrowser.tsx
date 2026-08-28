@@ -75,7 +75,14 @@ function TrialArtifactsModal({ outDir, trial, onClose }: { outDir: string; trial
                 <span>wall time {secs(trial.wallTimeMs)}</span>
                 {trial.blockedReason ? <span>blocked: {trial.blockedReason}</span> : null}
                 {trial.error ? <span>error: {trial.error}</span> : null}
-                {trial.transcriptAuditHits.length ? <span>transcript audit hits: {trial.transcriptAuditHits.join(", ")}</span> : null}
+                {trial.transcriptAuditHits.length ? (
+                  <span>
+                    transcript audit hits:{" "}
+                    {trial.transcriptAuditHits
+                      .map((hit) => (hit.confidence === "low" ? `${hit.pattern} (low-confidence)` : hit.pattern))
+                      .join(", ")}
+                  </span>
+                ) : null}
               </div>
               <h3>score.json</h3>
               {artifacts.scoreJson ? (

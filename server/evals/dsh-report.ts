@@ -12,6 +12,7 @@
  */
 
 import type { SessionStats } from "./dsh-session-stats.js";
+import type { TranscriptAuditHit } from "./transcript-audit.js";
 
 export type DshTrialOutcome = "passed" | "task_failed" | "verify_failed" | "invalidated" | "blocked" | "driver_error";
 
@@ -41,12 +42,18 @@ export type DshTrialRecord = {
   /**
    * #107's transcript audit: hits from server/evals/transcript-audit.ts
    * against the container's captured output and the agent's own artifacts
-   * (findings.json, its .test files). Any hit forces "invalidated" - the
-   * same reasoning as integrityOk, extended to cover what the agent *said*
-   * or *wrote* about material outside the exam room, not just whether it
-   * actually tampered with protected files.
+   * (findings.json, its .test files). A "high" confidence hit forces
+   * "invalidated" - the same reasoning as integrityOk, extended to cover
+   * what the agent *said* or *wrote* about material outside the exam room,
+   * not just whether it actually tampered with protected files. A "low"
+   * confidence hit (#131) is recorded and shown in the per-trial report for
+   * human review, but does not by itself invalidate a trial - #130/#134/#136
+   * found 6/115 trials where ordinary mutation-testing vocabulary in the
+   * agent's own methodology narration ("not overfit to the mutant") tripped
+   * the bare `mutant` pattern with no actual reference to material outside
+   * the exam room.
    */
-  transcriptAuditHits: string[];
+  transcriptAuditHits: TranscriptAuditHit[];
   /**
    * #126 (vendor/tinytable-evals's grade.py, its own issue #21 "Grader
    * v2"): fraction of --grader-runs probabilistic-scoring seeds that
@@ -128,7 +135,11 @@ export type DshTrialRecord = {
 
 /**
  * Scores one cell. "invalidated" takes priority over everything else - see
- * DshTrialRecord.integrityOk/transcriptAuditHits. "blocked" is next: an
+ * DshTrialRecord.integrityOk/transcriptAuditHits. A transcript-audit hit
+ * only counts toward this if it's "high" confidence (#131) - a "low"
+ * confidence hit (ordinary mutation-testing vocabulary, not evidence of an
+ * actual reference outside the exam room) is still recorded on the trial for
+ * human review but does not by itself invalidate it. "blocked" is next: an
  * agent that printed BLOCKED: per UNATTENDED_PREAMBLE made no claim about
  * the fixture at all. Otherwise this reads grade.py's own verdict:
  * killed==false means the agent's suite never caught the seeded defect
@@ -144,7 +155,7 @@ export function classifyDshOutcome(
   >
 ): DshTrialOutcome {
   if (cell.error) return "driver_error";
-  if (!cell.integrityOk || cell.transcriptAuditHits.length > 0) return "invalidated";
+  if (!cell.integrityOk || cell.transcriptAuditHits.some((hit) => hit.confidence === "high")) return "invalidated";
   if (cell.blockedReason) return "blocked";
   if (cell.killed === null || cell.contractOk === null) return "driver_error";
   if (!cell.killed) return "task_failed";
@@ -372,7 +383,7 @@ export function buildDshComparisonReport(input: DshComparisonReportInput): strin
   lines.push("## Summary");
   lines.push("");
   lines.push(
-    "Pass rate excludes `blocked`, `invalidated`, and `driver_error` trials from its denominator - none carry a pass/fail signal about the agent's test-engineering. `invalidated` (#107) means either the post-run manifest re-check (#106) found tinytable/, sql-tests/official/, or another protected fixture file changed, or the transcript audit found the agent's own output/artifacts referencing material outside the exam room - the #103 failure mode - regardless of what grade.py itself reported."
+    "Pass rate excludes `blocked`, `invalidated`, and `driver_error` trials from its denominator - none carry a pass/fail signal about the agent's test-engineering. `invalidated` (#107) means either the post-run manifest re-check (#106) found tinytable/, sql-tests/official/, or another protected fixture file changed, or the transcript audit found a high-confidence reference (#131) in the agent's own output/artifacts to material outside the exam room - the #103 failure mode - regardless of what grade.py itself reported. A low-confidence transcript hit (ordinary mutation-testing vocabulary, not evidence of an actual reference) is shown per-trial below but does not affect this classification."
   );
   lines.push("");
   lines.push(
@@ -430,7 +441,11 @@ export function buildDshComparisonReport(input: DshComparisonReportInput): strin
     (a, b) => a.fixture.localeCompare(b.fixture) || a.profile.localeCompare(b.profile) || a.trial - b.trial
   );
   for (const trial of sorted) {
-    const auditCell = trial.transcriptAuditHits.length ? `${trial.transcriptAuditHits.length} hit(s): ${trial.transcriptAuditHits.join(", ")}` : "clean";
+    const auditCell = trial.transcriptAuditHits.length
+      ? `${trial.transcriptAuditHits.length} hit(s): ${trial.transcriptAuditHits
+          .map((hit) => (hit.confidence === "low" ? `${hit.pattern} (low-confidence)` : hit.pattern))
+          .join(", ")}`
+      : "clean";
     const turns = trial.sessionStats?.turns;
     const turnsCell = turns === undefined || turns === null ? "n/a" : turns > 1 ? `${turns} ⚠multi-turn` : String(turns);
     const llmTimeCell = trial.sessionStatsTimingIssue ? `${seconds(trial.sessionStats?.llmMs)} ⚠timing suspect` : seconds(trial.sessionStats?.llmMs);

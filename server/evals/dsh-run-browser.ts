@@ -25,6 +25,7 @@ import {
   type FixtureCellSummary,
   type ProfileSummary
 } from "./dsh-report.js";
+import type { TranscriptAuditHit } from "./transcript-audit.js";
 
 export type DshEvalsState = {
   config: { image: string; smoke: boolean; dshVersion: string };
@@ -78,11 +79,27 @@ export function normalizeDshOutDir(inputPath: unknown): string {
 function normalizeTrial(raw: DshTrialRecord): DshTrialRecord {
   return {
     ...raw,
-    transcriptAuditHits: raw.transcriptAuditHits ?? [],
+    transcriptAuditHits: normalizeTranscriptAuditHits(raw.transcriptAuditHits),
     killRate: raw.killRate ?? null,
     killedByKind: raw.killedByKind ?? null,
     pgAdjudicationTally: raw.pgAdjudicationTally ?? null
   };
+}
+
+/**
+ * #131: pre-#131 state.json files carry transcriptAuditHits as bare pattern
+ * name strings (e.g. "mutant"), not { pattern, excerpt, confidence } hit
+ * objects - the low/high confidence split didn't exist yet. Treat every
+ * such entry as "high" confidence: the conservative choice for old data,
+ * since that's the classification browsing that directory always produced
+ * before this fix, rather than silently reclassifying a historical run's
+ * outcome as a side effect of loading it in the browser.
+ */
+function normalizeTranscriptAuditHits(raw: unknown): TranscriptAuditHit[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((entry): TranscriptAuditHit =>
+    typeof entry === "string" ? { pattern: entry, excerpt: "", confidence: "high" } : (entry as TranscriptAuditHit)
+  );
 }
 
 async function readState(outDir: string): Promise<DshEvalsState> {
