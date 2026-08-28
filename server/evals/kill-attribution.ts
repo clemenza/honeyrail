@@ -243,7 +243,24 @@ const STOP_TOKENS = new Set([
   "which", "where", "when", "what", "there", "their", "these", "those", "table", "column", "value", "values"
 ]);
 
-export type OperatorMeta = { id: string; file: string; specSection: string; tokens: string[]; family: string | null };
+export type OperatorMeta = {
+  id: string;
+  file: string;
+  specSection: string;
+  tokens: string[];
+  family: string | null;
+  /**
+   * #139's interim difficultyTier source, pending clemenza/tinytable-evals#53's
+   * staged L0-L4 benchmark levels: #44's `statefulness` difficulty axis
+   * (`mutate.py`'s own "ordered tiers, each subsuming the one before it" -
+   * single-statement < multi-statement < multi-object < transactional <
+   * crash-recovery), only declared for Gen2 (`family`-carrying) operators.
+   * null for every Gen1 operator - i.e. every fixture in the 22-operator
+   * default matrix #136 analyzed by hand - since Gen1 predates #44 and
+   * carries no difficulty metadata at all yet.
+   */
+  tier: string | null;
+};
 
 /** Identifier-shaped tokens (>=4 chars, not a stopword) pulled from an operator's anchor `find` text - a cheap proxy for "names the mutated function/constraint". */
 export function extractOperatorTokens(findSnippet: string): string[] {
@@ -332,27 +349,32 @@ export function classifyKillAttribution(lines: TranscriptLine[], operator: Opera
 }
 
 /**
- * Queries every operator's {id, file, spec_section, find, family} from the
- * pinned vendor/tinytable-evals/mutate.py once (not per trial) via a single
- * subprocess call - the same "shell out to Python for mutate.py-adjacent
- * work" pattern build_seed_root.py/grade.py invocations already use. Returns
- * an empty map (not a throw) if python3/mutate.py aren't available, so a
- * checkout without the submodule initialized still produces a report/trial
- * record - just without spec-section/token-based claim detection (the
- * generic defect-assertion regex still works on its own).
+ * Queries every operator's {id, file, spec_section, find, family, tier} from
+ * the pinned vendor/tinytable-evals/mutate.py once (not per trial) via a
+ * single subprocess call - the same "shell out to Python for mutate.py-
+ * adjacent work" pattern build_seed_root.py/grade.py invocations already
+ * use. `tier` is #44's `statefulness` axis, read straight off `o.axes` when
+ * declared (see OperatorMeta's own docstring for why that's the field #139
+ * picked as its interim difficultyTier source) - `None` for every Gen1
+ * operator, same as `family`. Returns an empty map (not a throw) if
+ * python3/mutate.py aren't available, so a checkout without the submodule
+ * initialized still produces a report/trial record - just without
+ * spec-section/token-based claim detection (the generic defect-assertion
+ * regex still works on its own) or a difficultyTier.
  */
 export async function loadOperatorMetadata(vendorDir: string): Promise<Map<string, OperatorMeta>> {
-  const script = "import mutate, json; print(json.dumps([{'id': o.id, 'file': o.file, 'specSection': o.spec_section, 'find': o.find, 'family': o.family} for o in mutate.OPERATORS]))";
+  const script =
+    "import mutate, json; print(json.dumps([{'id': o.id, 'file': o.file, 'specSection': o.spec_section, 'find': o.find, 'family': o.family, 'tier': (o.axes.statefulness if o.axes else None)} for o in mutate.OPERATORS]))";
   const result = await runCommandSafe("python3", ["-c", script], { cwd: vendorDir });
   if (!result.ok) {
     console.error(`  warning: could not query operator metadata from ${vendorDir} (${result.stderr.trim() || "unknown error"}) - claim detection will use generic patterns only`);
     return new Map();
   }
   try {
-    const raw = JSON.parse(result.stdout) as Array<{ id: string; file: string; specSection: string; find: string; family: string | null }>;
+    const raw = JSON.parse(result.stdout) as Array<{ id: string; file: string; specSection: string; find: string; family: string | null; tier: string | null }>;
     const map = new Map<string, OperatorMeta>();
     for (const op of raw) {
-      map.set(op.id, { id: op.id, file: op.file, specSection: op.specSection, tokens: extractOperatorTokens(op.find), family: op.family });
+      map.set(op.id, { id: op.id, file: op.file, specSection: op.specSection, tokens: extractOperatorTokens(op.find), family: op.family, tier: op.tier });
     }
     return map;
   } catch {

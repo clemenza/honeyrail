@@ -346,8 +346,13 @@ async function executeCell(
     manifest = await buildSeedRoot({ seed: fixtureSeed, outDir: seedRootDir });
     await writeFile(join(artifactsDir, "manifest.json"), JSON.stringify(manifest, null, 2));
   } catch (error) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: false, transcriptAuditHits: [], killRate: null, killedByKind: null, error: (error as Error).message };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: false, transcriptAuditHits: [], killRate: null, killedByKind: null, difficultyTier: null, error: (error as Error).message };
   }
+
+  // #139: known as soon as the manifest names an operator id - independent
+  // of whether the trial ever reaches scoring, so every return path below
+  // (including the early error ones above/below) carries it.
+  const difficultyTier = operators.get(manifest.operatorId)?.tier ?? null;
 
   const preflightMismatches = await findManifestMismatches(seedRootDir, { files: manifest.files });
   if (preflightMismatches.length) {
@@ -360,6 +365,7 @@ async function executeCell(
       transcriptAuditHits: [],
       killRate: null,
       killedByKind: null,
+      difficultyTier,
       error: `#106 preflight: freshly-built seed-root doesn't match its own manifest: ${preflightMismatches.map(describeManifestMismatch).join("; ")}`
     };
   }
@@ -440,11 +446,11 @@ async function executeCell(
   const sessionStats = sessionStatsReport?.aggregate ?? null;
 
   if (result.timedOut) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, sessionStats, error: `trial timed out after ${options.trialTimeoutMinutes}m and was killed` };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killRate: null, killedByKind: null, difficultyTier, wallTimeMs, sessionStats, error: `trial timed out after ${options.trialTimeoutMinutes}m and was killed` };
   }
   const fatal = dshAdapter.findFatalError?.(combinedOutput);
   if (fatal) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, sessionStats, error: `dsh fatal error (${fatal.code}): ${fatal.message}` };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killRate: null, killedByKind: null, difficultyTier, wallTimeMs, sessionStats, error: `dsh fatal error (${fatal.code}): ${fatal.message}` };
   }
   const blocked = findBlockedReason(combinedOutput);
 
@@ -468,7 +474,7 @@ async function executeCell(
   }
 
   if (!scoreOrError.ok) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk, transcriptAuditHits, killRate: null, killedByKind: null, wallTimeMs, sessionStats, blockedReason: blocked?.message, error: scoreOrError.error };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk, transcriptAuditHits, killRate: null, killedByKind: null, difficultyTier, wallTimeMs, sessionStats, blockedReason: blocked?.message, error: scoreOrError.error };
   }
 
   // #148: classify a killed trial's discovery channel (test-driven / code-
@@ -505,6 +511,12 @@ async function executeCell(
     transcriptAuditHits,
     killRate: scoreOrError.score.kill_rate,
     killedByKind: scoreOrError.score.killed_by_kind,
+    // #139: score.json's own f_mutant - every record the agent's suite
+    // asserted as failing against the mutant, the denominator precision
+    // (server/evals/dsh-report.ts's FixtureCellSummary.precision) divides
+    // killedByKind's genuine-kill numerator by.
+    assertedFailingCount: scoreOrError.score.f_mutant.length,
+    difficultyTier,
     wallTimeMs,
     sessionStats,
     pgAdjudicationTally: scoreOrError.score.pg_adjudication_tally,
