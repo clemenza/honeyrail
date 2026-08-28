@@ -7,10 +7,12 @@ import { zstdCompressSync, zstdDecompressSync } from "node:zlib";
 
 import {
   decodeZstdSessionLog,
+  findSessionStatsTimingInconsistency,
   foldSessionStats,
   parseSessionLog,
   readSessionStats,
-  type DshRawEvent
+  type DshRawEvent,
+  type SessionStats
 } from "../server/evals/dsh-session-stats.js";
 
 async function tempDir(t: TestContext, prefix: string): Promise<string> {
@@ -200,4 +202,29 @@ test("readSessionStats: reads a real .jsonl.zstd session log (dsh's default comp
   assert.equal(report!.sessions.length, 1);
   assert.equal(report!.sessions[0]!.file, join("proj", "session.jsonl.zstd"));
   assert.deepEqual(report!.aggregate, { turns: 1, steps: 1, llmMs: 40, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 });
+});
+
+// #141: llmMs/toolMs are each sums of sub-intervals of one trial's own real
+// wall-clock span, so either reading higher than the trial's own
+// wallTimeMs is never legitimate - the defensive check acceptance
+// criterion 3 (excluding untrustworthy time-based metrics from any
+// aggregate) depends on.
+function baseStats(overrides: Partial<SessionStats> = {}): SessionStats {
+  return { turns: 1, steps: 1, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0, ...overrides };
+}
+
+test("findSessionStatsTimingInconsistency: null when llmMs/toolMs are within wallTimeMs", () => {
+  assert.equal(findSessionStatsTimingInconsistency(baseStats({ llmMs: 400, toolMs: 100 }), 1000), null);
+  // Exactly equal to wallTimeMs is still consistent (not a strict "<").
+  assert.equal(findSessionStatsTimingInconsistency(baseStats({ llmMs: 1000 }), 1000), null);
+});
+
+test("findSessionStatsTimingInconsistency: flags llmMs exceeding wallTimeMs - the real #134/#136 shape (1021.6s llmMs vs 787.1s wallTimeMs)", () => {
+  const reason = findSessionStatsTimingInconsistency(baseStats({ turns: 2, llmMs: 1_021_600 }), 787_100);
+  assert.match(reason!, /llmMs \(1021600ms\) exceeds wallTimeMs \(787100ms\)/);
+});
+
+test("findSessionStatsTimingInconsistency: flags toolMs exceeding wallTimeMs too, not just llmMs", () => {
+  const reason = findSessionStatsTimingInconsistency(baseStats({ toolMs: 500 }), 100);
+  assert.match(reason!, /toolMs \(500ms\) exceeds wallTimeMs \(100ms\)/);
 });

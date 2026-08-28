@@ -285,7 +285,7 @@ test("buildDshComparisonReport's per-fixture table shows n\\/a for precision and
   const report = buildDshComparisonReport(
     reportInput([trial({ fixture: "m01", profile: "baseline", trial: 1, trialId: "m01-baseline-1" })])
   );
-  assert.match(report, /\| n\/a \| n\/a \|$/m);
+  assert.match(report, /\| n\/a \| n\/a \| 0\/1 \|$/m);
 });
 
 test("buildDshComparisonReport's paired delta table states a per-fixture kill-rate delta with no significance claim", () => {
@@ -316,4 +316,71 @@ test("buildDshComparisonReport's per-trial evidence table names every field and 
   );
   assert.match(report, /\/tmp\/dsh-evals-report\/cells\/m01-baseline-1/);
   assert.doesNotMatch(report, /api\/runs/);
+});
+
+// #142: a session re-entering a second turn is a trial-health signal worth
+// surfacing automatically, independent of pass/fail classification - so it
+// counts over every trial with sessionStats, not just scorable ones (a
+// multi-turn trial that timed out, #134's real-world case, is exactly what
+// this should catch).
+test("summarizeFixtureCells counts multi-turn trials (sessionStats.turns > 1) per cell, including non-scorable ones", () => {
+  const cells = summarizeFixtureCells([
+    trial({ fixture: "m01", profile: "baseline", trial: 1, sessionStats: { turns: 1, steps: 1, llmMs: 100, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 } }),
+    trial({ fixture: "m01", profile: "baseline", trial: 2, sessionStats: { turns: 2, steps: 5, llmMs: 200, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 } }),
+    // A timed-out trial (killed: null) still carries partial telemetry and still counts - #134's 33-baseline-4 shape.
+    trial({ fixture: "m01", profile: "baseline", trial: 3, killed: null, falseAlarms: null, contractOk: null, error: "trial timed out after 15m and was killed", sessionStats: { turns: 2, steps: 80, llmMs: 300, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 } })
+  ]);
+  const cell = cells.find((c) => c.fixture === "m01" && c.profile === "baseline")!;
+  assert.equal(cell.multiTurnCount, 2);
+});
+
+test("buildDshComparisonReport's per-trial evidence table flags a multi-turn session's Turns cell", () => {
+  const report = buildDshComparisonReport(
+    reportInput([
+      trial({
+        fixture: "m01",
+        profile: "baseline",
+        trial: 1,
+        sessionStats: { turns: 2, steps: 80, llmMs: 100, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 }
+      })
+    ])
+  );
+  assert.match(report, /\| 2 ⚠multi-turn \|/);
+});
+
+// #141: llmMs > wallTimeMs is impossible under correct accounting - the
+// per-trial table must flag it rather than silently print the bogus
+// number as if it were trustworthy cost data.
+test("buildDshComparisonReport's per-trial evidence table flags a session-stats timing inconsistency on the LLM time cell", () => {
+  const report = buildDshComparisonReport(
+    reportInput([
+      trial({
+        fixture: "m01",
+        profile: "baseline",
+        trial: 1,
+        wallTimeMs: 787_100,
+        sessionStats: { turns: 2, steps: 80, llmMs: 1_021_600, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+        sessionStatsTimingIssue: "llmMs (1021600ms) exceeds wallTimeMs (787100ms)"
+      })
+    ])
+  );
+  assert.match(report, /\| 1021\.6s ⚠timing suspect \|/);
+});
+
+test("buildDshComparisonReport's per-trial evidence table shows a plain Turns/LLM time cell when nothing is flagged", () => {
+  const report = buildDshComparisonReport(
+    reportInput([
+      trial({
+        fixture: "m01",
+        profile: "baseline",
+        trial: 1,
+        sessionStats: { turns: 1, steps: 1, llmMs: 400, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 }
+      })
+    ])
+  );
+  // Turns=1, LLM time=0.4s, Wall time=60s (default trial() wallTimeMs),
+  // with nothing appended to either cell - a precise match, not just
+  // "doesn't contain ⚠ anywhere," since this report's own column-legend
+  // prose above the table legitimately mentions both marker strings.
+  assert.match(report, /\| 1 \| 0\.4s \| 60s \|/);
 });

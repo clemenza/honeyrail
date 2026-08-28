@@ -70,6 +70,19 @@ export type DshTrialRecord = {
    */
   sessionStats?: SessionStats | null;
   /**
+   * #141: non-null when `sessionStats.llmMs`/`toolMs` reads higher than
+   * this trial's own `wallTimeMs` - impossible under correct accounting
+   * (both are sums of sub-intervals of that same wall-clock span), so a
+   * non-null value here means `sessionStats`' time-based fields (llmMs,
+   * toolMs, ttftMs, decodeMs - not `turns`/`steps`, which aren't
+   * time-based) are not trustworthy for this trial and should be excluded
+   * from any aggregate. See server/evals/dsh-session-stats.ts's
+   * `findSessionStatsTimingInconsistency` for the value and the
+   * root-cause investigation. null when `sessionStats` is null, or its
+   * numbers are internally consistent.
+   */
+  sessionStatsTimingIssue?: string | null;
+  /**
    * #57, opt-in via --pg-adjudicate (off by default): summed across
    * --grader-runs seeds' F_mutant & F_clean disputes, settled by a
    * PostgreSQL oracle into reference_bug (a real clean/ bug - see
@@ -177,6 +190,15 @@ export type FixtureCellSummary = {
   precision: number | null;
   /** This fixture's difficultyTier (constant across its cells' trials); null until one trial in this cell carries one - see DshTrialRecord.difficultyTier. */
   difficultyTier: string | null;
+  /**
+   * #142: count of this cell's trials whose sessionStats.turns > 1 - a
+   * session re-entering a second turn correlates (3/115 tracked trials so
+   * far, all either timeouts or unusually slow) with a trial being "in
+   * trouble," independent of pass/fail classification, so this counts
+   * over every trial with sessionStats, not just scorable ones (a
+   * multi-turn trial that timed out is exactly the case worth surfacing).
+   */
+  multiTurnCount: number;
 };
 
 function median(values: number[]): number | null {
@@ -272,7 +294,8 @@ export function summarizeFixtureCells(trials: DshTrialRecord[]): FixtureCellSumm
         ? kindTallies.reduce((acc, k) => ({ assertion: acc.assertion + k.assertion, invariant: acc.invariant + k.invariant }), { assertion: 0, invariant: 0 })
         : null,
       precision: totalAsserted > 0 ? totalGenuineKills / totalAsserted : null,
-      difficultyTier: records.find((r) => r.difficultyTier != null)?.difficultyTier ?? null
+      difficultyTier: records.find((r) => r.difficultyTier != null)?.difficultyTier ?? null,
+      multiTurnCount: records.filter((r) => (r.sessionStats?.turns ?? 0) > 1).length
     };
   });
 }
@@ -369,20 +392,20 @@ export function buildDshComparisonReport(input: DshComparisonReportInput): strin
   );
   lines.push("");
   lines.push(
-    "Precision (#139) is genuine kills / total asserted failing records, pooled across this cell's scorable trials: how much of what the agent's suite flagged as failing against the mutant actually was the seeded defect, as opposed to a false-alarm record bundled in alongside it - a finer-grained view than the false-alarm rate column, which only asks whether a trial had *any* false alarm at all. Difficulty tier is #44's `statefulness` axis (`clemenza/tinytable-evals`), an interim signal pending #53's staged L0-L4 benchmark levels - `n/a` for every Gen1 operator (the entire 22-operator default matrix #136 analyzed by hand), not a sign of missing data."
+    "Precision (#139) is genuine kills / total asserted failing records, pooled across this cell's scorable trials: how much of what the agent's suite flagged as failing against the mutant actually was the seeded defect, as opposed to a false-alarm record bundled in alongside it - a finer-grained view than the false-alarm rate column, which only asks whether a trial had *any* false alarm at all. Difficulty tier is #44's `statefulness` axis (`clemenza/tinytable-evals`), an interim signal pending #53's staged L0-L4 benchmark levels - `n/a` for every Gen1 operator (the entire 22-operator default matrix #136 analyzed by hand), not a sign of missing data. Multi-turn trials (#142) counts trials whose session re-entered a second turn - a secondary difficulty signal: 3/115 tracked trials so far, all either timeouts or unusually slow."
   );
   lines.push("");
   lines.push(
-    "| Fixture | Profile | Trials | Kill rate | False-alarm rate | Contract compliance | Mean kill rate | Killed by kind (assertion/invariant) | Median wall time | Precision | Difficulty tier |"
+    "| Fixture | Profile | Trials | Kill rate | False-alarm rate | Contract compliance | Mean kill rate | Killed by kind (assertion/invariant) | Median wall time | Precision | Difficulty tier | Multi-turn trials |"
   );
-  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const fixture of input.fixtures) {
     for (const profile of profiles) {
       const cell = cells.find((item) => item.fixture === fixture && item.profile === profile);
       if (!cell) continue;
       const killedByKind = cell.killedByKind ? `${cell.killedByKind.assertion}/${cell.killedByKind.invariant}` : "n/a";
       lines.push(
-        `| \`${fixture}\` | \`${profile}\` | ${cell.trials} | ${percent(cell.killRate)} | ${percent(cell.falseAlarmRate)} | ${percent(cell.contractComplianceRate)} | ${percent(cell.meanKillRate)} | ${killedByKind} | ${seconds(cell.medianWallTimeMs)} | ${percent(cell.precision)} | ${cell.difficultyTier ?? "n/a"} |`
+        `| \`${fixture}\` | \`${profile}\` | ${cell.trials} | ${percent(cell.killRate)} | ${percent(cell.falseAlarmRate)} | ${percent(cell.contractComplianceRate)} | ${percent(cell.meanKillRate)} | ${killedByKind} | ${seconds(cell.medianWallTimeMs)} | ${percent(cell.precision)} | ${cell.difficultyTier ?? "n/a"} | ${cell.multiTurnCount}/${cell.trials} |`
       );
     }
   }
@@ -398,7 +421,7 @@ export function buildDshComparisonReport(input: DshComparisonReportInput): strin
   );
   lines.push("");
   lines.push(
-    "Turns/LLM time come from dsh's own session-persistence JSONL log, folded by server/evals/dsh-session-stats.ts (a direct port of dsh's `sessionStats` projection) - \"n/a\" means the trial's session captured no readable telemetry, not that it took zero turns."
+    "Turns/LLM time come from dsh's own session-persistence JSONL log, folded by server/evals/dsh-session-stats.ts (a direct port of dsh's `sessionStats` projection) - \"n/a\" means the trial's session captured no readable telemetry, not that it took zero turns. `⚠multi-turn` (#142) flags a session that re-entered a second turn - a secondary difficulty signal, independent of pass/fail. `⚠timing suspect` (#141) flags `llmMs`/`toolMs` reading higher than the trial's own wall time - impossible under correct accounting, so treat that trial's session-derived time figures as untrustworthy rather than as real cost data; every known instance so far is also a `⚠multi-turn` trial."
   );
   lines.push("");
   lines.push("| Fixture | Profile | Trial | Outcome | Killed | False alarms | Contract OK | Integrity OK | Transcript audit | Turns | LLM time | Wall time | Artifacts |");
@@ -408,8 +431,11 @@ export function buildDshComparisonReport(input: DshComparisonReportInput): strin
   );
   for (const trial of sorted) {
     const auditCell = trial.transcriptAuditHits.length ? `${trial.transcriptAuditHits.length} hit(s): ${trial.transcriptAuditHits.join(", ")}` : "clean";
+    const turns = trial.sessionStats?.turns;
+    const turnsCell = turns === undefined || turns === null ? "n/a" : turns > 1 ? `${turns} ⚠multi-turn` : String(turns);
+    const llmTimeCell = trial.sessionStatsTimingIssue ? `${seconds(trial.sessionStats?.llmMs)} ⚠timing suspect` : seconds(trial.sessionStats?.llmMs);
     lines.push(
-      `| \`${trial.fixture}\` | \`${trial.profile}\` | ${trial.trial} | ${classifyDshOutcome(trial)} | ${trial.killed === null ? "n/a" : trial.killed} | ${trial.falseAlarms ?? "n/a"} | ${trial.contractOk === null ? "n/a" : trial.contractOk} | ${trial.integrityOk} | ${auditCell} | ${trial.sessionStats?.turns ?? "n/a"} | ${seconds(trial.sessionStats?.llmMs)} | ${seconds(trial.wallTimeMs)} | \`${trial.artifactsDir}\` |`
+      `| \`${trial.fixture}\` | \`${trial.profile}\` | ${trial.trial} | ${classifyDshOutcome(trial)} | ${trial.killed === null ? "n/a" : trial.killed} | ${trial.falseAlarms ?? "n/a"} | ${trial.contractOk === null ? "n/a" : trial.contractOk} | ${trial.integrityOk} | ${auditCell} | ${turnsCell} | ${llmTimeCell} | ${seconds(trial.wallTimeMs)} | \`${trial.artifactsDir}\` |`
     );
   }
   lines.push("");

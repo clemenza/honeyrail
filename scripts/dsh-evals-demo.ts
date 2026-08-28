@@ -72,7 +72,7 @@ import { findBlockedReason, withUnattendedPreamble } from "../server/agents/comm
 import { dshAdapter } from "../server/agents/dsh.js";
 import { buildDshComparisonReport, classifyDshOutcome, type DshComparisonReportInput, type DshTrialRecord } from "../server/evals/dsh-report.js";
 import { describeManifestMismatch, findManifestMismatches } from "../server/evals/manifest-preflight.js";
-import { readSessionStats } from "../server/evals/dsh-session-stats.js";
+import { findSessionStatsTimingInconsistency, readSessionStats } from "../server/evals/dsh-session-stats.js";
 import { appendDerivedTrajectoryEvents } from "../server/evals/dsh-trajectory-bridge.js";
 import { writeTranscript } from "../server/evals/dsh-transcript.js";
 import { classifyKillAttribution, loadOperatorMetadata, parseTranscript, type OperatorMeta } from "../server/evals/kill-attribution.js";
@@ -445,12 +445,22 @@ async function executeCell(
 
   const sessionStats = sessionStatsReport?.aggregate ?? null;
 
+  // #141: llmMs/toolMs can never legitimately exceed the trial's own
+  // driver-measured wallTimeMs (both are sums of sub-intervals of that
+  // same real-time span) - flag it rather than silently report an
+  // impossible number. See findSessionStatsTimingInconsistency's own
+  // docstring for the investigation into why this happens.
+  const sessionStatsTimingIssue = sessionStats ? findSessionStatsTimingInconsistency(sessionStats, wallTimeMs) : null;
+  if (sessionStatsTimingIssue) {
+    console.error(`  ${trialId}: SESSION STATS TIMING INCONSISTENCY: ${sessionStatsTimingIssue}`);
+  }
+
   if (result.timedOut) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killRate: null, killedByKind: null, difficultyTier, wallTimeMs, sessionStats, error: `trial timed out after ${options.trialTimeoutMinutes}m and was killed` };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killRate: null, killedByKind: null, difficultyTier, wallTimeMs, sessionStats, sessionStatsTimingIssue, error: `trial timed out after ${options.trialTimeoutMinutes}m and was killed` };
   }
   const fatal = dshAdapter.findFatalError?.(combinedOutput);
   if (fatal) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killRate: null, killedByKind: null, difficultyTier, wallTimeMs, sessionStats, error: `dsh fatal error (${fatal.code}): ${fatal.message}` };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: true, transcriptAuditHits, killRate: null, killedByKind: null, difficultyTier, wallTimeMs, sessionStats, sessionStatsTimingIssue, error: `dsh fatal error (${fatal.code}): ${fatal.message}` };
   }
   const blocked = findBlockedReason(combinedOutput);
 
@@ -474,7 +484,7 @@ async function executeCell(
   }
 
   if (!scoreOrError.ok) {
-    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk, transcriptAuditHits, killRate: null, killedByKind: null, difficultyTier, wallTimeMs, sessionStats, blockedReason: blocked?.message, error: scoreOrError.error };
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk, transcriptAuditHits, killRate: null, killedByKind: null, difficultyTier, wallTimeMs, sessionStats, sessionStatsTimingIssue, blockedReason: blocked?.message, error: scoreOrError.error };
   }
 
   // #148: classify a killed trial's discovery channel (test-driven / code-
@@ -519,6 +529,7 @@ async function executeCell(
     difficultyTier,
     wallTimeMs,
     sessionStats,
+    sessionStatsTimingIssue,
     pgAdjudicationTally: scoreOrError.score.pg_adjudication_tally,
     killAttribution,
     blockedReason: blocked?.message
