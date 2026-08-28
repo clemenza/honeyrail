@@ -90,6 +90,26 @@ export type DshTrialRecord = {
    * classify from, or scoring never reached that point.
    */
   killAttribution?: { channel: string; claimMatchedBy: string | null; tClaim: string | null; tFirstOwnFailingTest: string | null; tFirstSourceRead: string | null; leakHitCount: number; oracleHitCount: number } | null;
+  /**
+   * #139: total F_mutant records (score.json's own field) - every record
+   * the agent's own `sql-tests/agent/` suite asserted as failing against
+   * this trial's mutant, before subtracting the ones that also fail
+   * against clean/ (grade.py's `killed_tests`, i.e. `killedByKind`'s sum,
+   * is the genuine-kill numerator over this same denominator - see
+   * FixtureCellSummary.precision). null whenever `killedByKind` is (the
+   * trial never reached scoring, or scoring errored).
+   */
+  assertedFailingCount?: number | null;
+  /**
+   * #139: this fixture's difficulty tier, sourced from
+   * server/evals/kill-attribution.ts's OperatorMeta.tier (clemenza/
+   * tinytable-evals#44's `statefulness` axis) as an interim signal pending
+   * clemenza/tinytable-evals#53's staged L0-L4 benchmark levels. null for
+   * every Gen1 operator (the entire 22-operator default matrix #136
+   * analyzed by hand) and whenever operator metadata couldn't be loaded at
+   * all (see loadOperatorMetadata's own docstring).
+   */
+  difficultyTier?: string | null;
   error?: string;
 };
 
@@ -145,6 +165,18 @@ export type FixtureCellSummary = {
   meanKillRate: number | null;
   /** Summed killedByKind across scorable trials that have one; null if none do. */
   killedByKind: { assertion: number; invariant: number } | null;
+  /**
+   * #139: precision - genuine kills / total asserted failing records,
+   * pooled across this cell's scorable trials (sum of killedByKind's
+   * assertion+invariant totals, divided by the sum of
+   * assertedFailingCount) rather than a mean of per-trial ratios, so a
+   * cell's precision reflects its total record counts, not an average that
+   * treats a 1-record trial the same as a 20-record one. null when no
+   * scorable trial in this cell carries an assertedFailingCount.
+   */
+  precision: number | null;
+  /** This fixture's difficultyTier (constant across its cells' trials); null until one trial in this cell carries one - see DshTrialRecord.difficultyTier. */
+  difficultyTier: string | null;
 };
 
 function median(values: number[]): number | null {
@@ -214,6 +246,17 @@ export function summarizeFixtureCells(trials: DshTrialRecord[]): FixtureCellSumm
     const wallTimes = records.map((r) => r.wallTimeMs).filter((ms): ms is number => typeof ms === "number");
     const probabilisticKillRates = scorable.map((r) => r.killRate).filter((rate): rate is number => rate !== null);
     const kindTallies = scorable.map((r) => r.killedByKind).filter((k): k is { assertion: number; invariant: number } => k !== null);
+    // #139: precision's denominator/numerator, pooled across every scorable
+    // trial that reached scoring - same scorable set as killRate/
+    // falseAlarmRate/contractComplianceRate above, for the same reason
+    // (an invalidated/blocked/driver_error trial's assertedFailingCount
+    // can't be trusted any more than its killed/contractOk fields).
+    const precisionRecords = scorable.filter((r) => typeof r.assertedFailingCount === "number");
+    const totalAsserted = precisionRecords.reduce((sum, r) => sum + (r.assertedFailingCount ?? 0), 0);
+    const totalGenuineKills = precisionRecords.reduce(
+      (sum, r) => sum + ((r.killedByKind?.assertion ?? 0) + (r.killedByKind?.invariant ?? 0)),
+      0
+    );
     return {
       fixture,
       profile,
@@ -227,7 +270,9 @@ export function summarizeFixtureCells(trials: DshTrialRecord[]): FixtureCellSumm
         : null,
       killedByKind: kindTallies.length
         ? kindTallies.reduce((acc, k) => ({ assertion: acc.assertion + k.assertion, invariant: acc.invariant + k.invariant }), { assertion: 0, invariant: 0 })
-        : null
+        : null,
+      precision: totalAsserted > 0 ? totalGenuineKills / totalAsserted : null,
+      difficultyTier: records.find((r) => r.difficultyTier != null)?.difficultyTier ?? null
     };
   });
 }
@@ -323,15 +368,21 @@ export function buildDshComparisonReport(input: DshComparisonReportInput): strin
     "Mean kill rate (#126) is the mean, across this cell's scorable trials, of vendor/tinytable-evals's grade.py `kill_rate` - the fraction of `--grader-runs` probabilistic-scoring seeds that killed the trial's own mutant (a generalization of the boolean `Kill rate` column for nondeterministic bugs; equal to it when `--grader-runs 1`, the default). Killed by kind sums how many killed tests were an \"invariant\" violation (`assert_stats`/`--check-admissibility`) vs a plain assertion, across the same trials."
   );
   lines.push("");
-  lines.push("| Fixture | Profile | Trials | Kill rate | False-alarm rate | Contract compliance | Mean kill rate | Killed by kind (assertion/invariant) | Median wall time |");
-  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+  lines.push(
+    "Precision (#139) is genuine kills / total asserted failing records, pooled across this cell's scorable trials: how much of what the agent's suite flagged as failing against the mutant actually was the seeded defect, as opposed to a false-alarm record bundled in alongside it - a finer-grained view than the false-alarm rate column, which only asks whether a trial had *any* false alarm at all. Difficulty tier is #44's `statefulness` axis (`clemenza/tinytable-evals`), an interim signal pending #53's staged L0-L4 benchmark levels - `n/a` for every Gen1 operator (the entire 22-operator default matrix #136 analyzed by hand), not a sign of missing data."
+  );
+  lines.push("");
+  lines.push(
+    "| Fixture | Profile | Trials | Kill rate | False-alarm rate | Contract compliance | Mean kill rate | Killed by kind (assertion/invariant) | Median wall time | Precision | Difficulty tier |"
+  );
+  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const fixture of input.fixtures) {
     for (const profile of profiles) {
       const cell = cells.find((item) => item.fixture === fixture && item.profile === profile);
       if (!cell) continue;
       const killedByKind = cell.killedByKind ? `${cell.killedByKind.assertion}/${cell.killedByKind.invariant}` : "n/a";
       lines.push(
-        `| \`${fixture}\` | \`${profile}\` | ${cell.trials} | ${percent(cell.killRate)} | ${percent(cell.falseAlarmRate)} | ${percent(cell.contractComplianceRate)} | ${percent(cell.meanKillRate)} | ${killedByKind} | ${seconds(cell.medianWallTimeMs)} |`
+        `| \`${fixture}\` | \`${profile}\` | ${cell.trials} | ${percent(cell.killRate)} | ${percent(cell.falseAlarmRate)} | ${percent(cell.contractComplianceRate)} | ${percent(cell.meanKillRate)} | ${killedByKind} | ${seconds(cell.medianWallTimeMs)} | ${percent(cell.precision)} | ${cell.difficultyTier ?? "n/a"} |`
       );
     }
   }

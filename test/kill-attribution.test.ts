@@ -50,7 +50,8 @@ const OPERATOR: OperatorMeta = {
   file: "sql.py",
   specSection: "Constraints: NOT NULL, CHECK, FOREIGN KEY",
   tokens: ["_check_not_null", "_check_check_constraints"],
-  family: null
+  family: null,
+  tier: null
 };
 
 test("parseTranscript: parses ndjson lines back into TranscriptLine objects", () => {

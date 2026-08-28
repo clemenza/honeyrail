@@ -219,6 +219,75 @@ test("summarizeFixtureCells / buildDshComparisonReport surface mean kill rate an
   assert.doesNotMatch(report, /## Kill matrix/);
 });
 
+// #139: precision (genuine kills / total asserted failing records) and
+// difficultyTier, surfaced per fixture in state.json/comparison-report.md
+// alongside the existing kill-rate/false-alarm-rate metrics.
+test("summarizeFixtureCells computes precision as genuine kills pooled over total asserted failing records", () => {
+  const cells = summarizeFixtureCells([
+    // 3 asserted failing records, 2 genuine kills (1 false alarm).
+    trial({ fixture: "m01", profile: "baseline", trial: 1, killed: true, falseAlarms: 1, contractOk: false, killedByKind: { assertion: 2, invariant: 0 }, assertedFailingCount: 3 }),
+    // 1 asserted failing record, 1 genuine kill, no false alarm.
+    trial({ fixture: "m01", profile: "baseline", trial: 2, killed: true, falseAlarms: 0, contractOk: true, killedByKind: { assertion: 1, invariant: 0 }, assertedFailingCount: 1 })
+  ]);
+  const cell = cells.find((c) => c.fixture === "m01" && c.profile === "baseline")!;
+  // Pooled: (2 + 1) genuine kills / (3 + 1) asserted = 3/4, not a mean of
+  // the two trials' own ratios (2/3 and 1/1), which would give 0.833.
+  assert.equal(cell.precision, 3 / 4);
+});
+
+test("summarizeFixtureCells excludes unscorable trials from precision, same as kill/false-alarm/contract rates", () => {
+  const cells = summarizeFixtureCells([
+    trial({ fixture: "m01", profile: "baseline", trial: 1, killed: true, falseAlarms: 0, contractOk: true, killedByKind: { assertion: 1, invariant: 0 }, assertedFailingCount: 1 }),
+    trial({ fixture: "m01", profile: "baseline", trial: 2, integrityOk: false, killedByKind: { assertion: 5, invariant: 5 }, assertedFailingCount: 10 })
+  ]);
+  const cell = cells.find((c) => c.fixture === "m01" && c.profile === "baseline")!;
+  assert.equal(cell.precision, 1);
+});
+
+test("summarizeFixtureCells: precision is null when no scorable trial carries an assertedFailingCount", () => {
+  const cells = summarizeFixtureCells([
+    trial({ fixture: "m01", profile: "baseline", trial: 1, killed: true, falseAlarms: 0, contractOk: true })
+  ]);
+  const cell = cells.find((c) => c.fixture === "m01" && c.profile === "baseline")!;
+  assert.equal(cell.precision, null);
+});
+
+test("summarizeFixtureCells surfaces a fixture's difficultyTier from any trial that carries one", () => {
+  const cells = summarizeFixtureCells([
+    trial({ fixture: "m01", profile: "baseline", trial: 1, difficultyTier: null }),
+    trial({ fixture: "m01", profile: "baseline", trial: 2, difficultyTier: "multi-object" })
+  ]);
+  const cell = cells.find((c) => c.fixture === "m01" && c.profile === "baseline")!;
+  assert.equal(cell.difficultyTier, "multi-object");
+});
+
+test("buildDshComparisonReport's per-fixture table surfaces precision and difficulty tier", () => {
+  const report = buildDshComparisonReport(
+    reportInput([
+      trial({
+        fixture: "m01",
+        profile: "baseline",
+        trial: 1,
+        trialId: "m01-baseline-1",
+        killed: true,
+        falseAlarms: 0,
+        contractOk: true,
+        killedByKind: { assertion: 1, invariant: 0 },
+        assertedFailingCount: 1,
+        difficultyTier: "multi-object"
+      })
+    ])
+  );
+  assert.match(report, /\| `m01` \| `baseline` \| 1 \| 100% \| 0% \| 100% \| n\/a \| 1\/0 \| 60s \| 100% \| multi-object \|/);
+});
+
+test("buildDshComparisonReport's per-fixture table shows n\\/a for precision and difficulty tier when neither is known", () => {
+  const report = buildDshComparisonReport(
+    reportInput([trial({ fixture: "m01", profile: "baseline", trial: 1, trialId: "m01-baseline-1" })])
+  );
+  assert.match(report, /\| n\/a \| n\/a \|$/m);
+});
+
 test("buildDshComparisonReport's paired delta table states a per-fixture kill-rate delta with no significance claim", () => {
   const report = buildDshComparisonReport(
     reportInput([

@@ -341,3 +341,17 @@ all:
   `transcript.ndjson` files (no new trials) and writes a per-trial/per-
   family channel-share report, for auditing runs from before this field
   existed.
+- **#139: per-fixture `precision` and `difficultyTier`, in `state.json` and
+  `comparison-report.md`'s per-fixture table.** `precision` is genuine
+  kills / total asserted failing records - `killedByKind`'s sum divided by
+  a new `assertedFailingCount` field (score.json's `f_mutant.length`, the
+  size of everything the agent's suite claimed failed against the mutant
+  before subtracting what also fails against clean/) - pooled across a
+  cell's scorable trials, a finer-grained view than `falseAlarmRate` (which
+  only asks whether a trial had *any* false alarm). This automates the
+  hand-computed table in #136. `difficultyTier` is `server/evals/
+  kill-attribution.ts`'s `OperatorMeta.tier`, an interim source (#44's
+  `statefulness` axis) pending `tinytable-evals#53`'s staged L0-L4
+  benchmark levels - `null` for every Gen1 operator, i.e. the entire
+  22-operator default matrix #136 analyzed by hand, since Gen1 predates #44
+  and carries no difficulty metadata at all yet.
