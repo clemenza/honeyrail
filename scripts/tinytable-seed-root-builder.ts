@@ -44,13 +44,18 @@
  *                            build_seed_root.py's chosen operator id)
  *   --source <dir>           Override the tinytable-evals checkout (default:
  *                            vendor/tinytable-evals next to this repo)
+ *   --black-box              #158: hides tinytable/{core,sql}.py (compiled
+ *                            to .pyc, source deleted) - see
+ *                            BuildSeedRootOptions.blackBox's own docstring
+ *                            for what this does and doesn't defend against
  */
 
 import { createHash } from "node:crypto";
-import { lstat, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runCommandSafe, type SafeCommandOutput } from "../server/utils.js";
+import { runInExamRoom, DEFAULT_IMAGE } from "./tinytable-exam-room.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_SOURCE_ROOT = resolve(__dirname, "..", "vendor", "tinytable-evals");
@@ -99,7 +104,87 @@ export type BuildSeedRootOptions = {
   seed: number;
   outDir: string;
   sourceRoot?: string;
+  /**
+   * #158 (a first, cheap probe, not the real fix - see that issue's own
+   * scoping writeup): compiles `tinytable/core.py` and `tinytable/sql.py`
+   * to `.pyc` and deletes the `.py` sources, so a `read`/`grep`/`cat` of
+   * either file finds nothing. Both files are always hidden together
+   * (never just the one an operator actually mutated) so presence/absence
+   * alone can't leak which file holds the seeded defect.
+   *
+   * This does NOT block introspection of the *live, imported* module -
+   * `import tinytable.sql, dis; dis.dis(tinytable.sql)` from the same
+   * container's own Python (which the agent needs anyway, to run
+   * `sql-tests/agent/*.test` via `run_sql_tests.py`) reproduces fully
+   * readable disassembly, complete with original variable names and
+   * source line numbers, in one stdlib call - confirmed empirically before
+   * this option was added. A real black-box mode needs the mutated engine
+   * behind a process boundary the agent's own container can't
+   * `import`/`dis.dis()` into at all (see #158's design writeup) - this
+   * flag exists to get a cheap, real first read on whether even *this*
+   * weak a barrier changes discovery-channel behavior, not because it's
+   * believed to be robust.
+   */
+  blackBox?: boolean;
+  /**
+   * The exam-room image to compile black-box `.pyc`s with (default
+   * DEFAULT_IMAGE) - MUST match the image the trial itself later runs in.
+   * A `.pyc`'s magic number is tied to the exact CPython minor version
+   * that compiled it; compiling with the *host's* python3 instead (this
+   * option's reason for existing) produced a real trial's `ImportError:
+   * bad magic number in 'tinytable.core'` on the very first import - a
+   * silently-broken seed-root, not a real black-box probe, confirmed
+   * against clemenza/honeyrail#158's own first real run (host was Python
+   * 3.10.13, the exam-room image is 3.11.2).
+   */
+  image?: string;
 };
+
+/** Files #158's black-box mode hides - the only two files any mutation operator (Gen1 or Gen2) ever touches. Always both, regardless of which one a given seed actually mutated - see BuildSeedRootOptions.blackBox's own docstring for why. */
+const BLACK_BOX_HIDDEN_FILES = ["tinytable/core.py", "tinytable/sql.py"];
+
+/**
+ * Compiles each of BLACK_BOX_HIDDEN_FILES to a same-directory, sourceless
+ * `.pyc` (still importable - Python resolves a bare `<module>.pyc` with no
+ * matching `.py` just fine), deletes the `.py`, and wipes `.git` -
+ * `build_seed_root.py` already `git init`/`add`/`commit`s the seed-root
+ * *with the readable `.py` present* before this ever runs, so the original
+ * blob stays fully recoverable from `.git/objects/` (`git show
+ * HEAD:tinytable/sql.py`, or a bare zlib-inflate of the object file - both
+ * confirmed against a real trial that tried exactly this) even after the
+ * working-tree file is deleted. Deleting `.py`s without also wiping `.git`
+ * doesn't hide anything - it just moves the leak from "one read call" to
+ * "one git command." The caller (scripts/dsh-evals-demo.ts's
+ * `gitInitCommit`, already run unconditionally as defense in depth after
+ * every `buildSeedRoot()` call) re-initializes a fresh single-commit
+ * history over the now-transformed tree, so no earlier commit - and no
+ * earlier blob - survives for `git` (or a raw `.git/objects` read) to
+ * recover.
+ *
+ * Compiles *inside a throwaway run of the exam-room image itself*
+ * (scripts/tinytable-exam-room.ts's own runInExamRoom, network disabled -
+ * this is a builder-zone step, no agent involved yet), not the host's own
+ * python3 - see BuildSeedRootOptions.image's own docstring for why that
+ * distinction is load-bearing, not stylistic.
+ */
+async function applyBlackBoxTransform(outDir: string, image: string): Promise<void> {
+  const compileScript = BLACK_BOX_HIDDEN_FILES
+    .map((f) => `py_compile.compile(${JSON.stringify(f)}, cfile=${JSON.stringify(f.replace(/\.py$/, ".pyc"))}, doraise=True)`)
+    .join("; ");
+  const result = await runInExamRoom({
+    seedRootDir: outDir,
+    image,
+    network: "none",
+    command: ["python3", "-c", `import py_compile; ${compileScript}`]
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(`#158 black-box transform: failed to compile ${BLACK_BOX_HIDDEN_FILES.join(", ")} inside ${image}: ${result.stderr || result.stdout}`);
+  }
+  for (const relFile of BLACK_BOX_HIDDEN_FILES) {
+    await rm(join(outDir, relFile));
+  }
+  await rm(join(outDir, ".git"), { recursive: true, force: true });
+}
 
 type SeedRootJson = { seed: number; out: string; operator_id: string; created_utc: string };
 
@@ -130,6 +215,10 @@ export async function buildSeedRoot(
     throw new Error(`build_seed_root.py failed (exit ${result.code}): ${(result.stderr || result.stdout).trim()}`);
   }
   const seedRootJson = parseSeedRootJson(result.stdout);
+
+  if (options.blackBox) {
+    await applyBlackBoxTransform(outDir, options.image ?? DEFAULT_IMAGE);
+  }
 
   const relFiles = await listFilesRecursive(outDir);
   const files = await Promise.all(
@@ -166,13 +255,14 @@ export async function buildSeedRoot(
 // CLI
 // ---------------------------------------------------------------------------
 
-type CliOptions = { seed: number; outDir: string; manifestOut: string; sourceRoot?: string };
+type CliOptions = { seed: number; outDir: string; manifestOut: string; sourceRoot?: string; blackBox: boolean };
 
 function parseArgs(argv: string[]): CliOptions {
   let seed: number | undefined;
   let outDir: string | undefined;
   let manifestOut: string | undefined;
   let sourceRoot: string | undefined;
+  let blackBox = false;
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     const next = () => {
@@ -186,6 +276,7 @@ function parseArgs(argv: string[]): CliOptions {
       case "--out": outDir = next(); break;
       case "--manifest-out": manifestOut = next(); break;
       case "--source": sourceRoot = next(); break;
+      case "--black-box": blackBox = true; break;
       case "--help":
       case "-h":
         console.log("See the header comment of scripts/tinytable-seed-root-builder.ts for usage.");
@@ -207,7 +298,7 @@ function parseArgs(argv: string[]): CliOptions {
     throw new Error(`--manifest-out ${resolvedManifest} must not be inside --out ${resolvedOut}`);
   }
 
-  return { seed, outDir, manifestOut, sourceRoot };
+  return { seed, outDir, manifestOut, sourceRoot, blackBox };
 }
 
 async function main(): Promise<void> {

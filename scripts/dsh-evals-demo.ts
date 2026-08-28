@@ -61,6 +61,10 @@
  *   --smoke                       2 fixtures x 2 profiles x 1 trial - cheap end-to-end validation
  *   --dry-run                     Print the matrix and budget note, launch nothing
  *   --report-only                 Skip execution; rebuild the report from state.json
+ *   --black-box                   #158 (off by default, a first cheap probe - not believed robust,
+ *                                 see scripts/tinytable-seed-root-builder.ts's own docstring): hides
+ *                                 tinytable/{core,sql}.py from the seed-root (compiled to .pyc, source
+ *                                 deleted) before the agent ever sees it
  */
 
 import { createHash } from "node:crypto";
@@ -108,6 +112,7 @@ type CliOptions = {
   killRateThreshold: number;
   trialTimeoutMinutes: number;
   pgAdjudicate: boolean;
+  blackBox: boolean;
   smoke: boolean;
   dryRun: boolean;
   reportOnly: boolean;
@@ -122,6 +127,7 @@ function parseArgs(argv: string[]): CliOptions {
     killRateThreshold: 1.0,
     trialTimeoutMinutes: 15,
     pgAdjudicate: false,
+    blackBox: false,
     smoke: false,
     dryRun: false,
     reportOnly: false
@@ -150,6 +156,7 @@ function parseArgs(argv: string[]): CliOptions {
       case "--kill-rate-threshold": options.killRateThreshold = Number(next()); break;
       case "--trial-timeout-minutes": options.trialTimeoutMinutes = Number(next()); break;
       case "--pg-adjudicate": options.pgAdjudicate = true; break;
+      case "--black-box": options.blackBox = true; break;
       case "--smoke": options.smoke = true; break;
       case "--dry-run": options.dryRun = true; break;
       case "--report-only": options.reportOnly = true; break;
@@ -343,7 +350,7 @@ async function executeCell(
   let manifest: SeedRootManifest;
   try {
     await mkdir(artifactsDir, { recursive: true });
-    manifest = await buildSeedRoot({ seed: fixtureSeed, outDir: seedRootDir });
+    manifest = await buildSeedRoot({ seed: fixtureSeed, outDir: seedRootDir, blackBox: options.blackBox, image: options.image });
     await writeFile(join(artifactsDir, "manifest.json"), JSON.stringify(manifest, null, 2));
   } catch (error) {
     return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: false, transcriptAuditHits: [], killRate: null, killedByKind: null, difficultyTier: null, error: (error as Error).message };
@@ -538,7 +545,7 @@ async function executeCell(
 }
 
 type StateFile = {
-  config: { image: string; smoke: boolean; dshVersion: string; graderRuns: number; killRateThreshold: number };
+  config: { image: string; smoke: boolean; dshVersion: string; graderRuns: number; killRateThreshold: number; blackBox: boolean };
   profiles: Array<{ label: string; sha256: string }>;
   fixtures: string[];
   trials: DshTrialRecord[];
@@ -611,7 +618,7 @@ async function main(): Promise<void> {
   const operators = await loadOperatorMetadata(vendorDir);
 
   const state: StateFile = {
-    config: { image: options.image, smoke: options.smoke, dshVersion, graderRuns: options.graderRuns, killRateThreshold: options.killRateThreshold },
+    config: { image: options.image, smoke: options.smoke, dshVersion, graderRuns: options.graderRuns, killRateThreshold: options.killRateThreshold, blackBox: options.blackBox },
     profiles: profiles.map(({ label, sha256 }) => ({ label, sha256 })),
     fixtures: fixtureSeeds.map(String),
     trials: []
