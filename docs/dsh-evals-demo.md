@@ -355,3 +355,37 @@ all:
   benchmark levels - `null` for every Gen1 operator, i.e. the entire
   22-operator default matrix #136 analyzed by hand, since Gen1 predates #44
   and carries no difficulty metadata at all yet.
+- **#142: `comparison-report.md` visibly flags a trial whose session
+  re-entered a second turn.** The per-trial evidence table's Turns cell
+  shows `2 ⚠multi-turn` instead of a bare `2`, and the per-fixture table
+  gains a `Multi-turn trials` column (count of a cell's trials with
+  `sessionStats.turns > 1`, over *every* trial with sessionStats, not just
+  scorable ones - #134's `33-baseline-4` timeout is exactly the case this
+  needs to still catch). 3/115 tracked trials so far, all either timeouts
+  or unusually slow - a secondary difficulty signal alongside
+  `tinytable-evals#44`'s axes / #139's `difficultyTier`.
+- **#141: `DshTrialRecord` gains `sessionStatsTimingIssue`, flagging
+  `sessionStats.llmMs`/`toolMs` reading higher than the trial's own
+  `wallTimeMs`** (`server/evals/dsh-session-stats.ts`'s
+  `findSessionStatsTimingInconsistency`) - impossible under correct
+  accounting (both are sums of sub-intervals of that same wall-clock
+  span), observed on exactly the two known `turns: 2` trials with
+  telemetry (#134's `33-baseline-4`, #136's `9-baseline-5`). Root-cause
+  investigation: `foldSessionStats` is re-verified byte-for-byte against
+  the pinned `@deepseek-ai/dsh-session-stats@0.1.0-rc.7` tarball - no
+  divergence, so the accumulation logic itself isn't the source. The
+  upstream package's own projection docstring says it exists to serve
+  "full-session figures that paging and compaction cannot change," i.e.
+  dsh's live in-process projection is designed to survive mid-session
+  context compaction; `foldSessionStats` has no such live state to read,
+  only a cold refold of whatever the persisted JSONL log currently holds -
+  the leading hypothesis is that a compaction/resume boundary (plausible
+  given both known cases are also the only unusually-long, multi-turn
+  sessions on record) causes that persisted log to reflect some
+  pre-compaction step more than once, which a cold refold would
+  double-count. Confirming this precisely needs a real affected trial's
+  raw session log, not available in-repo, so the shippable fix here is the
+  defensive one the acceptance criteria call for regardless of exact
+  cause: flag it, and the per-trial table marks the LLM time cell
+  `⚠timing suspect` rather than printing an impossible number as if it
+  were trustworthy cost data.

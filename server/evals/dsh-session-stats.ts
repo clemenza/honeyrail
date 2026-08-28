@@ -170,6 +170,43 @@ export function foldSessionStats(events: DshRawEvent[]): SessionStats {
   return viewOf(events.reduce(applyEvent, initFoldState()));
 }
 
+/**
+ * #141: `llmMs`/`toolMs` are each sums of disjoint sub-intervals of one
+ * trial's real wall-clock span (`step/start`->`assistant/message` steps,
+ * `tool/call`->`tool/result` pairs) - a subset can never exceed the whole,
+ * so either one reading higher than the trial's own driver-measured
+ * `wallTimeMs` is never legitimate, regardless of what produced it.
+ * Observed on exactly two real trials so far (#134's `33-baseline-4`,
+ * #136's `9-baseline-5` - `llmMs` 1021.6s vs. `wallTimeMs` 787.1s), both
+ * also the only `turns: 2` sessions seen across 115 tracked trials.
+ *
+ * Root-cause note: this module's `foldSessionStats` is a verified
+ * byte-for-byte port of the pinned `@deepseek-ai/dsh-session-stats@0.1.0-rc.7`
+ * tarball's own `apply`/`view` (re-diffed against the published `lib/
+ * index.js` while investigating this issue - no divergence), so the
+ * accumulation logic itself isn't the source. The upstream package's own
+ * projection docstring says its whole point is serving "full-session
+ * figures that paging and compaction cannot change" - i.e. dsh's live,
+ * in-process projection is explicitly designed to survive a session's
+ * context being compacted mid-run. `foldSessionStats` has no such live
+ * state to read: it can only cold-refold whatever raw events the
+ * persisted JSONL log currently holds, so if compaction (plausible given
+ * both known cases are also the only 2-turn, unusually-long sessions on
+ * record) causes that persisted log to reflect pre-compaction step events
+ * more than once, a cold refold would double-count them in exactly this
+ * shape - inflated `llmMs`, but `turns` still only 2 (compaction
+ * resuming into the *same* turn number wouldn't trip the `lastTurn`
+ * increment). Confirming this exactly would need a real affected trial's
+ * raw session log, which isn't available in-repo; this function is the
+ * defensive mitigation the acceptance criteria call for either way - never
+ * trust an impossible number, whatever produced it.
+ */
+export function findSessionStatsTimingInconsistency(stats: SessionStats, wallTimeMs: number): string | null {
+  if (stats.llmMs > wallTimeMs) return `llmMs (${stats.llmMs}ms) exceeds wallTimeMs (${wallTimeMs}ms)`;
+  if (stats.toolMs > wallTimeMs) return `toolMs (${stats.toolMs}ms) exceeds wallTimeMs (${wallTimeMs}ms)`;
+  return null;
+}
+
 function sumStats(stats: SessionStats[]): SessionStats {
   return stats.reduce(
     (acc, s) => ({
