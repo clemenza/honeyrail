@@ -117,6 +117,34 @@ test("runScorePy passes --runs and --kill-rate-threshold through to grade.py whe
   });
 });
 
+test("runScorePy uses pythonBin instead of the default python3 when given (#158: grading a black-box seed-root needs a version-matched interpreter)", async () => {
+  await withTempDir(async (dir) => {
+    await writeFile(join(dir, "score.json"), JSON.stringify({ killed: true, false_alarms: 0, contract_ok: true, passed: true }));
+
+    let receivedCmd = "";
+    const capturingRun = async (cmd: string): Promise<SafeCommandOutput> => {
+      receivedCmd = cmd;
+      return { ok: true, stdout: "", stderr: "", code: 0 };
+    };
+    await runScorePy(dir, capturingRun, { pythonBin: "python3.11" });
+    assert.equal(receivedCmd, "python3.11");
+  });
+});
+
+test("runScorePy defaults to plain python3 when pythonBin is omitted (the normal, source-visible seed-root case)", async () => {
+  await withTempDir(async (dir) => {
+    await writeFile(join(dir, "score.json"), JSON.stringify({ killed: true, false_alarms: 0, contract_ok: true, passed: true }));
+
+    let receivedCmd = "";
+    const capturingRun = async (cmd: string): Promise<SafeCommandOutput> => {
+      receivedCmd = cmd;
+      return { ok: true, stdout: "", stderr: "", code: 0 };
+    };
+    await runScorePy(dir, capturingRun, {});
+    assert.equal(receivedCmd, "python3");
+  });
+});
+
 test("runScorePy omits --runs and --kill-rate-threshold when they're the defaults (matches original single-run behavior)", async () => {
   await withTempDir(async (dir) => {
     await writeFile(join(dir, "score.json"), JSON.stringify({ killed: true, false_alarms: 0, contract_ok: true, passed: true }));
