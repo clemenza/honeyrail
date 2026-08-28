@@ -278,7 +278,7 @@ export type ScoreJson = {
 // will ever name, unlike `error`.
 export type RunScorePyResult = { ok: true; score: ScoreJson } | { ok: false; error: string };
 
-export type GraderOptions = { runs?: number; killRateThreshold?: number; trajectoryLog?: string; pgAdjudicate?: boolean };
+export type GraderOptions = { runs?: number; killRateThreshold?: number; trajectoryLog?: string; pgAdjudicate?: boolean; pythonBin?: string };
 
 // `run` defaults to the real subprocess call; overridable so tests can
 // exercise the read/parse/discriminate logic (the actual site of #114's
@@ -289,7 +289,7 @@ export async function runScorePy(
   run: typeof runCommandSafe = runCommandSafe,
   graderOptions: GraderOptions = {}
 ): Promise<RunScorePyResult> {
-  const result = await run("python3", [
+  const result = await run(graderOptions.pythonBin ?? "python3", [
     gradePyPath,
     "--artifacts", worktreePath,
     "--out", "score.json",
@@ -337,7 +337,8 @@ async function executeCell(
   profile: ProfileSpec,
   trial: number,
   cellsDir: string,
-  operators: Map<string, OperatorMeta>
+  operators: Map<string, OperatorMeta>,
+  graderPythonBin: string
 ): Promise<DshTrialRecord> {
   const fixture = String(fixtureSeed);
   const trialId = `${fixture}-${profile.label}-${trial}`;
@@ -483,7 +484,8 @@ async function executeCell(
     runs: options.graderRuns,
     killRateThreshold: options.killRateThreshold,
     trajectoryLog: "trajectory.jsonl",
-    pgAdjudicate: options.pgAdjudicate
+    pgAdjudicate: options.pgAdjudicate,
+    pythonBin: graderPythonBin
   });
   const postMismatches = await findManifestMismatches(seedRootDir, { files: manifest.files });
   const integrityOk = postMismatches.length === 0;
@@ -557,6 +559,54 @@ async function fingerprintDshVersion(image: string): Promise<string> {
   return result.stdout.trim() || "(unknown)";
 }
 
+/**
+ * #158: grade.py (the grader zone, run on the *host*, after the exam-room
+ * container has already exited) imports both `--artifacts` (the seed-root
+ * the agent left behind) and `clean/` to compare behavior. Under
+ * `--black-box`, `--artifacts`'s `tinytable/{core,sql}.pyc` is
+ * version-locked to whatever Python compiled it (`buildSeedRoot`'s own
+ * transform, matched to `image`'s Python via `runInExamRoom` - see
+ * BuildSeedRootOptions.image's docstring) - if the host's own `python3`
+ * happens to be a different minor version, grade.py crashes on import with
+ * "ImportError: bad magic number", not a graded verdict. A real trial hit
+ * exactly this: grade.py's own exception handling folded the crash into a
+ * `killed: false` verdict indistinguishable from a genuine miss, silently
+ * reporting `task_failed` for a trial the agent's own test (re-graded with
+ * a matching interpreter afterward) had actually killed.
+ *
+ * Resolves a host `python3.<minor>` binary matching `image`'s own Python
+ * minor version (CPython's `.pyc` magic number is stable across patch
+ * releases within a minor series, so an exact patch match isn't needed).
+ * Falls back to plain `python3` with a loud warning if no matching binary
+ * is found on the host - grading will likely crash exactly as above, but
+ * silently defaulting to a wrong interpreter would be worse than a clear
+ * warning up front. Only called when `--black-box` is set; the host's
+ * `python3` grades a normal (source-visible) seed-root just fine
+ * regardless of its own version, since nothing there is precompiled.
+ */
+async function resolveGraderPythonBin(image: string): Promise<string> {
+  const scratchDir = await mkdtemp(join(tmpdir(), "dsh-evals-pyversion-"));
+  const versionResult = await runInExamRoom({
+    seedRootDir: scratchDir,
+    image,
+    network: "none",
+    command: ["python3", "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+    timeoutMs: 30_000
+  });
+  const minorVersion = versionResult.stdout.trim();
+  if (!/^\d+\.\d+$/.test(minorVersion)) {
+    console.warn(`  warning: could not determine ${image}'s Python version (got "${minorVersion}") - grading will use the host's own python3, which may not match`);
+    return "python3";
+  }
+  const candidate = `python3.${minorVersion.split(".")[1]}`;
+  const probe = await runCommandSafe(candidate, ["--version"]);
+  if (!probe.ok) {
+    console.warn(`  warning: ${image} runs Python ${minorVersion}, but no matching "${candidate}" was found on the host PATH - grading black-box artifacts with the host's own python3 instead, which will crash on import if it's a different minor version`);
+    return "python3";
+  }
+  return candidate;
+}
+
 async function writeReport(outDir: string, state: StateFile): Promise<string> {
   const profilePaths = new Map(state.profiles.map((p) => [p.label, join(profilesDir, `${p.label}.cordis.patch.yml`)]));
   const input: DshComparisonReportInput = {
@@ -617,6 +667,15 @@ async function main(): Promise<void> {
   await mkdir(cellsDir, { recursive: true });
   const operators = await loadOperatorMetadata(vendorDir);
 
+  // #158: only matters for --black-box (grading a source-visible seed-root
+  // works with any host python3) - see resolveGraderPythonBin's own
+  // docstring for the real trial that found this gap.
+  let graderPythonBin = "python3";
+  if (options.blackBox) {
+    graderPythonBin = await resolveGraderPythonBin(options.image);
+    console.log(`Black-box mode: grading with ${graderPythonBin} (matched to ${options.image}'s own Python)`);
+  }
+
   const state: StateFile = {
     config: { image: options.image, smoke: options.smoke, dshVersion, graderRuns: options.graderRuns, killRateThreshold: options.killRateThreshold, blackBox: options.blackBox },
     profiles: profiles.map(({ label, sha256 }) => ({ label, sha256 })),
@@ -633,7 +692,7 @@ async function main(): Promise<void> {
       for (let trial = 1; trial <= trialsPerCell; trial += 1) {
         const label = `seed-${fixtureSeed}/${profile.label}/trial-${trial}`;
         console.log(`Cell ${label} (${state.trials.length + 1}/${totalRuns}):`);
-        const record = await executeCell(options, taskPrompt, fixtureSeed, profile, trial, cellsDir, operators);
+        const record = await executeCell(options, taskPrompt, fixtureSeed, profile, trial, cellsDir, operators, graderPythonBin);
         state.trials.push(record);
         console.log(`  ${label} finished: outcome=${classifyDshOutcome(record)} killed=${record.killed} falseAlarms=${record.falseAlarms} contractOk=${record.contractOk} integrityOk=${record.integrityOk}${record.blockedReason ? ` blocked="${record.blockedReason}"` : ""}${record.error ? ` error="${record.error}"` : ""}`);
         await writeFile(statePath, JSON.stringify(state, null, 2));
