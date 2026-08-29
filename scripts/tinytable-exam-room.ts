@@ -59,8 +59,19 @@ export type ExamRoomOptions = {
   timeoutMs?: number;
   memory?: string;
   pidsLimit?: number;
-  /** "bridge" (default) gives the agent outbound network for its model API calls, in its own network namespace - it cannot reach the host's loopback services. "none" disables networking entirely. */
-  network?: "none" | "bridge";
+  /**
+   * "bridge" (default) gives the agent outbound network for its model API
+   * calls, in its own network namespace - it cannot reach the host's
+   * loopback services. "none" disables networking entirely. Also accepts
+   * any other docker network name - #168's oracle-container black-box
+   * mode passes a private, per-trial network created by
+   * scripts/tinytable-engine-service.ts's startEngineService() here, so
+   * this container becomes the *only other* member of that network
+   * (reaching the engine-service by its container-name DNS alias, see
+   * that file) while still getting normal outbound internet, since that
+   * network is a plain user-defined bridge, not `--internal`.
+   */
+  network?: "none" | "bridge" | (string & {});
   /**
    * Host directory to bind-mount at /dsh-home, read-write, with $DSH_HOME
    * pointed at it - so dsh's session-persistence JSONL log (turns/steps/
