@@ -129,30 +129,23 @@ export function buildEngineServiceDockerArgs(options: EngineServiceOptions, cont
   ];
 }
 
-async function getContainerAddress(containerName: string, networkName: string): Promise<string> {
-  const result = await run("docker", ["inspect", "-f", `{{(index .NetworkSettings.Networks "${networkName}").IPAddress}}`, containerName]);
-  const address = result.stdout.trim();
-  if (result.code !== 0 || !address) {
-    throw new Error(`could not determine ${containerName}'s address on network ${networkName}: ${result.stderr || "(no address)"}`);
-  }
-  return address;
-}
-
-async function waitForHealth(host: string, port: number, timeoutMs: number): Promise<boolean> {
+/**
+ * Polls readiness via `docker exec ... python3` hitting the container's own
+ * loopback, rather than `fetch()`ing the container's bridge-network IP from
+ * this (host) process. The latter only works when the host can route
+ * directly to a docker bridge network, which is true on native Linux
+ * dockerd but NOT on Docker Desktop (macOS/Windows), where containers run
+ * inside a VM the host has no such route into - `docker exec` talks to the
+ * daemon API instead of the container network, so it works identically on
+ * both. The engine-service image is `FROM python:3.11-slim-bookworm`, so
+ * `python3` is always present without adding curl/wget to it.
+ */
+async function waitForHealth(containerName: string, port: number, timeoutMs: number): Promise<boolean> {
+  const probe = `import urllib.request,sys; sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:${port}/health", timeout=1).status == 200 else 1)`;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 1_000);
-      try {
-        const response = await fetch(`http://${host}:${port}/health`, { signal: controller.signal });
-        if (response.ok) return true;
-      } finally {
-        clearTimeout(timeout);
-      }
-    } catch {
-      // not up yet - keep polling until timeoutMs elapses
-    }
+    const result = await run("docker", ["exec", containerName, "python3", "-c", probe]);
+    if (result.code === 0) return true;
     await new Promise((r) => setTimeout(r, 200));
   }
   return false;
@@ -185,8 +178,7 @@ export async function startEngineService(options: EngineServiceOptions): Promise
     }
     containerStarted = true;
 
-    const address = await getContainerAddress(containerName, networkName);
-    const healthy = await waitForHealth(address, port, options.healthTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS);
+    const healthy = await waitForHealth(containerName, port, options.healthTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS);
     if (!healthy) {
       const logs = await run("docker", ["logs", containerName]);
       throw new Error(

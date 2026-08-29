@@ -128,7 +128,10 @@ test("runInExamRoom + startEngineService: the exam-room container reaches the en
   const result = await runInExamRoom({
     seedRootDir,
     network: handle.networkName,
-    command: ["sh", "-c", `wget -qO- http://${handle.hostname}:${handle.port}/health`],
+    // tinytable-exam-room:latest deliberately ships no wget/curl (minimal
+    // image per docker/tinytable-exam-room/Dockerfile) - python3 is already
+    // there for run_sql_tests.py/score.py, so use it as the http client too.
+    command: ["python3", "-c", `import urllib.request; print(urllib.request.urlopen("http://${handle.hostname}:${handle.port}/health").read().decode())`],
     timeoutMs: 30_000
   });
 
