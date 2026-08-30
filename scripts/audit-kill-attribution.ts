@@ -29,6 +29,7 @@ import {
   parseTranscript,
   type AttributionResult,
   type Channel,
+  type EngineAccess,
   type OperatorMeta
 } from "../server/evals/kill-attribution.js";
 
@@ -72,7 +73,22 @@ function globToRegExp(pattern: string): RegExp {
 }
 
 type StateFileTrial = { fixture: string; profile: string; trialId: string; artifactsDir: string; killed: boolean | null };
-type StateFile = { config?: { blackBox?: boolean }; trials: StateFileTrial[] };
+// `blackBox` is the pre-#168 field name - back-compat read only, see
+// resolveEngineAccess() below; new state.json files write `engineAccess`.
+type StateFile = { config?: { engineAccess?: EngineAccess; blackBox?: boolean }; trials: StateFileTrial[] };
+
+/**
+ * honeyrail#168 renamed state.json's mode field from a boolean (`blackBox`)
+ * to a 3-way enum (`engineAccess`) - the ~10 `dsh-evals-report-*`
+ * directories already in this repo predate that rename and only have the
+ * old field. Prefers `engineAccess` when present; otherwise maps the old
+ * boolean the same way it always behaved (`true` -> "bytecode" mode, `false`/
+ * absent -> "source").
+ */
+function resolveEngineAccess(config: StateFile["config"]): EngineAccess {
+  if (config?.engineAccess) return config.engineAccess;
+  return config?.blackBox ? "bytecode" : "source";
+}
 
 async function findReportDirs(root: string, pattern: RegExp): Promise<string[]> {
   const entries = await readdir(root, { withFileTypes: true });
@@ -102,7 +118,7 @@ type TrialAudit = {
   attribution: AttributionResult | null; // null when not killed, or no transcript
 };
 
-async function auditTrial(reportDir: string, trial: StateFileTrial, operators: Map<string, OperatorMeta>, blackBoxMode: boolean): Promise<TrialAudit> {
+async function auditTrial(reportDir: string, trial: StateFileTrial, operators: Map<string, OperatorMeta>, engineAccess: EngineAccess): Promise<TrialAudit> {
   const manifest = await readJson<{ operatorId?: string; seed?: number }>(join(trial.artifactsDir, "manifest.json"));
   const operatorId = manifest?.operatorId ?? null;
   const operator = operatorId ? operators.get(operatorId) ?? null : null;
@@ -119,9 +135,9 @@ async function auditTrial(reportDir: string, trial: StateFileTrial, operators: M
   // transcript leak-scanned. `channel` (test-driven/code-review/...) is
   // only meaningful for killed trials; the report layer below only reads
   // it for those, but leakHits/oracleHits are used for every trial.
-  // `blackBoxMode` (#164) comes from this report's own state.json config -
-  // it's a matrix-wide run setting, not a per-trial one.
-  const attribution = classifyKillAttribution(lines, operator, blackBoxMode);
+  // `engineAccess` (#168, ex-`blackBoxMode`/#164) comes from this report's
+  // own state.json config - it's a matrix-wide run setting, not a per-trial one.
+  const attribution = classifyKillAttribution(lines, operator, engineAccess);
   return { ...base, hasTranscript: true, attribution };
 }
 
@@ -254,9 +270,9 @@ async function main(): Promise<void> {
       console.error(`  skipping ${reportDir}: no readable state.json`);
       continue;
     }
-    const blackBoxMode = state.config?.blackBox ?? false;
+    const engineAccess = resolveEngineAccess(state.config);
     for (const trial of state.trials) {
-      audits.push(await auditTrial(reportDir, trial, operators, blackBoxMode));
+      audits.push(await auditTrial(reportDir, trial, operators, engineAccess));
     }
   }
 

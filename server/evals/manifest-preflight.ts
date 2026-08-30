@@ -19,7 +19,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 
 export type ManifestFileEntry = { path: string; sha256: string };
@@ -60,6 +60,46 @@ export async function findManifestMismatches(rootPath: string, manifest: Preflig
   }
   return mismatches;
 }
+
+/**
+ * honeyrail#168's own required check: unlike `findManifestMismatches` (which
+ * only verifies the manifest's own files are present/unchanged and
+ * structurally cannot notice an *extra* file), an oracle-mode agentRoot must
+ * be proven to contain none of the real `tinytable` implementation at all -
+ * the exact class of leak `tinytable-evals#70` shipped once already (a
+ * pre-mutation-compiled `__pycache__` that decompiled straight back to the
+ * answer). Walks the whole tree (skipping `.git`, same as
+ * `tinytable-seed-root-builder.ts`'s own `listFilesRecursive`) and returns
+ * every posix-relative path matching any given pattern - empty means clean.
+ */
+export async function findStrayArtifacts(rootPath: string, patterns: RegExp[], relBase = ""): Promise<string[]> {
+  const entries = await readdir(join(rootPath, relBase), { withFileTypes: true });
+  const hits: string[] = [];
+  for (const entry of entries) {
+    const rel = relBase ? `${relBase}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      if (entry.name === ".git") continue;
+      hits.push(...(await findStrayArtifacts(rootPath, patterns, rel)));
+    } else if (patterns.some((re) => re.test(rel))) {
+      hits.push(rel);
+    }
+  }
+  return hits;
+}
+
+/**
+ * honeyrail#168 `engineAccess=oracle`: agentRoot must never contain the real
+ * `tinytable/` package, any compiled bytecode, or `run_sql_tests.py`'s
+ * direct-execution-only siblings (which only make sense alongside a real
+ * `tinytable/` to import - their presence with no `tinytable/` would be a
+ * red flag on its own, and with one would be the leak itself).
+ */
+export const ORACLE_STRAY_ARTIFACT_PATTERNS: RegExp[] = [
+  /(^|\/)tinytable(\/|$)/,
+  /\.pyc$/,
+  /(^|\/)__pycache__(\/|$)/,
+  /(^|\/)(admissibility|scheduler|substrate|trajectory)\.py$/
+];
 
 const SHA256_RE = /^[0-9a-f]{64}$/i;
 
