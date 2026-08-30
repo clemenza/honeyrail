@@ -51,11 +51,13 @@
  */
 
 import { createHash } from "node:crypto";
-import { lstat, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runCommandSafe, type SafeCommandOutput } from "../server/utils.js";
 import { runInExamRoom, DEFAULT_IMAGE } from "./tinytable-exam-room.js";
+import { findStrayArtifacts, ORACLE_STRAY_ARTIFACT_PATTERNS } from "../server/evals/manifest-preflight.js";
+import type { EngineAccess } from "../server/evals/kill-attribution.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_SOURCE_ROOT = resolve(__dirname, "..", "vendor", "tinytable-evals");
@@ -125,7 +127,17 @@ export type BuildSeedRootOptions = {
    * weak a barrier changes discovery-channel behavior, not because it's
    * believed to be robust.
    */
-  blackBox?: boolean;
+  /**
+   * honeyrail#168's mode taxonomy - see server/evals/kill-attribution.ts's
+   * own `EngineAccess` docstring. Default `"source"` (today's plain,
+   * fully-visible seed-root - unchanged). `"bytecode"` is the old
+   * `blackBox: true` behavior (applyBlackBoxTransform, below), renamed but
+   * behaviorally identical. `"oracle"` does *not* change what
+   * `buildSeedRoot()` itself produces at `outDir` - that tree IS
+   * privateRoot (the real `tinytable/`, untouched, same as `"source"`
+   * mode) - the agent-visible split is a separate step, `buildOracleAgentRoot()` below.
+   */
+  engineAccess?: EngineAccess;
   /**
    * The exam-room image to compile black-box `.pyc`s with (default
    * DEFAULT_IMAGE) - MUST match the image the trial itself later runs in.
@@ -216,7 +228,7 @@ export async function buildSeedRoot(
   }
   const seedRootJson = parseSeedRootJson(result.stdout);
 
-  if (options.blackBox) {
+  if (options.engineAccess === "bytecode") {
     await applyBlackBoxTransform(outDir, options.image ?? DEFAULT_IMAGE);
   }
 
@@ -251,18 +263,127 @@ export async function buildSeedRoot(
   };
 }
 
+/**
+ * grade.py's own docstring requires `--artifacts` to already be "its own
+ * git repository, freshly seeded before the agent touched it" - its
+ * protected-path check (`_check_protected_paths_untouched`) runs `git
+ * status` and reports "not a git repository" (failing contract_ok)
+ * otherwise. `build_seed_root.py` already git-init/commits its own output
+ * before this ever runs, so calling this over that same tree is redundant
+ * defense in depth (a no-op git init against an already-clean tree); it's
+ * load-bearing, not redundant, for a fresh `engineAccess=oracle` agentRoot
+ * (`buildOracleAgentRoot`, below), which has no baseline commit of its own
+ * yet after its `.git` gets wiped alongside `tinytable/`.
+ */
+export async function gitInitCommit(repoPath: string): Promise<void> {
+  await runCommandSafe("git", ["init", "-q", "-b", "main"], { cwd: repoPath });
+  await runCommandSafe(
+    "git",
+    ["-c", "user.name=dsh-evals-demo", "-c", "user.email=dsh-evals-demo@localhost", "add", "-A"],
+    { cwd: repoPath }
+  );
+  await runCommandSafe(
+    "git",
+    ["-c", "user.name=dsh-evals-demo", "-c", "user.email=dsh-evals-demo@localhost", "commit", "-q", "-m", "seed"],
+    { cwd: repoPath }
+  );
+}
+
+/**
+ * `run_sql_tests.py`'s own direct-execution-only siblings (imported by it,
+ * never by `oracle_run_sql_tests.py` - see that file's own docstring: it
+ * "deliberately does not import run_sql_tests.py itself, which would need
+ * its sibling admissibility.py/scheduler.py/substrate.py/trajectory.py
+ * alongside it"). An `engineAccess=oracle` agentRoot has no legitimate use
+ * for any of them, since it never runs `.test` files in-process.
+ */
+const DIRECT_EXECUTION_SIBLINGS = ["admissibility.py", "scheduler.py", "substrate.py", "trajectory.py"];
+
+export type OracleAgentRoot = { agentFiles: Array<{ path: string; sha256: string }>; agentRootSha256: string };
+
+/**
+ * honeyrail#168's privateRoot/agentRoot split: `privateRootDir` is expected
+ * to be a `buildSeedRoot()` output (has the real `tinytable/`, never
+ * mounted into the scored agent's container). Materializes `agentRootDir`
+ * as a copy with `tinytable/` and its direct-execution-only siblings
+ * removed, and `run_sql_tests.py` replaced by `oracle_run_sql_tests.py` (the
+ * thin HTTP proxy client, clemenza/tinytable-evals#73) under the same
+ * filename - the agent's own CLI invocation (`python3 run_sql_tests.py
+ * --root . sql-tests/agent`) never has to change.
+ *
+ * Throws (leaving nothing half-built for a caller to accidentally mount) if
+ * `findStrayArtifacts` finds so much as one stray `.pyc`/`__pycache__`/
+ * mutant-source file afterward - the same class of leak
+ * `tinytable-evals#70` shipped once already via an unfiltered copytree.
+ */
+export async function buildOracleAgentRoot(privateRootDir: string, agentRootDir: string, sourceRoot?: string): Promise<OracleAgentRoot> {
+  const resolvedSourceRoot = resolve(sourceRoot ?? DEFAULT_SOURCE_ROOT);
+  await cp(privateRootDir, agentRootDir, { recursive: true });
+
+  await rm(join(agentRootDir, "tinytable"), { recursive: true, force: true });
+  for (const sibling of DIRECT_EXECUTION_SIBLINGS) {
+    await rm(join(agentRootDir, sibling), { force: true });
+  }
+  await rm(join(agentRootDir, "run_sql_tests.py"), { force: true });
+  const oracleClient = await readFile(join(resolvedSourceRoot, "oracle_run_sql_tests.py"));
+  await writeFile(join(agentRootDir, "run_sql_tests.py"), oracleClient);
+
+  await rm(join(agentRootDir, ".git"), { recursive: true, force: true });
+  await gitInitCommit(agentRootDir);
+
+  const strayArtifacts = await findStrayArtifacts(agentRootDir, ORACLE_STRAY_ARTIFACT_PATTERNS);
+  if (strayArtifacts.length > 0) {
+    throw new Error(
+      `engineAccess=oracle agentRoot leak: ${strayArtifacts.join(", ")} - the real tinytable implementation (or a compiled ` +
+        "trace of it) must never be reachable from the scored agent's own container; check buildOracleAgentRoot() before this can ship"
+    );
+  }
+
+  const relFiles = await listFilesRecursive(agentRootDir);
+  const agentFiles = await Promise.all(
+    relFiles.map(async (relFile) => ({ path: toPosixPath(relFile), sha256: sha256(await readFile(join(agentRootDir, relFile))) }))
+  );
+  agentFiles.sort((a, b) => a.path.localeCompare(b.path));
+  const agentRootSha256 = createHash("sha256").update(JSON.stringify(agentFiles)).digest("hex");
+
+  return { agentFiles, agentRootSha256 };
+}
+
+/**
+ * The only safe copy-back direction (agentRoot -> privateRoot) once a
+ * trial's agent finishes: honeyrail#168 explicitly warns this must be
+ * "mechanically restricted to exactly" `sql-tests/agent/**` and
+ * `findings.json`, "never a general directory sync" - grade.py's
+ * `_check_protected_paths_untouched` runs `git status --porcelain` inside
+ * privateRoot and would spuriously fail (every file the agent touched, or
+ * the copy having removed `tinytable/`, would look like `tinytable/`/
+ * `sql-tests/official/` was "added/modified/deleted") if this ever became a
+ * recursive merge instead of this explicit allowlist.
+ */
+export async function copyBackAgentArtifacts(agentRootDir: string, privateRootDir: string): Promise<void> {
+  const agentTestsDir = join(agentRootDir, "sql-tests", "agent");
+  await rm(join(privateRootDir, "sql-tests", "agent"), { recursive: true, force: true });
+  await cp(agentTestsDir, join(privateRootDir, "sql-tests", "agent"), { recursive: true, force: true }).catch(() => undefined);
+
+  const findingsPath = join(agentRootDir, "findings.json");
+  const findings = await readFile(findingsPath).catch(() => null);
+  if (findings !== null) {
+    await writeFile(join(privateRootDir, "findings.json"), findings);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
-type CliOptions = { seed: number; outDir: string; manifestOut: string; sourceRoot?: string; blackBox: boolean };
+type CliOptions = { seed: number; outDir: string; manifestOut: string; sourceRoot?: string; engineAccess: EngineAccess };
 
 function parseArgs(argv: string[]): CliOptions {
   let seed: number | undefined;
   let outDir: string | undefined;
   let manifestOut: string | undefined;
   let sourceRoot: string | undefined;
-  let blackBox = false;
+  let engineAccess: EngineAccess = "source";
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     const next = () => {
@@ -276,7 +397,16 @@ function parseArgs(argv: string[]): CliOptions {
       case "--out": outDir = next(); break;
       case "--manifest-out": manifestOut = next(); break;
       case "--source": sourceRoot = next(); break;
-      case "--black-box": blackBox = true; break;
+      case "--engine-access": {
+        const value = next();
+        if (value !== "source" && value !== "bytecode" && value !== "oracle") {
+          throw new Error(`--engine-access must be one of source|bytecode|oracle, got "${value}"`);
+        }
+        engineAccess = value;
+        break;
+      }
+      // Back-compat alias for the pre-#168 flag name - identical to `--engine-access bytecode`.
+      case "--black-box": engineAccess = "bytecode"; break;
       case "--help":
       case "-h":
         console.log("See the header comment of scripts/tinytable-seed-root-builder.ts for usage.");
@@ -298,7 +428,7 @@ function parseArgs(argv: string[]): CliOptions {
     throw new Error(`--manifest-out ${resolvedManifest} must not be inside --out ${resolvedOut}`);
   }
 
-  return { seed, outDir, manifestOut, sourceRoot, blackBox };
+  return { seed, outDir, manifestOut, sourceRoot, engineAccess };
 }
 
 async function main(): Promise<void> {

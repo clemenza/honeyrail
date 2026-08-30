@@ -29,6 +29,21 @@ import type { DshRawEvent } from "./dsh-session-stats.js";
 import type { TranscriptLine } from "./dsh-transcript.js";
 import { runCommandSafe } from "../utils.js";
 
+/**
+ * honeyrail#168's mode taxonomy: how much of the real `tinytable`
+ * implementation the scored agent's own container can reach.
+ *   source   - normal white-box/source-visible evaluation (default)
+ *   bytecode - #158's `.pyc`-only, source-hidden research mode (the old
+ *              boolean `blackBoxMode`/`--black-box`)
+ *   oracle   - #168's true behavioral black-box mode: no `.py`/`.pyc`
+ *              anywhere in the agent's own container, only a narrow HTTP
+ *              proxy to a separate engine-service container
+ * Deliberately not reusing "black box" as a mode name in code - #168 warns
+ * that's ambiguous between `bytecode` (hides source, still importable) and
+ * `oracle` (a real process boundary); `engineAccess` avoids that.
+ */
+export type EngineAccess = "source" | "bytecode" | "oracle";
+
 export function parseTranscript(text: string): TranscriptLine[] {
   return text
     .split("\n")
@@ -143,6 +158,23 @@ const ORACLE_EXPLOIT_PATTERNS: Array<{ name: string; re: RegExp }> = [
   { name: "mutants/", re: /\bmutants\// },
   { name: "golden", re: /\bgolden\b/ },
   { name: "score.py", re: /\bscore\.py\b/ }
+];
+
+/**
+ * honeyrail#168's own sanctioned-surface ask for `engineAccess=oracle`: a
+ * normal proxy call (agentRoot's `run_sql_tests.py` talking to the
+ * engine-service over its narrow `/health`/`/run` HTTP interface) is
+ * expected and fine; an attempt to reach the engine-service container's
+ * filesystem/process directly, or to read its connection internals beyond
+ * that interface, is not. Kept deliberately small per #168's own non-goals
+ * (this is kill-attribution, not a generic threat model for the
+ * engine-service itself - that's the container hardening/timeout work).
+ * Only unioned into the leak pattern set when `engineAccess === "oracle"`.
+ */
+const ORACLE_BOUNDARY_LEAK_PATTERNS: Array<{ name: string; re: RegExp }> = [
+  { name: "docker exec/inspect", re: /\bdocker\s+(?:exec|inspect)\b/ },
+  { name: "docker.sock", re: /\/var\/run\/docker\.sock/ },
+  { name: "/mutant", re: /\/mutant\b/ }
 ];
 
 function scanPatterns(text: string, patterns: Array<{ name: string; re: RegExp }>, tMs: number | null, ts: string | null, source: LeakHit["source"]): LeakHit[] {
@@ -358,13 +390,29 @@ export type AttributionResult = {
  * wins:
  *   1. leak - any hard-leak-pattern hit before t_claim (or at all, if no
  *      claim was ever made) -> the trial is invalid, not a genuine kill.
- *      `blackBoxMode` (#164) excludes BYTECODE_LEAK_PATTERNS from this
- *      check - under `--black-box`, reading/disassembling the compiled
- *      `.pyc` is the mode's own sanctioned surface, not a leak;
+ *      `engineAccess === "bytecode"` (#164) excludes BYTECODE_LEAK_PATTERNS
+ *      from this check - under that mode, reading/disassembling the
+ *      compiled `.pyc` is the mode's own sanctioned surface, not a leak;
  *      HOST_LEAK_PATTERNS (host paths, git archaeology) still applies
- *      either way.
+ *      regardless of mode. `engineAccess === "oracle"` additionally unions
+ *      in ORACLE_BOUNDARY_LEAK_PATTERNS (attempts to reach the
+ *      engine-service container directly, beyond its narrow HTTP
+ *      interface) - and, unlike source/bytecode mode, keeps
+ *      BYTECODE_LEAK_PATTERNS active: there's no legitimate `.pyc` in an
+ *      oracle-mode agentRoot at all, so a hit is exactly as suspicious as
+ *      under source mode.
  *   2. oracle-exploit - an ORACLE_EXPLOIT_PATTERNS hit before t_claim,
- *      softer than (1), kept separate rather than folded in.
+ *      softer than (1), kept separate rather than folded in. Under
+ *      `engineAccess === "oracle"`, only counts a hit that came from an
+ *      actually-executed command or its output (`LeakHit.source !==
+ *      "text"`) - #170's real trial found the classifier flagging an
+ *      agent's own generic reasoning ("the reference is `clean/tinytable`
+ *      and I don't have it") as oracle-exploit with zero actual access,
+ *      because oracle mode's agentRoot genuinely has no `clean/` to find;
+ *      unlike source/bytecode mode (where `clean/`-shaped paths have
+ *      historically been real, reachable leaked material - #148 - so a
+ *      text mention is still worth flagging), a bare mention in reasoning
+ *      text is not evidence of anything under oracle mode.
  *   3. test-driven - the agent's own test failed at or before the claim.
  *   4. code-review - the mutated `.py` file was read before the claim,
  *      with no own failing test before it (a confirming test written
@@ -383,11 +431,20 @@ export type AttributionResult = {
  *   7. unattributable - none of the above (including: no claim was ever
  *      made at all).
  */
-export function classifyKillAttribution(lines: TranscriptLine[], operator: OperatorMeta | null, blackBoxMode = false): AttributionResult {
+export function classifyKillAttribution(lines: TranscriptLine[], operator: OperatorMeta | null, engineAccess: EngineAccess = "source"): AttributionResult {
   const derived = deriveTrajectoryEvents(toRawEvents(lines));
-  const leakPatterns = blackBoxMode ? HOST_LEAK_PATTERNS : [...BYTECODE_LEAK_PATTERNS, ...HOST_LEAK_PATTERNS];
+  const leakPatterns =
+    engineAccess === "bytecode"
+      ? HOST_LEAK_PATTERNS
+      : engineAccess === "oracle"
+        ? [...BYTECODE_LEAK_PATTERNS, ...HOST_LEAK_PATTERNS, ...ORACLE_BOUNDARY_LEAK_PATTERNS]
+        : [...BYTECODE_LEAK_PATTERNS, ...HOST_LEAK_PATTERNS];
   const leakHits = scanForPatterns(lines, derived, leakPatterns);
-  const oracleHits = scanForPatterns(lines, derived, ORACLE_EXPLOIT_PATTERNS);
+  const rawOracleHits = scanForPatterns(lines, derived, ORACLE_EXPLOIT_PATTERNS);
+  // See classifyKillAttribution's own docstring, rule 2: under oracle mode a
+  // bare reasoning-text mention isn't evidence of access, since there's
+  // nothing real at those paths to have found.
+  const oracleHits = engineAccess === "oracle" ? rawOracleHits.filter((h) => h.source !== "text") : rawOracleHits;
   const claim = findFirstClaim(lines, operator);
   const firstOwnFailingTest = findFirstOwnFailingTest(derived);
   const firstSourceRead = findFirstSourceRead(derived);

@@ -8,6 +8,8 @@ import { test, type TestContext } from "node:test";
 import {
   describeManifestMismatch,
   findManifestMismatches,
+  findStrayArtifacts,
+  ORACLE_STRAY_ARTIFACT_PATTERNS,
   parseExpectedManifest
 } from "../server/evals/manifest-preflight.js";
 
@@ -110,4 +112,55 @@ test("parseExpectedManifest: rejects malformed shapes with a clear error", () =>
     () => parseExpectedManifest({ files: [{ path: "/etc/passwd", sha256: sha256("x") }] }),
     /relative path without "\.\."/
   );
+});
+
+// --- findStrayArtifacts (honeyrail#168) -------------------------------------
+
+test("findStrayArtifacts: empty on a clean tree", async (t) => {
+  const root = await tempDir(t);
+  await mkdir(join(root, "sql-tests", "agent"), { recursive: true });
+  await writeFile(join(root, "SPEC.md"), "spec\n");
+  await writeFile(join(root, "run_sql_tests.py"), "# oracle client\n");
+
+  const hits = await findStrayArtifacts(root, ORACLE_STRAY_ARTIFACT_PATTERNS);
+  assert.deepEqual(hits, []);
+});
+
+test("findStrayArtifacts: reports a stray tinytable/ package and a compiled __pycache__ (tinytable-evals#70's leak class)", async (t) => {
+  const root = await tempDir(t);
+  await mkdir(join(root, "tinytable", "__pycache__"), { recursive: true });
+  await writeFile(join(root, "tinytable", "core.py"), "class Table: ...\n");
+  await writeFile(join(root, "tinytable", "__pycache__", "core.cpython-311.pyc"), "fake bytecode");
+  await writeFile(join(root, "SPEC.md"), "spec\n");
+
+  const hits = await findStrayArtifacts(root, ORACLE_STRAY_ARTIFACT_PATTERNS);
+  assert.ok(hits.includes("tinytable/core.py"));
+  assert.ok(hits.includes("tinytable/__pycache__/core.cpython-311.pyc"));
+  assert.ok(!hits.includes("SPEC.md"));
+});
+
+test("findStrayArtifacts: reports a bare .pyc with no surrounding tinytable/ directory too", async (t) => {
+  const root = await tempDir(t);
+  await writeFile(join(root, "stray.pyc"), "fake bytecode");
+
+  const hits = await findStrayArtifacts(root, ORACLE_STRAY_ARTIFACT_PATTERNS);
+  assert.deepEqual(hits, ["stray.pyc"]);
+});
+
+test("findStrayArtifacts: reports run_sql_tests.py's direct-execution-only siblings", async (t) => {
+  const root = await tempDir(t);
+  await writeFile(join(root, "admissibility.py"), "# ...\n");
+  await writeFile(join(root, "scheduler.py"), "# ...\n");
+
+  const hits = await findStrayArtifacts(root, ORACLE_STRAY_ARTIFACT_PATTERNS);
+  assert.deepEqual(hits.sort(), ["admissibility.py", "scheduler.py"]);
+});
+
+test("findStrayArtifacts: skips .git", async (t) => {
+  const root = await tempDir(t);
+  await mkdir(join(root, ".git", "objects"), { recursive: true });
+  await writeFile(join(root, ".git", "objects", "whatever.pyc"), "not real git content, just proving .git is skipped");
+
+  const hits = await findStrayArtifacts(root, ORACLE_STRAY_ARTIFACT_PATTERNS);
+  assert.deepEqual(hits, []);
 });

@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test, type TestContext } from "node:test";
 
-import { buildSeedRoot } from "../scripts/tinytable-seed-root-builder.js";
+import { buildOracleAgentRoot, buildSeedRoot, copyBackAgentArtifacts } from "../scripts/tinytable-seed-root-builder.js";
 import { runInExamRoom } from "../scripts/tinytable-exam-room.js";
 import { runCommandSafe, type SafeCommandOutput } from "../server/utils.js";
 
@@ -135,7 +135,7 @@ test("buildSeedRoot surfaces build_seed_root.py's own stderr on failure", async 
 
 test("buildSeedRoot --black-box hides tinytable/{core,sql}.py, leaves __init__.py, and the seed-root still runs the official suite inside the same exam-room image", async (t) => {
   const outDir = await freshOutDir(t, "honeyrail-seed-root-blackbox-");
-  const manifest = await buildSeedRoot({ seed: 10, outDir, blackBox: true });
+  const manifest = await buildSeedRoot({ seed: 10, outDir, engineAccess: "bytecode" });
 
   const paths = manifest.files.map((f) => f.path);
   assert.ok(!paths.includes("tinytable/core.py"), "core.py should be hidden");
@@ -156,9 +156,9 @@ test("buildSeedRoot --black-box hides tinytable/{core,sql}.py, leaves __init__.p
 
 test("buildSeedRoot --black-box: both core.py and sql.py are always hidden together, even for an operator that only mutates one of them", async (t) => {
   // Presence/absence alone must not leak which file holds the seeded
-  // defect - see BuildSeedRootOptions.blackBox's own docstring.
+  // defect - see BuildSeedRootOptions.engineAccess's own docstring.
   const outDir = await freshOutDir(t, "honeyrail-seed-root-blackbox-");
-  const manifest = await buildSeedRoot({ seed: 10, outDir, blackBox: true }); // seed 10 mutates sql.py only
+  const manifest = await buildSeedRoot({ seed: 10, outDir, engineAccess: "bytecode" }); // seed 10 mutates sql.py only
   const paths = manifest.files.map((f) => f.path);
   assert.ok(!paths.includes("tinytable/core.py") && !paths.includes("tinytable/sql.py"));
 });
@@ -173,7 +173,7 @@ test("buildSeedRoot --black-box wipes .git so the hidden .py content isn't recov
   // gitInitCommit() call, since that's what actually re-seeds history for
   // a real trial.
   const outDir = await freshOutDir(t, "honeyrail-seed-root-blackbox-");
-  await buildSeedRoot({ seed: 10, outDir, blackBox: true });
+  await buildSeedRoot({ seed: 10, outDir, engineAccess: "bytecode" });
 
   await runCommandSafe("git", ["init", "-q", "-b", "main"], { cwd: outDir });
   await runCommandSafe("git", ["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"], { cwd: outDir });
@@ -184,4 +184,87 @@ test("buildSeedRoot --black-box wipes .git so the hidden .py content isn't recov
 
   const logCount = await runCommandSafe("git", ["rev-list", "--count", "HEAD"], { cwd: outDir });
   assert.equal(logCount.stdout.trim(), "1", "history must be exactly one commit - no earlier, pre-transform commit to recover a blob from");
+});
+
+// #168: engineAccess=oracle's privateRoot/agentRoot split.
+
+test("buildOracleAgentRoot: agentRoot has no tinytable/ or direct-execution siblings, and oracle_run_sql_tests.py in place of run_sql_tests.py", async (t) => {
+  const privateRoot = await freshOutDir(t, "honeyrail-oracle-private-");
+  await buildSeedRoot({ seed: 10, outDir: privateRoot });
+  const agentRoot = await tempDir(t, "honeyrail-oracle-agent-");
+
+  const result = await buildOracleAgentRoot(privateRoot, agentRoot);
+
+  const paths = result.agentFiles.map((f) => f.path);
+  assert.ok(!paths.some((p) => p.startsWith("tinytable/")), "no tinytable/ file should exist in agentRoot");
+  for (const sibling of ["admissibility.py", "scheduler.py", "substrate.py", "trajectory.py"]) {
+    assert.ok(!paths.includes(sibling), `${sibling} should not exist in agentRoot`);
+  }
+  assert.ok(paths.includes("run_sql_tests.py"), "run_sql_tests.py should still exist (as the oracle client)");
+  const runSqlTests = await readFile(join(agentRoot, "run_sql_tests.py"), "utf8");
+  assert.match(runSqlTests, /oracle_run_sql_tests/, "run_sql_tests.py's content should be the oracle client, not the direct-execution runner");
+  assert.ok(paths.includes("SPEC.md"), "sanctioned material (SPEC.md) should still be present");
+});
+
+test("buildOracleAgentRoot: agentRoot has no import path to tinytable at all", async (t) => {
+  const privateRoot = await freshOutDir(t, "honeyrail-oracle-private-");
+  await buildSeedRoot({ seed: 10, outDir: privateRoot });
+  const agentRoot = await tempDir(t, "honeyrail-oracle-agent-");
+  await buildOracleAgentRoot(privateRoot, agentRoot);
+
+  // No docker needed - this is the same host-python3 sanity check #170's
+  // manual trial used to confirm the boundary structurally, not just by
+  // convention.
+  const attempt = await runCommandSafe("python3", ["-c", "import tinytable"], { cwd: agentRoot });
+  assert.ok(!attempt.ok, "import tinytable must fail from agentRoot");
+  assert.match(attempt.stderr, /ModuleNotFoundError/);
+});
+
+test("buildOracleAgentRoot: throws if a stray artifact survives into agentRoot (defense in depth against tinytable-evals#70's leak class)", async (t) => {
+  // A synthetic fixture, not a real buildSeedRoot() output - proves the
+  // check itself works without needing docker/a real mutant, mirroring
+  // the existing operator-id-leak test's fakeRun style above.
+  const privateRoot = await tempDir(t, "honeyrail-oracle-private-poisoned-");
+  await mkdir(join(privateRoot, "tinytable"), { recursive: true });
+  await writeFile(join(privateRoot, "tinytable", "__init__.py"), "");
+  await mkdir(join(privateRoot, "sql-tests", "agent"), { recursive: true });
+  await writeFile(join(privateRoot, "SPEC.md"), "spec\n");
+  await writeFile(join(privateRoot, "run_sql_tests.py"), "# real runner\n");
+  // Stray content OUTSIDE tinytable/ (which buildOracleAgentRoot always
+  // deletes wholesale) and not one of the named direct-execution siblings -
+  // simulates a leak that survives the rest of the transform.
+  await mkdir(join(privateRoot, "some_dir", "__pycache__"), { recursive: true });
+  await writeFile(join(privateRoot, "some_dir", "__pycache__", "mod.cpython-311.pyc"), "fake bytecode");
+
+  const agentRoot = await tempDir(t, "honeyrail-oracle-agent-poisoned-");
+  await assert.rejects(() => buildOracleAgentRoot(privateRoot, agentRoot), /engineAccess=oracle agentRoot leak/);
+});
+
+test("copyBackAgentArtifacts: touches only sql-tests/agent/** and findings.json, never tinytable/ or sql-tests/official/", async (t) => {
+  const privateRoot = await freshOutDir(t, "honeyrail-oracle-copyback-private-");
+  await buildSeedRoot({ seed: 10, outDir: privateRoot });
+  await runCommandSafe("git", ["init", "-q", "-b", "main"], { cwd: privateRoot });
+  await runCommandSafe("git", ["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"], { cwd: privateRoot });
+  await runCommandSafe("git", ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "seed"], { cwd: privateRoot });
+
+  const agentRoot = await tempDir(t, "honeyrail-oracle-copyback-agent-");
+  await buildOracleAgentRoot(privateRoot, agentRoot);
+  await writeFile(join(agentRoot, "sql-tests", "agent", "my_probe.test"), "statement ok\nSELECT 1\n");
+  await writeFile(join(agentRoot, "findings.json"), "[]\n");
+
+  await copyBackAgentArtifacts(agentRoot, privateRoot);
+
+  const status = await runCommandSafe("git", ["status", "--porcelain"], { cwd: privateRoot });
+  const changedPaths = status.stdout.trim().split("\n").filter(Boolean).map((line) => line.slice(3).replace(/^"|"$/g, ""));
+  for (const path of changedPaths) {
+    assert.ok(
+      path.startsWith("sql-tests/agent/") || path === "findings.json",
+      `copy-back touched an unexpected path: ${path} - grade.py's protected-path check would spuriously fail on this`
+    );
+  }
+  assert.ok(changedPaths.includes("sql-tests/agent/my_probe.test"));
+  assert.ok(changedPaths.includes("findings.json"));
+
+  const protectedCheck = await runCommandSafe("git", ["status", "--porcelain", "--", "tinytable/", "sql-tests/official/"], { cwd: privateRoot });
+  assert.equal(protectedCheck.stdout.trim(), "", "tinytable/ and sql-tests/official/ must show zero git changes after copy-back");
 });

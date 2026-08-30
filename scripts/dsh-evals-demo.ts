@@ -61,10 +61,17 @@
  *   --smoke                       2 fixtures x 2 profiles x 1 trial - cheap end-to-end validation
  *   --dry-run                     Print the matrix and budget note, launch nothing
  *   --report-only                 Skip execution; rebuild the report from state.json
- *   --black-box                   #158 (off by default, a first cheap probe - not believed robust,
- *                                 see scripts/tinytable-seed-root-builder.ts's own docstring): hides
- *                                 tinytable/{core,sql}.py from the seed-root (compiled to .pyc, source
- *                                 deleted) before the agent ever sees it
+ *   --engine-access <mode>        source (default) | bytecode | oracle - honeyrail#168's mode taxonomy,
+ *                                 see server/evals/kill-attribution.ts's own EngineAccess docstring.
+ *                                 "bytecode" is #158's old --black-box (below), kept as a research mode.
+ *                                 "oracle" is #168's real process-boundary black-box: builds a
+ *                                 privateRoot/agentRoot split (scripts/tinytable-seed-root-builder.ts's
+ *                                 buildOracleAgentRoot()), starts a separate engine-service container
+ *                                 (scripts/tinytable-engine-service.ts) owning the real tinytable/, and
+ *                                 runs the agent against agentRoot only - no .py/.pyc ever enters its
+ *                                 container.
+ *   --black-box                   Back-compat alias for `--engine-access bytecode` (#158's original
+ *                                 flag name, before #168 introduced the 3-mode taxonomy)
  */
 
 import { createHash } from "node:crypto";
@@ -79,12 +86,14 @@ import { describeManifestMismatch, findManifestMismatches } from "../server/eval
 import { findSessionStatsTimingInconsistency, readSessionStats } from "../server/evals/dsh-session-stats.js";
 import { appendDerivedTrajectoryEvents } from "../server/evals/dsh-trajectory-bridge.js";
 import { writeTranscript } from "../server/evals/dsh-transcript.js";
-import { classifyKillAttribution, loadOperatorMetadata, parseTranscript, type OperatorMeta } from "../server/evals/kill-attribution.js";
+import { classifyKillAttribution, loadOperatorMetadata, parseTranscript, type EngineAccess, type OperatorMeta } from "../server/evals/kill-attribution.js";
 import { logAgentSnapshot, logFileDiff } from "../server/evals/dsh-trajectory-filesystem-events.js";
 import { auditTranscript } from "../server/evals/transcript-audit.js";
+import { findStrayArtifacts, ORACLE_STRAY_ARTIFACT_PATTERNS } from "../server/evals/manifest-preflight.js";
 import { runCommandSafe } from "../server/utils.js";
-import { buildSeedRoot, type SeedRootManifest } from "./tinytable-seed-root-builder.js";
+import { buildOracleAgentRoot, buildSeedRoot, copyBackAgentArtifacts, gitInitCommit, type SeedRootManifest } from "./tinytable-seed-root-builder.js";
 import { DEFAULT_IMAGE, runInExamRoom } from "./tinytable-exam-room.js";
+import { startEngineService } from "./tinytable-engine-service.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const tinytableEvalDir = resolve(__dirname, "..", "examples", "tinytable-eval");
@@ -112,7 +121,7 @@ type CliOptions = {
   killRateThreshold: number;
   trialTimeoutMinutes: number;
   pgAdjudicate: boolean;
-  blackBox: boolean;
+  engineAccess: EngineAccess;
   smoke: boolean;
   dryRun: boolean;
   reportOnly: boolean;
@@ -127,7 +136,7 @@ function parseArgs(argv: string[]): CliOptions {
     killRateThreshold: 1.0,
     trialTimeoutMinutes: 15,
     pgAdjudicate: false,
-    blackBox: false,
+    engineAccess: "source",
     smoke: false,
     dryRun: false,
     reportOnly: false
@@ -156,7 +165,16 @@ function parseArgs(argv: string[]): CliOptions {
       case "--kill-rate-threshold": options.killRateThreshold = Number(next()); break;
       case "--trial-timeout-minutes": options.trialTimeoutMinutes = Number(next()); break;
       case "--pg-adjudicate": options.pgAdjudicate = true; break;
-      case "--black-box": options.blackBox = true; break;
+      case "--engine-access": {
+        const value = next();
+        if (value !== "source" && value !== "bytecode" && value !== "oracle") {
+          throw new Error(`--engine-access must be one of source|bytecode|oracle, got "${value}"`);
+        }
+        options.engineAccess = value;
+        break;
+      }
+      // Back-compat alias for the pre-#168 flag name - identical to `--engine-access bytecode`.
+      case "--black-box": options.engineAccess = "bytecode"; break;
       case "--smoke": options.smoke = true; break;
       case "--dry-run": options.dryRun = true; break;
       case "--report-only": options.reportOnly = true; break;
@@ -207,31 +225,10 @@ async function loadProfiles(options: CliOptions): Promise<ProfileSpec[]> {
   return profiles;
 }
 
-async function gitInitCommit(repoPath: string): Promise<void> {
-  // grade.py's own docstring requires --artifacts to already be "its own
-  // git repository, freshly seeded before the agent touched it" - its
-  // protected-path check (step 4, `_check_protected_paths_untouched`) runs
-  // `git status` and reports "not a git repository" (failing contract_ok)
-  // otherwise. #104's buildSeedRoot() deliberately doesn't do this (it's a
-  // builder-zone concern, not the exam room's) - #126 note: unlike the old
-  // in-repo builder, vendor/tinytable-evals's build_seed_root.py *does*
-  // already git-init and commit the seed-root itself before this driver
-  // even runs, so this re-init is technically redundant against a
-  // #126-built seed-root; kept anyway as defense in depth (it's a no-op
-  // git init against an already-clean tree) and to keep this driver
-  // independent of exactly which builder produced the worktree.
-  await runCommandSafe("git", ["init", "-q", "-b", "main"], { cwd: repoPath });
-  await runCommandSafe(
-    "git",
-    ["-c", "user.name=dsh-evals-demo", "-c", "user.email=dsh-evals-demo@localhost", "add", "-A"],
-    { cwd: repoPath }
-  );
-  await runCommandSafe(
-    "git",
-    ["-c", "user.name=dsh-evals-demo", "-c", "user.email=dsh-evals-demo@localhost", "commit", "-q", "-m", "seed"],
-    { cwd: repoPath }
-  );
-}
+// gitInitCommit() now lives in ./tinytable-seed-root-builder.js - hoisted
+// from here since engineAccess=oracle's agentRoot (buildOracleAgentRoot())
+// needs the exact same defense-in-depth re-init this file's own privateRoot
+// call below already did.
 
 export type ScoreJson = {
   artifacts: string;
@@ -351,7 +348,7 @@ async function executeCell(
   let manifest: SeedRootManifest;
   try {
     await mkdir(artifactsDir, { recursive: true });
-    manifest = await buildSeedRoot({ seed: fixtureSeed, outDir: seedRootDir, blackBox: options.blackBox, image: options.image });
+    manifest = await buildSeedRoot({ seed: fixtureSeed, outDir: seedRootDir, engineAccess: options.engineAccess, image: options.image });
     await writeFile(join(artifactsDir, "manifest.json"), JSON.stringify(manifest, null, 2));
   } catch (error) {
     return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: false, transcriptAuditHits: [], killRate: null, killedByKind: null, difficultyTier: null, error: (error as Error).message };
@@ -379,34 +376,84 @@ async function executeCell(
   }
 
   await gitInitCommit(seedRootDir);
-  await writeFile(join(seedRootDir, PROFILE_PATCH_FILENAME), profile.content);
 
-  const prompt = withUnattendedPreamble(taskPrompt);
+  // engineAccess=oracle (#168): the agent works in a separate agentRoot -
+  // no tinytable/ or its direct-execution-only siblings, run_sql_tests.py
+  // swapped for the HTTP proxy client - joined to a private network whose
+  // only other member is a freshly-started engine-service container owning
+  // the real (privateRoot's) tinytable/. source/bytecode modes are
+  // unchanged: the agent works directly in seedRootDir (privateRoot),
+  // "bridge" networking, no engine-service.
+  const isOracle = options.engineAccess === "oracle";
+  const agentRootDir = join(artifactsDir, "agent-root");
+  const workspaceDir = isOracle ? agentRootDir : seedRootDir;
+  const engineHandle = isOracle ? await startEngineService({ mutantRootDir: join(seedRootDir, "tinytable") }) : null;
+
   const dshHomeDir = join(artifactsDir, "dsh-home");
   const startedAt = Date.now();
-  const result = await runInExamRoom({
-    seedRootDir,
-    image: options.image,
-    dshHomeDir,
-    command: ["dsh", "--profile", "headless", "--patch", PROFILE_PATCH_FILENAME, prompt],
-    env: {
-      ...(process.env.DEEPSEEK_API_KEY ? { DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY } : {}),
-      // #115: dsh's default `workspace-write` mode makes its own tool-bash
-      // build a nested sandbox for every command, which needs to mount a
-      // fresh /proc - blocked by Docker's default seccomp profile
-      // regardless of --cap-drop/--security-opt, so bash is completely
-      // unusable inside this container otherwise. The exam-room container
-      // itself (--cap-drop=ALL, --read-only, only the seed-root mounted -
-      // see scripts/tinytable-exam-room.ts) is already the real security
-      // boundary for a scored trial, so dsh's own redundant nested sandbox
-      // is unnecessary here, not just broken.
-      DSH_PERMISSION_MODE: process.env.DSH_PERMISSION_MODE ?? "danger-full-access"
-    },
-    timeoutMs: options.trialTimeoutMinutes * 60_000
-  });
+  let result: Awaited<ReturnType<typeof runInExamRoom>>;
+  try {
+    if (isOracle) {
+      const oracleAgentRoot = await buildOracleAgentRoot(seedRootDir, agentRootDir);
+      await writeFile(join(artifactsDir, "agent-manifest.json"), JSON.stringify(oracleAgentRoot, null, 2));
+    }
+    await writeFile(join(workspaceDir, PROFILE_PATCH_FILENAME), profile.content);
+
+    const prompt = withUnattendedPreamble(taskPrompt);
+    result = await runInExamRoom({
+      seedRootDir: workspaceDir,
+      image: options.image,
+      dshHomeDir,
+      network: engineHandle?.networkName,
+      command: ["dsh", "--profile", "headless", "--patch", PROFILE_PATCH_FILENAME, prompt],
+      env: {
+        ...(process.env.DEEPSEEK_API_KEY ? { DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY } : {}),
+        // #115: dsh's default `workspace-write` mode makes its own tool-bash
+        // build a nested sandbox for every command, which needs to mount a
+        // fresh /proc - blocked by Docker's default seccomp profile
+        // regardless of --cap-drop/--security-opt, so bash is completely
+        // unusable inside this container otherwise. The exam-room container
+        // itself (--cap-drop=ALL, --read-only, only the seed-root mounted -
+        // see scripts/tinytable-exam-room.ts) is already the real security
+        // boundary for a scored trial, so dsh's own redundant nested sandbox
+        // is unnecessary here, not just broken.
+        DSH_PERMISSION_MODE: process.env.DSH_PERMISSION_MODE ?? "danger-full-access",
+        ...(engineHandle ? { ENGINE_SERVICE_URL: `http://${engineHandle.hostname}:${engineHandle.port}` } : {})
+      },
+      timeoutMs: options.trialTimeoutMinutes * 60_000
+    });
+  } catch (error) {
+    return { ...base, killed: null, falseAlarms: null, contractOk: null, integrityOk: false, transcriptAuditHits: [], killRate: null, killedByKind: null, difficultyTier, error: (error as Error).message };
+  } finally {
+    // AC#10: the engine-service container and its private network must be
+    // torn down on every exit path - success, agent timeout, or a thrown
+    // error above - not just the happy path. Nothing after this point needs
+    // the engine-service still running.
+    await engineHandle?.stop();
+  }
+
   const wallTimeMs = Date.now() - startedAt;
   const combinedOutput = `${result.stdout}\n${result.stderr}`;
   await writeFile(join(artifactsDir, "container.log"), `--- stdout ---\n${result.stdout}\n--- stderr ---\n${result.stderr}\n`);
+
+  // #168: copy back *only* sql-tests/agent/** + findings.json from
+  // agentRoot into privateRoot (seedRootDir) - the sole allowlisted path
+  // grade.py's protected-path check (git status against tinytable/ and
+  // sql-tests/official/) tolerates. Everything downstream (gatherAuditableText,
+  // runScorePy) reads seedRootDir exactly as source/bytecode mode already did.
+  let strayArtifacts: string[] = [];
+  if (isOracle) {
+    await copyBackAgentArtifacts(workspaceDir, seedRootDir);
+    // Defense-in-depth re-check: buildOracleAgentRoot() already refused to
+    // produce a leaky agentRoot up front, but the agent's own container has
+    // read-write access to agentRoot for the whole trial - re-verify nothing
+    // showed up there afterward (e.g. the agent creating a decoy) before
+    // trusting this trial's result.
+    strayArtifacts = await findStrayArtifacts(workspaceDir, ORACLE_STRAY_ARTIFACT_PATTERNS);
+    if (strayArtifacts.length) {
+      console.error(`  ${trialId}: ORACLE INTEGRITY FAILURE - stray artifact(s) appeared in agentRoot during the trial: ${strayArtifacts.join(", ")}`);
+    }
+  }
 
   // Turn/step/wall-time telemetry from dsh's own session-persistence JSONL
   // log, now that dshHomeDir gave it somewhere durable to write - see
@@ -488,8 +535,8 @@ async function executeCell(
     pythonBin: graderPythonBin
   });
   const postMismatches = await findManifestMismatches(seedRootDir, { files: manifest.files });
-  const integrityOk = postMismatches.length === 0;
-  if (!integrityOk) {
+  const integrityOk = postMismatches.length === 0 && strayArtifacts.length === 0;
+  if (postMismatches.length) {
     console.error(`  ${trialId}: INTEGRITY FAILURE - protected fixture files changed: ${postMismatches.map(describeManifestMismatch).join("; ")}`);
   }
 
@@ -507,7 +554,7 @@ async function executeCell(
   if (scoreOrError.score.killed) {
     try {
       const transcriptText = await readFile(join(artifactsDir, "transcript.ndjson"), "utf8");
-      const attr = classifyKillAttribution(parseTranscript(transcriptText), operators.get(manifest.operatorId) ?? null, options.blackBox);
+      const attr = classifyKillAttribution(parseTranscript(transcriptText), operators.get(manifest.operatorId) ?? null, options.engineAccess);
       killAttribution = {
         channel: attr.channel,
         claimMatchedBy: attr.claim?.matchedBy ?? null,
@@ -548,7 +595,7 @@ async function executeCell(
 }
 
 type StateFile = {
-  config: { image: string; smoke: boolean; dshVersion: string; graderRuns: number; killRateThreshold: number; blackBox: boolean };
+  config: { image: string; smoke: boolean; dshVersion: string; graderRuns: number; killRateThreshold: number; engineAccess: EngineAccess };
   profiles: Array<{ label: string; sha256: string }>;
   fixtures: string[];
   trials: DshTrialRecord[];
@@ -668,17 +715,19 @@ async function main(): Promise<void> {
   await mkdir(cellsDir, { recursive: true });
   const operators = await loadOperatorMetadata(vendorDir);
 
-  // #158: only matters for --black-box (grading a source-visible seed-root
-  // works with any host python3) - see resolveGraderPythonBin's own
-  // docstring for the real trial that found this gap.
+  // #158: only matters for engineAccess=bytecode (a source-visible
+  // privateRoot - "source" and "oracle" both are, "oracle"'s tinytable/
+  // never gets compiled to .pyc - grades fine with any host python3) - see
+  // resolveGraderPythonBin's own docstring for the real trial that found
+  // this gap.
   let graderPythonBin = "python3";
-  if (options.blackBox) {
+  if (options.engineAccess === "bytecode") {
     graderPythonBin = await resolveGraderPythonBin(options.image);
-    console.log(`Black-box mode: grading with ${graderPythonBin} (matched to ${options.image}'s own Python)`);
+    console.log(`Bytecode mode: grading with ${graderPythonBin} (matched to ${options.image}'s own Python)`);
   }
 
   const state: StateFile = {
-    config: { image: options.image, smoke: options.smoke, dshVersion, graderRuns: options.graderRuns, killRateThreshold: options.killRateThreshold, blackBox: options.blackBox },
+    config: { image: options.image, smoke: options.smoke, dshVersion, graderRuns: options.graderRuns, killRateThreshold: options.killRateThreshold, engineAccess: options.engineAccess },
     profiles: profiles.map(({ label, sha256 }) => ({ label, sha256 })),
     fixtures: fixtureSeeds.map(String),
     trials: []
