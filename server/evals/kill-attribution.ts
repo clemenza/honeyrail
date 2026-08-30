@@ -137,7 +137,17 @@ const BYTECODE_LEAK_PATTERNS: Array<{ name: string; re: RegExp }> = [
  * becomes sanctioned just because source is hidden.
  */
 const HOST_LEAK_PATTERNS: Array<{ name: string; re: RegExp }> = [
-  { name: "git log/diff/show", re: /\bgit\s+(?:log|diff|show)\b/ },
+  // A bare `git log`/`git log --oneline` (no `-p`/`--patch`) reveals nothing
+  // beyond "1 commit, message: seed" on the single-commit repo every
+  // mode's root now is (build_seed_root.py's own baseline commit, re-init'd
+  // by gitInitCommit()) - confirmed a real false positive twice: an agent's
+  // routine "let me look around" `git log --oneline | head -30 && git
+  // status` at the very start of a trial, not archaeology. `git log -p`/
+  // `--patch` (prints full diffs, i.e. file content) and `git show`/`git
+  // diff` stay flagged - see #158's own black-box wipe-and-recommit
+  // rationale for exactly the content-resurrection risk those still guard
+  // against.
+  { name: "git log/diff/show", re: /\bgit\s+(?:show|diff)\b|\bgit\s+log\b[^\n]*(?:-p\b|--patch\b)/ },
   { name: "/mnt/", re: /\/mnt\// },
   { name: "/host", re: /\/host\b/ },
   { name: "/Users/", re: /\/Users\// },
@@ -177,13 +187,28 @@ const ORACLE_BOUNDARY_LEAK_PATTERNS: Array<{ name: string; re: RegExp }> = [
   { name: "/mutant", re: /\/mutant\b/ }
 ];
 
+/**
+ * Every seed-root/agentRoot ships this exact `.gitignore`
+ * (`vendor/tinytable-evals/.gitignore`, copied verbatim by
+ * build_seed_root.py) - fully public/sanctioned content. The existing
+ * `isSanctionedFileRead` check below only exempts a dedicated `read` tool
+ * call on the file; it doesn't recognize the same three lines showing up
+ * inside a `cat .gitignore`-style bash command's combined output (often
+ * bundled with several other commands in one "let me look around" call) -
+ * confirmed a real false positive twice, tripping BYTECODE_LEAK_PATTERNS'
+ * `__pycache__`/`.pyc` entries with nothing actually leaked. Stripped from
+ * any text before pattern-matching, regardless of how it was read.
+ */
+const SANCTIONED_GITIGNORE_CONTENT = "__pycache__/\n*.pyc\n.pytest_cache/";
+
 function scanPatterns(text: string, patterns: Array<{ name: string; re: RegExp }>, tMs: number | null, ts: string | null, source: LeakHit["source"]): LeakHit[] {
   const hits: LeakHit[] = [];
+  const cleaned = text.split(SANCTIONED_GITIGNORE_CONTENT).join("");
   for (const { name, re } of patterns) {
-    const match = re.exec(text);
+    const match = re.exec(cleaned);
     if (match) {
       const start = Math.max(0, match.index - 40);
-      hits.push({ tMs, ts, source, pattern: name, snippet: text.slice(start, match.index + match[0].length + 40) });
+      hits.push({ tMs, ts, source, pattern: name, snippet: cleaned.slice(start, match.index + match[0].length + 40) });
     }
   }
   return hits;
