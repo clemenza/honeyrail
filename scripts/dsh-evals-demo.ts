@@ -657,6 +657,19 @@ async function resolveGraderPythonBin(image: string): Promise<string> {
 
 async function writeReport(outDir: string, state: StateFile): Promise<string> {
   const profilePaths = new Map(state.profiles.map((p) => [p.label, join(profilesDir, `${p.label}.cordis.patch.yml`)]));
+  // #174: best-effort attach a sibling trial-diagnosis.json, if
+  // scripts/tinytable-diagnose.ts already wrote one for this trial - a
+  // separate, opt-in stage this driver never runs itself, so a trial with no
+  // trial-diagnosis.json (the common case) is unaffected, same ".catch(() =>
+  // null)" pattern writeTranscript already uses below.
+  const trialsWithDiagnosis = await Promise.all(
+    state.trials.map(async (trial) => {
+      const diagnosis = await readFile(join(trial.artifactsDir, "trial-diagnosis.json"), "utf8")
+        .then((raw) => JSON.parse(raw))
+        .catch(() => null);
+      return diagnosis ? { ...trial, diagnosis } : trial;
+    })
+  );
   const input: DshComparisonReportInput = {
     generatedAt: new Date().toISOString(),
     dshVersion: state.config.dshVersion,
@@ -664,7 +677,7 @@ async function writeReport(outDir: string, state: StateFile): Promise<string> {
     smoke: state.config.smoke,
     profiles: state.profiles.map((p) => ({ label: p.label, path: profilePaths.get(p.label) || PROFILE_PATCH_FILENAME, sha256: p.sha256 })),
     fixtures: state.fixtures,
-    trials: state.trials
+    trials: trialsWithDiagnosis
   };
   const reportPath = join(outDir, "comparison-report.md");
   await writeFile(reportPath, buildDshComparisonReport(input));
