@@ -61,7 +61,7 @@
  *   --smoke                       2 fixtures x 2 profiles x 1 trial - cheap end-to-end validation
  *   --dry-run                     Print the matrix and budget note, launch nothing
  *   --report-only                 Skip execution; rebuild the report from state.json
- *   --engine-access <mode>        source (default) | bytecode | oracle - honeyrail#168's mode taxonomy,
+ *   --engine-access <mode>        source | bytecode | oracle (default) - honeyrail#168's mode taxonomy,
  *                                 see server/evals/kill-attribution.ts's own EngineAccess docstring.
  *                                 "bytecode" is #158's old --black-box (below), kept as a research mode.
  *                                 "oracle" is #168's real process-boundary black-box: builds a
@@ -69,7 +69,12 @@
  *                                 buildOracleAgentRoot()), starts a separate engine-service container
  *                                 (scripts/tinytable-engine-service.ts) owning the real tinytable/, and
  *                                 runs the agent against agentRoot only - no .py/.pyc ever enters its
- *                                 container.
+ *                                 container. Default since a real trial (clemenza/honeyrail acceptance
+ *                                 check for #174) confirmed "source" mode's own agent reads tinytable/
+ *                                 source directly and reasons from it - a genuine, sanctioned code-review
+ *                                 find in that mode, but not the black-box eval this driver runs by
+ *                                 default; pass --engine-access source|bytecode explicitly for white-box
+ *                                 or bytecode-disassembly research instead.
  *   --black-box                   Back-compat alias for `--engine-access bytecode` (#158's original
  *                                 flag name, before #168 introduced the 3-mode taxonomy)
  */
@@ -82,6 +87,7 @@ import { fileURLToPath } from "node:url";
 import { findBlockedReason, withUnattendedPreamble } from "../server/agents/common.js";
 import { dshAdapter } from "../server/agents/dsh.js";
 import { buildDshComparisonReport, classifyDshOutcome, type DshComparisonReportInput, type DshTrialRecord } from "../server/evals/dsh-report.js";
+import { decodeTrialDiagnosis } from "../server/evals/trial-diagnosis.js";
 import { describeManifestMismatch, findManifestMismatches } from "../server/evals/manifest-preflight.js";
 import { findSessionStatsTimingInconsistency, readSessionStats } from "../server/evals/dsh-session-stats.js";
 import { appendDerivedTrajectoryEvents } from "../server/evals/dsh-trajectory-bridge.js";
@@ -136,7 +142,16 @@ function parseArgs(argv: string[]): CliOptions {
     killRateThreshold: 1.0,
     trialTimeoutMinutes: 15,
     pgAdjudicate: false,
-    engineAccess: "source",
+    // Default to #168's real behavioral black box: the agent's own
+    // container never sees tinytable/*.py or *.pyc at all, only the narrow
+    // engine-service HTTP proxy - source/bytecode mode both let the agent
+    // read (or, for bytecode, disassemble) the implementation directly,
+    // which isn't the black-box eval this driver is meant to run by
+    // default. Still selectable via `--engine-access source|bytecode` or
+    // the `--black-box` back-compat alias for source/bytecode-mode work
+    // (e.g. #158's own bytecode-review research, or kill-attribution
+    // studies that specifically want white-box behavior).
+    engineAccess: "oracle",
     smoke: false,
     dryRun: false,
     reportOnly: false
@@ -657,6 +672,24 @@ async function resolveGraderPythonBin(image: string): Promise<string> {
 
 async function writeReport(outDir: string, state: StateFile): Promise<string> {
   const profilePaths = new Map(state.profiles.map((p) => [p.label, join(profilesDir, `${p.label}.cordis.patch.yml`)]));
+  // #174: best-effort attach a sibling trial-diagnosis.json, if
+  // scripts/tinytable-diagnose.ts already wrote one for this trial - a
+  // separate, opt-in stage this driver never runs itself, so a trial with no
+  // trial-diagnosis.json (the common case) is unaffected, same ".catch(() =>
+  // null)" pattern writeTranscript already uses below. Goes through
+  // decodeTrialDiagnosis rather than a raw JSON.parse + spread - the on-disk
+  // file is snake_case (#174 §7), TrialDiagnosis is camelCase; spreading the
+  // raw parse directly used to leave d.capabilityGaps/d.trialId/etc
+  // undefined on every real diagnosed trial (review fix).
+  const trialsWithDiagnosis = await Promise.all(
+    state.trials.map(async (trial) => {
+      const raw = await readFile(join(trial.artifactsDir, "trial-diagnosis.json"), "utf8")
+        .then((text) => JSON.parse(text) as unknown)
+        .catch(() => null);
+      const diagnosis = raw ? decodeTrialDiagnosis(raw) : null;
+      return diagnosis ? { ...trial, diagnosis } : trial;
+    })
+  );
   const input: DshComparisonReportInput = {
     generatedAt: new Date().toISOString(),
     dshVersion: state.config.dshVersion,
@@ -664,7 +697,7 @@ async function writeReport(outDir: string, state: StateFile): Promise<string> {
     smoke: state.config.smoke,
     profiles: state.profiles.map((p) => ({ label: p.label, path: profilePaths.get(p.label) || PROFILE_PATCH_FILENAME, sha256: p.sha256 })),
     fixtures: state.fixtures,
-    trials: state.trials
+    trials: trialsWithDiagnosis
   };
   const reportPath = join(outDir, "comparison-report.md");
   await writeFile(reportPath, buildDshComparisonReport(input));

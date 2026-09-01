@@ -13,6 +13,7 @@
 
 import type { SessionStats } from "./dsh-session-stats.js";
 import type { TranscriptAuditHit } from "./transcript-audit.js";
+import type { TrialDiagnosis } from "./trial-diagnosis.js";
 
 export type DshTrialOutcome = "passed" | "task_failed" | "verify_failed" | "invalidated" | "blocked" | "driver_error";
 
@@ -144,6 +145,15 @@ export type DshTrialRecord = {
    */
   difficultyTier?: string | null;
   error?: string;
+  /**
+   * #174: this trial's TrialDiagnosis, if a sibling `trial-diagnosis.json`
+   * was found next to manifest.json/score.json in artifactsDir (written by
+   * `node --import tsx scripts/tinytable-diagnose.ts <trial-id-or-path>`, a
+   * separate opt-in stage - see docs/trial-diagnosis.md). undefined for
+   * every trial produced before #174 or not yet diagnosed; buildDshComparisonReport
+   * renders nothing extra in that case, so existing reports are unaffected.
+   */
+  diagnosis?: TrialDiagnosis | null;
 };
 
 /**
@@ -467,5 +477,53 @@ export function buildDshComparisonReport(input: DshComparisonReportInput): strin
     );
   }
   lines.push("");
+  lines.push(...trialDiagnosisSection(sorted));
   return lines.join("\n");
+}
+
+/**
+ * #174: renders only when at least one trial carries a `diagnosis`
+ * (`trial-diagnosis.json` is a separate, opt-in post-hoc stage - most
+ * reports won't have one yet) - an empty return keeps every pre-#174 report
+ * byte-for-byte unchanged.
+ */
+function trialDiagnosisSection(sortedTrials: DshTrialRecord[]): string[] {
+  const diagnosed = sortedTrials.filter((t): t is DshTrialRecord & { diagnosis: TrialDiagnosis } => !!t.diagnosis);
+  if (diagnosed.length === 0) return [];
+  const lines: string[] = [];
+  lines.push("## Trial diagnoses");
+  lines.push("");
+  lines.push(
+    "#174's TrialDiagnosis (server/evals/trial-diagnosis.ts): a deterministic, no-LLM comparison of each trial's actual SQL/behavioral coverage (observed probe shape) against a private, fixture-specific required probe shape. Only trials with a sibling `trial-diagnosis.json` appear here."
+  );
+  lines.push("");
+  for (const trial of diagnosed) {
+    const d = trial.diagnosis;
+    // #174 review fix round 2: diagnosisStatus is now the first-class
+    // validity signal (trial-diagnosis.ts's own DiagnosisStatus doc-comment)
+    // - "capability gaps: none" only renders for a genuinely `complete`
+    // diagnosis; `required_shape_unavailable`/`ineligible` render their
+    // status explicitly instead, so a report reader never mistakes "never
+    // actually checked" or "this trial's data isn't trustworthy" for a real
+    // clean pass.
+    lines.push(`### \`${trial.fixture}\` / \`${trial.profile}\` / trial ${trial.trial} (\`${d.trialId}\`)`);
+    lines.push("");
+    lines.push(`- Outcome: \`${d.outcome}\` | Feature: \`${d.feature}\` | Diagnosis status: \`${d.diagnosisStatus}\``);
+    lines.push(
+      `- Capability gaps: ${
+        d.diagnosisStatus === "required_shape_unavailable"
+          ? "**unknown - no required probe shape configured for this operator**"
+          : d.diagnosisStatus === "ineligible"
+            ? "**not meaningful - trial outcome makes its observed probe shape untrustworthy**"
+            : d.capabilityGaps.length
+              ? d.capabilityGaps.map((g) => `\`${g}\``).join(", ")
+              : "none"
+      }`
+    );
+    lines.push(`- Required probe shape: \`${JSON.stringify(d.requiredProbeShapes)}\``);
+    lines.push(`- Observed probe shape: \`${JSON.stringify(d.observedProbeShapes)}\``);
+    lines.push(`- Evidence: ${d.evidence.length ? d.evidence.map((e) => `\`${e.kind}\``).join(", ") : "none"}`);
+    lines.push("");
+  }
+  return lines;
 }

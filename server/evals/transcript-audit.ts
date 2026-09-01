@@ -66,6 +66,11 @@ const SUSPICIOUS_PATTERNS: SuspiciousPattern[] = [
   { name: "selfcheck", pattern: /selfcheck/i },
   { name: "tinytable-eval", pattern: /tinytable-eval/i },
   { name: "honeyrail", pattern: /honeyrail/i },
+  // #174: guards PRIVATE_REQUIRED_PROBE_SHAPES (server/evals/trial-diagnosis.ts)
+  // - a private, evaluator-side map keyed by operatorId, same trust boundary
+  // as manifest.json's own operatorId - never a legitimate string for a
+  // transcript to contain.
+  { name: "required-probe-shape", pattern: /required[_-]?probe[_-]?shapes?/i },
   { name: "agent-worktrees", pattern: /agent-worktrees/i },
   // A literal /home/<user>/... or /Users/<user>/... path is exactly what
   // #103's agent read off the shared host filesystem - a legitimate exam
