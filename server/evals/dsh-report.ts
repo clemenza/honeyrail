@@ -499,22 +499,25 @@ function trialDiagnosisSection(sortedTrials: DshTrialRecord[]): string[] {
   lines.push("");
   for (const trial of diagnosed) {
     const d = trial.diagnosis;
-    // #174 review fix: `lookupRequiredProbeShape` (trial-diagnosis.ts) marks
-    // an operator id with no PRIVATE_REQUIRED_PROBE_SHAPES entry with this
-    // evidence kind - "capability gaps: none" and "capability gaps: unknown,
-    // never checked" must render differently, or a report reader can't tell
-    // a genuine clean pass from an unconfigured operator.
-    const requiredShapeUnavailable = d.evidence.some((e) => e.kind === "required-shape-unavailable");
+    // #174 review fix round 2: diagnosisStatus is now the first-class
+    // validity signal (trial-diagnosis.ts's own DiagnosisStatus doc-comment)
+    // - "capability gaps: none" only renders for a genuinely `complete`
+    // diagnosis; `required_shape_unavailable`/`ineligible` render their
+    // status explicitly instead, so a report reader never mistakes "never
+    // actually checked" or "this trial's data isn't trustworthy" for a real
+    // clean pass.
     lines.push(`### \`${trial.fixture}\` / \`${trial.profile}\` / trial ${trial.trial} (\`${d.trialId}\`)`);
     lines.push("");
-    lines.push(`- Outcome: \`${d.outcome}\` | Feature: \`${d.feature}\``);
+    lines.push(`- Outcome: \`${d.outcome}\` | Feature: \`${d.feature}\` | Diagnosis status: \`${d.diagnosisStatus}\``);
     lines.push(
       `- Capability gaps: ${
-        requiredShapeUnavailable
+        d.diagnosisStatus === "required_shape_unavailable"
           ? "**unknown - no required probe shape configured for this operator**"
-          : d.capabilityGaps.length
-            ? d.capabilityGaps.map((g) => `\`${g}\``).join(", ")
-            : "none"
+          : d.diagnosisStatus === "ineligible"
+            ? "**not meaningful - trial outcome makes its observed probe shape untrustworthy**"
+            : d.capabilityGaps.length
+              ? d.capabilityGaps.map((g) => `\`${g}\``).join(", ")
+              : "none"
       }`
     );
     lines.push(`- Required probe shape: \`${JSON.stringify(d.requiredProbeShapes)}\``);

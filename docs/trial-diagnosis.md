@@ -71,9 +71,45 @@ written into the seed-root"):
   `required-probe-shape` pattern, so a leaked reference (a hallucination, or
   a genuinely confused agent) still gets flagged the same way a leaked
   `mutant`/`golden`/`score.py` reference already is.
-- An operator id with no entry in the map just yields an empty
-  `RequiredProbeShape`, i.e. no capability gaps - a safe default, not an
-  error. The map is not required to be exhaustive for v0.
+- An operator id with no entry in the map is **not** silently treated as "no
+  capability gap" - `lookupRequiredProbeShape()` is the only sanctioned way
+  to read `PRIVATE_REQUIRED_PROBE_SHAPES`; for an unconfigured operator id it
+  returns an empty shape *plus* an explicit `required-shape-unavailable`
+  `Evidence` entry, and `diagnoseTrial()` reflects that as
+  `diagnosisStatus: "required_shape_unavailable"` rather than
+  `"complete"`. The map is not required to be exhaustive for v0, but callers
+  must distinguish these three states:
+  - **configured required shape, zero gaps** (`diagnosisStatus: "complete"`,
+    `capabilityGaps: []`) - a genuine clean pass.
+  - **required shape unavailable** (`diagnosisStatus:
+    "required_shape_unavailable"`) - never actually checked; `capabilityGaps`
+    is computed against an empty shape and is not meaningful evidence of
+    anything.
+  - **ineligible** (`diagnosisStatus: "ineligible"`) - the trial's own
+    `outcome` is `blocked`/`invalidated`/`driver_error`, so its observed
+    probe shape reflects a run that never produced trustworthy data to
+    diagnose in the first place.
+
+  `dsh-report.ts` renders each state differently (`"unknown - no required
+  probe shape configured"` / `"not meaningful - trial outcome makes its
+  observed probe shape untrustworthy"` vs. a real gap list or `"none"`) -
+  never collapses "unknown" into "none". A future consumer (Harness
+  Self-Improve v0, #173's M3) must check `diagnosisStatus` before trusting
+  `capabilityGaps`, not infer validity from whether the gap list happens to
+  be empty.
+
+Every configured operator's `RequiredProbeShape` is held to one acceptance
+principle: **a known valid killing workload for that operator must be
+classified by `extractProbeShape()` as satisfying the requirement** (see
+`test/trial-diagnosis.test.ts`'s per-operator acceptance tests) - not merely
+"the feature that happened to be absent in one historical miss". For
+`check-on-update-sees-only-assigned-columns`, for example, a single
+per-column `CHECK`/full-row `UPDATE` (golden case A's own shape) does *not*
+satisfy the requirement, because it isn't actually capable of triggering
+that specific mutant; only an `OR`-composed, multi-column `CHECK` plus a
+partial `UPDATE` that leaves a referenced column unassigned does (see that
+operator's own comment in `PRIVATE_REQUIRED_PROBE_SHAPES` for the worked
+three-valued-logic example of why `AND` alone doesn't distinguish it).
 
 ## Adding a new capability-gap tag
 

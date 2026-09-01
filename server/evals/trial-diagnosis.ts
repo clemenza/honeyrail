@@ -69,12 +69,47 @@ export type ProbeShape = {
   checkTested: boolean;
   updateTested: boolean;
   crossColumnDependency: boolean;
+  /**
+   * Review fix round 2 (P0): `crossColumnDependency` alone (a single ATOMIC
+   * clause referencing >=2 columns, e.g. `CHECK (a > b)`) is deliberately
+   * narrow - it must stay exactly that narrow so golden case A
+   * (`CHECK (a > 10 AND b > 10)` is per-column decomposable, not
+   * cross-column) keeps holding. `check-on-update-sees-only-assigned-columns`'s
+   * real discriminating shape is different: a CHECK whose overall reference
+   * set spans >=2 columns REGARDLESS of clause structure
+   * (`multiColumnCheck`), composed with `OR` at the top level
+   * (`orComposition` - only an `OR` lets one operand's spurious UNKNOWN
+   * survive to make the whole predicate pass), where a partial `UPDATE`
+   * leaves at least one of those referenced columns unassigned
+   * (`checkReferencesUnassignedColumn`). All three are required together -
+   * see `PRIVATE_REQUIRED_PROBE_SHAPES`'s own comment for the worked
+   * example and why an `AND`-only composition does NOT distinguish this
+   * mutant (an `AND` operand that's genuinely `FALSE` short-circuits
+   * correctly even under the bug).
+   */
+  multiColumnCheck: boolean;
+  /** True once some CHECK constraint's own predicate has a top-level `OR` (after unwrapping only the predicate's own fully-enclosing parens - not recursive into nested groups; see `containsTopLevelOr`). */
+  orComposition: boolean;
+  /** True once an `UPDATE`'s assigned-column set omits a column referenced by some CHECK constraint declared on that table - the shape that exercises `check-on-update-sees-only-assigned-columns`'s "reads as NULL because unassigned" bug. */
+  checkReferencesUnassignedColumn: boolean;
   checkReferencedColumns: Record<string, string[]>;
   updateAssignedColumns: Record<string, string[]>;
   partialUpdate: boolean;
   fkTested: boolean;
   negativeFkTested: boolean;
   maxFkPerTable: number;
+  /**
+   * Review fix round 2 (P0): `maxFkPerTable >= 2` alone is necessary but not
+   * sufficient for `fk-only-last-declared-constraint-registered` - the
+   * mutant keeps only the LAST declared FK, so an agent can have two FKs and
+   * still never distinguish the mutant if every negative test violates the
+   * (correctly-enforced) last one. True once some `statement error`
+   * INSERT/UPDATE is found that satisfies a table's last-declared FK while
+   * violating an earlier-declared one (existence checked against values
+   * already `INSERT`ed into the referenced table/column - see
+   * `evaluateFkSatisfaction`).
+   */
+  nonLastFkViolationTested: boolean;
   // statement-level
   insertPresent: boolean;
   updatePresent: boolean;
@@ -114,6 +149,24 @@ export type CapabilityGapTag =
   | "state-transition"
   | "transaction-sequence";
 
+/**
+ * Review fix round 2 (P1): makes diagnosis validity first-class instead of
+ * encoded indirectly through `Evidence[]` (a consumer reading only
+ * `capabilityGaps` could otherwise mistake "never actually checked" or "this
+ * trial's own data isn't trustworthy" for a genuine clean pass).
+ * - `complete` - a configured required shape was compared against a
+ *   trustworthy observed shape; `capabilityGaps` is meaningful.
+ * - `required_shape_unavailable` - no `PRIVATE_REQUIRED_PROBE_SHAPES` entry
+ *   for this operator (see `lookupRequiredProbeShape`); `capabilityGaps` is
+ *   computed against an empty required shape and is NOT meaningful evidence
+ *   of a clean pass.
+ * - `ineligible` - the trial's own `outcome` is `blocked`/`invalidated`/
+ *   `driver_error`; its observed probe shape reflects a run that never
+ *   produced trustworthy data to diagnose in the first place.
+ * Deliberately not a large state machine - three states, no transitions.
+ */
+export type DiagnosisStatus = "complete" | "required_shape_unavailable" | "ineligible";
+
 export type TrialDiagnosis = {
   trialId: string;
   outcome: DshTrialOutcome;
@@ -122,6 +175,7 @@ export type TrialDiagnosis = {
   requiredProbeShapes: RequiredProbeShape;
   capabilityGaps: CapabilityGapTag[];
   evidence: Evidence[];
+  diagnosisStatus: DiagnosisStatus;
 };
 
 /**
@@ -134,21 +188,44 @@ export type TrialDiagnosis = {
  */
 export const PRIVATE_REQUIRED_PROBE_SHAPES: Record<string, RequiredProbeShape> = {
   // mutate.py: "Killing it needs three tables and a child declaring two
-  // FKs - one obvious single-FK test still passes." - exactly
-  // same-kind-multiplicity's own definition.
-  "fk-only-last-declared-constraint-registered": { minFkPerTable: 2 },
+  // FKs - one obvious single-FK test still passes." Review fix round 2:
+  // minFkPerTable alone is necessary but not sufficient - the mutant keeps
+  // only the LAST declared FK, so two FKs where every negative test happens
+  // to violate the (correctly-enforced) last one still never distinguishes
+  // it. nonLastFkViolationTested is the missing second dimension: a
+  // statement error that satisfies the last FK while violating an earlier
+  // one.
+  "fk-only-last-declared-constraint-registered": { minFkPerTable: 2, nonLastFkViolationTested: true },
   // mutate.py: "CHECK is re-validated on UPDATE against the assignment list
-  // alone rather than the merged row... Only an UPDATE whose untouched
-  // column is the one carrying the constraint (e.g. the surviving disjunct
-  // of an OR-CHECK) distinguishes it." The real kill also needs a partial
-  // UPDATE that leaves the checked column unassigned, not just a
-  // cross-column CHECK in isolation - crossColumnDependency alone is the
-  // narrower, golden-case-A-shaped signal this v0 extractor can actually
-  // detect (a single clause referencing >=2 columns); tracked here rather
-  // than silently requiring partialUpdate too, since v0's crossColumnDependency
-  // heuristic doesn't yet distinguish an AND-joined predicate from the
-  // OR-disjunct shape this specific mutant needs.
-  "check-on-update-sees-only-assigned-columns": { crossColumnDependency: true }
+  // alone rather than the merged row, so every column the UPDATE doesn't
+  // touch reads as NULL - unknown, therefore passing. Only an UPDATE whose
+  // *untouched* column is the one carrying the constraint (e.g. the
+  // surviving disjunct of an OR-CHECK) distinguishes it."
+  //
+  // Worked example of why all three fields below are required together, not
+  // crossColumnDependency alone (review fix round 2):
+  //   CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a > 10 OR b > 10))
+  //   INSERT INTO t VALUES (5, 20)                -- a fails, b passes
+  //   statement error
+  //   UPDATE t SET b = 5 WHERE a = 5               -- b now fails too
+  // Real (merged-row) evaluation: a=5, b=5 -> (a>10 OR b>10) = FALSE OR
+  // FALSE = FALSE -> correctly rejected. Mutant (assignment-list-only)
+  // evaluation: only b=5 is in scope, a reads as NULL -> UNKNOWN(a>10) OR
+  // FALSE(b>10) = UNKNOWN -> a CHECK's own 3VL rule treats UNKNOWN as
+  // passing, same as a real, non-buggy CHECK would for a genuinely
+  // ambiguous predicate - the bug is which columns get evaluated, not the
+  // 3VL rule itself - so the mutant wrongly lets the UPDATE through.
+  // An AND-only composition does NOT distinguish this mutant: if any AND
+  // operand is genuinely FALSE, three-valued AND short-circuits to FALSE
+  // regardless of an UNKNOWN sibling, so the mutant still correctly
+  // rejects - orComposition is therefore a real necessary condition, not
+  // an optional nice-to-have.
+  "check-on-update-sees-only-assigned-columns": {
+    multiColumnCheck: true,
+    orComposition: true,
+    checkReferencesUnassignedColumn: true,
+    partialUpdate: true
+  }
 };
 
 /**
@@ -279,6 +356,27 @@ function andOrBoundary(text: string, i: number): number {
   return m ? m[0].length : 0;
 }
 
+function orOnlyBoundary(text: string, i: number): number {
+  const prev = i === 0 ? "" : text[i - 1];
+  if (/[A-Za-z0-9_]/.test(prev)) return 0;
+  const m = /^OR\b/i.exec(text.slice(i));
+  return m ? m[0].length : 0;
+}
+
+/**
+ * True once a CHECK predicate's own top level (after unwrapping only its
+ * own fully-enclosing parens) splits into >1 part on `OR`. Deliberately
+ * shallow - checks the predicate's outermost structure only, not every `OR`
+ * anywhere in the tree (an `OR` nested inside a top-level `AND`, e.g.
+ * `(a > 5 OR b > 5) AND c > 5`, is invisible to this check) - matching the
+ * v0 scope of a "small, named" signal per #174 §6, not a full boolean-tree
+ * classifier.
+ */
+function containsTopLevelOr(predicate: string): boolean {
+  const unwrapped = unwrapOuterParens(predicate);
+  return splitTopLevel(unwrapped, orOnlyBoundary).length > 1;
+}
+
 /** Strips every fully-enclosing balanced paren pair (`((x))` -> `x`), not just one layer. */
 function unwrapOuterParens(text: string): string {
   let s = text.trim();
@@ -309,6 +407,8 @@ function extractAtomicClauses(predicate: string): string[] {
   return clauses.flatMap((clause) => extractAtomicClauses(clause));
 }
 
+type FkConstraint = { fkColumn: string; referencedTable: string; referencedColumn: string };
+
 type BuildCtx = {
   tableCount: number;
   columnCount: number;
@@ -319,6 +419,9 @@ type BuildCtx = {
   checkReferencedColumns: Record<string, string[]>;
   updateAssignedColumns: Record<string, string[]>;
   crossColumnDependency: boolean;
+  multiColumnCheck: boolean;
+  orComposition: boolean;
+  checkReferencesUnassignedColumn: boolean;
   partialUpdate: boolean;
   insertPresent: boolean;
   updatePresent: boolean;
@@ -330,7 +433,16 @@ type BuildCtx = {
   commitUsed: boolean;
   nullInputTested: boolean;
   duplicateInputTested: boolean;
+  nonLastFkViolationTested: boolean;
   tableColumns: Map<string, Set<string>>;
+  /** Declared column order per table, from CREATE TABLE - what a column-list-omitted `INSERT INTO t VALUES (...)` positionally maps against (SPEC.md). */
+  tableColumnOrder: Map<string, string[]>;
+  /** Columns referenced by ANY CHECK constraint declared on a table (union across all of that table's CHECK constraints) - checkReferencesUnassignedColumn's own reference set. */
+  checkRelevantColumns: Map<string, Set<string>>;
+  /** FK constraints per table, in CREATE TABLE declaration order - order is load-bearing for nonLastFkViolationTested (which one is "last"). */
+  fkConstraintsByTable: Map<string, FkConstraint[]>;
+  /** Distinct literal value text INSERTed so far into a given "table.column" - the running "does this value exist in the referenced table" ledger evaluateFkSatisfaction reads. Only INSERT populates this (v0 simplification - an UPDATE to a referenced column isn't tracked). */
+  insertedValuesByTableColumn: Map<string, Set<string>>;
   touchedTables: Set<string>;
   seenInsertValues: Set<string>;
 };
@@ -346,6 +458,9 @@ function makeCtx(): BuildCtx {
     checkReferencedColumns: {},
     updateAssignedColumns: {},
     crossColumnDependency: false,
+    multiColumnCheck: false,
+    orComposition: false,
+    checkReferencesUnassignedColumn: false,
     partialUpdate: false,
     insertPresent: false,
     updatePresent: false,
@@ -357,7 +472,12 @@ function makeCtx(): BuildCtx {
     commitUsed: false,
     nullInputTested: false,
     duplicateInputTested: false,
+    nonLastFkViolationTested: false,
     tableColumns: new Map(),
+    tableColumnOrder: new Map(),
+    checkRelevantColumns: new Map(),
+    fkConstraintsByTable: new Map(),
+    insertedValuesByTableColumn: new Map(),
     touchedTables: new Set(),
     seenInsertValues: new Set()
   };
@@ -381,6 +501,7 @@ function parseCreateTable(body: string, ctx: BuildCtx): void {
   const elements = splitTopLevel(body.slice(openIdx + 1, closeIdx), commaBoundary);
 
   const columns = new Set<string>();
+  const columnOrder: string[] = [];
   const constraintElements: string[] = [];
   for (const el of elements) {
     if (/^CHECK\s*\(/i.test(el) || /^FOREIGN\s+KEY\s*\(/i.test(el)) {
@@ -390,11 +511,13 @@ function parseCreateTable(body: string, ctx: BuildCtx): void {
     const colMatch = /^(\w+)\s+(INTEGER|REAL|TEXT|BOOLEAN)\b(\s+NOT\s+NULL)?/i.exec(el);
     if (colMatch) {
       columns.add(colMatch[1]);
+      columnOrder.push(colMatch[1]);
       ctx.columnCount += 1;
       if (colMatch[3]) ctx.constraintCountByKind.not_null += 1;
     }
   }
   ctx.tableColumns.set(table, columns);
+  ctx.tableColumnOrder.set(table, columnOrder);
 
   for (const el of constraintElements) {
     if (/^CHECK\s*\(/i.test(el)) {
@@ -413,9 +536,25 @@ function parseCreateTable(body: string, ctx: BuildCtx): void {
         if (refCols.size >= 2) ctx.crossColumnDependency = true;
       }
       ctx.checkReferencedColumns[`${table}.check${idx}`] = [...allRefs];
+      // Review fix round 2: multiColumnCheck is the UNION of every clause's
+      // referenced columns across the whole predicate, deliberately broader
+      // than crossColumnDependency's per-atomic-clause definition above -
+      // see ProbeShape.multiColumnCheck's own doc-comment for why these must
+      // stay two separate fields, not one broadened one.
+      if (allRefs.size >= 2) ctx.multiColumnCheck = true;
+      const relevant = ctx.checkRelevantColumns.get(table) ?? new Set<string>();
+      for (const c of allRefs) relevant.add(c);
+      ctx.checkRelevantColumns.set(table, relevant);
+      if (containsTopLevelOr(predicate)) ctx.orComposition = true;
     } else {
+      const fkMatch = /^FOREIGN\s+KEY\s*\(\s*(\w+)\s*\)\s*REFERENCES\s+(\w+)\s*\(\s*(\w+)\s*\)/i.exec(el);
       ctx.fkPerTable.set(table, (ctx.fkPerTable.get(table) ?? 0) + 1);
       ctx.constraintCountByKind.fk += 1;
+      if (fkMatch) {
+        const list = ctx.fkConstraintsByTable.get(table) ?? [];
+        list.push({ fkColumn: fkMatch[1], referencedTable: fkMatch[2], referencedColumn: fkMatch[3] });
+        ctx.fkConstraintsByTable.set(table, list);
+      }
     }
   }
 }
@@ -427,35 +566,102 @@ function parseCreateIndex(body: string, ctx: BuildCtx): void {
   if (m[1]) ctx.constraintCountByKind.unique += 1;
 }
 
-function parseInsert(body: string, ctx: BuildCtx): void {
+/**
+ * Review fix round 2 (P0): `maxFkPerTable >= 2` alone can't tell "the agent
+ * violated the correctly-enforced last FK twice" apart from "the agent
+ * selectively violated an earlier one while satisfying the last" - only the
+ * latter actually distinguishes `fk-only-last-declared-constraint-registered`.
+ * `assignedValues` is this record's own column -> raw literal value text.
+ * For each of the table's FK constraints (in declaration order), a `NULL`
+ * assignment or a value present in `insertedValuesByTableColumn` for the
+ * referenced table/column counts as satisfied; anything else (including "no
+ * value assigned for this FK column at all") counts as violated. Sets
+ * `ctx.nonLastFkViolationTested` when the LAST FK is satisfied while some
+ * EARLIER FK is violated - deliberately v0-lightweight: only INSERTed
+ * values are tracked as "existing" (see `insertedValuesByTableColumn`'s own
+ * doc-comment), so this can under-detect (never over-detect) satisfaction.
+ */
+function evaluateFkSatisfaction(table: string, assignedValues: Map<string, string>, ctx: BuildCtx): void {
+  const fks = ctx.fkConstraintsByTable.get(table);
+  if (!fks || fks.length < 2) return;
+  const violated = fks.map((fk) => {
+    const value = assignedValues.get(fk.fkColumn);
+    if (value === undefined || /^NULL$/i.test(value)) return false;
+    const refSet = ctx.insertedValuesByTableColumn.get(`${fk.referencedTable}.${fk.referencedColumn}`);
+    return !(refSet?.has(value) ?? false);
+  });
+  const lastSatisfied = violated[violated.length - 1] === false;
+  const earlierViolated = violated.slice(0, -1).some((v) => v === true);
+  if (lastSatisfied && earlierViolated) ctx.nonLastFkViolationTested = true;
+}
+
+/** Records this INSERT's own values into `insertedValuesByTableColumn` (v0: INSERT-only, see that field's own doc-comment) - called after `evaluateFkSatisfaction` reads the ledger's PRIOR state, so a record never satisfies its own FK against itself. */
+function recordInsertedValues(table: string, assignedValues: Map<string, string>, ctx: BuildCtx): void {
+  for (const [column, value] of assignedValues) {
+    const key = `${table}.${column}`;
+    const set = ctx.insertedValuesByTableColumn.get(key) ?? new Set<string>();
+    set.add(value);
+    ctx.insertedValuesByTableColumn.set(key, set);
+  }
+}
+
+/** `INSERT INTO t (col, ...) VALUES (v, ...)` (explicit column list) or `INSERT INTO t VALUES (v, ...)` (positional, per SPEC.md's declared column order) -> column name -> raw literal value text. */
+function extractInsertColumnValues(body: string, table: string, ctx: BuildCtx): Map<string, string> {
+  const map = new Map<string, string>();
+  const valuesMatch = /VALUES\s*\(([\s\S]*)\)\s*$/i.exec(body);
+  if (!valuesMatch) return map;
+  const values = splitTopLevel(valuesMatch[1], commaBoundary);
+  const explicitCols = /^INSERT\s+INTO\s+\w+\s*\(([^)]*)\)/i.exec(body);
+  const cols = explicitCols ? splitTopLevel(explicitCols[1], commaBoundary) : (ctx.tableColumnOrder.get(table) ?? []);
+  for (let i = 0; i < Math.min(cols.length, values.length); i += 1) {
+    map.set(cols[i].trim(), values[i].trim());
+  }
+  return map;
+}
+
+function parseInsert(body: string, ctx: BuildCtx, expectation: "ok" | "error" | null): void {
   const m = /^INSERT\s+INTO\s+(\w+)/i.exec(body);
   if (!m) return;
+  const table = m[1];
   ctx.insertPresent = true;
-  ctx.touchedTables.add(m[1]);
+  ctx.touchedTables.add(table);
   const valuesMatch = /VALUES\s*(\([\s\S]*\))\s*$/i.exec(body);
   if (valuesMatch) {
-    const key = `${m[1]}::${valuesMatch[1].replace(/\s+/g, " ").trim()}`;
+    const key = `${table}::${valuesMatch[1].replace(/\s+/g, " ").trim()}`;
     if (ctx.seenInsertValues.has(key)) ctx.duplicateInputTested = true;
     ctx.seenInsertValues.add(key);
   }
   if (/\bNULL\b/i.test(body)) ctx.nullInputTested = true;
+
+  const assignedValues = extractInsertColumnValues(body, table, ctx);
+  if (expectation === "error") evaluateFkSatisfaction(table, assignedValues, ctx);
+  recordInsertedValues(table, assignedValues, ctx);
 }
 
-function parseUpdate(body: string, ctx: BuildCtx, updateIdx: number): void {
+function parseUpdate(body: string, ctx: BuildCtx, updateIdx: number, expectation: "ok" | "error" | null): void {
   const m = /^UPDATE\s+(\w+)\s+SET\s+([\s\S]+?)(?:\s+WHERE\s+[\s\S]+)?$/i.exec(body);
   if (!m) return;
   ctx.updatePresent = true;
   const table = m[1];
   ctx.touchedTables.add(table);
   const cols: string[] = [];
+  const assignedValues = new Map<string, string>();
   for (const assignment of splitTopLevel(m[2], commaBoundary)) {
-    const am = /^(\w+)\s*=/.exec(assignment);
-    if (am) cols.push(am[1]);
+    const am = /^(\w+)\s*=\s*([\s\S]+)$/.exec(assignment);
+    if (am) {
+      cols.push(am[1]);
+      assignedValues.set(am[1], am[2].trim());
+    }
   }
   ctx.updateAssignedColumns[`${table}.update${updateIdx}`] = cols;
   const knownCols = ctx.tableColumns.get(table);
   if (knownCols && cols.length > 0 && cols.length < knownCols.size) ctx.partialUpdate = true;
+  const checkRelevant = ctx.checkRelevantColumns.get(table);
+  if (checkRelevant && cols.length > 0 && [...checkRelevant].some((c) => !cols.includes(c))) {
+    ctx.checkReferencesUnassignedColumn = true;
+  }
   if (/\bNULL\b/i.test(body)) ctx.nullInputTested = true;
+  if (expectation === "error") evaluateFkSatisfaction(table, assignedValues, ctx);
 }
 
 function parseDelete(body: string, ctx: BuildCtx): void {
@@ -509,10 +715,10 @@ export function extractProbeShape(transcript: TranscriptLine[], sqlStatements: s
       ctx.ddlPresent = true;
       parseCreateIndex(body, ctx);
     } else if (/^INSERT\b/i.test(body)) {
-      parseInsert(body, ctx);
+      parseInsert(body, ctx, expectation);
     } else if (/^UPDATE\b/i.test(body)) {
       updateIdx += 1;
-      parseUpdate(body, ctx, updateIdx);
+      parseUpdate(body, ctx, updateIdx, expectation);
     } else if (/^DELETE\b/i.test(body)) {
       parseDelete(body, ctx);
     } else if (/^SAVEPOINT\b/i.test(body)) {
@@ -553,12 +759,16 @@ export function extractProbeShape(transcript: TranscriptLine[], sqlStatements: s
     checkTested: ctx.constraintCountByKind.check > 0,
     updateTested: ctx.updatePresent,
     crossColumnDependency: ctx.crossColumnDependency,
+    multiColumnCheck: ctx.multiColumnCheck,
+    orComposition: ctx.orComposition,
+    checkReferencesUnassignedColumn: ctx.checkReferencesUnassignedColumn,
     checkReferencedColumns: ctx.checkReferencedColumns,
     updateAssignedColumns: ctx.updateAssignedColumns,
     partialUpdate: ctx.partialUpdate,
     fkTested: ctx.constraintCountByKind.fk > 0,
     negativeFkTested,
     maxFkPerTable,
+    nonLastFkViolationTested: ctx.nonLastFkViolationTested,
     insertPresent: ctx.insertPresent,
     updatePresent: ctx.updatePresent,
     deletePresent: ctx.deletePresent,
@@ -593,9 +803,43 @@ type GapCheck = { tag: CapabilityGapTag; hasGap: (required: RequiredProbeShape, 
  * would be needed for a different "same kind, more than N" axis rather than
  * overloading this one.
  */
+/**
+ * Review fix round 2 (P0): `cross-column-dependency`'s comparator now
+ * recognizes two distinct required shapes that both belong under this same
+ * tag - `crossColumnDependency` alone (golden case A's narrow atomic-clause
+ * definition) OR the composed `multiColumnCheck`+`orComposition`+
+ * `checkReferencesUnassignedColumn` shape `check-on-update-sees-only-assigned-columns`
+ * actually needs (see PRIVATE_REQUIRED_PROBE_SHAPES's own worked example).
+ * `partialUpdate` is deliberately NOT folded in here even though that
+ * operator's required shape sets it - it's already its own independent
+ * `partial-update` tag below, so a trial missing only the partial-update
+ * piece gets exactly that tag, not a second, redundant
+ * cross-column-dependency one.
+ */
+function hasCrossColumnDependencyGap(r: RequiredProbeShape, o: ProbeShape): boolean {
+  if (r.crossColumnDependency === true && o.crossColumnDependency !== true) return true;
+  const composedFields: Array<keyof ProbeShape> = ["multiColumnCheck", "orComposition", "checkReferencesUnassignedColumn"];
+  const requiredComposedFields = composedFields.filter((field) => r[field] === true);
+  if (requiredComposedFields.length === 0) return false;
+  return requiredComposedFields.some((field) => o[field] !== true);
+}
+
+/**
+ * Review fix round 2 (P0): `minFkPerTable` (raw multiplicity) is necessary
+ * but not sufficient for `fk-only-last-declared-constraint-registered` -
+ * `nonLastFkViolationTested` is the missing "which FK did the agent
+ * actually violate" dimension (see PRIVATE_REQUIRED_PROBE_SHAPES's own
+ * comment).
+ */
+function hasSameKindMultiplicityGap(r: RequiredProbeShape, o: ProbeShape): boolean {
+  if (typeof r.minFkPerTable === "number" && (o.maxFkPerTable ?? 0) < r.minFkPerTable) return true;
+  if (r.nonLastFkViolationTested === true && o.nonLastFkViolationTested !== true) return true;
+  return false;
+}
+
 const GAP_CHECKS: GapCheck[] = [
-  { tag: "cross-column-dependency", hasGap: (r, o) => r.crossColumnDependency === true && o.crossColumnDependency !== true },
-  { tag: "same-kind-multiplicity", hasGap: (r, o) => typeof r.minFkPerTable === "number" && (o.maxFkPerTable ?? 0) < r.minFkPerTable },
+  { tag: "cross-column-dependency", hasGap: hasCrossColumnDependencyGap },
+  { tag: "same-kind-multiplicity", hasGap: hasSameKindMultiplicityGap },
   { tag: "negative-obligation", hasGap: (r, o) => r.negativeObligationTested === true && o.negativeObligationTested !== true },
   { tag: "partial-update", hasGap: (r, o) => r.partialUpdate === true && o.partialUpdate !== true },
   { tag: "multi-object-interaction", hasGap: (r, o) => r.multiObjectInteraction === true && o.multiObjectInteraction !== true },
@@ -603,7 +847,20 @@ const GAP_CHECKS: GapCheck[] = [
   { tag: "transaction-sequence", hasGap: (r, o) => r.transactionUsed === true && o.transactionUsed !== true }
 ];
 
-/** Pure diff: `Required Probe Shape - Observed Probe Shape = Capability Gap` (#174 §6). No LLM. */
+/** Outcomes whose own probe shape reflects a run that never produced trustworthy data to diagnose - see `DiagnosisStatus`'s own doc-comment. */
+const INELIGIBLE_OUTCOMES: ReadonlySet<DshTrialOutcome> = new Set(["blocked", "invalidated", "driver_error"]);
+
+/**
+ * Pure diff: `Required Probe Shape - Observed Probe Shape = Capability Gap`
+ * (#174 §6). No LLM. `capabilityGaps` is always computed as a plain function
+ * of `required`/`observed` - `diagnosisStatus` is a SEPARATE, explicit
+ * validity signal (review fix round 2, P1), not folded into
+ * `capabilityGaps` by forcing it empty when the trial is ineligible or the
+ * required shape was unavailable. Forcing gaps to `[]` in either case would
+ * just re-create the exact ambiguity `diagnosisStatus` exists to remove - a
+ * consumer must check `diagnosisStatus`, not infer validity from whether
+ * `capabilityGaps` happens to be empty.
+ */
 export function diagnoseTrial(
   observed: ProbeShape,
   required: RequiredProbeShape,
@@ -611,6 +868,11 @@ export function diagnoseTrial(
   evidence: Evidence[]
 ): TrialDiagnosis {
   const capabilityGaps = GAP_CHECKS.filter((check) => check.hasGap(required, observed)).map((check) => check.tag);
+  const diagnosisStatus: DiagnosisStatus = INELIGIBLE_OUTCOMES.has(trial.outcome)
+    ? "ineligible"
+    : evidence.some((e) => e.kind === "required-shape-unavailable")
+      ? "required_shape_unavailable"
+      : "complete";
   return {
     trialId: trial.trialId,
     outcome: trial.outcome,
@@ -618,7 +880,8 @@ export function diagnoseTrial(
     observedProbeShapes: observed,
     requiredProbeShapes: required,
     capabilityGaps,
-    evidence
+    evidence,
+    diagnosisStatus
   };
 }
 
@@ -641,6 +904,7 @@ export type TrialDiagnosisFile = {
   required_probe_shapes: RequiredProbeShape;
   capability_gaps: CapabilityGapTag[];
   evidence: Evidence[];
+  diagnosis_status: DiagnosisStatus;
 };
 
 export function encodeTrialDiagnosis(diagnosis: TrialDiagnosis): TrialDiagnosisFile {
@@ -651,9 +915,12 @@ export function encodeTrialDiagnosis(diagnosis: TrialDiagnosis): TrialDiagnosisF
     observed_probe_shapes: diagnosis.observedProbeShapes,
     required_probe_shapes: diagnosis.requiredProbeShapes,
     capability_gaps: diagnosis.capabilityGaps,
-    evidence: diagnosis.evidence
+    evidence: diagnosis.evidence,
+    diagnosis_status: diagnosis.diagnosisStatus
   };
 }
+
+const DIAGNOSIS_STATUSES: ReadonlySet<string> = new Set<DiagnosisStatus>(["complete", "required_shape_unavailable", "ineligible"]);
 
 /** Defensive decode of a `trial-diagnosis.json` payload of unknown provenance (age, hand-editing, a future schema change) - `null` for anything that doesn't match the expected shape, rather than an exception or a half-populated `TrialDiagnosis`. */
 export function decodeTrialDiagnosis(raw: unknown): TrialDiagnosis | null {
@@ -668,7 +935,9 @@ export function decodeTrialDiagnosis(raw: unknown): TrialDiagnosis | null {
     typeof r.observed_probe_shapes !== "object" ||
     r.observed_probe_shapes === null ||
     typeof r.required_probe_shapes !== "object" ||
-    r.required_probe_shapes === null
+    r.required_probe_shapes === null ||
+    typeof r.diagnosis_status !== "string" ||
+    !DIAGNOSIS_STATUSES.has(r.diagnosis_status)
   ) {
     return null;
   }
@@ -679,6 +948,7 @@ export function decodeTrialDiagnosis(raw: unknown): TrialDiagnosis | null {
     observedProbeShapes: r.observed_probe_shapes as Partial<ProbeShape>,
     requiredProbeShapes: r.required_probe_shapes as RequiredProbeShape,
     capabilityGaps: r.capability_gaps as CapabilityGapTag[],
-    evidence: r.evidence as Evidence[]
+    evidence: r.evidence as Evidence[],
+    diagnosisStatus: r.diagnosis_status
   };
 }

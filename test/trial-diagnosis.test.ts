@@ -170,7 +170,7 @@ test("extractProbeShape: an OR of two parenthesized per-column groups stays per-
 
 test("lookupRequiredProbeShape: a known operator returns its configured shape with no evidence", () => {
   const { shape, evidence } = lookupRequiredProbeShape("fk-only-last-declared-constraint-registered");
-  assert.deepEqual(shape, { minFkPerTable: 2 });
+  assert.deepEqual(shape, { minFkPerTable: 2, nonLastFkViolationTested: true });
   assert.deepEqual(evidence, []);
 });
 
@@ -181,9 +181,17 @@ test("lookupRequiredProbeShape: an unconfigured operator returns an empty shape 
   assert.equal(evidence[0].kind, "required-shape-unavailable");
 });
 
-test("PRIVATE_REQUIRED_PROBE_SHAPES: seeded with the two real operators that motivated #174", () => {
-  assert.deepEqual(PRIVATE_REQUIRED_PROBE_SHAPES["fk-only-last-declared-constraint-registered"], { minFkPerTable: 2 });
-  assert.deepEqual(PRIVATE_REQUIRED_PROBE_SHAPES["check-on-update-sees-only-assigned-columns"], { crossColumnDependency: true });
+test("PRIVATE_REQUIRED_PROBE_SHAPES: seeded with the two real operators that motivated #174, review round 2's richer shapes", () => {
+  assert.deepEqual(PRIVATE_REQUIRED_PROBE_SHAPES["fk-only-last-declared-constraint-registered"], {
+    minFkPerTable: 2,
+    nonLastFkViolationTested: true
+  });
+  assert.deepEqual(PRIVATE_REQUIRED_PROBE_SHAPES["check-on-update-sees-only-assigned-columns"], {
+    multiColumnCheck: true,
+    orComposition: true,
+    checkReferencesUnassignedColumn: true,
+    partialUpdate: true
+  });
 });
 
 test("diagnoseTrial: an unconfigured operator's diagnosis never claims a clean pass - capabilityGaps is empty but evidence flags it as unchecked", () => {
@@ -298,4 +306,192 @@ test("round trip: an unconfigured operator's diagnosis renders as unknown, not a
   });
   assert.match(report, /unknown - no required probe shape configured/);
   assert.doesNotMatch(report, /Capability gaps: none/);
+});
+
+// --- review round 2: RequiredProbeShape must describe a genuinely
+// discriminating test shape, not just "the feature absent in one historical
+// miss". Acceptance principle for every configured operator: a known
+// killing workload -> extractProbeShape() satisfies that operator's
+// RequiredProbeShape -> no capability gap; a known non-killing/historical
+// miss workload still produces the gap. -----------------------------------
+
+const CHECK_ON_UPDATE_REQUIRED = PRIVATE_REQUIRED_PROBE_SHAPES["check-on-update-sees-only-assigned-columns"];
+const FK_ONLY_LAST_REQUIRED = PRIVATE_REQUIRED_PROBE_SHAPES["fk-only-last-declared-constraint-registered"];
+
+test("extractProbeShape: an OR-CHECK across 2 columns plus a partial UPDATE leaving one referenced column unassigned sets all three composed signals", () => {
+  const sqlStatements = [
+    record("statement ok", "CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a > 10 OR b > 10))"),
+    record("statement ok", "INSERT INTO t VALUES (5, 20)"),
+    record("statement error", "UPDATE t SET b = 5 WHERE a = 5")
+  ];
+  const observed = extractProbeShape(NO_TRANSCRIPT, sqlStatements);
+  assert.equal(observed.multiColumnCheck, true);
+  assert.equal(observed.orComposition, true);
+  assert.equal(observed.checkReferencesUnassignedColumn, true);
+  assert.equal(observed.partialUpdate, true);
+});
+
+test("check-on-update-sees-only-assigned-columns: the real killing workload from mutate.py's own notes satisfies the operator's required shape - no capability gap", () => {
+  const sqlStatements = [
+    record("statement ok", "CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a > 10 OR b > 10))"),
+    record("statement ok", "INSERT INTO t VALUES (5, 20)"),
+    record("statement error", "UPDATE t SET b = 5 WHERE a = 5")
+  ];
+  const observed = extractProbeShape(NO_TRANSCRIPT, sqlStatements);
+  const diagnosis = diagnoseTrial(
+    observed,
+    CHECK_ON_UPDATE_REQUIRED,
+    { trialId: "check-on-update-kill", outcome: "task_failed", feature: "check-on-update-sees-only-assigned-columns" },
+    []
+  );
+  assert.deepEqual(diagnosis.capabilityGaps, []);
+});
+
+test("check-on-update-sees-only-assigned-columns: the historical golden-case-A-shaped non-killing workload still produces a gap against the real operator's required shape", () => {
+  // Every CHECK is a separate, single-column constraint (not an OR-composed
+  // multi-column one) - the #170-shaped miss this operator was filed over.
+  const sqlStatements = [
+    record("statement ok", "CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a > 10), CHECK (b > 10))"),
+    record("statement ok", "INSERT INTO t (a, b) VALUES (11, 11)"),
+    record("statement ok", "UPDATE t SET a = 12 WHERE a = 11")
+  ];
+  const observed = extractProbeShape(NO_TRANSCRIPT, sqlStatements);
+  const diagnosis = diagnoseTrial(
+    observed,
+    CHECK_ON_UPDATE_REQUIRED,
+    { trialId: "check-on-update-miss", outcome: "task_failed", feature: "check-on-update-sees-only-assigned-columns" },
+    []
+  );
+  assert.ok(diagnosis.capabilityGaps.includes("cross-column-dependency"));
+});
+
+test("extractProbeShape: an AND-only multi-column CHECK plus a partial UPDATE does NOT set orComposition - AND short-circuits correctly even under the mutant", () => {
+  const sqlStatements = [
+    record("statement ok", "CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a > 10 AND b > 10))"),
+    record("statement ok", "INSERT INTO t VALUES (20, 20)"),
+    record("statement error", "UPDATE t SET a = 5 WHERE a = 20")
+  ];
+  const observed = extractProbeShape(NO_TRANSCRIPT, sqlStatements);
+  assert.equal(observed.multiColumnCheck, true);
+  assert.equal(observed.orComposition, false);
+});
+
+test("extractProbeShape: nonLastFkViolationTested stays false when only the last declared FK is violated (2 FKs, non-discriminating workload)", () => {
+  const sqlStatements = [
+    record("statement ok", "CREATE TABLE dept (id INTEGER)"),
+    record("statement ok", "CREATE TABLE dept2 (id INTEGER)"),
+    record(
+      "statement ok",
+      "CREATE TABLE emp (id INTEGER, dept_id INTEGER, dept2_id INTEGER, FOREIGN KEY (dept_id) REFERENCES dept (id), FOREIGN KEY (dept2_id) REFERENCES dept2 (id))"
+    ),
+    record("statement ok", "INSERT INTO dept (id) VALUES (1)"),
+    record("statement ok", "INSERT INTO dept2 (id) VALUES (1)"),
+    // Violates only the LAST FK (dept2_id) - dept_id (earlier) is satisfied.
+    record("statement error", "INSERT INTO emp (id, dept_id, dept2_id) VALUES (1, 1, 999)")
+  ];
+  const observed = extractProbeShape(NO_TRANSCRIPT, sqlStatements);
+  assert.equal(observed.maxFkPerTable, 2);
+  assert.equal(observed.nonLastFkViolationTested, false);
+});
+
+test("extractProbeShape: nonLastFkViolationTested is true when an earlier FK is violated while the last is satisfied (discriminating workload)", () => {
+  const sqlStatements = [
+    record("statement ok", "CREATE TABLE dept (id INTEGER)"),
+    record("statement ok", "CREATE TABLE dept2 (id INTEGER)"),
+    record(
+      "statement ok",
+      "CREATE TABLE emp (id INTEGER, dept_id INTEGER, dept2_id INTEGER, FOREIGN KEY (dept_id) REFERENCES dept (id), FOREIGN KEY (dept2_id) REFERENCES dept2 (id))"
+    ),
+    record("statement ok", "INSERT INTO dept (id) VALUES (1)"),
+    record("statement ok", "INSERT INTO dept2 (id) VALUES (1)"),
+    // Violates the EARLIER FK (dept_id) while satisfying the LAST (dept2_id).
+    record("statement error", "INSERT INTO emp (id, dept_id, dept2_id) VALUES (1, 999, 1)")
+  ];
+  const observed = extractProbeShape(NO_TRANSCRIPT, sqlStatements);
+  assert.equal(observed.maxFkPerTable, 2);
+  assert.equal(observed.nonLastFkViolationTested, true);
+});
+
+test("fk-only-last-declared-constraint-registered: a two-FK workload that only violates the last FK still produces a gap - minFkPerTable alone is not sufficient", () => {
+  const sqlStatements = [
+    record("statement ok", "CREATE TABLE dept (id INTEGER)"),
+    record("statement ok", "CREATE TABLE dept2 (id INTEGER)"),
+    record(
+      "statement ok",
+      "CREATE TABLE emp (id INTEGER, dept_id INTEGER, dept2_id INTEGER, FOREIGN KEY (dept_id) REFERENCES dept (id), FOREIGN KEY (dept2_id) REFERENCES dept2 (id))"
+    ),
+    record("statement ok", "INSERT INTO dept (id) VALUES (1)"),
+    record("statement ok", "INSERT INTO dept2 (id) VALUES (1)"),
+    record("statement error", "INSERT INTO emp (id, dept_id, dept2_id) VALUES (1, 1, 999)")
+  ];
+  const observed = extractProbeShape(NO_TRANSCRIPT, sqlStatements);
+  const diagnosis = diagnoseTrial(
+    observed,
+    FK_ONLY_LAST_REQUIRED,
+    { trialId: "fk-non-discriminating", outcome: "task_failed", feature: "fk-only-last-declared-constraint-registered" },
+    []
+  );
+  assert.deepEqual(diagnosis.capabilityGaps, ["same-kind-multiplicity"]);
+});
+
+test("fk-only-last-declared-constraint-registered: a discriminating workload (violate an earlier FK, satisfy the last) satisfies the required shape - no gap", () => {
+  const sqlStatements = [
+    record("statement ok", "CREATE TABLE dept (id INTEGER)"),
+    record("statement ok", "CREATE TABLE dept2 (id INTEGER)"),
+    record(
+      "statement ok",
+      "CREATE TABLE emp (id INTEGER, dept_id INTEGER, dept2_id INTEGER, FOREIGN KEY (dept_id) REFERENCES dept (id), FOREIGN KEY (dept2_id) REFERENCES dept2 (id))"
+    ),
+    record("statement ok", "INSERT INTO dept (id) VALUES (1)"),
+    record("statement ok", "INSERT INTO dept2 (id) VALUES (1)"),
+    record("statement error", "INSERT INTO emp (id, dept_id, dept2_id) VALUES (1, 999, 1)")
+  ];
+  const observed = extractProbeShape(NO_TRANSCRIPT, sqlStatements);
+  const diagnosis = diagnoseTrial(
+    observed,
+    FK_ONLY_LAST_REQUIRED,
+    { trialId: "fk-discriminating", outcome: "task_failed", feature: "fk-only-last-declared-constraint-registered" },
+    []
+  );
+  assert.deepEqual(diagnosis.capabilityGaps, []);
+});
+
+// --- review round 2: diagnosisStatus is a first-class validity signal ------
+
+test("diagnoseTrial: diagnosisStatus is 'complete' for a normal, configured, trustworthy diagnosis", () => {
+  const observed = extractProbeShape(NO_TRANSCRIPT, [record("statement ok", "CREATE TABLE t (a INTEGER)")]);
+  const diagnosis = diagnoseTrial(observed, {}, { trialId: "t1", outcome: "passed", feature: "none" }, []);
+  assert.equal(diagnosis.diagnosisStatus, "complete");
+});
+
+test("diagnoseTrial: diagnosisStatus is 'required_shape_unavailable' when lookupRequiredProbeShape found no registry entry", () => {
+  const observed = extractProbeShape(NO_TRANSCRIPT, [record("statement ok", "CREATE TABLE t (a INTEGER)")]);
+  const { shape, evidence } = lookupRequiredProbeShape("nobody-configured-this-one");
+  const diagnosis = diagnoseTrial(observed, shape, { trialId: "t2", outcome: "passed", feature: "x" }, evidence);
+  assert.equal(diagnosis.diagnosisStatus, "required_shape_unavailable");
+});
+
+for (const outcome of ["blocked", "invalidated", "driver_error"] as const) {
+  test(`diagnoseTrial: diagnosisStatus is 'ineligible' for outcome "${outcome}" - its observed shape is not trustworthy evidence`, () => {
+    const observed = extractProbeShape(NO_TRANSCRIPT, [record("statement ok", "CREATE TABLE t (a INTEGER)")]);
+    const diagnosis = diagnoseTrial(observed, { crossColumnDependency: true }, { trialId: "t3", outcome, feature: "x" }, []);
+    assert.equal(diagnosis.diagnosisStatus, "ineligible");
+  });
+}
+
+test("encodeTrialDiagnosis/decodeTrialDiagnosis: diagnosisStatus round-trips as snake_case diagnosis_status", () => {
+  const observed = extractProbeShape(NO_TRANSCRIPT, [record("statement ok", "CREATE TABLE t (a INTEGER)")]);
+  const diagnosis = diagnoseTrial(observed, {}, { trialId: "rt2", outcome: "passed", feature: "x" }, []);
+  const onDisk = JSON.parse(JSON.stringify(encodeTrialDiagnosis(diagnosis)));
+  assert.equal(onDisk.diagnosis_status, "complete");
+  assert.equal(onDisk.diagnosisStatus, undefined);
+  const decoded = decodeTrialDiagnosis(onDisk);
+  assert.deepEqual(decoded, diagnosis);
+});
+
+test("decodeTrialDiagnosis: rejects a payload with a malformed diagnosis_status", () => {
+  const observed = extractProbeShape(NO_TRANSCRIPT, [record("statement ok", "CREATE TABLE t (a INTEGER)")]);
+  const diagnosis = diagnoseTrial(observed, {}, { trialId: "rt3", outcome: "passed", feature: "x" }, []);
+  const onDisk = { ...JSON.parse(JSON.stringify(encodeTrialDiagnosis(diagnosis))), diagnosis_status: "not-a-real-status" };
+  assert.equal(decodeTrialDiagnosis(onDisk), null);
 });
