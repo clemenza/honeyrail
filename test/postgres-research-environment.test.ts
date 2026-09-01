@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -590,7 +590,7 @@ test("re-materializing an earlier ref over a later snapshot leaves no file from 
   assert.deepEqual(leftovers, [], "staging directories and tarballs must not survive a successful publish");
 });
 
-test("a failed materialization publishes nothing and leaves an existing snapshot untouched", async (t) => {
+test("a failed extraction publishes nothing and leaves an existing snapshot untouched", async (t) => {
   if (await skipWithoutToolchain(t)) return;
   const fixture = await withFixture(t);
   const brokenTar: typeof runCommandSafe = async (command, args, options) => {
@@ -621,6 +621,37 @@ test("a failed materialization publishes nothing and leaves an existing snapshot
   );
   assert.equal(await exists(join(existing, fixture.repo.laterFile)), true, "the previous snapshot must be left intact");
   assert.equal(before.sourceDir, existing);
+});
+
+test("a failure at the publish rename rolls the previous snapshot back into place", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  const fixture = await withFixture(t);
+  const dest = join(fixture.tempDir, "rollback-snapshot");
+
+  const before = await materializePostgresSource({ repoPath: fixture.repo.repoPath, ref: fixture.repo.laterRef }, dest);
+  assert.equal(await exists(join(dest, fixture.repo.laterFile)), true);
+
+  // The stage the extraction test cannot reach: the swap itself. Publishing a
+  // directory is two renames, not one atomic operation, so the interesting
+  // failure is the one that happens after the old snapshot has moved aside.
+  const failingPublish: typeof rename = async (from, to) => {
+    if (String(to) === dest && String(from).includes(".staging-")) throw new Error("injected publish failure");
+    return rename(from, to);
+  };
+
+  await assert.rejects(
+    materializePostgresSource({ repoPath: fixture.repo.repoPath, ref: fixture.repo.ref }, dest, {
+      publishRename: failingPublish
+    }),
+    /injected publish failure/
+  );
+
+  // Rolled back, not lost: the destination is the previous snapshot, whole.
+  assert.equal(await exists(join(dest, fixture.repo.laterFile)), true, "the previous snapshot was not restored");
+  assert.equal(await exists(join(dest, "configure")), true);
+  assert.equal(before.sourceDir, dest);
+  const leftovers = (await readdir(fixture.tempDir)).filter((name) => name.startsWith("rollback-snapshot."));
+  assert.deepEqual(leftovers, [], "staging, tarball and backup paths must not survive a failed publish");
 });
 
 // --- SHOULD FIX 4: bounded recovery from the allocatePort() TOCTOU window --

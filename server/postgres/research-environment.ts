@@ -27,17 +27,24 @@ import {
  * canonical reproducer) is ever derived from or written by this module. The
  * only thing that varies between "buggy" and "fixed" is the caller's `ref`.
  *
- * The eval boundary is a filesystem split, not a naming convention:
+ * This module lays out the trees; it does not confine anything:
  *
- *   <root>                  agent-visible: source/, pgdata/, postgres.log
+ *   <root>                  research surface: source/, pgdata/, postgres.log
  *   <root>-private          grader-only: build logs (configure/make)
- *   <cacheRoot>/<entryId>   agent-visible (it is on PATH): built binaries
- *                           plus one non-identifying completion marker
+ *   <cacheRoot>/<entryId>   grader-only: built binaries plus a completion
+ *                           marker; an agent is shown a per-trial view of it
  *
  * Source ref, resolved commit, source tree hash and build cache key are
  * written into none of those. They live only in the manifests
  * materializePostgresSource()/buildPostgres() return, which the caller
  * records on the grader side.
+ *
+ * That is minimization, not enforcement: a process running as the same OS
+ * user could read any of it. The boundary that actually holds is the
+ * container ./agent-container.ts launches an agent in, which bind-mounts the
+ * research surface and nothing else. Callers driving this module directly
+ * (the `postgres-research` executor, tests, scripts) are grader-side code and
+ * are trusted with all of it.
  */
 
 /** Bumped when the build recipe itself changes; participates in the cache key. */
@@ -46,10 +53,10 @@ export const BUILD_PROFILE_VERSION = "pg-research-env-v1";
 /**
  * The only file HoneyRail writes into a cache entry. It exists so an
  * interrupted build is never mistaken for a usable one, and it says nothing
- * else: the entry sits on the agent-visible side of the boundary
- * (`HR_PG_BIN_DIR` points into it), so it must not carry source ref, commit,
- * tree hash or cache key. It replaces v0's `honeyrail-build.json`, which
- * carried all four.
+ * else. It carries the `entryId`, which is deterministic, so
+ * agent-container.ts's createBuildView() deliberately leaves it out of the
+ * view an agent sees. It replaces v0's `honeyrail-build.json`, which carried
+ * source ref, commit, tree hash and cache key as well.
  */
 export const BUILD_COMPLETE_MARKER = "honeyrail-build-complete.json";
 export const BUILD_COMPLETE_MARKER_ID = "honeyrail-pg-build-complete";
@@ -422,14 +429,16 @@ export function computeBuildCacheKey(input: BuildCacheKeyInput): string {
 }
 
 /**
- * The cache entry's directory name.
+ * The cache entry's directory name: a domain-separated one-way digest of the
+ * cache key rather than the key itself, so a grader-side directory listing
+ * does not double as a list of the sources under research.
  *
- * A separate, domain-separated one-way digest of the cache key rather than
- * the cache key itself: `HR_PG_BIN_DIR` is agent-visible, so if the entry
- * were named by the key the agent could read a stable identifier of the
- * source it is supposed to be rediscovering straight off its own PATH. The
- * mapping only runs forwards - HoneyRail knows key -> entry id, the agent
- * cannot go back.
+ * It is deterministic and unkeyed, and therefore *not* a secret: an agent
+ * with a bounded candidate set of refs could recompute candidate entry ids
+ * and match one. That is why it is never exposed to an agent at all - not on
+ * a path, not in the environment, and not through the container's mount
+ * table; see agent-container.ts's createBuildView(). Hashing it again would
+ * not have helped.
  */
 export function computeBuildEntryId(cacheKey: string): string {
   return createHash("sha256").update(`honeyrail-pg-build-entry ${cacheKey}`).digest("hex").slice(0, 32);
@@ -443,18 +452,36 @@ export function computeBuildEntryId(cacheKey: string): string {
  * commit.
  *
  * `destDir` is *published*, not filled in place: the tree is extracted into
- * a fresh sibling staging directory, checked, and only then renamed over any
- * previous content. `tar -x` overlays rather than replaces, so extracting
- * into a non-empty destination would let a file that exists only in a later
- * ref (in historical mode: the fix) survive into a snapshot of an earlier
- * one. Publishing atomically also means a failed materialization leaves
- * either the previous snapshot or nothing - never a half-extracted tree that
- * looks like an exact snapshot.
+ * a fresh sibling staging directory, checked, and only then swapped into
+ * place. `tar -x` overlays rather than replaces, so extracting into a
+ * non-empty destination would let a file that exists only in a later ref (in
+ * historical mode: the fix) survive into a snapshot of an earlier one.
+ *
+ * The swap is rollback-safe rather than atomic - POSIX has no atomic
+ * directory replacement, and claiming one would be a lie. An existing
+ * snapshot is renamed aside to a random sibling backup first, so the failure
+ * modes are:
+ *
+ *   extraction/validation fails -> nothing is touched; the old snapshot stands
+ *   publish rename fails        -> the backup is renamed back into place
+ *   publish rename succeeds     -> the backup is removed
+ *
+ * Staging directory, tarball and backup are cleaned up on every path. All
+ * three are siblings of `destDir`, so no rename ever crosses a filesystem.
  */
 export async function materializePostgresSource(
   spec: PostgresSourceSpec,
   destDir: string,
-  options: { runCommand?: RunCommand; timeout?: number } = {}
+  options: {
+    runCommand?: RunCommand;
+    timeout?: number;
+    /**
+     * Test seam: the filesystem primitive the publish/rollback sequence uses.
+     * Overridden only to inject a deterministic failure at the rename itself,
+     * which is otherwise unreachable from a test.
+     */
+    publishRename?: typeof rename;
+  } = {}
 ): Promise<PostgresSourceManifest> {
   const runCommand = options.runCommand ?? runCommandSafe;
   const timeout = options.timeout ?? DEFAULT_TIMEOUTS.git;
@@ -486,6 +513,10 @@ export async function materializePostgresSource(
   const suffix = randomBytes(6).toString("hex");
   const staging = `${destDir}.staging-${suffix}`;
   const tarPath = `${destDir}.tar-${suffix}`;
+  const backup = `${destDir}.backup-${suffix}`;
+  const publishRename = options.publishRename ?? rename;
+  let backedUp = false;
+  let keepBackup = false;
   try {
     await mkdir(staging, { recursive: true });
     const archive = await runCommand("git", ["-C", repoPath, "archive", "--format=tar", "-o", tarPath, resolvedCommit], {
@@ -506,16 +537,34 @@ export async function materializePostgresSource(
       throw new PostgresResearchError(`Materialized source snapshot unexpectedly contains a .git directory: ${destDir}`);
     }
 
-    // Publish. The old tree is removed first because rename() onto a
-    // non-empty directory fails; the window between the two is the price of
-    // not needing a second filesystem.
-    await rm(destDir, { recursive: true, force: true });
-    await rename(staging, destDir);
+    // Publish. rename() onto a non-empty directory fails, so any existing
+    // snapshot has to move out of the way first - moved aside, not deleted,
+    // so the window between the two steps is recoverable.
+    if (await pathExists(destDir)) {
+      await publishRename(destDir, backup);
+      backedUp = true;
+    }
+    try {
+      await publishRename(staging, destDir);
+    } catch (error) {
+      if (backedUp) {
+        try {
+          await publishRename(backup, destDir);
+          backedUp = false;
+        } catch {
+          // Both renames failed: the previous snapshot is still intact under
+          // `backup`, so keep it rather than deleting the only copy.
+          keepBackup = true;
+        }
+      }
+      throw error;
+    }
   } catch (error) {
     await rm(staging, { recursive: true, force: true });
     throw error;
   } finally {
     await rm(tarPath, { force: true });
+    if (backedUp && !keepBackup) await rm(backup, { recursive: true, force: true });
   }
 
   return {
@@ -590,8 +639,8 @@ export type BuildPostgresInput = {
  * Nothing identifying is written into the cache tree: the entry directory is
  * named by the one-way entry id and the marker file says only "this build
  * finished". The full provenance lives in the manifest this returns, which
- * the caller records grader-side. `HR_PG_BIN_DIR` points inside this tree,
- * so anything written here is agent-readable by construction.
+ * the caller records grader-side. The tree itself stays grader-side; an agent
+ * is shown a per-trial view of it (see agent-container.ts).
  */
 export async function buildPostgres(input: BuildPostgresInput): Promise<PostgresBuildManifest> {
   const runCommand = input.runCommand ?? runCommandSafe;
@@ -721,10 +770,10 @@ export async function buildPostgres(input: BuildPostgresInput): Promise<Postgres
 
 export class PostgresResearchEnvironment {
   /**
-   * The agent-visible root. `source/`, `pgdata/` and `postgres.log` are the
-   * only things in it, and every path agentEnvironment() hands out is inside
-   * it (or inside the shared build cache, which is identity-free by
-   * construction - see buildPostgres()).
+   * The research surface: `source/`, `pgdata/`, `postgres.log`, and the
+   * agent's own `agent-work/` scratch directory. These are the only host
+   * directories an isolated agent ever gets mounted (plus its socket
+   * directory and a view of the build).
    */
   readonly root: string;
   /** Grader-private sibling of `root`: build logs. Never handed to an agent. */
@@ -847,29 +896,17 @@ export class PostgresResearchEnvironment {
   }
 
   /**
-   * Flat KEY=value view of connectionInfo() for handing to a subprocess -
-   * the environment `runAgentInPostgresResearchEnvironment()` merges into an
-   * agent process, and the shape a driver passes to `agent-task`'s
-   * `input.environment`.
+   * Flat KEY=value view of connectionInfo(), in **host** paths.
    *
-   * The eval-isolation contract is a filesystem contract, not just an
-   * omission from this map:
+   * This is the map for a caller driving the environment itself, and the one
+   * the explicitly-unisolated development mode exports. It carries no ref, no
+   * commit, no source hash and no cache key, and the snapshot it points at
+   * has no `.git` - but every value is a real host path, so it is not what an
+   * isolated agent gets. That is agent-container.ts's
+   * containerAgentEnvironment(), which returns the in-container paths.
    *
-   * - every path here is inside `root` (the agent-visible root, which holds
-   *   the snapshot, PGDATA and the server log and nothing else) or inside
-   *   the shared build cache entry, whose directory name is the one-way
-   *   `entryId` and whose only HoneyRail file is a completion marker;
-   * - source ref, resolved commit, source tree hash and cache key are
-   *   written *nowhere* under either of those trees - they exist only in the
-   *   manifests the caller records grader-side;
-   * - the snapshot has no `.git`, so the ref cannot be recovered from the
-   *   tree either.
-   *
-   * What it does not do is sandbox the agent: a process with unrestricted
-   * filesystem access and knowledge of where HoneyRail keeps its attachments
-   * can still read them. Keeping the private tree out of reach is the
-   * caller's job (see runAgentInPostgresResearchEnvironment, which does not
-   * export any attachment path).
+   * Handing these values to an unconfined process is minimization, not a
+   * boundary: such a process can read anything its OS user can.
    */
   agentEnvironment(prefix = "HR_PG"): Record<string, string> {
     const info = this.connectionInfo();
@@ -964,6 +1001,15 @@ export class PostgresResearchEnvironment {
     }
     this.running = true;
     this.record("cluster.started", { port: this.port, socketDir: this.socketDir }, Date.now() - started);
+    if (this.closed) {
+      // cleanup() ran while this start was still in flight - the session
+      // timeout arm does exactly that. Its data directory is already gone, so
+      // the server that just came up would be orphaned against a deleted
+      // PGDATA; stop it and fail rather than report a ready cluster.
+      await this.stop("immediate").catch(() => {});
+      this.running = false;
+      throw new PostgresResearchError("PostgreSQL research environment was cleaned up while it was starting");
+    }
     return this.waitReady();
   }
 

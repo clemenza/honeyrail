@@ -5,13 +5,24 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 
 import { PostgresResearchError, type PostgresResearchSpec } from "../server/postgres/research-environment.js";
-import { runAgentInPostgresResearchEnvironment } from "../server/postgres/research-session.js";
+import {
+  runAgentInPostgresResearchEnvironment,
+  type PostgresResearchSessionOptions
+} from "../server/postgres/research-session.js";
 import { createSyntheticPostgresSourceRepo, hasFixtureToolchain, type SyntheticPostgresSourceRepo } from "./helpers/postgres-source-fixture.js";
 
 // SHOULD FIX 3 (#179 review): the one supported composition where an agent
 // drives a *live* research PostgreSQL. Everything runs against the synthetic
 // source fixture, and the "agent" is a shell script - what is under test is
 // the lifecycle, not any real agent CLI.
+//
+// These tests are about lifecycle and teardown ordering, not about the
+// agent-execution boundary, so they deliberately opt out of isolation with
+// `allowUnisolatedForDevelopment` and run the agent as a host process. The
+// boundary itself is tested through the real container launch in
+// test/postgres-research-isolation.test.ts.
+
+const DEV_MODE: PostgresResearchSessionOptions = { isolation: { allowUnisolatedForDevelopment: true } };
 
 async function exists(path: string) {
   return Boolean(await stat(path).catch(() => null));
@@ -73,7 +84,7 @@ test("an agent process receives the dynamic coordinates and queries the live clu
   );
 
   const spec = specFor(fixture, "live");
-  const session = await runAgentInPostgresResearchEnvironment(spec, { command: agentPath, timeoutMs: 60_000 });
+  const session = await runAgentInPostgresResearchEnvironment(spec, { command: agentPath, timeoutMs: 60_000 }, DEV_MODE);
 
   // 1. It ran against a live server, with runtime-only coordinates.
   assert.equal(session.agent.ok, true, `agent failed: ${session.agent.stderr}`);
@@ -83,6 +94,10 @@ test("an agent process receives the dynamic coordinates and queries the live clu
   assert.equal(session.agentEnvironment.HR_PG_PORT, String(session.connection.port));
   assert.equal(session.agentEnvironment.HR_PG_SOURCE_DIR, join(spec.root, "source"));
   assert.equal(session.agent.cwd, spec.root, "the agent runs inside the agent-visible root by default");
+  // ...and the result says plainly that this ran without a boundary.
+  assert.equal(session.isolation.mode, "unisolated-development");
+  assert.equal(session.isolation.isolated, false);
+  assert.match(session.isolation.warning!, /not a scored trial/);
 
   // 2. Cleanup happened, and strictly after the agent's last action.
   const finishedAt = (await readFile(join(spec.root, "agent-finished"), "utf8")).trim();
@@ -111,7 +126,7 @@ test("an agent that exits non-zero is an observation, and the environment is sti
   const agentPath = await writeAgent(fixture, "agent-failure.sh", ['echo "starting"', 'echo "boom" >&2', "exit 3", ""].join("\n"));
 
   const spec = specFor(fixture, "failing");
-  const session = await runAgentInPostgresResearchEnvironment(spec, { command: agentPath, timeoutMs: 60_000 });
+  const session = await runAgentInPostgresResearchEnvironment(spec, { command: agentPath, timeoutMs: 60_000 }, DEV_MODE);
 
   // A failed agent is a trial outcome, not an environment failure - the same
   // rule psql() follows for a failing statement.
@@ -132,7 +147,10 @@ test("an agent that hangs is killed at its timeout and the environment is torn d
 
   const spec = specFor(fixture, "hanging");
   const started = Date.now();
-  const session = await runAgentInPostgresResearchEnvironment(spec, { command: agentPath, timeoutMs: 750 });
+  // Wide enough that a loaded machine still schedules the agent's first echo
+  // before the kill lands - the assertion below is about output survival, not
+  // about how tight the timeout can be - and far below the 60s sleep.
+  const session = await runAgentInPostgresResearchEnvironment(spec, { command: agentPath, timeoutMs: 5000 }, DEV_MODE);
 
   assert.equal(session.agent.timedOut, true);
   assert.equal(session.agent.ok, false);
@@ -152,13 +170,13 @@ test("an unrunnable agent command fails loudly and still cleans up", async (t) =
   const spec = specFor(fixture, "missing-agent");
 
   await assert.rejects(
-    runAgentInPostgresResearchEnvironment(spec, { command: join(fixture.tempDir, "does-not-exist.sh") }),
+    runAgentInPostgresResearchEnvironment(spec, { command: join(fixture.tempDir, "does-not-exist.sh") }, DEV_MODE),
     (error: Error) => error instanceof PostgresResearchError && /Could not run research agent/.test(error.message)
   );
   assert.equal(await exists(join(spec.root, "pgdata")), false, "cleanup runs on the error path too");
 
   await assert.rejects(
-    runAgentInPostgresResearchEnvironment(spec, { command: "  " }),
+    runAgentInPostgresResearchEnvironment(spec, { command: "  " }, DEV_MODE),
     (error: Error) => error instanceof PostgresResearchError && /requires a command/.test(error.message)
   );
 });

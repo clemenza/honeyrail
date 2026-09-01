@@ -24,11 +24,14 @@ import { ConfigError, type ExecutionHandle, type ExecutionState, type Executor, 
  * for - "buggy" and "fixed" differ only by input.source.ref.
  *
  * Everything it writes lands under attachmentRoot (operator/grader side) and
- * carries the full provenance a grader needs. The environment's own
- * agent-visible root deliberately does *not* live under attachmentRoot: it
- * is created under agentEnvRoot() so that no `..` walk from a path in
- * agentEnvironment() arrives at the manifests below. See the eval-isolation
- * contract on PostgresResearchEnvironment.agentEnvironment().
+ * carries the full provenance a grader needs. The environment's own research
+ * root deliberately does *not* live under attachmentRoot: it is created under
+ * agentEnvRoot(), keeping the two hierarchies disjoint.
+ *
+ * No agent runs in this step - it is grader-side code driving an environment,
+ * with the whole host to itself. The isolated agent path is
+ * runAgentInPostgresResearchEnvironment(); see
+ * docs/postgres-research-environment.md's "Agent execution boundary".
  */
 
 const SCENARIO = "postgres-research-environment";

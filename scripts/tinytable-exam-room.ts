@@ -38,15 +38,12 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
-import { userInfo } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { containerHardeningArgs } from "../server/containers/hardening.js";
 
 export const DEFAULT_IMAGE = "tinytable-exam-room:latest";
 const DEFAULT_TIMEOUT_MS = 10 * 60_000;
-const DEFAULT_MEMORY = "2g";
-const DEFAULT_PIDS_LIMIT = 256;
-const DEFAULT_TMP_SIZE = "256m";
 
 export type ExamRoomOptions = {
   /** Host directory to bind-mount at /workspace, read-write. The only host path ever exposed to the container, unless dshHomeDir is also given. */
@@ -94,31 +91,20 @@ export type ExamRoomResult = {
 /** The `docker run` argv this module uses, exposed for tests/inspection without requiring a docker daemon. */
 export function buildDockerArgs(options: ExamRoomOptions, containerName: string): string[] {
   const seedRootDir = resolve(options.seedRootDir);
-  const { uid, gid } = userInfo();
 
+  // Shared with the PostgreSQL research environment's isolated agent launcher
+  // (server/postgres/agent-container.ts) so both enforce the same boundary:
+  // --read-only root, all caps dropped, no-new-privileges, pid/memory caps,
+  // the host uid/gid (so the agent can write into the bind-mounted seed-root
+  // without it being pre-chowned - the seed-root is answer-free by
+  // construction, #104), and a tmpfs $HOME.
   const args = [
-    "run",
-    "--rm",
-    "--name", containerName,
-    "--network", options.network ?? "bridge",
-    "--cap-drop=ALL",
-    "--security-opt", "no-new-privileges",
-    // The container's own root filesystem is read-only (defense in depth,
-    // not load-bearing for the host-isolation guarantee itself): dsh's only
-    // writes are to $HOME=/tmp (a tmpfs) and /workspace (the bind mount),
-    // both exempted below.
-    "--read-only",
-    "--pids-limit", String(options.pidsLimit ?? DEFAULT_PIDS_LIMIT),
-    "--memory", options.memory ?? DEFAULT_MEMORY,
-    // Match the host uid/gid that owns the bind-mounted seed-root, rather
-    // than the image's baked-in `examroom` user, so the agent can write
-    // sql-tests/agent/ and findings.json into it regardless of which local
-    // user is running the harness. The seed-root is answer-free by
-    // construction (#104), so this permissive-by-identity approach costs
-    // nothing security-wise.
-    "--user", `${uid}:${gid}`,
-    "--tmpfs", `/tmp:size=${DEFAULT_TMP_SIZE}`,
-    "-e", "HOME=/tmp",
+    ...containerHardeningArgs({
+      containerName,
+      network: options.network,
+      memory: options.memory,
+      pidsLimit: options.pidsLimit
+    }),
     "-v", `${seedRootDir}:/workspace:rw`,
     "-w", "/workspace"
   ];

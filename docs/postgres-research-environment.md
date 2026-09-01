@@ -14,12 +14,11 @@ In scope (this is #179):
 - source build with a correctly-keyed build cache
 - isolated ephemeral cluster: initdb / start / readiness / psql / restart / stop
 - arbitrary local SQL and shell experiments against the running cluster
-- one agent process driving that live cluster, with cleanup ordered behind it
-- a grader-private / agent-visible filesystem split that keeps ref, commit, source hash and cache key off every path the agent is handed
+- one agent process driving that live cluster inside a container that bind-mounts only its research surface, with cleanup ordered behind it
 - source/build/runtime manifests as artifacts, lifecycle facts as evidence
 - deterministic cleanup on success, throw, and timeout
 
-Out of scope (tracked elsewhere): cross-step DAG composition of a live environment (an environment lease through the orchestration kernel — see [What is *not* wired](#what-is-not-wired-cross-step-dag-composition)), sandboxing the agent process, the historical bug corpus ([#178](https://github.com/clemenza/honeyrail/issues/178)), the first pilot over historical PG tasks ([#180](https://github.com/clemenza/honeyrail/issues/180)), and the generic `EvalProvider` abstraction ([#172](https://github.com/clemenza/honeyrail/issues/172)).
+Out of scope (tracked elsewhere): cross-step DAG composition of a live environment (an environment lease through the orchestration kernel — see [What is *not* wired](#what-is-not-wired-cross-step-dag-composition)), the historical bug corpus ([#178](https://github.com/clemenza/honeyrail/issues/178)), the first pilot over historical PG tasks ([#180](https://github.com/clemenza/honeyrail/issues/180)), and the generic `EvalProvider` abstraction ([#172](https://github.com/clemenza/honeyrail/issues/172)).
 
 ## Architecture
 
@@ -38,7 +37,10 @@ Four pieces:
 - `server/postgres/runtime.ts` — the low-level PostgreSQL mechanics shared with the alpha executor: `allocatePort()` (bind port 0 on loopback, read the port back), `isAddressInUseFailure()` and `waitForPostgresReady()` (poll `SELECT 1`). Extracted from `server/executors/postgres.ts`; its defaults reproduce the original behavior exactly.
 - `server/postgres/research-environment.ts` — the environment itself. Store-agnostic and executor-agnostic, so it can be driven from a script, a test, or an executor.
 - `server/postgres/research-session.ts` — `runAgentInPostgresResearchEnvironment()`: the one supported composition where an agent process drives a *live* cluster. See [Agent research surface](#agent-research-surface).
+- `server/postgres/agent-container.ts` — the isolated launch path for that agent: which host paths are bind-mounted, at which in-container paths, and how the selected build is exposed without its identity. See [Agent execution boundary](#agent-execution-boundary).
 - `server/executors/postgres-research.ts` — the `postgres-research` executor: a thin wrapper that turns one environment into the runtime's standard Artifact/Evidence record.
+
+`server/containers/hardening.ts` holds the `docker run` hardening flags shared with `scripts/tinytable-exam-room.ts` (#105), so both isolated launch paths enforce the same container posture rather than two drifting copies of it.
 
 ## Module API
 
@@ -65,7 +67,7 @@ const groupCount = await withPostgresResearchEnvironment(
 
 An environment exposes `root`, `privateDir`, `sourceDir`, `installDir`, `dataDir`, `socketDir`, `logPath`, `port`, `binaries`, plus `start()`, `stop()`, `restart()`, `psql()`, `psqlFile()`, `exec()`, `cleanup()`, `connectionInfo()`, `agentEnvironment()`, `lifecycleEvents()` and `runtimeManifest()`.
 
-`root` and `privateDir` are two different sides of the eval boundary, not two scratch directories — see [Private-truth boundary](#private-truth-boundary). `createPostgresResearchEnvironment()` refuses a `privateDir` nested inside `root`.
+`root` and `privateDir` are two different sides of the eval boundary, not two scratch directories — see [Agent execution boundary](#agent-execution-boundary). `createPostgresResearchEnvironment()` refuses a `privateDir` nested inside `root`.
 
 `psql()` does not throw on SQL errors. A research environment exists to observe what the server actually does, including failures, so the caller decides what counts as a problem.
 
@@ -91,7 +93,7 @@ The ref is resolved once with `git rev-parse --verify <ref>^{commit}`. An unreso
 
 ### The exact-snapshot invariant
 
-The destination is **published, not filled in place**: the archive is extracted into a fresh sibling staging directory, checked for `.git`, and only then does the old destination get removed and the staging directory renamed over it.
+The destination is **published, not filled in place**: the archive is extracted into a fresh sibling staging directory, checked for `.git`, and only then swapped into place.
 
 That matters because `tar -x` overlays a directory rather than replacing it. Filling a non-empty destination would let a file that exists only in a *later* ref survive into a snapshot of an earlier one — and in historical mode that later file is the answer key:
 
@@ -100,7 +102,17 @@ materialize <later ref>   -> FUTURE_FIX.txt exists
 materialize <earlier ref> -> tar overlays the older tree, FUTURE_FIX.txt survives   ← the bug
 ```
 
-Publishing atomically also means a failed materialization leaves either the previous snapshot intact or nothing at all — never a half-extracted tree that looks like an exact snapshot. Both properties are regression-tested (`re-materializing an earlier ref over a later snapshot leaves no file from the later ref`, `a failed materialization publishes nothing and leaves an existing snapshot untouched`).
+The swap is **rollback-safe, not atomic**. POSIX has no atomic directory replacement, so publishing is two renames, and saying otherwise would overstate it. An existing snapshot is renamed aside to a random sibling backup rather than deleted, which gives three precise guarantees:
+
+| Failure point | Result |
+| --- | --- |
+| extraction or `.git` validation | nothing is touched; the previous snapshot stands, and nothing is published into a fresh destination |
+| the publish rename itself | the backup is renamed back into place, so the destination is again the previous snapshot, whole |
+| none (success) | the destination is an exact clean snapshot of the ref, and the backup is removed |
+
+Staging directory, tarball and backup are cleaned up on every path, and all three are siblings of the destination so no rename crosses a filesystem. If *both* the publish and the rollback rename fail, the previous snapshot is deliberately left behind under its `.backup-<rand>` name rather than deleted — losing the only copy would be worse than leaving a stray directory.
+
+All three rows are regression-tested (`re-materializing an earlier ref over a later snapshot leaves no file from the later ref`, `a failed extraction publishes nothing and leaves an existing snapshot untouched`, `a failure at the publish rename rolls the previous snapshot back into place`). The last one injects the failure at the rename itself through `materializePostgresSource`'s `publishRename` seam, because a mocked `tar` failure cannot reach that stage.
 
 ## Build and cache key
 
@@ -139,14 +151,11 @@ This is a declared pass-through, not a hermetic toolchain fingerprint. A machine
 
 The cache root defaults to `~/.honeyrail/pg-research-build-cache`, overridable per spec or with `HONEYRAIL_PG_BUILD_CACHE`.
 
-### The cache entry is agent-visible
+### The cache entry stays grader-side
 
-`HR_PG_BIN_DIR` points inside a cache entry, so everything about that entry is readable by the agent. Two consequences are load-bearing:
+The cache root, the entry directory and the `entryId` that names it are **never** exposed to an isolated agent. The entry holds one HoneyRail-written file, `honeyrail-build-complete.json` (`{ marker, entryId, profileVersion, completedAt }`), so an interrupted build is not mistaken for a usable one; it says nothing else, and it is excluded from the view the agent sees. Full provenance lives in the `PostgresBuildManifest` the build returns, which the caller records grader-side.
 
-- the entry directory is named by an **`entryId`** — a domain-separated one-way digest of the cache key — and never by the cache key itself, which is a stable identifier of the source under research;
-- the only file HoneyRail writes into an entry is `honeyrail-build-complete.json`, holding `{ marker, entryId, profileVersion, completedAt }`. It exists so an interrupted build is not mistaken for a usable one and says nothing else. (v0 wrote `honeyrail-build.json` there, containing `sourceRef`, `sourceCommit`, `sourceHash` and `cacheKey` — `cat "$HR_PG_BIN_DIR/../honeyrail-build.json"` recovered all four. That file is gone.)
-
-Full provenance lives in the `PostgresBuildManifest` the build returns, which the caller records grader-side.
+An agent gets the *binaries*, at a fixed neutral path, through a per-trial view — see [Exposing the build without its identity](#exposing-the-build-without-its-identity).
 
 **Apple Silicon build note:** near-HEAD PostgreSQL sources may fail `make` on arm64 macOS with `error: call to undeclared function 'x86_feature_available'`. This is a known clang cross-detection artifact — `configure`'s AVX2 attribute probe compiles and links cleanly on arm64 without ever emitting an AVX2 instruction, so it wrongly enables `USE_AVX2_WITH_RUNTIME_CHECK`, whose runtime check is x86-only. Work around it by exporting the autoconf cache variable before building: `export pgac_cv_avx2_support=no`. This does not touch PostgreSQL source and is unrelated to whatever bug is under research.
 
@@ -188,17 +197,26 @@ A timeout rejects the caller and tears the cluster down immediately. JavaScript 
 
 ## Agent research surface
 
-An agent driving a research environment can read and grep the materialized source, write arbitrary SQL/shell repros, execute the built `postgres`/`psql`/`pg_ctl`, query the running server, and read its log. The coordinates it needs come from `PostgresResearchEnvironment.agentEnvironment()`:
+An agent driving a research environment can read and grep the materialized source, write arbitrary SQL/shell repros, execute the built `postgres`/`psql`/`pg_ctl`, query the running server, and read its log. The coordinates it needs are injected into its environment:
 
-| Variable | |
-| --- | --- |
-| `HR_PG_HOST`, `HR_PG_PORT`, `HR_PG_SOCKET_DIR`, `HR_PG_URL` | how to connect |
-| `HR_PG_USER`, `HR_PG_DATABASE` | who to connect as |
-| `HR_PG_BIN_DIR` | the built `psql`/`pg_ctl`/`postgres`/`initdb` |
-| `HR_PG_SOURCE_DIR` | the exact `.git`-free snapshot |
-| `HR_PG_DATA_DIR`, `HR_PG_LOG` | `PGDATA` and the server's own log |
+| Variable | | Isolated value |
+| --- | --- | --- |
+| `HR_PG_HOST`, `HR_PG_SOCKET_DIR` | how to connect | `/workspace/runtime/socket` |
+| `HR_PG_PORT`, `HR_PG_URL` | | the runtime port; a socket-host URL |
+| `HR_PG_USER`, `HR_PG_DATABASE` | who to connect as | `postgres` / `postgres` |
+| `HR_PG_BIN_DIR` | the built `psql`/`pg_ctl`/`postgres`/`initdb` | `/opt/honeyrail/postgres/bin` |
+| `HR_PG_SOURCE_DIR` | the exact `.git`-free snapshot | `/workspace/source` |
+| `HR_PG_DATA_DIR`, `HR_PG_LOG` | `PGDATA` and the server's own log | `/workspace/runtime/pgdata`, `/workspace/runtime/postgres.log` |
+| `HR_PG_WORK_DIR` | scratch for repros, notes and results | `/workspace/agent` |
 
-Every one of those values is decided at runtime — the port, socket directory, snapshot path and install directory do not exist until the environment has been created.
+Two variants exist, and the difference matters:
+
+- `PostgresResearchEnvironment.agentEnvironment()` returns **host** paths and `127.0.0.1`. It is what a caller uses when it is driving the environment itself, and what the explicitly-unisolated development mode exports.
+- `containerAgentEnvironment()` (`server/postgres/agent-container.ts`) returns the **in-container** paths in the table above, and is what an isolated agent gets. No host path is exported to it at all: a leaked host path would disclose HoneyRail's layout even where the agent cannot read it, and would break the moment any code used the exported value for a real filesystem operation.
+
+`HR_PG_HOST` is the socket directory rather than a loopback address because a container has its own network namespace and therefore no route to the host's `127.0.0.1`. libpq treats a host beginning with `/` as a Unix-domain socket directory, and AF_UNIX filesystem sockets resolve through the *mount* namespace — the same mechanism that makes bind-mounting `/var/run/docker.sock` into a container work.
+
+Every value is decided at runtime — the port, socket directory, snapshot and build view do not exist until the environment has been created.
 
 ### Live composition: `runAgentInPostgresResearchEnvironment()`
 
@@ -214,14 +232,17 @@ const session = await runAgentInPostgresResearchEnvironment(
     source: { repoPath: "/path/to/postgres-mirror", ref: "<exact sha>" },
     build: { jobs: 8 }
   },
-  { command: "/path/to/agent-driver.sh", timeoutMs: 45 * 60 * 1000 }
+  { command: "/workspace/agent/driver.sh", timeoutMs: 45 * 60 * 1000 }
 );
 
 session.agent;             // exit code, stdout/stderr, timedOut, duration
 session.agentEnvironment;  // exactly what the agent process was given
+session.isolation;         // how it was confined: mode, image, network, mounts
 session.source;            // grader-side provenance the agent never saw
 session.build;
 ```
+
+`agent.command` is resolved **inside the container**, so it must be something the image provides or something reachable through a mount — typically a driver script the caller writes into `$HR_PG_WORK_DIR` (host: `<root>/agent-work`) beforehand. A container also inherits nothing from the host environment, so anything the agent needs (a model API key, say) has to be passed explicitly in `agent.env`.
 
 It materializes, builds, starts PostgreSQL, spawns the agent with `agentEnvironment()` merged into its environment and its cwd inside the agent-visible root, waits for it to exit, and only then tears the environment down. The ordering is the point: an agent whose server disappears mid-experiment produces garbage evidence rather than a failed trial. It holds on all four exits —
 
@@ -230,7 +251,9 @@ It materializes, builds, starts PostgreSQL, spawns the agent with `agentEnvironm
 - a hang, where `agent.timeoutMs` SIGTERMs then SIGKILLs the agent's whole **process group** (an agent is usually a shell that shells out; killing only the direct child leaves a grandchild holding the pipes) and teardown waits for it to actually exit;
 - an unrunnable command, which throws `PostgresResearchError` with cleanup already done.
 
-The agent process also gets the same `PG*` hygiene the environment applies to itself: every inherited `PG*` variable is dropped so an ambient `PGHOST`/`PGPORT` cannot redirect it at some other server, and `HR_PG_BIN_DIR` goes first on `PATH`. No path into HoneyRail's attachment tree is exported.
+A timeout in isolated mode `docker kill`s the container before escalating on the client process — signalling only the local `docker` client would leave the container, and therefore the agent, running.
+
+`PATH` puts `HR_PG_BIN_DIR` first in both modes. In unisolated mode the agent additionally gets the `PG*` hygiene the environment applies to itself (every inherited `PGHOST`/`PGPORT`/`PGDATA` dropped, so an ambient value cannot redirect it at some other server); in isolated mode the question does not arise, because a container inherits no host environment at all.
 
 ### What is *not* wired: cross-step DAG composition
 
@@ -251,34 +274,88 @@ That hook is **static step input, captured at run creation**. It works for coord
 
 So: **a `postgres-research` step followed by an `agent-task` step does not give the agent a live server**, and nothing in this PR claims it does. Live agent-driven research is composed through `runAgentInPostgresResearchEnvironment()`, outside the DAG. Wiring an environment lease through the orchestration kernel is deliberately not attempted here; if #180 needs it inside the DAG, that is its own change.
 
-### Private-truth boundary
+## Agent execution boundary
 
-For historical rediscovery an agent must not be able to read the answer out of its own environment. The boundary is a **filesystem split**, not an omission from a variable map. Three trees exist:
+For historical rediscovery an agent must not be able to read the answer out of its own environment. There are two distinct things going on here, and they are worth naming separately because only one of them is enforced by anything.
+
+### 1. Path and API minimization (a design property)
+
+HoneyRail does not *hand* the agent anything identifying. `source.ref`, the resolved commit, the source tree hash and the cache key are written into no file and no path the agent is given; the snapshot has no `.git`, so the ref cannot be recovered from the tree either; the agent-visible root lives under `agentEnvRoot()` (`$HONEYRAIL_PG_ENV_ROOT`, default `<tmpdir>/honeyrail-pg-env`) rather than inside the attachment tree; `createPostgresResearchEnvironment()` refuses a `privateDir` nested inside the agent root; and whatever a driver puts in `agent-task`'s `input.environment` must carry coordinates only (the `harness.environment` evidence record stores key names and a content hash, not values).
+
+This is real and worth having, but on its own it is only a convention. A process running as the same OS user can look anywhere it likes. Round 1 of this work stopped here and described the result as a boundary; it was not one.
+
+### 2. Process and filesystem isolation (enforced)
+
+`runAgentInPostgresResearchEnvironment()` launches the agent inside a container that bind-mounts **only** its research surface, using the same mechanism `docs/tinytable-exam-room-isolation.md` (#105) established after an agent read tinytable-eval's answer key straight off the shared filesystem (#103):
 
 ```text
-<root>                    agent-visible   source/, pgdata/, postgres.log
-<privateDir>              grader-only     build/configure.log, make.log, make-install.log
-<cacheRoot>/<entryId>     agent-visible   built binaries + completion marker
-attachmentRoot/runs/...   grader-only     source/build/runtime manifests, evidence, copied logs
+host                                    in container            mode
+<root>/source                        -> /workspace/source        rw
+<root>/pgdata                        -> /workspace/runtime/pgdata rw
+<socketDir>                          -> /workspace/runtime/socket rw
+<root>/postgres.log                  -> /workspace/runtime/postgres.log ro
+<root>/agent-work                    -> /workspace/agent          rw
+<buildViewsRoot>/view-*/<random>     -> /opt/honeyrail/postgres   ro
 ```
 
-The rules that make it hold:
+Nothing else is ever mounted. `attachmentRoot`, `<privateDir>`, the PostgreSQL source mirror and its `.git`, the shared build-cache root, and every sibling trial's directory are not "unmentioned" — they do not exist inside the container's mount namespace, so no amount of searching finds them.
 
-1. **Identity is written nowhere agent-visible.** `source.ref`, the resolved commit, the source tree hash and the cache key appear in no file and no path under `<root>` or under the cache entry. They exist only in the manifests the caller records grader-side.
-2. **The cache entry is named by `entryId`, not by the cache key** (see [above](#the-cache-entry-is-agent-visible)), and holds only a completion marker.
-3. **The agent-visible root is not inside the attachment tree.** The `postgres-research` executor creates it under `agentEnvRoot()` — `$HONEYRAIL_PG_ENV_ROOT`, default `<tmpdir>/honeyrail-pg-env` — precisely so that no `..` walk from `$HR_PG_SOURCE_DIR` arrives at `source-manifest.json`. The server log is *copied* into the attachment tree as an artifact rather than registered in place.
-4. **The private directory may not be nested inside the agent root**; `createPostgresResearchEnvironment()` throws if a caller tries.
-5. The snapshot has no `.git`, so the ref cannot be recovered from the tree either.
-6. Whatever a driver puts in `input.environment` is agent-visible by construction, so it must carry coordinates only. The `harness.environment` evidence record stores key names and a content hash, not values.
+Container posture comes from `containerHardeningArgs()` (shared with the exam room): `--rm`, `--cap-drop=ALL`, `--security-opt no-new-privileges`, `--read-only` root, `--pids-limit`, `--memory`, `--user <host uid:gid>` (so the agent writes into its mounts without them being pre-chowned), `--tmpfs /tmp` with `HOME=/tmp`.
 
-This is enforced by tests that walk the trees rather than inspecting the environment map: `nothing reachable from agentEnvironment() reveals the source ref, commit, tree hash or cache key` and `the executor keeps full provenance grader-side and out of every agent-visible tree`.
+PostgreSQL itself keeps running as a **host** process. Containerizing the server would mean containerizing the build too, which is a much larger change (see [Platform limitation](#platform-limitation-container-architecture-must-match-the-build-host)). The agent reaches the host cluster through the bind-mounted socket directory, because AF_UNIX filesystem-path sockets are resolved through the mount namespace rather than the network namespace.
 
-**What this is not.** It is not a sandbox. An agent process with unrestricted filesystem access that knows where HoneyRail keeps its attachments can still read them — nothing here prevents that, and pretending otherwise is what the boundary is supposed to avoid. What the split guarantees is that no path HoneyRail *hands* the agent leads anywhere near the answer key, so recovering it requires deliberately going looking outside the research surface. Confining the agent process (container, sandbox, unprivileged user) is the operator's job and is not part of this primitive.
+The image is `docker/postgres-research/Dockerfile` (`honeyrail-postgres-research:latest`), deliberately minimal and without an agent CLI — derive from it (`FROM honeyrail-postgres-research:latest`) and point `isolation.image` at the result.
 
-Two further limitations, stated because they are real:
+### No silent degradation
 
-- the snapshot is a genuine PostgreSQL tree, so it reveals the *version* under study even though it reveals nothing about the bug;
-- the build cache is content-addressed and shared, so two trials over the same source land on the same `entryId` directory. An agent that can observe both can tell they share a build. Giving each trial its own install tree is not possible without breaking macOS's absolute `install_name` for `libpq`.
+If no docker daemon is reachable, `runAgentInPostgresResearchEnvironment()` **throws before materializing anything**. It never falls back to an unconfined host process while continuing to claim a boundary.
+
+The escape hatch is opt-in and named for what it costs:
+
+```ts
+await runAgentInPostgresResearchEnvironment(spec, agent, {
+  isolation: { allowUnisolatedForDevelopment: true }   // local dev / CI without docker
+});
+```
+
+A session run that way records `isolation: { mode: "unisolated-development", isolated: false, warning: "..." }`, so output produced without a boundary is never indistinguishable from output produced with one. An isolated session instead records the image, the network, the container name and the exact `-v` specs.
+
+### Exposing the build without its identity
+
+The cache stays deterministic and shared grader-side: same source, same flags, same compiler → same `cacheKey` → same `entryId` → a cache hit. What the agent sees is a **per-trial hard-link view** of that entry, mounted at the fixed neutral path `/opt/honeyrail/postgres`.
+
+Both halves are necessary:
+
+- The fixed in-container path means the pathname, `realpath`, and every exported variable are identical across trials and carry no identity.
+- The per-trial random *host* directory is needed because a bind mount publishes its source path inside the container, in `/proc/self/mountinfo`. Mounting `<cacheRoot>/<entryId>` directly puts the literal `entryId` in the container's own mount table — verified directly, which is why this is not theoretical. An agent with a bounded candidate set of refs could recompute candidate entry IDs and match. Mounting a per-trial random directory puts a random string there instead.
+
+The view is built with hard links, so this is a second *view* of one build, not a second copy of it — no expensive build is duplicated to randomize identity. It is removed when the trial ends. The completion marker (`honeyrail-build-complete.json`, which carries the `entryId`) is deliberately excluded from the view. `HONEYRAIL_PG_BUILD_VIEWS` or `isolation.buildViewsRoot` overrides where views live; the default is a sibling of the cache root, so the cache root's own name never appears in the mount table either.
+
+### Threat model for #180
+
+What a scored trial's agent can and cannot do, stated exactly:
+
+| | |
+| --- | --- |
+| **Inaccessible host paths** | everything not in the mount table above: `attachmentRoot` and all grader artifacts, `<privateDir>` and the build logs, the PostgreSQL source mirror and any `.git`, the build-cache root and its entries, other trials' directories, the HoneyRail checkout, the operator's home directory |
+| **Accessible** | the `.git`-free snapshot (rw), PGDATA (rw), the socket directory (rw), the server log (ro), its own scratch directory (rw), the build view (ro) |
+| **Network** | on by default (`network: "bridge"`) so an agent can reach its own model API. Its own network namespace means no route to the host's loopback — the cluster is reachable only through the mounted socket. Egress is otherwise **unrestricted**: an internet-connected agent can still fingerprint a PostgreSQL version against public sources. Set `isolation.network: "none"` for a trial policy that forbids that |
+| **Process listing / `/proc`** | the container has its own PID namespace, so it sees only its own processes — not the host's `postgres`, not HoneyRail. `/proc/self/mountinfo` **is** readable and does disclose the *host pathnames of the six mounted directories* (this is why the build view is randomized). It does not disclose any unmounted path |
+| **Concurrency** | yes. Trials get distinct ports, PGDATA, socket directories, snapshots and build views; each container is `--rm` and named per trial. `--pids-limit`/`--memory` bound one container, not the aggregate — many concurrent trials are a driver-level concern |
+| **Cached binaries** | exposed through a per-trial hard-link view at a fixed neutral path, with no stable source identity in the path, in `realpath`, in the environment, in the mount table, or in any file below it |
+
+Shared-kernel caveat, as in the exam room: this is Docker's namespace + cgroup + capability model, not gVisor or a microVM. A kernel or runtime vulnerability could in principle allow an escape. This is a boundary sized to the actual threat (an agent reading host files that a lenient in-process sandbox does not restrict), not a defense against a kernel exploit. Deployments should also run HoneyRail as a non-root user: `--user` maps the host uid, so a root host process maps to an in-container root, which weakens (though `--cap-drop=ALL` does not eliminate) the benefit of the read-only root.
+
+### Platform limitation: container architecture must match the build host
+
+PostgreSQL is built **natively on the host** and executed **inside a Linux container**. On a Linux host those agree and the whole path works end to end with real PostgreSQL binaries. On macOS or Windows they do not: Docker Desktop runs containers inside a Linux VM, and a natively-built Mach-O or PE binary cannot execute there. This is a genuine, unavoidable property of building natively and running in a Linux container — not a defect in the isolation, and not something a flag fixes.
+
+Consequences, stated plainly:
+
+- **Linux host (the expected deployment and CI target):** full end-to-end operation, real PostgreSQL binaries inside the boundary. The container image's libc must be able to run the host's build — `docker/postgres-research/Dockerfile` uses bookworm; override `isolation.image` for a different build host.
+- **macOS/Windows host:** the isolation mechanism itself works and is tested (see [Testing](#testing) — the synthetic fixture's "binaries" are `#!/bin/sh` scripts, which are architecture-portable text and run correctly inside a Linux container), but a *real* PostgreSQL build made on the host cannot be executed by the agent. Use `allowUnisolatedForDevelopment` for local development against real PostgreSQL, and understand that such a run is not a scored trial.
+
+One further limitation, stated because it is real: the snapshot is a genuine PostgreSQL tree, so it reveals the *version* under study even though it reveals nothing about the bug.
 
 ## Executor
 
@@ -338,14 +415,29 @@ Reusing the existing `db.*` taxonomy where one fits, plus three new kinds for fa
 ## Testing
 
 ```sh
+docker build -t honeyrail-postgres-research:latest docker/postgres-research
 node --import tsx --test test/postgres-research-environment.test.ts
 node --import tsx --test test/postgres-research-session.test.ts
+node --import tsx --test test/postgres-research-isolation.test.ts
 node --import tsx --test test/agent-task-environment.test.ts
 ```
 
-The suite runs against a synthetic source fixture (`test/helpers/postgres-source-fixture.ts`): a git repository whose `configure`/`make`/`make install` install four stub binaries that emulate just enough of `initdb`/`pg_ctl`/`psql`/`postgres` to exercise the real lifecycle in seconds. That keeps the whole matrix — no-`.git` snapshots, exact-ref resolution, snapshot republication, cache-key composition, cache hits, build-environment keying, concurrent isolation, port-collision recovery, the eval-isolation boundary, lifecycle, restart, live agent composition, and all the cleanup paths — runnable in CI without a PostgreSQL checkout or a C toolchain, and keeps the real corpus out of committed test code. Tests skip with a clear message when `git`, `make`, `tar` or a `cc` probe is unavailable.
+The suite runs against a synthetic source fixture (`test/helpers/postgres-source-fixture.ts`): a git repository whose `configure`/`make`/`make install` install four stub binaries that emulate just enough of `initdb`/`pg_ctl`/`psql`/`postgres` to exercise the real lifecycle in seconds. That keeps the whole matrix — no-`.git` snapshots, exact-ref resolution, snapshot publication and rollback, cache-key composition, cache hits, build-environment keying, concurrent isolation, port-collision recovery, the agent execution boundary, lifecycle, restart, live agent composition, and all the cleanup paths — runnable in CI without a PostgreSQL checkout or a C toolchain, and keeps the real corpus out of committed test code. Tests skip with a clear message when `git`, `make`, `tar` or a `cc` probe is unavailable, and the container tests skip when no docker daemon or research image is present.
 
-The two race-shaped properties (a port collision, a failed `tar`) are tested with a stubbed `runCommand` that fails deterministically on the first attempt, not by hoping the OS reproduces the race.
+The stub server really does create its listening socket in the `-k` directory under the name libpq derives from the port, so a socket-host connection genuinely resolves through that directory — which is what the isolated agent's connection exercises when the directory is bind-mounted.
+
+The three race-shaped properties (a port collision, a failed `tar`, a failed publish rename) are injected deterministically — a stubbed `runCommand`, or `materializePostgresSource`'s `publishRename` seam — rather than by hoping the OS reproduces the race.
+
+### Isolation tests
+
+`test/postgres-research-isolation.test.ts` tests the boundary **through the real agent launch path**, not by inspecting an environment map:
+
+- `an isolated agent cannot read grader artifacts, the source mirror, sibling trials or the build cache` — a live containerized agent, against a live cluster, that probes every grader-private host path by name, searches the whole filesystem for grader filenames, greps for a planted private-truth sentinel, and checks the mount table. All attempts must fail.
+- `an isolated agent can still read the source, drive the live cluster, read the log and record results` — the same boundary, from the other side: grep `$HR_PG_SOURCE_DIR`, run the research build's `psql` over the mounted socket, query the cluster, read the server log, and write a reproducer and a result file that come back out onto the host.
+- `two trials over one cached build see the same binaries at the same neutral path and no stable host identity` — same `cacheKey`/`entryId` grader-side and a genuine cache hit, identical binaries at `/opt/honeyrail/postgres/bin`, but different mount sources and no `ref`/`resolvedCommit`/`sourceHash`/`cacheKey`/`entryId` anywhere the agent could see.
+- `docker being unavailable fails loudly instead of running the agent unisolated`, plus static assertions on the exact mount list, the hardening flags, the in-container-only environment, and the marker-free build view.
+
+Because the fixture's binaries are shell scripts, these run and enforce real container isolation on a macOS host too — docker's namespaces do not care what is inside the mount. What a macOS host *cannot* test is a real PostgreSQL build executing inside the container; see [Platform limitation](#platform-limitation-container-architecture-must-match-the-build-host).
 
 Validating against real PostgreSQL is a manual step: populate a mirror as shown above, then drive `withPostgresResearchEnvironment()` over a pre-fix ref and its fix ref with the same build profile and the same reproducer, and confirm the two disagree. The build cache keys them apart automatically because their source hashes differ.
 
@@ -357,6 +449,9 @@ Validating against real PostgreSQL is a manual step: populate a mirror as shown 
 - Build-cache concurrency is safe (staged build + atomic rename) but not coordinated: two environments needing the same cold build may both build it.
 - The cache key covers a declared set of build-environment variables, not a hermetic toolchain fingerprint.
 - `timeoutMs` cancels the caller and tears down the cluster; it cannot abort a JavaScript `await` already in flight. For an agent, prefer `agent.timeoutMs` on the session helper, which kills the agent first and cleans up after.
-- The eval boundary is a filesystem layout, not a sandbox: it keeps the answer key off every path the agent is handed, but confining the agent process is the operator's job.
+- The agent boundary is a container, so it needs a docker daemon; without one, an agent session fails rather than degrading. It is shared-kernel isolation, not a microVM.
+- A real PostgreSQL build can only execute inside the boundary when the container's architecture and libc match the build host — in practice, a Linux host. See [Platform limitation](#platform-limitation-container-architecture-must-match-the-build-host).
+- Container egress is unrestricted by default, so an internet-connected agent can still fingerprint a PostgreSQL version against public sources. `isolation.network: "none"` closes that off if the trial policy requires it.
+- The `postgres-research` executor itself does not run an agent, so nothing about it is isolated; it is a grader-side environment driver.
 - Live agent research is composed by `runAgentInPostgresResearchEnvironment()`, not by the DAG; a `postgres-research` step cannot hand a running cluster to a later step.
 - The agent-visible root defaults to a temp root and, like v0, keeps the source snapshot after cleanup unless `removeSourceDir` is set. Long campaigns should set it, or point `HONEYRAIL_PG_ENV_ROOT` somewhere with room.

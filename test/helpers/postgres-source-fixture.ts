@@ -102,7 +102,9 @@ fi
 stub_stop() {
   PORT=$(cat "$DATADIR/stub.port" 2>/dev/null || echo "")
   if [ -n "$PORT" ]; then rm -f "$REG/$PORT.info"; fi
-  rm -f "$DATADIR/stub.port"
+  SOCKFILE=$(cat "$DATADIR/stub.sockfile" 2>/dev/null || echo "")
+  if [ -n "$SOCKFILE" ]; then rm -f "$SOCKFILE"; fi
+  rm -f "$DATADIR/stub.port" "$DATADIR/stub.sockfile"
   if [ -n "$LOG" ]; then echo "database system is shut down" >> "$LOG"; fi
   echo "server stopped"
 }
@@ -117,8 +119,18 @@ stub_start() {
     echo "pg_ctl: no port in server options" >&2
     exit 1
   fi
+  SOCKDIR=$(printf '%s' "$OPTS" | sed -n 's/.*-k \\([^ ]*\\).*/\\1/p')
   printf '%s' "$PORT" > "$DATADIR/stub.port"
   printf '%s' "$DATADIR" > "$REG/$PORT.info"
+  # The listening socket really is created in the -k directory, under the
+  # name libpq derives from the port. That is what makes a socket-host
+  # connection (psql -h <dir>) resolve through that directory - and therefore
+  # what the container-isolation path exercises when it bind-mounts it.
+  if [ -n "$SOCKDIR" ]; then
+    mkdir -p "$SOCKDIR"
+    printf '%s' "$DATADIR" > "$SOCKDIR/.s.PGSQL.$PORT"
+    printf '%s' "$SOCKDIR/.s.PGSQL.$PORT" > "$DATADIR/stub.sockfile"
+  fi
   if [ -n "$LOG" ]; then
     echo "listening on port $PORT" >> "$LOG"
     echo "database system is ready to accept connections" >> "$LOG"
@@ -140,21 +152,38 @@ ${STUB_REGISTRY}
 PORT=""
 SQL=""
 FILE=""
+HOST=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -p) PORT="$2"; shift 2 ;;
     -c) SQL="$2"; shift 2 ;;
     -f) FILE="$2"; shift 2 ;;
-    -h|-U|-d|-v) shift 2 ;;
+    -h) HOST="$2"; shift 2 ;;
+    -U|-d|-v) shift 2 ;;
     *) shift ;;
   esac
 done
-INFO="$REG/$PORT.info"
+# libpq treats a host beginning with "/" as a socket directory, so resolve
+# through the socket file the server created there. Any other host is a TCP
+# connection, which this stub models with a registry keyed by port.
+case "$HOST" in
+  /*) INFO="$HOST/.s.PGSQL.$PORT" ;;
+  *) INFO="$REG/$PORT.info" ;;
+esac
 if [ ! -f "$INFO" ]; then
-  echo "psql: could not connect to server on port $PORT" >&2
+  echo "psql: could not connect to server on \\"$HOST\\" port $PORT" >&2
   exit 2
 fi
 DATADIR=$(cat "$INFO")
+# The one place this stub departs from real client/server semantics: a real
+# psql talks to a server process over the socket and never touches PGDATA,
+# but this "server" has no process, so the client has to reach the cluster's
+# state through the filesystem. When the client is in a different mount
+# namespace from the server (the isolated-agent path), PGDATA is mounted
+# somewhere else, and $HR_PG_DATA_DIR is where.
+if [ ! -d "$DATADIR" ] && [ -n "\${HR_PG_DATA_DIR:-}" ]; then
+  DATADIR="$HR_PG_DATA_DIR"
+fi
 TABLE="$DATADIR/stub_table"
 
 run_statement() {

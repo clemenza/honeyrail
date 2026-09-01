@@ -31,7 +31,11 @@ integration that are not part of this issue.
   `scripts/tinytable-exam-room.ts`'s module docstring for why this doesn't
   weaken the guarantee below: it carries no fixture/answer material, and
   nothing about it is a path the agent can read *out* through).
-- **Container hardening** (`buildDockerArgs()`): `--read-only` root
+- **Container hardening** (`buildDockerArgs()`, via the shared
+  `server/containers/hardening.ts`, which the PostgreSQL research
+  environment's isolated agent launcher also uses - see
+  `docs/postgres-research-environment.md` - so both boundaries have one
+  posture rather than two drifting copies): `--read-only` root
   filesystem (dsh's writes go to `$HOME=/tmp`, a tmpfs, and to `/workspace`,
   both exempted), `--cap-drop=ALL`, `--security-opt no-new-privileges`,
   `--pids-limit`, `--memory`, and `--user <host uid:gid>` so the agent can
