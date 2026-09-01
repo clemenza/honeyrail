@@ -61,7 +61,7 @@
  *   --smoke                       2 fixtures x 2 profiles x 1 trial - cheap end-to-end validation
  *   --dry-run                     Print the matrix and budget note, launch nothing
  *   --report-only                 Skip execution; rebuild the report from state.json
- *   --engine-access <mode>        source (default) | bytecode | oracle - honeyrail#168's mode taxonomy,
+ *   --engine-access <mode>        source | bytecode | oracle (default) - honeyrail#168's mode taxonomy,
  *                                 see server/evals/kill-attribution.ts's own EngineAccess docstring.
  *                                 "bytecode" is #158's old --black-box (below), kept as a research mode.
  *                                 "oracle" is #168's real process-boundary black-box: builds a
@@ -69,7 +69,12 @@
  *                                 buildOracleAgentRoot()), starts a separate engine-service container
  *                                 (scripts/tinytable-engine-service.ts) owning the real tinytable/, and
  *                                 runs the agent against agentRoot only - no .py/.pyc ever enters its
- *                                 container.
+ *                                 container. Default since a real trial (clemenza/honeyrail acceptance
+ *                                 check for #174) confirmed "source" mode's own agent reads tinytable/
+ *                                 source directly and reasons from it - a genuine, sanctioned code-review
+ *                                 find in that mode, but not the black-box eval this driver runs by
+ *                                 default; pass --engine-access source|bytecode explicitly for white-box
+ *                                 or bytecode-disassembly research instead.
  *   --black-box                   Back-compat alias for `--engine-access bytecode` (#158's original
  *                                 flag name, before #168 introduced the 3-mode taxonomy)
  */
@@ -137,7 +142,16 @@ function parseArgs(argv: string[]): CliOptions {
     killRateThreshold: 1.0,
     trialTimeoutMinutes: 15,
     pgAdjudicate: false,
-    engineAccess: "source",
+    // Default to #168's real behavioral black box: the agent's own
+    // container never sees tinytable/*.py or *.pyc at all, only the narrow
+    // engine-service HTTP proxy - source/bytecode mode both let the agent
+    // read (or, for bytecode, disassemble) the implementation directly,
+    // which isn't the black-box eval this driver is meant to run by
+    // default. Still selectable via `--engine-access source|bytecode` or
+    // the `--black-box` back-compat alias for source/bytecode-mode work
+    // (e.g. #158's own bytecode-review research, or kill-attribution
+    // studies that specifically want white-box behavior).
+    engineAccess: "oracle",
     smoke: false,
     dryRun: false,
     reportOnly: false
