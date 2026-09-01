@@ -4,10 +4,17 @@ import type { runCommandSafe } from "../utils.js";
 export type RunCommand = typeof runCommandSafe;
 
 /**
- * Binds port 0 on the loopback interface and reads the port the kernel
- * assigned back, then releases it. Two environments created concurrently
- * therefore never collide on a port, and nothing has to guess a "probably
- * free" number.
+ * Binds port 0 on the loopback interface, reads the port the kernel assigned
+ * back, and releases it.
+ *
+ * This is a *candidate* port, not a reservation. The listener is closed
+ * before PostgreSQL binds the same number, so there is a real (if narrow)
+ * time-of-check/time-of-use window in which another process - including a
+ * second research environment - can take it. The kernel's "hand out the
+ * least-recently-used ephemeral port" policy makes a collision unlikely, not
+ * impossible, so callers that actually bind the port must be able to recover:
+ * see `isAddressInUseFailure()` and the bounded start retry in
+ * PostgresResearchEnvironment.start().
  *
  * Extracted verbatim from the transaction-restart-alpha path in
  * executors/postgres.ts so the research environment reuses the exact same
@@ -24,6 +31,19 @@ export async function allocatePort() {
   await new Promise<void>((resolve) => server.close(() => resolve()));
   if (!port) throw new Error("Failed to allocate PostgreSQL test port");
   return port;
+}
+
+/**
+ * Recognises "the port I was handed is already taken" in whatever a failed
+ * server start left behind - `pg_ctl`'s own stderr, or the tail of the
+ * server log it points at, which is where PostgreSQL actually reports a bind
+ * failure ("could not bind IPv4 address ...: Address already in use").
+ *
+ * Deliberately narrow: any other startup failure must stay a hard failure
+ * rather than being retried on a different port.
+ */
+export function isAddressInUseFailure(text: string): boolean {
+  return /address already in use|could not bind|EADDRINUSE|address is already in use/i.test(text);
 }
 
 export type PostgresConnectionTarget = {

@@ -1,19 +1,22 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
 
 import { createDefaultExecutorRegistry } from "../server/executors/index.js";
 import { EventBus } from "../server/events.js";
 import { OrchestrationService } from "../server/orchestration/service.js";
 import {
+  BUILD_COMPLETE_MARKER,
   BUILD_PROFILE_VERSION,
   computeBuildCacheKey,
+  computeBuildEntryId,
   createPostgresResearchEnvironment,
   materializePostgresSource,
   PostgresResearchError,
   PostgresResearchTimeoutError,
+  resolveBuildEnv,
   withPostgresResearchEnvironment,
   type PostgresResearchEnvironment,
   type PostgresResearchSpec
@@ -55,6 +58,36 @@ async function skipWithoutToolchain(t: TestContext) {
   if (await hasFixtureToolchain()) return false;
   t.skip("git, make, tar or a C compiler probe is unavailable");
   return true;
+}
+
+/** Every file under `root`, as [relative path, contents] pairs. */
+async function walkFiles(root: string, prefix = ""): Promise<Array<[string, string]>> {
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+  const files: Array<[string, string]> = [];
+  for (const entry of entries) {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    const full = join(root, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...(await walkFiles(full, rel)));
+    } else if (entry.isFile()) {
+      files.push([rel, await readFile(full, "utf8").catch(() => "")]);
+    }
+  }
+  return files;
+}
+
+/**
+ * Fails if any private fact appears in a path or in a file's bytes anywhere
+ * under `root`. This is the eval-isolation assertion the whole boundary
+ * rests on, so it reads the trees rather than trusting the environment map.
+ */
+async function assertNoSecretsUnder(root: string, secrets: Record<string, string>, label: string) {
+  for (const [path, content] of await walkFiles(root)) {
+    for (const [name, secret] of Object.entries(secrets)) {
+      assert.equal(path.includes(secret), false, `${label}: ${name} appears in the path ${path}`);
+      assert.equal(content.includes(secret), false, `${label}: ${name} appears inside ${path}`);
+    }
+  }
 }
 
 test("materialized source snapshot carries no .git and no history past the ref", async (t) => {
@@ -396,4 +429,335 @@ test("the postgres-research executor rejects malformed input before anything is 
     }),
     /requires a non-empty ref/
   );
+});
+
+// --- MUST FIX 1: the agent-visible / grader-private filesystem boundary ----
+
+test("nothing reachable from agentEnvironment() reveals the source ref, commit, tree hash or cache key", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  const fixture = await withFixture(t);
+  // Both trees live under one directory so the walk below covers the
+  // agent-visible root *and* its grader-private sibling.
+  const area = join(fixture.tempDir, "isolation");
+  const env = await createPostgresResearchEnvironment(
+    specFor(fixture, "unused", { root: join(area, "env"), privateDir: join(area, "env-private") })
+  );
+  t.after(async () => env.cleanup());
+  await env.start();
+  await env.psql("SELECT 1;");
+
+  const secrets = {
+    "source.ref": fixture.repo.ref,
+    resolvedCommit: env.sourceManifest.resolvedCommit,
+    sourceHash: env.sourceManifest.sourceHash,
+    cacheKey: env.buildManifest.cacheKey
+  };
+
+  // 1. The map itself.
+  const surface = env.agentEnvironment();
+  for (const [key, value] of Object.entries(surface)) {
+    for (const [name, secret] of Object.entries(secrets)) {
+      assert.equal(`${key}=${value}`.includes(secret), false, `${name} must not appear in ${key}`);
+    }
+  }
+
+  // 2. Every filesystem tree those values can reach: the environment root
+  //    with its grader-private sibling, and the shared build cache including
+  //    every other entry in it.
+  await assertNoSecretsUnder(area, secrets, "agent-visible environment tree");
+  await assertNoSecretsUnder(fixture.cacheRoot, secrets, "shared build cache");
+
+  // 3. The specific v0 leak: the cache entry's marker carried all four, and
+  //    the entry directory was named by the cache key itself.
+  const marker = JSON.parse(await readFile(join(env.installDir, BUILD_COMPLETE_MARKER), "utf8"));
+  assert.deepEqual(Object.keys(marker).sort(), ["completedAt", "entryId", "marker", "profileVersion"]);
+  assert.equal(env.buildManifest.entryId, computeBuildEntryId(env.buildManifest.cacheKey));
+  assert.equal(env.installDir, join(fixture.cacheRoot, env.buildManifest.entryId));
+  assert.equal(await exists(join(env.installDir, "honeyrail-build.json")), false, "the v0 identity manifest must be gone");
+
+  // 4. No exported path leads into the grader-private tree.
+  assert.equal(env.privateDir.startsWith(`${env.root}/`), false);
+  for (const value of Object.values(surface)) {
+    if (!value.startsWith("/")) continue;
+    assert.equal(value.startsWith(env.privateDir), false, `${value} must not lead into the grader-private tree`);
+  }
+
+  // 5. The grader side still has everything.
+  assert.equal(env.sourceManifest.ref, fixture.repo.ref);
+  assert.match(env.sourceManifest.sourceHash, /^[0-9a-f]{40}$/);
+  assert.match(env.buildManifest.cacheKey, /^[0-9a-f]{64}$/);
+  assert.equal(env.buildManifest.sourceCommit, env.sourceManifest.resolvedCommit);
+});
+
+test("the executor keeps full provenance grader-side and out of every agent-visible tree", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  const fixture = await withFixture(t);
+  const envRootParent = join(fixture.tempDir, "agent-envs");
+  const previous = process.env.HONEYRAIL_PG_ENV_ROOT;
+  process.env.HONEYRAIL_PG_ENV_ROOT = envRootParent;
+  t.after(() => {
+    if (previous === undefined) delete process.env.HONEYRAIL_PG_ENV_ROOT;
+    else process.env.HONEYRAIL_PG_ENV_ROOT = previous;
+  });
+
+  const attachmentRoot = join(fixture.tempDir, "attachments-isolation");
+  const store = new JsonStore(join(fixture.tempDir, "isolation-store.json"));
+  const service = new OrchestrationService({
+    store,
+    bus: new EventBus(),
+    tmux: { listSessions: async () => [], startSession: async () => {}, killSession: async () => {}, capture: async () => "", sendInput: async () => {} } as any,
+    worktrees: { create: async () => ({}), runChecks: async () => ({ ok: true, runs: [] }) } as any,
+    runCommand: runCommandSafe,
+    sessionLogRoot: join(fixture.tempDir, "isolation-sessions"),
+    attachmentRoot,
+    executors: createDefaultExecutorRegistry()
+  });
+  const project = await store.createProject({
+    name: "pg-research-isolation",
+    repoPath: fixture.tempDir,
+    defaultBranch: "main",
+    defaultAgent: "shell",
+    testCommands: [],
+    runCommands: []
+  });
+
+  const result = await service.createRun({
+    projectId: project.id,
+    goal: "isolation",
+    steps: [
+      {
+        id: "research",
+        name: "research",
+        executor: "postgres-research",
+        input: {
+          source: { repoPath: fixture.repo.repoPath, ref: fixture.repo.ref },
+          build: { cacheRoot: fixture.cacheRoot, jobs: 1 },
+          experiments: [{ name: "probe", sql: "SELECT 1;" }]
+        }
+      }
+    ]
+  });
+  assert.equal(result.run.status, "succeeded");
+
+  const artifacts = await store.listArtifacts(result.run.id, "research");
+  const sourceManifest = JSON.parse(await readFile(String(artifacts.find((item) => item.name === "source-manifest.json")!.path), "utf8"));
+  const buildManifest = JSON.parse(await readFile(String(artifacts.find((item) => item.name === "build-manifest.json")!.path), "utf8"));
+  const runtimeManifest = JSON.parse(await readFile(String(artifacts.find((item) => item.name === "runtime-manifest.json")!.path), "utf8"));
+
+  // Grader side: complete provenance, as required for scoring a trial.
+  assert.equal(sourceManifest.ref, fixture.repo.ref);
+  assert.equal(buildManifest.sourceCommit, sourceManifest.resolvedCommit);
+  assert.match(String(buildManifest.cacheKey), /^[0-9a-f]{64}$/);
+  assert.ok(artifacts.some((item) => item.name === "postgres.log"), "the server log is copied grader-side");
+
+  // Agent side: the environment root is not inside the attachment tree, so no
+  // number of `..` hops from HR_PG_SOURCE_DIR arrives at those manifests.
+  const agentRoot = String(runtimeManifest.root);
+  assert.equal(agentRoot.startsWith(attachmentRoot), false, "the agent-visible root must live outside attachmentRoot");
+  assert.equal(agentRoot.startsWith(envRootParent), true);
+  assert.equal(String(runtimeManifest.privateDir).startsWith(attachmentRoot), true, "build logs stay grader-side");
+  await assertNoSecretsUnder(
+    envRootParent,
+    {
+      "source.ref": fixture.repo.ref,
+      resolvedCommit: sourceManifest.resolvedCommit,
+      sourceHash: sourceManifest.sourceHash,
+      cacheKey: buildManifest.cacheKey
+    },
+    "executor agent-env root"
+  );
+});
+
+// --- MUST FIX 2: materialization publishes an exact, clean snapshot -------
+
+test("re-materializing an earlier ref over a later snapshot leaves no file from the later ref", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  const fixture = await withFixture(t);
+  const dest = join(fixture.tempDir, "reused-snapshot");
+
+  const later = await materializePostgresSource({ repoPath: fixture.repo.repoPath, ref: fixture.repo.laterRef }, dest);
+  assert.equal(await exists(join(dest, fixture.repo.laterFile)), true, "the later ref does contain the future file");
+
+  const earlier = await materializePostgresSource({ repoPath: fixture.repo.repoPath, ref: fixture.repo.ref }, dest);
+
+  // The invariant: a snapshot of the earlier ref must not carry a file that
+  // exists only in later history - in historical mode that file is the answer.
+  assert.equal(await exists(join(dest, fixture.repo.laterFile)), false, "a stale future file survived materialization");
+  assert.equal(await exists(join(dest, "configure")), true);
+  assert.notEqual(earlier.sourceHash, later.sourceHash);
+  assert.equal(earlier.resolvedCommit, fixture.repo.ref);
+  const leftovers = (await readdir(fixture.tempDir)).filter((name) => name.startsWith("reused-snapshot."));
+  assert.deepEqual(leftovers, [], "staging directories and tarballs must not survive a successful publish");
+});
+
+test("a failed materialization publishes nothing and leaves an existing snapshot untouched", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  const fixture = await withFixture(t);
+  const brokenTar: typeof runCommandSafe = async (command, args, options) => {
+    if (command === "tar") return { ok: false, stdout: "", stderr: "tar: unexpected end of file", code: 2 };
+    return runCommandSafe(command, args, options);
+  };
+
+  // Into a fresh destination: nothing may be published at all.
+  const fresh = join(fixture.tempDir, "fresh-snapshot");
+  await assert.rejects(
+    materializePostgresSource({ repoPath: fixture.repo.repoPath, ref: fixture.repo.ref }, fresh, { runCommand: brokenTar }),
+    (error: Error) => error instanceof PostgresResearchError && /Extracting source snapshot failed/.test(error.message)
+  );
+  assert.equal(await exists(fresh), false, "a failed materialization must not publish a destination");
+  assert.deepEqual(
+    (await readdir(fixture.tempDir)).filter((name) => name.startsWith("fresh-snapshot")),
+    [],
+    "no staging directory or tarball may survive a failure"
+  );
+
+  // Over an existing snapshot: the previous exact tree survives intact rather
+  // than becoming a half-extracted mix of the two.
+  const existing = join(fixture.tempDir, "existing-snapshot");
+  const before = await materializePostgresSource({ repoPath: fixture.repo.repoPath, ref: fixture.repo.laterRef }, existing);
+  await assert.rejects(
+    materializePostgresSource({ repoPath: fixture.repo.repoPath, ref: fixture.repo.ref }, existing, { runCommand: brokenTar }),
+    PostgresResearchError
+  );
+  assert.equal(await exists(join(existing, fixture.repo.laterFile)), true, "the previous snapshot must be left intact");
+  assert.equal(before.sourceDir, existing);
+});
+
+// --- SHOULD FIX 4: bounded recovery from the allocatePort() TOCTOU window --
+
+test("a port collision at startup is retried on a freshly allocated port", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  const fixture = await withFixture(t);
+  // Deterministic stand-in for the race: the first pg_ctl start fails the way
+  // PostgreSQL fails when something else took the port between allocatePort()
+  // closing its probe socket and the server binding it.
+  let collisions = 0;
+  const collidingStart: typeof runCommandSafe = async (command, args, options) => {
+    if (command.endsWith("pg_ctl") && (args ?? []).includes("start") && collisions === 0) {
+      collisions += 1;
+      return {
+        ok: false,
+        stdout: "",
+        stderr: 'pg_ctl: could not start server\nLOG:  could not bind IPv4 address "127.0.0.1": Address already in use',
+        code: 1
+      };
+    }
+    return runCommandSafe(command, args, options);
+  };
+
+  const env = await createPostgresResearchEnvironment(specFor(fixture, "port-retry", { runCommand: collidingStart }));
+  t.after(async () => env.cleanup());
+  const candidate = env.port;
+
+  const readiness = await env.start();
+
+  assert.equal(collisions, 1);
+  assert.equal(readiness.ready, true);
+  assert.notEqual(env.port, candidate, "the retry must use a newly allocated port");
+  const retry = env.lifecycleEvents().find((event) => event.phase === "cluster.port.retry")!;
+  assert.ok(retry, "the retry must be recorded as a lifecycle event");
+  assert.equal(retry.detail?.previousPort, candidate);
+  assert.equal(retry.detail?.port, env.port);
+  assert.equal((await env.psql("SELECT 1;")).stdout, "1", "the cluster must be usable on the retried port");
+
+  const cleanup = await env.cleanup();
+  assert.equal(cleanup.stopped, true);
+  assert.equal(await exists(env.dataDir), false);
+});
+
+test("a startup failure that is not a port collision fails immediately", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  const fixture = await withFixture(t);
+  let attempts = 0;
+  const brokenStart: typeof runCommandSafe = async (command, args, options) => {
+    if (command.endsWith("pg_ctl") && (args ?? []).includes("start")) {
+      attempts += 1;
+      return { ok: false, stdout: "", stderr: "pg_ctl: directory is not a database cluster directory", code: 1 };
+    }
+    return runCommandSafe(command, args, options);
+  };
+
+  const env = await createPostgresResearchEnvironment(specFor(fixture, "port-hard-fail", { runCommand: brokenStart }));
+  t.after(async () => env.cleanup());
+  const candidate = env.port;
+
+  await assert.rejects(env.start(), (error: Error) => error instanceof PostgresResearchError && /pg_ctl start failed/.test(error.message));
+  assert.equal(attempts, 1, "only a bind collision may be retried");
+  assert.equal(env.port, candidate);
+});
+
+// --- SHOULD FIX 5: the build cache key covers the build environment -------
+
+test("the build cache key covers the declared build environment", () => {
+  const compiler = { command: "cc", version: "Apple clang version 17.0.0", target: "arm64-apple-darwin25.0.0" };
+  const base = {
+    sourceHash: "a".repeat(40),
+    configureArgs: ["--without-readline"],
+    platform: "darwin",
+    arch: "arm64",
+    compiler
+  };
+  const unoptimized = computeBuildCacheKey({ ...base, buildEnv: { CFLAGS: "-O0" } });
+  const optimized = computeBuildCacheKey({ ...base, buildEnv: { CFLAGS: "-O2" } });
+  assert.notEqual(unoptimized, optimized, "CFLAGS=-O0 and CFLAGS=-O2 are not interchangeable builds");
+  assert.equal(computeBuildCacheKey({ ...base, buildEnv: { CFLAGS: "-O0" } }), unoptimized);
+
+  const variants: Array<Record<string, string>> = [
+    { CC: "clang" },
+    { CPPFLAGS: "-DDEBUG" },
+    { LDFLAGS: "-L/opt/lib" },
+    { PKG_CONFIG_PATH: "/opt/lib/pkgconfig" },
+    { pgac_cv_avx2_support: "no" }
+  ];
+  for (const buildEnv of variants) {
+    assert.notEqual(
+      computeBuildCacheKey({ ...base, buildEnv }),
+      computeBuildCacheKey(base),
+      `${JSON.stringify(buildEnv)} must change the key`
+    );
+  }
+  // Key order is not an input; the values are.
+  assert.equal(
+    computeBuildCacheKey({ ...base, buildEnv: { CFLAGS: "-O2", CC: "clang" } }),
+    computeBuildCacheKey({ ...base, buildEnv: { CC: "clang", CFLAGS: "-O2" } })
+  );
+
+  // resolveBuildEnv() picks up exactly the declared pass-through plus the
+  // pgac_cv_* autoconf overrides, and drops empties and everything else.
+  assert.deepEqual(
+    resolveBuildEnv(
+      { CFLAGS: "-O0", LDFLAGS: "", HOME: "/home/nobody", pgac_cv_avx2_support: "no", UNRELATED: "x" },
+      { CC: "clang" }
+    ),
+    { CC: "clang", CFLAGS: "-O0", pgac_cv_avx2_support: "no" }
+  );
+});
+
+test("a different CFLAGS cannot reuse another profile's cached build", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  const fixture = await withFixture(t);
+
+  const unoptimized = await createPostgresResearchEnvironment(
+    specFor(fixture, "cflags-o0", { build: { cacheRoot: fixture.cacheRoot, jobs: 1, env: { CFLAGS: "-O0" } } })
+  );
+  t.after(async () => unoptimized.cleanup());
+  const optimized = await createPostgresResearchEnvironment(
+    specFor(fixture, "cflags-o2", { build: { cacheRoot: fixture.cacheRoot, jobs: 1, env: { CFLAGS: "-O2" } } })
+  );
+  t.after(async () => optimized.cleanup());
+
+  assert.equal(unoptimized.buildManifest.cacheHit, false);
+  assert.equal(optimized.buildManifest.cacheHit, false, "a different CFLAGS must not hit the -O0 entry");
+  assert.notEqual(optimized.buildManifest.cacheKey, unoptimized.buildManifest.cacheKey);
+  assert.notEqual(optimized.installDir, unoptimized.installDir);
+  assert.equal(unoptimized.buildManifest.buildEnv.CFLAGS, "-O0");
+  assert.equal(optimized.buildManifest.buildEnv.CFLAGS, "-O2");
+
+  // ...and an identical declared environment still hits.
+  const again = await createPostgresResearchEnvironment(
+    specFor(fixture, "cflags-o2-again", { build: { cacheRoot: fixture.cacheRoot, jobs: 1, env: { CFLAGS: "-O2" } } })
+  );
+  t.after(async () => again.cleanup());
+  assert.equal(again.buildManifest.cacheHit, true);
+  assert.equal(again.installDir, optimized.installDir);
 });

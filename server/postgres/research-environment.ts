@@ -1,9 +1,16 @@
 import { createHash, randomBytes } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { arch, cpus, homedir, platform, tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { nowIso, runCommandSafe } from "../utils.js";
-import { allocatePort, psqlArgs, waitForPostgresReady, type PostgresReadiness, type RunCommand } from "./runtime.js";
+import {
+  allocatePort,
+  isAddressInUseFailure,
+  psqlArgs,
+  waitForPostgresReady,
+  type PostgresReadiness,
+  type RunCommand
+} from "./runtime.js";
 
 /**
  * PostgreSQL research environment (#179).
@@ -19,10 +26,41 @@ import { allocatePort, psqlArgs, waitForPostgresReady, type PostgresReadiness, t
  * hunted, and nothing that identifies a bug (real identity, fixed ref,
  * canonical reproducer) is ever derived from or written by this module. The
  * only thing that varies between "buggy" and "fixed" is the caller's `ref`.
+ *
+ * The eval boundary is a filesystem split, not a naming convention:
+ *
+ *   <root>                  agent-visible: source/, pgdata/, postgres.log
+ *   <root>-private          grader-only: build logs (configure/make)
+ *   <cacheRoot>/<entryId>   agent-visible (it is on PATH): built binaries
+ *                           plus one non-identifying completion marker
+ *
+ * Source ref, resolved commit, source tree hash and build cache key are
+ * written into none of those. They live only in the manifests
+ * materializePostgresSource()/buildPostgres() return, which the caller
+ * records on the grader side.
  */
 
 /** Bumped when the build recipe itself changes; participates in the cache key. */
-export const BUILD_PROFILE_VERSION = "pg-research-env-v0";
+export const BUILD_PROFILE_VERSION = "pg-research-env-v1";
+
+/**
+ * The only file HoneyRail writes into a cache entry. It exists so an
+ * interrupted build is never mistaken for a usable one, and it says nothing
+ * else: the entry sits on the agent-visible side of the boundary
+ * (`HR_PG_BIN_DIR` points into it), so it must not carry source ref, commit,
+ * tree hash or cache key. It replaces v0's `honeyrail-build.json`, which
+ * carried all four.
+ */
+export const BUILD_COMPLETE_MARKER = "honeyrail-build-complete.json";
+export const BUILD_COMPLETE_MARKER_ID = "honeyrail-pg-build-complete";
+
+/**
+ * How many candidate ports a single start() will try. Bounded recovery from
+ * the allocatePort() TOCTOU window, not a reservation subsystem: three
+ * consecutive collisions on kernel-assigned ephemeral ports means something
+ * is wrong that retrying will not fix.
+ */
+export const START_PORT_ATTEMPTS = 3;
 
 /**
  * Minimal profile: no readline (interactive niceties), no zlib (compression),
@@ -33,6 +71,70 @@ export const BUILD_PROFILE_VERSION = "pg-research-env-v0";
 export const DEFAULT_CONFIGURE_ARGS = ["--without-readline", "--without-zlib", "--without-icu"] as const;
 
 export const DEFAULT_INITDB_ARGS = ["-A", "trust", "-U", "postgres", "--no-locale"] as const;
+
+/**
+ * The ambient variables HoneyRail intentionally lets through into
+ * `configure`/`make` - and therefore has to hash into the cache key, because
+ * every one of them changes the binaries that come out (`CFLAGS=-O0` and
+ * `CFLAGS=-O2` are not interchangeable builds).
+ *
+ * This is a declared pass-through list, not a hermetic toolchain
+ * fingerprint: the build still inherits the rest of the operator's
+ * environment (PATH above all), so a machine-level toolchain change that
+ * none of these variables mentions is still invisible to the key. The
+ * compiler identity in the key covers the common case of that.
+ */
+export const BUILD_ENV_VARS = [
+  "AR",
+  "CC",
+  "CFLAGS",
+  "CPP",
+  "CPPFLAGS",
+  "CXX",
+  "CXXFLAGS",
+  "LD",
+  "LDFLAGS",
+  "LIBS",
+  "MACOSX_DEPLOYMENT_TARGET",
+  "MAKEFLAGS",
+  "NM",
+  "PKG_CONFIG",
+  "PKG_CONFIG_PATH",
+  "RANLIB",
+  "SDKROOT",
+  "STRIP"
+] as const;
+
+/**
+ * Prefixes whose every ambient variable is passed through and hashed.
+ * `pgac_cv_*` is autoconf's result cache: setting one (e.g. the documented
+ * `pgac_cv_avx2_support=no` workaround) overrides a configure probe and
+ * genuinely changes the resulting binaries, so it must key the cache too.
+ */
+export const BUILD_ENV_PREFIXES = ["pgac_cv_"] as const;
+
+/**
+ * The subset of `ambient` (plus explicit `overrides`) that participates in
+ * the build: recorded in the build manifest and hashed into the cache key.
+ * Empty values are dropped so "unset" and "set to empty" key identically,
+ * which is what configure sees anyway.
+ */
+export function resolveBuildEnv(
+  ambient: NodeJS.ProcessEnv = process.env,
+  overrides: Record<string, string> = {}
+): Record<string, string> {
+  const resolved: Record<string, string> = {};
+  const take = (key: string, value: string | undefined) => {
+    const text = String(value ?? "");
+    if (text) resolved[key] = text;
+  };
+  for (const key of BUILD_ENV_VARS) take(key, ambient[key]);
+  for (const [key, value] of Object.entries(ambient)) {
+    if (BUILD_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) take(key, value);
+  }
+  for (const [key, value] of Object.entries(overrides)) take(key, value);
+  return Object.fromEntries(Object.entries(resolved).sort(([left], [right]) => left.localeCompare(right)));
+}
 
 export type PostgresSourceSpec = {
   /**
@@ -52,6 +154,15 @@ export type PostgresBuildSpec = {
   jobs?: number;
   /** Shared across environments; defaults to ~/.honeyrail/pg-research-build-cache. */
   cacheRoot?: string;
+  /**
+   * Explicit build-environment overrides layered on top of the ambient
+   * BUILD_ENV_VARS pass-through. Applied to configure/make *and* hashed into
+   * the cache key, so two profiles that differ only here cannot share a
+   * cache entry.
+   */
+  env?: Record<string, string>;
+  /** Where configure/make logs are written. Grader-private; never inside the agent-visible root. */
+  logDir?: string;
 };
 
 export type PostgresResearchTimeouts = {
@@ -75,8 +186,21 @@ export const DEFAULT_TIMEOUTS: PostgresResearchTimeouts = {
 };
 
 export type PostgresResearchSpec = {
-  /** Directory this environment owns: snapshot, PGDATA, logs, build logs. */
+  /**
+   * The environment's agent-visible root: the snapshot (`source/`), PGDATA
+   * (`pgdata/`) and the server log (`postgres.log`) live here and nothing
+   * else does. Every path `agentEnvironment()` hands out is inside it.
+   *
+   * HoneyRail writes no source/build identity anywhere in this tree, and the
+   * caller must not put grader-private material in it or in its parent - see
+   * the eval-isolation contract on `agentEnvironment()`.
+   */
   root: string;
+  /**
+   * Grader-private directory for this environment's build logs. Must be
+   * outside `root`; defaults to `<root>-private`.
+   */
+  privateDir?: string;
   source: PostgresSourceSpec;
   build?: PostgresBuildSpec;
   initdbArgs?: readonly string[];
@@ -111,6 +235,8 @@ export type BuildCacheKeyInput = {
   platform: string;
   arch: string;
   compiler: PostgresCompilerIdentity;
+  /** Resolved BUILD_ENV_VARS pass-through; see resolveBuildEnv(). */
+  buildEnv?: Record<string, string>;
   profileVersion?: string;
 };
 
@@ -132,8 +258,12 @@ export type PostgresBuildManifest = {
   make: string;
   platform: string;
   arch: string;
+  buildEnv: Record<string, string>;
   profileVersion: string;
+  /** Grader-private: identifies the source. Never written into the cache tree. */
   cacheKey: string;
+  /** The cache entry's on-disk directory name: a one-way digest of cacheKey. */
+  entryId: string;
   cacheHit: boolean;
   cacheRoot: string;
   installDir: string;
@@ -229,23 +359,52 @@ function socketRoot() {
   return process.env.HONEYRAIL_PG_SOCKET_ROOT || (platform() === "win32" ? tmpdir() : "/tmp");
 }
 
+/**
+ * Default parent directory for agent-visible environment roots, and the
+ * reason it is not the run's attachment directory: everything HoneyRail
+ * records about a research step (source manifest, build manifest, runtime
+ * manifest) lands under `attachmentRoot`, so an environment root nested in
+ * there would put the answer key one or two `..` hops from
+ * `$HR_PG_SOURCE_DIR`. Rooting agent-visible state in its own tree keeps the
+ * two hierarchies disjoint; siblings under here are other environments,
+ * which are identity-free for the same reason.
+ *
+ * Override with HONEYRAIL_PG_ENV_ROOT (e.g. onto a larger volume - snapshots
+ * of a real PostgreSQL tree are not small).
+ */
+export function agentEnvRoot() {
+  return process.env.HONEYRAIL_PG_ENV_ROOT || join(tmpdir(), "honeyrail-pg-env");
+}
+
+/** Creates a fresh agent-visible root under agentEnvRoot(). */
+export async function createAgentEnvRoot(prefix = "env-"): Promise<string> {
+  const parent = agentEnvRoot();
+  await mkdir(parent, { recursive: true });
+  return mkdtemp(join(parent, prefix));
+}
+
 async function pathExists(path: string) {
   return Boolean(await stat(path).catch(() => null));
 }
 
 /**
  * Cache key composition. A hit must never serve binaries built from
- * different source, different configure flags, a different machine
- * architecture or a different compiler, so all four are inputs - plus the
- * build profile version, so changing the recipe below invalidates every
- * existing entry.
+ * different source, different configure flags, a different declared build
+ * environment, a different machine architecture or a different compiler, so
+ * all of those are inputs - plus the build profile version, so changing the
+ * recipe below invalidates every existing entry.
  *
  * configureArgs is hashed in the order given (not sorted): reordering flags
  * can change their meaning for later-wins options, so the conservative
  * choice is an occasional redundant rebuild rather than a possible wrong
- * reuse.
+ * reuse. buildEnv *is* sorted - it is a map, and order carries no meaning.
+ *
+ * The key is grader-private. It is a stable identifier of the source under
+ * research, so it never appears on any path or in any file the agent can
+ * read; the on-disk cache entry is named by computeBuildEntryId() instead.
  */
 export function computeBuildCacheKey(input: BuildCacheKeyInput): string {
+  const buildEnv = input.buildEnv ?? {};
   const canonical = JSON.stringify({
     profileVersion: input.profileVersion ?? BUILD_PROFILE_VERSION,
     sourceHash: input.sourceHash,
@@ -256,9 +415,24 @@ export function computeBuildCacheKey(input: BuildCacheKeyInput): string {
       command: input.compiler.command,
       version: input.compiler.version,
       target: input.compiler.target
-    }
+    },
+    buildEnv: Object.fromEntries(Object.entries(buildEnv).sort(([left], [right]) => left.localeCompare(right)))
   });
   return createHash("sha256").update(canonical).digest("hex");
+}
+
+/**
+ * The cache entry's directory name.
+ *
+ * A separate, domain-separated one-way digest of the cache key rather than
+ * the cache key itself: `HR_PG_BIN_DIR` is agent-visible, so if the entry
+ * were named by the key the agent could read a stable identifier of the
+ * source it is supposed to be rediscovering straight off its own PATH. The
+ * mapping only runs forwards - HoneyRail knows key -> entry id, the agent
+ * cannot go back.
+ */
+export function computeBuildEntryId(cacheKey: string): string {
+  return createHash("sha256").update(`honeyrail-pg-build-entry ${cacheKey}`).digest("hex").slice(0, 32);
 }
 
 /**
@@ -267,6 +441,15 @@ export function computeBuildCacheKey(input: BuildCacheKeyInput): string {
  * after (or before) the ref. There is intentionally no "keep the git
  * directory" option - in historical mode that would hand the agent the fix
  * commit.
+ *
+ * `destDir` is *published*, not filled in place: the tree is extracted into
+ * a fresh sibling staging directory, checked, and only then renamed over any
+ * previous content. `tar -x` overlays rather than replaces, so extracting
+ * into a non-empty destination would let a file that exists only in a later
+ * ref (in historical mode: the fix) survive into a snapshot of an earlier
+ * one. Publishing atomically also means a failed materialization leaves
+ * either the previous snapshot or nothing - never a half-extracted tree that
+ * looks like an exact snapshot.
  */
 export async function materializePostgresSource(
   spec: PostgresSourceSpec,
@@ -299,26 +482,40 @@ export async function materializePostgresSource(
     throw new PostgresResearchError(`Cannot resolve source tree for commit ${resolvedCommit} in ${repoPath}`);
   }
 
-  await mkdir(destDir, { recursive: true });
-  const tarPath = `${destDir}.tar`;
-  const archive = await runCommand("git", ["-C", repoPath, "archive", "--format=tar", "-o", tarPath, resolvedCommit], {
-    timeout,
-    maxBuffer: 1024 * 1024 * 8
-  });
-  if (!archive.ok) {
-    await rm(tarPath, { force: true });
-    throw new PostgresResearchError(`git archive failed for ${resolvedCommit}: ${archive.stderr || archive.stdout}`);
-  }
-  const extract = await runCommand("tar", ["-xf", tarPath, "-C", destDir], { timeout, maxBuffer: 1024 * 1024 * 8 });
-  await rm(tarPath, { force: true });
-  if (!extract.ok) {
-    throw new PostgresResearchError(`Extracting source snapshot failed: ${extract.stderr || extract.stdout}`);
-  }
+  await mkdir(dirname(destDir), { recursive: true });
+  const suffix = randomBytes(6).toString("hex");
+  const staging = `${destDir}.staging-${suffix}`;
+  const tarPath = `${destDir}.tar-${suffix}`;
+  try {
+    await mkdir(staging, { recursive: true });
+    const archive = await runCommand("git", ["-C", repoPath, "archive", "--format=tar", "-o", tarPath, resolvedCommit], {
+      timeout,
+      maxBuffer: 1024 * 1024 * 8
+    });
+    if (!archive.ok) {
+      throw new PostgresResearchError(`git archive failed for ${resolvedCommit}: ${archive.stderr || archive.stdout}`);
+    }
+    const extract = await runCommand("tar", ["-xf", tarPath, "-C", staging], { timeout, maxBuffer: 1024 * 1024 * 8 });
+    if (!extract.ok) {
+      throw new PostgresResearchError(`Extracting source snapshot failed: ${extract.stderr || extract.stdout}`);
+    }
 
-  // Assertion, not a cleanup step: `git archive` cannot emit a .git, so a
-  // hit here means an assumption broke and the snapshot must not be used.
-  if (await pathExists(join(destDir, ".git"))) {
-    throw new PostgresResearchError(`Materialized source snapshot unexpectedly contains a .git directory: ${destDir}`);
+    // Assertion, not a cleanup step: `git archive` cannot emit a .git, so a
+    // hit here means an assumption broke and the snapshot must not be used.
+    if (await pathExists(join(staging, ".git"))) {
+      throw new PostgresResearchError(`Materialized source snapshot unexpectedly contains a .git directory: ${destDir}`);
+    }
+
+    // Publish. The old tree is removed first because rename() onto a
+    // non-empty directory fails; the window between the two is the price of
+    // not needing a second filesystem.
+    await rm(destDir, { recursive: true, force: true });
+    await rename(staging, destDir);
+  } catch (error) {
+    await rm(staging, { recursive: true, force: true });
+    throw error;
+  } finally {
+    await rm(tarPath, { force: true });
   }
 
   return {
@@ -333,9 +530,11 @@ export async function materializePostgresSource(
   };
 }
 
-export async function detectCompilerIdentity(options: { runCommand?: RunCommand } = {}): Promise<PostgresCompilerIdentity> {
+export async function detectCompilerIdentity(
+  options: { runCommand?: RunCommand; buildEnv?: Record<string, string> } = {}
+): Promise<PostgresCompilerIdentity> {
   const runCommand = options.runCommand ?? runCommandSafe;
-  const command = process.env.CC || "cc";
+  const command = options.buildEnv?.CC || process.env.CC || "cc";
   const version = await runCommand(command, ["--version"], { timeout: 15000 });
   if (!version.ok) {
     throw new PostgresResearchError(`No usable C compiler: ${command} --version failed (${version.stderr || version.code})`);
@@ -378,15 +577,21 @@ export type BuildPostgresInput = {
 
 /**
  * configure + make + make install into a cache entry named by
- * computeBuildCacheKey().
+ * computeBuildEntryId(computeBuildCacheKey(...)).
  *
  * The install is staged through DESTDIR and renamed into place only once
- * `make install` succeeded and the manifest marker was written, so an
+ * `make install` succeeded and the completion marker was written, so an
  * interrupted build can never be mistaken for a cache hit. DESTDIR rather
  * than a staging --prefix because the two are not equivalent: a PostgreSQL
  * install is only partly relocatable (binaries find share/ relative to
  * argv[0], but macOS bakes an absolute install_name for libpq into every
  * client program), so --prefix must already be the final path.
+ *
+ * Nothing identifying is written into the cache tree: the entry directory is
+ * named by the one-way entry id and the marker file says only "this build
+ * finished". The full provenance lives in the manifest this returns, which
+ * the caller records grader-side. `HR_PG_BIN_DIR` points inside this tree,
+ * so anything written here is agent-readable by construction.
  */
 export async function buildPostgres(input: BuildPostgresInput): Promise<PostgresBuildManifest> {
   const runCommand = input.runCommand ?? runCommandSafe;
@@ -395,17 +600,20 @@ export async function buildPostgres(input: BuildPostgresInput): Promise<Postgres
   const configureArgs = [...(input.build?.configureArgs ?? DEFAULT_CONFIGURE_ARGS)];
   const cacheRoot = input.build?.cacheRoot || defaultCacheRoot();
   const jobs = Math.max(1, input.build?.jobs ?? Math.min(8, cpus().length || 1));
-  const compiler = await detectCompilerIdentity({ runCommand });
+  const buildEnv = resolveBuildEnv(process.env, input.build?.env ?? {});
+  const compiler = await detectCompilerIdentity({ runCommand, buildEnv });
   const makeVersion = await runCommand("make", ["--version"], { timeout: 15000 });
   const cacheKey = computeBuildCacheKey({
     sourceHash: input.source.sourceHash,
     configureArgs,
     platform: platform(),
     arch: arch(),
-    compiler
+    compiler,
+    buildEnv
   });
-  const installDir = join(cacheRoot, cacheKey);
-  const markerPath = join(installDir, "honeyrail-build.json");
+  const entryId = computeBuildEntryId(cacheKey);
+  const installDir = join(cacheRoot, entryId);
+  const markerPath = join(installDir, BUILD_COMPLETE_MARKER);
   const base = {
     sourceRef: input.source.ref,
     sourceCommit: input.source.resolvedCommit,
@@ -415,17 +623,23 @@ export async function buildPostgres(input: BuildPostgresInput): Promise<Postgres
     make: firstLine(makeVersion.stdout),
     platform: platform(),
     arch: arch(),
+    buildEnv,
     profileVersion: BUILD_PROFILE_VERSION,
     cacheKey,
+    entryId,
     cacheRoot,
     installDir,
     jobs
   };
+  // The build steps see the ambient environment plus the declared overrides,
+  // and every variable that can change the output is in `buildEnv`, hence in
+  // the cache key above.
+  const commandEnv: NodeJS.ProcessEnv = { ...process.env, ...(input.build?.env ?? {}) };
 
   const cached = await readFile(markerPath, "utf8").catch(() => "");
   if (cached) {
-    const marker = JSON.parse(cached) as { cacheKey?: string };
-    if (marker.cacheKey === cacheKey) {
+    const marker = JSON.parse(cached) as { marker?: string; entryId?: string };
+    if (marker.marker === BUILD_COMPLETE_MARKER_ID && marker.entryId === entryId) {
       return {
         ...base,
         cacheHit: true,
@@ -447,6 +661,7 @@ export async function buildPostgres(input: BuildPostgresInput): Promise<Postgres
     const result = await runCommand(command, args, {
       cwd: input.source.sourceDir,
       timeout,
+      env: commandEnv,
       maxBuffer: 1024 * 1024 * 64
     });
     const durationMs = Date.now() - stepStarted;
@@ -472,13 +687,20 @@ export async function buildPostgres(input: BuildPostgresInput): Promise<Postgres
     );
     await step("make", "make", [`-j${jobs}`], timeouts.make, "make.log");
     await step("make install", "make", ["install", `DESTDIR=${staging}`], timeouts.install, "make-install.log");
-    await writeFile(join(stagedInstall, "honeyrail-build.json"), JSON.stringify({ ...base, builtAt: nowIso() }, null, 2));
+    // Completion marker only. Source ref, commit, tree hash and cache key
+    // stay out of the cache tree - see the module header on the eval
+    // boundary; the caller records them grader-side from the returned
+    // manifest.
+    await writeFile(
+      join(stagedInstall, BUILD_COMPLETE_MARKER),
+      JSON.stringify({ marker: BUILD_COMPLETE_MARKER_ID, entryId, profileVersion: BUILD_PROFILE_VERSION, completedAt: nowIso() }, null, 2)
+    );
     try {
       await rename(stagedInstall, installDir);
       await rm(staging, { recursive: true, force: true });
     } catch (error) {
       // Another environment finished the identical build first. Its entry is
-      // by definition equivalent (same cache key), so drop ours and use it.
+      // by definition equivalent (same entry id), so drop ours and use it.
       if (!(await pathExists(markerPath))) throw error;
       await rm(staging, { recursive: true, force: true });
     }
@@ -498,7 +720,15 @@ export async function buildPostgres(input: BuildPostgresInput): Promise<Postgres
 }
 
 export class PostgresResearchEnvironment {
+  /**
+   * The agent-visible root. `source/`, `pgdata/` and `postgres.log` are the
+   * only things in it, and every path agentEnvironment() hands out is inside
+   * it (or inside the shared build cache, which is identity-free by
+   * construction - see buildPostgres()).
+   */
   readonly root: string;
+  /** Grader-private sibling of `root`: build logs. Never handed to an agent. */
+  readonly privateDir: string;
   readonly sourceDir: string;
   readonly installDir: string;
   readonly binDir: string;
@@ -506,7 +736,6 @@ export class PostgresResearchEnvironment {
   readonly socketDir: string;
   readonly logPath: string;
   readonly buildLogDir: string;
-  readonly port: number;
   readonly host = "127.0.0.1";
   readonly user = "postgres";
   readonly database = "postgres";
@@ -519,6 +748,7 @@ export class PostgresResearchEnvironment {
   private readonly timeouts: PostgresResearchTimeouts;
   private readonly initdbArgs: string[];
   private readonly events: PostgresLifecycleEvent[] = [];
+  private currentPort: number;
   private initialized = false;
   private running = false;
   private closed = false;
@@ -526,6 +756,8 @@ export class PostgresResearchEnvironment {
 
   constructor(input: {
     root: string;
+    privateDir: string;
+    buildLogDir?: string;
     sourceManifest: PostgresSourceManifest;
     buildManifest: PostgresBuildManifest;
     port: number;
@@ -537,6 +769,7 @@ export class PostgresResearchEnvironment {
     events?: PostgresLifecycleEvent[];
   }) {
     this.root = input.root;
+    this.privateDir = input.privateDir;
     this.sourceManifest = input.sourceManifest;
     this.buildManifest = input.buildManifest;
     this.sourceDir = input.sourceManifest.sourceDir;
@@ -546,13 +779,22 @@ export class PostgresResearchEnvironment {
     this.dataDir = join(input.root, "pgdata");
     this.socketDir = input.socketDir;
     this.logPath = join(input.root, "postgres.log");
-    this.buildLogDir = join(input.root, "build");
-    this.port = input.port;
+    this.buildLogDir = input.buildLogDir ?? join(input.privateDir, "build");
+    this.currentPort = input.port;
     this.runCommand = input.runCommand;
     this.timeouts = input.timeouts;
     this.initdbArgs = input.initdbArgs;
     this.label = input.label;
     for (const event of input.events ?? []) this.events.push(event);
+  }
+
+  /**
+   * The port this cluster is on (or will next try). Not readonly: start()
+   * re-allocates on a bind collision, because allocatePort() hands out a
+   * candidate rather than a reservation - see START_PORT_ATTEMPTS.
+   */
+  get port(): number {
+    return this.currentPort;
   }
 
   /**
@@ -605,11 +847,29 @@ export class PostgresResearchEnvironment {
   }
 
   /**
-   * Flat KEY=value view of connectionInfo() for handing to a subprocess (see
-   * the agent-task `input.environment` hook). Carries connection and
-   * filesystem coordinates only - never ref, commit, source hash or cache
-   * key, which are exactly the things a historical-rediscovery agent must
-   * not be able to read out of its own environment.
+   * Flat KEY=value view of connectionInfo() for handing to a subprocess -
+   * the environment `runAgentInPostgresResearchEnvironment()` merges into an
+   * agent process, and the shape a driver passes to `agent-task`'s
+   * `input.environment`.
+   *
+   * The eval-isolation contract is a filesystem contract, not just an
+   * omission from this map:
+   *
+   * - every path here is inside `root` (the agent-visible root, which holds
+   *   the snapshot, PGDATA and the server log and nothing else) or inside
+   *   the shared build cache entry, whose directory name is the one-way
+   *   `entryId` and whose only HoneyRail file is a completion marker;
+   * - source ref, resolved commit, source tree hash and cache key are
+   *   written *nowhere* under either of those trees - they exist only in the
+   *   manifests the caller records grader-side;
+   * - the snapshot has no `.git`, so the ref cannot be recovered from the
+   *   tree either.
+   *
+   * What it does not do is sandbox the agent: a process with unrestricted
+   * filesystem access and knowledge of where HoneyRail keeps its attachments
+   * can still read them. Keeping the private tree out of reach is the
+   * caller's job (see runAgentInPostgresResearchEnvironment, which does not
+   * export any attachment path).
    */
   agentEnvironment(prefix = "HR_PG"): Record<string, string> {
     const info = this.connectionInfo();
@@ -631,6 +891,7 @@ export class PostgresResearchEnvironment {
     return {
       label: this.label,
       root: this.root,
+      privateDir: this.privateDir,
       sourceDir: this.sourceDir,
       installDir: this.installDir,
       binDir: this.binDir,
@@ -668,19 +929,38 @@ export class PostgresResearchEnvironment {
     return `-p ${this.port} -h ${this.host} -k ${this.socketDir}`;
   }
 
-  /** initdb (once) + pg_ctl start + readiness poll. */
+  /**
+   * initdb (once) + pg_ctl start + readiness poll.
+   *
+   * allocatePort() releases its candidate port before PostgreSQL binds it,
+   * so a concurrent process can take it in between. That window is narrow
+   * but real, so a start that fails specifically on a bind collision is
+   * retried on a freshly allocated port a bounded number of times. Every
+   * other startup failure stays a hard failure on the first attempt: a
+   * research environment that cannot start must say so rather than thrash.
+   */
   async start(): Promise<PostgresReadiness> {
     this.assertOpen();
     if (this.running) return { ready: true, latencyMs: 0 };
     await this.initdb();
     const started = Date.now();
-    const result = await this.runCommand(
-      this.binaries.pg_ctl,
-      ["-D", this.dataDir, "-l", this.logPath, "-o", this.pgCtlOptions(), "start", "-w"],
-      { cwd: this.root, timeout: this.timeouts.control, env: this.commandEnv(), maxBuffer: 1024 * 1024 * 8 }
-    );
-    if (!result.ok) {
-      throw new PostgresResearchError(`pg_ctl start failed: ${result.stderr || result.stdout}`);
+    for (let attempt = 1; ; attempt += 1) {
+      const result = await this.runCommand(
+        this.binaries.pg_ctl,
+        ["-D", this.dataDir, "-l", this.logPath, "-o", this.pgCtlOptions(), "start", "-w"],
+        { cwd: this.root, timeout: this.timeouts.control, env: this.commandEnv(), maxBuffer: 1024 * 1024 * 8 }
+      );
+      if (result.ok) break;
+      // PostgreSQL reports the bind failure in the server log pg_ctl was
+      // pointed at, not necessarily on pg_ctl's own stderr, so both count.
+      const logTail = await readFile(this.logPath, "utf8").catch(() => "");
+      const detail = `${result.stderr}\n${result.stdout}\n${logTail.slice(-4096)}`;
+      if (attempt >= START_PORT_ATTEMPTS || !isAddressInUseFailure(detail)) {
+        throw new PostgresResearchError(`pg_ctl start failed: ${result.stderr || result.stdout}`);
+      }
+      const previous = this.currentPort;
+      this.currentPort = await allocatePort();
+      this.record("cluster.port.retry", { attempt, previousPort: previous, port: this.currentPort });
     }
     this.running = true;
     this.record("cluster.started", { port: this.port, socketDir: this.socketDir }, Date.now() - started);
@@ -845,7 +1125,17 @@ export async function createPostgresResearchEnvironment(spec: PostgresResearchSp
   const runCommand = spec.runCommand ?? runCommandSafe;
   const timeouts = { ...DEFAULT_TIMEOUTS, ...spec.timeouts };
   const events: PostgresLifecycleEvent[] = [];
+  const privateDir = spec.privateDir ?? `${spec.root}-private`;
+  if (privateDir === spec.root || privateDir.startsWith(`${spec.root}/`)) {
+    // The whole point of the private directory is that no agent-visible path
+    // leads to it; nesting it under the agent root would silently undo that.
+    throw new PostgresResearchError(`privateDir must live outside the agent-visible root, got ${privateDir}`);
+  }
+  // Grader-private: configure/make logs quote the source path and every
+  // build flag, so they stay out of the agent-visible root.
+  const buildLogDir = spec.build?.logDir ?? join(privateDir, "build");
   await mkdir(spec.root, { recursive: true });
+  await mkdir(privateDir, { recursive: true });
 
   const sourceManifest = await materializePostgresSource(spec.source, join(spec.root, "source"), {
     runCommand,
@@ -861,7 +1151,7 @@ export async function createPostgresResearchEnvironment(spec: PostgresResearchSp
   const buildManifest = await buildPostgres({
     source: sourceManifest,
     build: spec.build,
-    logDir: join(spec.root, "build"),
+    logDir: buildLogDir,
     runCommand,
     timeouts
   });
@@ -878,6 +1168,8 @@ export async function createPostgresResearchEnvironment(spec: PostgresResearchSp
 
   return new PostgresResearchEnvironment({
     root: spec.root,
+    privateDir,
+    buildLogDir,
     sourceManifest,
     buildManifest,
     port,

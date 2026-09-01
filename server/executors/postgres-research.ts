@@ -1,6 +1,7 @@
-import { mkdir, stat } from "node:fs/promises";
+import { mkdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  createAgentEnvRoot,
   DEFAULT_CONFIGURE_ARGS,
   withPostgresResearchEnvironment,
   type PostgresQueryResult,
@@ -22,10 +23,12 @@ import { ConfigError, type ExecutionHandle, type ExecutionState, type Executor, 
  * whatever SQL the caller supplies. Nothing here knows what is being looked
  * for - "buggy" and "fixed" differ only by input.source.ref.
  *
- * Everything it writes lands under attachmentRoot (operator/grader side).
- * The only channel an agent sees is the connection environment produced by
- * PostgresResearchEnvironment.agentEnvironment(), which deliberately carries
- * no ref, commit or source hash.
+ * Everything it writes lands under attachmentRoot (operator/grader side) and
+ * carries the full provenance a grader needs. The environment's own
+ * agent-visible root deliberately does *not* live under attachmentRoot: it
+ * is created under agentEnvRoot() so that no `..` walk from a path in
+ * agentEnvironment() arrives at the manifests below. See the eval-isolation
+ * contract on PostgresResearchEnvironment.agentEnvironment().
  */
 
 const SCENARIO = "postgres-research-environment";
@@ -144,11 +147,14 @@ export class PostgresResearchExecutor implements Executor {
   async start(ctx: StepExecutionContext): Promise<ExecutionHandle> {
     const input = parsePostgresResearchInput(ctx.step.input);
     const attemptDir = join(ctx.attachmentRoot, "runs", ctx.runId, ctx.step.id, `attempt-${ctx.step.attempt}`);
-    const envRoot = join(attemptDir, "pg-env");
     await mkdir(attemptDir, { recursive: true });
+    // Agent-visible state goes in its own hierarchy; grader-private state
+    // (build logs, and the manifests written below) stays under attemptDir.
+    const envRoot = await createAgentEnvRoot(`${ctx.step.id}-`);
 
     const spec: PostgresResearchSpec = {
       root: envRoot,
+      privateDir: join(attemptDir, "env-private"),
       source: input.source,
       build: input.build,
       runCommand: ctx.runCommand,
@@ -321,7 +327,20 @@ export class PostgresResearchExecutor implements Executor {
       mediaType: "application/json",
       metadata: metadata("runtime", { port: env.port })
     });
-    const logArtifact = await registerIfPresent(ctx, "postgres.log", env.logPath, "postgres-log", { port: env.port });
+    // Copied rather than registered in place: the server log lives in the
+    // agent-visible root, which is outside attachmentRoot and transient, so
+    // the grader-side copy is the one that has to survive.
+    const serverLog = await readFile(env.logPath, "utf8").catch(() => null);
+    const logArtifact = serverLog === null
+      ? null
+      : await createDbFileArtifact(ctx, {
+          baseDir: attemptDir,
+          name: "postgres.log",
+          content: serverLog,
+          kind: "log",
+          mediaType: "text/plain",
+          metadata: metadata("postgres-log", { port: env.port })
+        });
     await createDbEvidence(ctx, {
       kind: "db.environment.cleanup",
       source: "postgres-research",
