@@ -34,9 +34,21 @@
  * never written into the seed-root" - the same trust boundary
  * `kill-attribution.ts`'s `OperatorMeta` (also `manifest.json`-sourced)
  * already relies on. This map is plain host-side TS source, never
- * materialized into any `seed-root`/`agent-root`; an operator id with no
- * entry here just yields an empty `RequiredProbeShape` (no capability gaps),
- * which is a safe default, not an error.
+ * materialized into any `seed-root`/`agent-root`.
+ *
+ * "Unknown operator" vs. "known operator, genuinely no gap" (review fix,
+ * see `lookupRequiredProbeShape`): an operator id with no registry entry
+ * must NOT be silently reported as "capability gaps: none" - that is
+ * indistinguishable from a real clean pass and would let an unconfigured
+ * operator look diagnosed when it never was. `lookupRequiredProbeShape`
+ * returns an explicit `required-shape-unavailable` `Evidence` entry in that
+ * case instead of a bare empty shape; callers (`scripts/tinytable-diagnose.ts`)
+ * must use it rather than reading `PRIVATE_REQUIRED_PROBE_SHAPES` directly.
+ *
+ * `trial-diagnosis.json`'s on-disk schema is snake_case (#174 §7's own
+ * output contract) while `TrialDiagnosis` is camelCase - `encodeTrialDiagnosis`/
+ * `decodeTrialDiagnosis` are the single source of truth for that boundary;
+ * nothing else should hand-rebuild either direction.
  */
 
 import { deriveTrajectoryEvents } from "./dsh-trajectory-bridge.js";
@@ -81,7 +93,17 @@ export type ProbeShape = {
   multiStatementInteraction: boolean;
 };
 
-export type RequiredProbeShape = Partial<Record<keyof ProbeShape | "minFkPerTable" | "constraintPositionVariation", boolean | number>>;
+/**
+ * Review fix (P1): `constraintPositionVariation` was part of #174's own
+ * type sketch but had no observed-telemetry field or `GAP_CHECKS`
+ * comparator behind it - a required-shape key a caller could set that could
+ * never actually produce a gap. Removed until a real signal + comparator is
+ * implemented (a required-shape field must never be silently ignored)
+ * rather than shipping it as a no-op key. Re-add together with its
+ * comparator if/when "constraints declared in varying element-list
+ * positions" becomes a real v0 signal.
+ */
+export type RequiredProbeShape = Partial<Record<keyof ProbeShape | "minFkPerTable", boolean | number>>;
 
 export type CapabilityGapTag =
   | "cross-column-dependency"
@@ -104,12 +126,57 @@ export type TrialDiagnosis = {
 
 /**
  * #174 §5: per-operator-id required probe shapes, private/evaluator-side
- * only - see this module's own docstring for the trust boundary. Empty for
- * an operator id with no known required shape (safe default: no gaps).
- * Grows as real operators get a documented required shape; not required to
- * be exhaustive for v0.
+ * only - see this module's own docstring for the trust boundary and for
+ * `lookupRequiredProbeShape`, the required way to read this map (an id with
+ * no entry is NOT the same as "no gap"). Seeded with the two real
+ * `vendor/tinytable-evals` operators that motivated #174 (`mutate.py`'s own
+ * `notes=` fields, quoted below); not required to be exhaustive for v0.
  */
-export const PRIVATE_REQUIRED_PROBE_SHAPES: Record<string, RequiredProbeShape> = {};
+export const PRIVATE_REQUIRED_PROBE_SHAPES: Record<string, RequiredProbeShape> = {
+  // mutate.py: "Killing it needs three tables and a child declaring two
+  // FKs - one obvious single-FK test still passes." - exactly
+  // same-kind-multiplicity's own definition.
+  "fk-only-last-declared-constraint-registered": { minFkPerTable: 2 },
+  // mutate.py: "CHECK is re-validated on UPDATE against the assignment list
+  // alone rather than the merged row... Only an UPDATE whose untouched
+  // column is the one carrying the constraint (e.g. the surviving disjunct
+  // of an OR-CHECK) distinguishes it." The real kill also needs a partial
+  // UPDATE that leaves the checked column unassigned, not just a
+  // cross-column CHECK in isolation - crossColumnDependency alone is the
+  // narrower, golden-case-A-shaped signal this v0 extractor can actually
+  // detect (a single clause referencing >=2 columns); tracked here rather
+  // than silently requiring partialUpdate too, since v0's crossColumnDependency
+  // heuristic doesn't yet distinguish an AND-joined predicate from the
+  // OR-disjunct shape this specific mutant needs.
+  "check-on-update-sees-only-assigned-columns": { crossColumnDependency: true }
+};
+
+/**
+ * The required way to read `PRIVATE_REQUIRED_PROBE_SHAPES` (review fix,
+ * P0): an operator id with no registry entry returns an explicit
+ * `required-shape-unavailable` `Evidence` entry instead of silently
+ * defaulting to `{}` (which `diagnoseTrial` would then report as "capability
+ * gaps: none" - indistinguishable from a real clean pass). Callers must
+ * pass the returned `evidence` through to `diagnoseTrial` so a report reader
+ * can tell "checked, no gap" apart from "never actually checked".
+ */
+export function lookupRequiredProbeShape(operatorId: string): { shape: RequiredProbeShape; evidence: Evidence[] } {
+  if (Object.prototype.hasOwnProperty.call(PRIVATE_REQUIRED_PROBE_SHAPES, operatorId)) {
+    return { shape: PRIVATE_REQUIRED_PROBE_SHAPES[operatorId], evidence: [] };
+  }
+  return {
+    shape: {},
+    evidence: [
+      {
+        id: `required-shape-unavailable-${operatorId || "unknown"}`,
+        runId: operatorId || "unknown",
+        kind: "required-shape-unavailable",
+        claim: `No PRIVATE_REQUIRED_PROBE_SHAPES entry for operator "${operatorId || "unknown"}" - capability gaps could not be determined (absence of evaluator truth, not absence of a gap).`,
+        createdAt: new Date().toISOString()
+      }
+    ]
+  };
+}
 
 // --- lightweight SQL tokenization -------------------------------------------
 
@@ -212,6 +279,36 @@ function andOrBoundary(text: string, i: number): number {
   return m ? m[0].length : 0;
 }
 
+/** Strips every fully-enclosing balanced paren pair (`((x))` -> `x`), not just one layer. */
+function unwrapOuterParens(text: string): string {
+  let s = text.trim();
+  while (s.startsWith("(") && matchParen(s, 0) === s.length - 1) {
+    s = s.slice(1, -1).trim();
+  }
+  return s;
+}
+
+/**
+ * Review fix (P1): a naive single top-level `AND`/`OR` split treats
+ * `CHECK ((a > 10 AND b > 10))` as one clause containing both `a` and `b`
+ * (the `AND` sits at paren-depth 1, below the outer group), falsely flagging
+ * `crossColumnDependency` for a predicate that's semantically identical to
+ * the un-parenthesized, correctly-decomposable `CHECK (a > 10 AND b > 10)`.
+ * Recursively unwraps fully-enclosing parens and re-splits on `AND`/`OR`
+ * until reaching atomic comparisons (no further top-level `AND`/`OR`, no
+ * further full-wrap to strip) - the leaves are what "does this one
+ * comparison reference >=2 columns" (`CHECK (a > b)`, including
+ * `((a > b))`) should actually be asked about, not an arbitrarily
+ * parenthesized substring.
+ */
+function extractAtomicClauses(predicate: string): string[] {
+  const unwrapped = unwrapOuterParens(predicate);
+  if (unwrapped === "") return [];
+  const clauses = splitTopLevel(unwrapped, andOrBoundary);
+  if (clauses.length <= 1) return [unwrapped];
+  return clauses.flatMap((clause) => extractAtomicClauses(clause));
+}
+
 type BuildCtx = {
   tableCount: number;
   columnCount: number;
@@ -304,7 +401,7 @@ function parseCreateTable(body: string, ctx: BuildCtx): void {
       const openI = el.indexOf("(");
       const closeI = matchParen(el, openI);
       const predicate = closeI === -1 ? el.slice(openI + 1) : el.slice(openI + 1, closeI);
-      const clauses = splitTopLevel(predicate, andOrBoundary);
+      const clauses = extractAtomicClauses(predicate);
       const idx = (ctx.checkPerTable.get(table) ?? 0) + 1;
       ctx.checkPerTable.set(table, idx);
       ctx.constraintCountByKind.check += 1;
@@ -522,5 +619,66 @@ export function diagnoseTrial(
     requiredProbeShapes: required,
     capabilityGaps,
     evidence
+  };
+}
+
+// --- on-disk schema (#174 §7's snake_case output contract) -----------------
+
+/**
+ * `trial-diagnosis.json`'s on-disk shape - deliberately snake_case per #174
+ * §7's own output contract, distinct from `TrialDiagnosis`'s camelCase
+ * in-memory shape. `encodeTrialDiagnosis`/`decodeTrialDiagnosis` are the
+ * only place this conversion should happen (review fix, P0: a prior version
+ * of `scripts/dsh-evals-demo.ts` read the raw JSON and spread it directly as
+ * a `TrialDiagnosis`, so `d.capabilityGaps` was `undefined` on every real
+ * diagnosed trial - `capability_gaps` was the actual key on disk).
+ */
+export type TrialDiagnosisFile = {
+  trial_id: string;
+  outcome: DshTrialOutcome;
+  feature: string;
+  observed_probe_shapes: Partial<ProbeShape>;
+  required_probe_shapes: RequiredProbeShape;
+  capability_gaps: CapabilityGapTag[];
+  evidence: Evidence[];
+};
+
+export function encodeTrialDiagnosis(diagnosis: TrialDiagnosis): TrialDiagnosisFile {
+  return {
+    trial_id: diagnosis.trialId,
+    outcome: diagnosis.outcome,
+    feature: diagnosis.feature,
+    observed_probe_shapes: diagnosis.observedProbeShapes,
+    required_probe_shapes: diagnosis.requiredProbeShapes,
+    capability_gaps: diagnosis.capabilityGaps,
+    evidence: diagnosis.evidence
+  };
+}
+
+/** Defensive decode of a `trial-diagnosis.json` payload of unknown provenance (age, hand-editing, a future schema change) - `null` for anything that doesn't match the expected shape, rather than an exception or a half-populated `TrialDiagnosis`. */
+export function decodeTrialDiagnosis(raw: unknown): TrialDiagnosis | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const r = raw as Partial<TrialDiagnosisFile>;
+  if (
+    typeof r.trial_id !== "string" ||
+    typeof r.outcome !== "string" ||
+    typeof r.feature !== "string" ||
+    !Array.isArray(r.capability_gaps) ||
+    !Array.isArray(r.evidence) ||
+    typeof r.observed_probe_shapes !== "object" ||
+    r.observed_probe_shapes === null ||
+    typeof r.required_probe_shapes !== "object" ||
+    r.required_probe_shapes === null
+  ) {
+    return null;
+  }
+  return {
+    trialId: r.trial_id,
+    outcome: r.outcome as DshTrialOutcome,
+    feature: r.feature,
+    observedProbeShapes: r.observed_probe_shapes as Partial<ProbeShape>,
+    requiredProbeShapes: r.required_probe_shapes as RequiredProbeShape,
+    capabilityGaps: r.capability_gaps as CapabilityGapTag[],
+    evidence: r.evidence as Evidence[]
   };
 }

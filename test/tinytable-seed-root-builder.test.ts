@@ -1,17 +1,39 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { promisify } from "node:util";
 import { test, type TestContext } from "node:test";
 
 import { buildOracleAgentRoot, buildSeedRoot, copyBackAgentArtifacts } from "../scripts/tinytable-seed-root-builder.js";
-import { runInExamRoom } from "../scripts/tinytable-exam-room.js";
+import { runInExamRoom, DEFAULT_IMAGE } from "../scripts/tinytable-exam-room.js";
 import { runCommandSafe, type SafeCommandOutput } from "../server/utils.js";
 
 async function tempDir(t: TestContext, prefix: string): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), prefix));
   t.after(async () => rm(dir, { recursive: true, force: true }));
   return dir;
+}
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * Review fix (P0/CI): `buildSeedRoot({ engineAccess: "bytecode" })` compiles
+ * `.pyc` *inside* `DEFAULT_IMAGE` (see `applyBlackBoxTransform`,
+ * scripts/tinytable-seed-root-builder.ts) - every `--black-box` test below
+ * depends on it, not just the one that also calls `runInExamRoom` directly.
+ * GitHub Actions doesn't build this image, so all three failed unguarded.
+ * Same skip-when-unbuilt pattern test/tinytable-exam-room.test.ts's own
+ * `examRoomImageAvailable` already uses.
+ */
+async function examRoomImageAvailable(): Promise<boolean> {
+  try {
+    await execFileAsync("docker", ["image", "inspect", DEFAULT_IMAGE]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -134,6 +156,10 @@ test("buildSeedRoot surfaces build_seed_root.py's own stderr on failure", async 
 // scoping writeup for why this is deliberately not believed to be robust).
 
 test("buildSeedRoot --black-box hides tinytable/{core,sql}.py, leaves __init__.py, and the seed-root still runs the official suite inside the same exam-room image", async (t) => {
+  if (!(await examRoomImageAvailable())) {
+    t.skip(`${DEFAULT_IMAGE} not built locally - see docker/tinytable-exam-room/Dockerfile`);
+    return;
+  }
   const outDir = await freshOutDir(t, "honeyrail-seed-root-blackbox-");
   const manifest = await buildSeedRoot({ seed: 10, outDir, engineAccess: "bytecode" });
 
@@ -155,6 +181,10 @@ test("buildSeedRoot --black-box hides tinytable/{core,sql}.py, leaves __init__.p
 });
 
 test("buildSeedRoot --black-box: both core.py and sql.py are always hidden together, even for an operator that only mutates one of them", async (t) => {
+  if (!(await examRoomImageAvailable())) {
+    t.skip(`${DEFAULT_IMAGE} not built locally - see docker/tinytable-exam-room/Dockerfile`);
+    return;
+  }
   // Presence/absence alone must not leak which file holds the seeded
   // defect - see BuildSeedRootOptions.engineAccess's own docstring.
   const outDir = await freshOutDir(t, "honeyrail-seed-root-blackbox-");
@@ -172,6 +202,10 @@ test("buildSeedRoot --black-box wipes .git so the hidden .py content isn't recov
   // scripts/dsh-evals-demo.ts's own unconditional post-buildSeedRoot
   // gitInitCommit() call, since that's what actually re-seeds history for
   // a real trial.
+  if (!(await examRoomImageAvailable())) {
+    t.skip(`${DEFAULT_IMAGE} not built locally - see docker/tinytable-exam-room/Dockerfile`);
+    return;
+  }
   const outDir = await freshOutDir(t, "honeyrail-seed-root-blackbox-");
   await buildSeedRoot({ seed: 10, outDir, engineAccess: "bytecode" });
 

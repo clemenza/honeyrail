@@ -82,6 +82,7 @@ import { fileURLToPath } from "node:url";
 import { findBlockedReason, withUnattendedPreamble } from "../server/agents/common.js";
 import { dshAdapter } from "../server/agents/dsh.js";
 import { buildDshComparisonReport, classifyDshOutcome, type DshComparisonReportInput, type DshTrialRecord } from "../server/evals/dsh-report.js";
+import { decodeTrialDiagnosis } from "../server/evals/trial-diagnosis.js";
 import { describeManifestMismatch, findManifestMismatches } from "../server/evals/manifest-preflight.js";
 import { findSessionStatsTimingInconsistency, readSessionStats } from "../server/evals/dsh-session-stats.js";
 import { appendDerivedTrajectoryEvents } from "../server/evals/dsh-trajectory-bridge.js";
@@ -661,12 +662,17 @@ async function writeReport(outDir: string, state: StateFile): Promise<string> {
   // scripts/tinytable-diagnose.ts already wrote one for this trial - a
   // separate, opt-in stage this driver never runs itself, so a trial with no
   // trial-diagnosis.json (the common case) is unaffected, same ".catch(() =>
-  // null)" pattern writeTranscript already uses below.
+  // null)" pattern writeTranscript already uses below. Goes through
+  // decodeTrialDiagnosis rather than a raw JSON.parse + spread - the on-disk
+  // file is snake_case (#174 §7), TrialDiagnosis is camelCase; spreading the
+  // raw parse directly used to leave d.capabilityGaps/d.trialId/etc
+  // undefined on every real diagnosed trial (review fix).
   const trialsWithDiagnosis = await Promise.all(
     state.trials.map(async (trial) => {
-      const diagnosis = await readFile(join(trial.artifactsDir, "trial-diagnosis.json"), "utf8")
-        .then((raw) => JSON.parse(raw))
+      const raw = await readFile(join(trial.artifactsDir, "trial-diagnosis.json"), "utf8")
+        .then((text) => JSON.parse(text) as unknown)
         .catch(() => null);
+      const diagnosis = raw ? decodeTrialDiagnosis(raw) : null;
       return diagnosis ? { ...trial, diagnosis } : trial;
     })
   );

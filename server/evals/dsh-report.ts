@@ -499,11 +499,23 @@ function trialDiagnosisSection(sortedTrials: DshTrialRecord[]): string[] {
   lines.push("");
   for (const trial of diagnosed) {
     const d = trial.diagnosis;
+    // #174 review fix: `lookupRequiredProbeShape` (trial-diagnosis.ts) marks
+    // an operator id with no PRIVATE_REQUIRED_PROBE_SHAPES entry with this
+    // evidence kind - "capability gaps: none" and "capability gaps: unknown,
+    // never checked" must render differently, or a report reader can't tell
+    // a genuine clean pass from an unconfigured operator.
+    const requiredShapeUnavailable = d.evidence.some((e) => e.kind === "required-shape-unavailable");
     lines.push(`### \`${trial.fixture}\` / \`${trial.profile}\` / trial ${trial.trial} (\`${d.trialId}\`)`);
     lines.push("");
     lines.push(`- Outcome: \`${d.outcome}\` | Feature: \`${d.feature}\``);
     lines.push(
-      `- Capability gaps: ${d.capabilityGaps.length ? d.capabilityGaps.map((g) => `\`${g}\``).join(", ") : "none"}`
+      `- Capability gaps: ${
+        requiredShapeUnavailable
+          ? "**unknown - no required probe shape configured for this operator**"
+          : d.capabilityGaps.length
+            ? d.capabilityGaps.map((g) => `\`${g}\``).join(", ")
+            : "none"
+      }`
     );
     lines.push(`- Required probe shape: \`${JSON.stringify(d.requiredProbeShapes)}\``);
     lines.push(`- Observed probe shape: \`${JSON.stringify(d.observedProbeShapes)}\``);

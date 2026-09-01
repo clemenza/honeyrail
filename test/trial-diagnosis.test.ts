@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { diagnoseTrial, extractProbeShape } from "../server/evals/trial-diagnosis.js";
+import {
+  decodeTrialDiagnosis,
+  diagnoseTrial,
+  encodeTrialDiagnosis,
+  extractProbeShape,
+  lookupRequiredProbeShape,
+  PRIVATE_REQUIRED_PROBE_SHAPES
+} from "../server/evals/trial-diagnosis.js";
+import { buildDshComparisonReport, type DshComparisonReportInput, type DshTrialRecord } from "../server/evals/dsh-report.js";
 import type { TranscriptLine } from "../server/evals/dsh-transcript.js";
 
 const NO_TRANSCRIPT: TranscriptLine[] = [];
@@ -136,4 +144,158 @@ test("diagnoseTrial: an empty required shape never raises a gap", () => {
   const observed = extractProbeShape(NO_TRANSCRIPT, [record("statement ok", "CREATE TABLE t (a INTEGER)")]);
   const diagnosis = diagnoseTrial(observed, {}, { trialId: "no-requirements", outcome: "passed", feature: "none" }, []);
   assert.deepEqual(diagnosis.capabilityGaps, []);
+});
+
+// --- review fix: parenthesized boolean groups must not false-positive ------
+
+test("extractProbeShape: CHECK ((a > 10 AND b > 10)) is still per-column decomposable despite the extra wrapping parens", () => {
+  const sqlStatements = [record("statement ok", "CREATE TABLE t (a INTEGER, b INTEGER, CHECK ((a > 10 AND b > 10)))")];
+  const observed = extractProbeShape(NO_TRANSCRIPT, sqlStatements);
+  assert.equal(observed.crossColumnDependency, false);
+});
+
+test("extractProbeShape: CHECK ((a > b)) is still recognized as a genuine cross-column predicate despite the extra wrapping parens", () => {
+  const sqlStatements = [record("statement ok", "CREATE TABLE t (a INTEGER, b INTEGER, CHECK ((a > b)))")];
+  const observed = extractProbeShape(NO_TRANSCRIPT, sqlStatements);
+  assert.equal(observed.crossColumnDependency, true);
+});
+
+test("extractProbeShape: an OR of two parenthesized per-column groups stays per-column - no single atomic clause needs both columns", () => {
+  const sqlStatements = [record("statement ok", "CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER, CHECK ((a > 5 AND b > 5) OR (c > 5)))")];
+  const observed = extractProbeShape(NO_TRANSCRIPT, sqlStatements);
+  assert.equal(observed.crossColumnDependency, false);
+});
+
+// --- review fix: PRIVATE_REQUIRED_PROBE_SHAPES must never silently mean "no gap" ---
+
+test("lookupRequiredProbeShape: a known operator returns its configured shape with no evidence", () => {
+  const { shape, evidence } = lookupRequiredProbeShape("fk-only-last-declared-constraint-registered");
+  assert.deepEqual(shape, { minFkPerTable: 2 });
+  assert.deepEqual(evidence, []);
+});
+
+test("lookupRequiredProbeShape: an unconfigured operator returns an empty shape PLUS explicit required-shape-unavailable evidence, not a silent {}", () => {
+  const { shape, evidence } = lookupRequiredProbeShape("some-operator-nobody-configured-yet");
+  assert.deepEqual(shape, {});
+  assert.equal(evidence.length, 1);
+  assert.equal(evidence[0].kind, "required-shape-unavailable");
+});
+
+test("PRIVATE_REQUIRED_PROBE_SHAPES: seeded with the two real operators that motivated #174", () => {
+  assert.deepEqual(PRIVATE_REQUIRED_PROBE_SHAPES["fk-only-last-declared-constraint-registered"], { minFkPerTable: 2 });
+  assert.deepEqual(PRIVATE_REQUIRED_PROBE_SHAPES["check-on-update-sees-only-assigned-columns"], { crossColumnDependency: true });
+});
+
+test("diagnoseTrial: an unconfigured operator's diagnosis never claims a clean pass - capabilityGaps is empty but evidence flags it as unchecked", () => {
+  const observed = extractProbeShape(NO_TRANSCRIPT, [record("statement ok", "CREATE TABLE t (a INTEGER)")]);
+  const { shape, evidence } = lookupRequiredProbeShape("unknown-operator-id");
+  const diagnosis = diagnoseTrial(observed, shape, { trialId: "t1", outcome: "passed", feature: "unknown-operator-id" }, evidence);
+  assert.deepEqual(diagnosis.capabilityGaps, []);
+  assert.ok(diagnosis.evidence.some((e) => e.kind === "required-shape-unavailable"));
+});
+
+// --- review fix: on-disk snake_case schema must round-trip through the report ---
+
+test("encodeTrialDiagnosis/decodeTrialDiagnosis: round-trips through a real JSON.stringify/parse cycle", () => {
+  const observed = extractProbeShape(NO_TRANSCRIPT, [
+    record("statement ok", "CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a > 10), CHECK (b > 10))")
+  ]);
+  const diagnosis = diagnoseTrial(observed, { crossColumnDependency: true }, { trialId: "round-trip", outcome: "task_failed", feature: "check_constraint" }, []);
+
+  const onDisk = JSON.parse(JSON.stringify(encodeTrialDiagnosis(diagnosis)));
+  // The actual on-disk keys are snake_case (#174 §7) - assert that shape
+  // directly, since a prior version of the report reader assumed camelCase
+  // and silently read `undefined` for every field.
+  assert.equal(onDisk.trial_id, "round-trip");
+  assert.ok(Array.isArray(onDisk.capability_gaps));
+  assert.equal(onDisk.trialId, undefined);
+  assert.equal(onDisk.capabilityGaps, undefined);
+
+  const decoded = decodeTrialDiagnosis(onDisk);
+  assert.deepEqual(decoded, diagnosis);
+});
+
+test("decodeTrialDiagnosis: rejects malformed/foreign JSON rather than returning a half-populated TrialDiagnosis", () => {
+  assert.equal(decodeTrialDiagnosis(null), null);
+  assert.equal(decodeTrialDiagnosis({}), null);
+  assert.equal(decodeTrialDiagnosis({ trialId: "camelCase-not-the-real-schema" }), null);
+});
+
+test("round trip: a serialized trial-diagnosis.json, decoded and attached to a trial, renders its capability gaps in the report", () => {
+  const observed = extractProbeShape(NO_TRANSCRIPT, [
+    record("statement ok", "CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a > 10), CHECK (b > 10))")
+  ]);
+  const diagnosis = diagnoseTrial(
+    observed,
+    { crossColumnDependency: true },
+    { trialId: "m10-baseline-1", outcome: "task_failed", feature: "check-on-update-sees-only-assigned-columns" },
+    []
+  );
+  const onDiskText = JSON.stringify(encodeTrialDiagnosis(diagnosis));
+  const decoded = decodeTrialDiagnosis(JSON.parse(onDiskText));
+  assert.notEqual(decoded, null);
+
+  const trial: DshTrialRecord = {
+    fixture: "m10",
+    profile: "baseline",
+    trial: 1,
+    trialId: "m10-baseline-1",
+    artifactsDir: "/tmp/cells/m10-baseline-1",
+    killed: false,
+    falseAlarms: null,
+    contractOk: null,
+    integrityOk: true,
+    transcriptAuditHits: [],
+    killRate: null,
+    killedByKind: null,
+    diagnosis: decoded
+  };
+  const input: DshComparisonReportInput = {
+    generatedAt: "2026-09-01T00:00:00.000Z",
+    dshVersion: "test",
+    image: "test",
+    smoke: false,
+    profiles: [{ label: "baseline", path: "baseline.cordis.patch.yml", sha256: "abc" }],
+    fixtures: ["m10"],
+    trials: [trial]
+  };
+
+  const report = buildDshComparisonReport(input);
+  assert.match(report, /## Trial diagnoses/);
+  assert.match(report, /`cross-column-dependency`/);
+});
+
+test("round trip: an unconfigured operator's diagnosis renders as unknown, not as a clean pass, in the report", () => {
+  const observed = extractProbeShape(NO_TRANSCRIPT, [record("statement ok", "CREATE TABLE t (a INTEGER)")]);
+  const { shape, evidence } = lookupRequiredProbeShape("unconfigured-operator-for-render-test");
+  const diagnosis = diagnoseTrial(observed, shape, { trialId: "m11-baseline-1", outcome: "passed", feature: "unconfigured-operator-for-render-test" }, evidence);
+  const decoded = decodeTrialDiagnosis(JSON.parse(JSON.stringify(encodeTrialDiagnosis(diagnosis))));
+  assert.notEqual(decoded, null);
+
+  const trial: DshTrialRecord = {
+    fixture: "m11",
+    profile: "baseline",
+    trial: 1,
+    trialId: "m11-baseline-1",
+    artifactsDir: "/tmp/cells/m11-baseline-1",
+    killed: true,
+    falseAlarms: 0,
+    contractOk: true,
+    integrityOk: true,
+    transcriptAuditHits: [],
+    killRate: null,
+    killedByKind: null,
+    diagnosis: decoded
+  };
+  const report = buildDshComparisonReport({
+    generatedAt: "2026-09-01T00:00:00.000Z",
+    dshVersion: "test",
+    image: "test",
+    smoke: false,
+    profiles: [{ label: "baseline", path: "baseline.cordis.patch.yml", sha256: "abc" }],
+    fixtures: ["m11"],
+    trials: [trial]
+  });
+  assert.match(report, /unknown - no required probe shape configured/);
+  assert.doesNotMatch(report, /Capability gaps: none/);
 });

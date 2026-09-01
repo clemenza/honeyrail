@@ -19,35 +19,72 @@
  *                 argument is already a directory.
  */
 
-import { readFile, readdir, writeFile } from "node:fs/promises";
+import { readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { diagnoseTrial, extractProbeShape, PRIVATE_REQUIRED_PROBE_SHAPES } from "../server/evals/trial-diagnosis.js";
-import { classifyDshOutcome } from "../server/evals/dsh-report.js";
+import { fileURLToPath } from "node:url";
+import { diagnoseTrial, extractProbeShape, encodeTrialDiagnosis, lookupRequiredProbeShape } from "../server/evals/trial-diagnosis.js";
+import { classifyDshOutcome, type DshTrialOutcome } from "../server/evals/dsh-report.js";
 import { parseTranscript } from "../server/evals/kill-attribution.js";
+import { auditTranscript, type TranscriptAuditHit } from "../server/evals/transcript-audit.js";
+import { findManifestMismatches } from "../server/evals/manifest-preflight.js";
+import { findBlockedReason } from "../server/agents/common.js";
 import type { TranscriptLine } from "../server/evals/dsh-transcript.js";
 
-type StateFileTrial = {
+export type StateFileTrial = {
   trialId: string;
   artifactsDir: string;
   killed: boolean | null;
   falseAlarms: number | null;
   contractOk: boolean | null;
   integrityOk: boolean;
-  transcriptAuditHits: unknown[];
+  transcriptAuditHits: TranscriptAuditHit[];
   blockedReason?: string;
   error?: string;
 };
+
+/** Everything `classifyDshOutcome` needs, reconstructed for a path-only trial that has no `state.json` record (see `resolveTrialOutcome`). */
+export type ReconstructedOutcomeInputs = {
+  integrityOk: boolean;
+  transcriptAuditHits: TranscriptAuditHit[];
+  blockedReason?: string;
+  killed: boolean | null;
+  falseAlarms: number | null;
+  contractOk: boolean | null;
+  error?: string;
+};
+
+/**
+ * Review fix (P0): a prior version hard-coded `integrityOk: true`,
+ * `transcriptAuditHits: []`, `blockedReason: undefined` when reclassifying a
+ * trial's outcome from `score.json` alone - so an invalidated (tampered
+ * fixture, or a high-confidence transcript audit hit) or blocked trial could
+ * silently reappear here as `passed`/`task_failed`/`verify_failed`, and then
+ * get presented as evidence of a genuine capability gap.
+ *
+ * When a `state.json` trial record is available (the trial id resolved
+ * against `--out`), its own already-classified fields are canonical -
+ * reused as-is via `classifyDshOutcome`, no re-derivation. Only when
+ * resolution was path-only (no matching state.json entry - state.json may
+ * not exist, or may predate this trial) does `main()` reconstruct
+ * `integrityOk`/`transcriptAuditHits`/`blockedReason` from the trial's own
+ * artifacts (manifest.json's protected-file re-check, container.log's
+ * transcript audit, container.log's blocked-marker scan) rather than assume
+ * a trustworthy default.
+ */
+export function resolveTrialOutcome(trialRecord: StateFileTrial | null, fallback: ReconstructedOutcomeInputs | null): DshTrialOutcome {
+  if (trialRecord) return classifyDshOutcome(trialRecord);
+  if (fallback) return classifyDshOutcome(fallback);
+  return "driver_error";
+}
 
 function isDirectory(entryStat: { isDirectory: () => boolean } | null): boolean {
   return entryStat !== null && entryStat.isDirectory();
 }
 
-async function resolveArtifactsDir(positional: string, outDir: string): Promise<string> {
+async function resolveArtifactsDir(positional: string, outDir: string): Promise<{ artifactsDir: string; trialRecord: StateFileTrial | null }> {
   const asPath = resolve(positional);
-  const stat = await import("node:fs/promises")
-    .then((fs) => fs.stat(asPath))
-    .catch(() => null);
-  if (isDirectory(stat)) return asPath;
+  const pathStat = await stat(asPath).catch(() => null);
+  if (isDirectory(pathStat)) return { artifactsDir: asPath, trialRecord: null };
 
   const statePath = join(resolve(outDir), "state.json");
   const raw = await readFile(statePath, "utf8").catch(() => {
@@ -56,7 +93,7 @@ async function resolveArtifactsDir(positional: string, outDir: string): Promise<
   const state = JSON.parse(raw) as { trials: StateFileTrial[] };
   const trial = state.trials.find((t) => t.trialId === positional);
   if (!trial) throw new Error(`No trial with trialId "${positional}" found in ${statePath}`);
-  return resolve(trial.artifactsDir);
+  return { artifactsDir: resolve(trial.artifactsDir), trialRecord: trial };
 }
 
 /**
@@ -82,6 +119,17 @@ function splitTestFileRecords(content: string): string[] {
     .filter((record) => record.length > 0);
 }
 
+async function walkTestFiles(dir: string): Promise<string[]> {
+  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+  const out: string[] = [];
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...(await walkTestFiles(full)));
+    else if (entry.name.endsWith(".test")) out.push(full);
+  }
+  return out;
+}
+
 async function collectSqlStatements(artifactsDir: string): Promise<string[]> {
   // Oracle mode's agent-root is where the agent's own sql-tests/agent live;
   // source/bytecode mode uses seed-root directly - try both, same fallback
@@ -103,15 +151,17 @@ async function collectSqlStatements(artifactsDir: string): Promise<string[]> {
   return [];
 }
 
-async function walkTestFiles(dir: string): Promise<string[]> {
-  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
-  const out: string[] = [];
-  for (const entry of entries) {
-    const full = join(dir, entry.name);
-    if (entry.isDirectory()) out.push(...(await walkTestFiles(full)));
-    else if (entry.name.endsWith(".test")) out.push(full);
+/** Same aggregation `scripts/dsh-evals-demo.ts`'s own `gatherAuditableText` performs for a live trial (container output + findings.json + the agent's own .test files) - duplicated here (small, ~10 lines) rather than imported, since that function isn't exported and this is a separate, path-only reconstruction path, not a shared runtime dependency. */
+async function gatherAuditableText(seedRootDir: string, containerLog: string): Promise<string> {
+  const parts = [containerLog];
+  parts.push(await readFile(join(seedRootDir, "findings.json"), "utf8").catch(() => ""));
+  const agentTestsDir = join(seedRootDir, "sql-tests", "agent");
+  const testFiles = await readdir(agentTestsDir, { recursive: true }).catch(() => [] as string[]);
+  for (const name of testFiles) {
+    const content = await readFile(join(agentTestsDir, name), "utf8").catch(() => "");
+    if (content) parts.push(content);
   }
-  return out;
+  return parts.join("\n");
 }
 
 async function main(): Promise<void> {
@@ -133,10 +183,10 @@ async function main(): Promise<void> {
   }
   if (positional === null) throw new Error("Usage: tinytable-diagnose.ts <trial-id-or-path> [--out <dir>]");
 
-  const artifactsDir = await resolveArtifactsDir(positional, outDir);
+  const { artifactsDir, trialRecord } = await resolveArtifactsDir(positional, outDir);
 
   const manifestRaw = await readFile(join(artifactsDir, "manifest.json"), "utf8");
-  const manifest = JSON.parse(manifestRaw) as { operatorId?: string };
+  const manifest = JSON.parse(manifestRaw) as { operatorId?: string; files?: Array<{ path: string; sha256: string }> };
   const operatorId = manifest.operatorId ?? "";
 
   const transcriptText = await readFile(join(artifactsDir, "transcript.ndjson"), "utf8").catch(() => "");
@@ -144,49 +194,57 @@ async function main(): Promise<void> {
 
   const sqlStatements = await collectSqlStatements(artifactsDir);
 
-  const scoreRaw = await readFile(join(artifactsDir, "score.json"), "utf8").catch(() => null);
-  const score = scoreRaw ? (JSON.parse(scoreRaw) as { killed?: boolean; false_alarms?: number; contract_ok?: boolean; error?: string }) : null;
-  const outcome = score
-    ? classifyDshOutcome({
-        integrityOk: true,
-        transcriptAuditHits: [],
-        blockedReason: undefined,
-        killed: score.killed ?? null,
-        falseAlarms: score.false_alarms ?? null,
-        contractOk: score.contract_ok ?? null,
-        error: score.error
-      })
-    : "driver_error";
+  let outcome: DshTrialOutcome;
+  if (trialRecord) {
+    outcome = resolveTrialOutcome(trialRecord, null);
+  } else {
+    console.warn(
+      `No state.json trial record for "${positional}" - reconstructing integrity/audit/blocked state from ${artifactsDir} (best-effort: replicates the protected-file manifest re-check, but not the oracle-mode stray-artifact leak check).`
+    );
+    const seedRootDir = join(artifactsDir, "seed-root");
+    const manifestFiles = manifest.files ?? [];
+    const postMismatches = manifestFiles.length ? await findManifestMismatches(seedRootDir, { files: manifestFiles }) : [];
+    const containerLog = await readFile(join(artifactsDir, "container.log"), "utf8").catch(() => "");
+    const auditableText = await gatherAuditableText(seedRootDir, containerLog);
+    const scoreRaw = await readFile(join(artifactsDir, "score.json"), "utf8").catch(() => null);
+    const score = scoreRaw ? (JSON.parse(scoreRaw) as { killed?: boolean; false_alarms?: number; contract_ok?: boolean; error?: string }) : null;
+    outcome = resolveTrialOutcome(null, {
+      integrityOk: postMismatches.length === 0,
+      transcriptAuditHits: auditTranscript(auditableText),
+      blockedReason: findBlockedReason(containerLog)?.message,
+      killed: score?.killed ?? null,
+      falseAlarms: score?.false_alarms ?? null,
+      contractOk: score?.contract_ok ?? null,
+      error: score?.error
+    });
+  }
 
   const observed = extractProbeShape(transcript, sqlStatements);
-  const required = PRIVATE_REQUIRED_PROBE_SHAPES[operatorId] ?? {};
+  const { shape: required, evidence } = lookupRequiredProbeShape(operatorId);
   // "feature" (#174 §7's output contract) has no dedicated field upstream
   // today - operatorId is the closest stable identifier a report reader can
   // trace back to vendor/tinytable-evals's mutate.OPERATORS, so it's used
   // directly rather than inventing a second, looser taxonomy here.
-  const diagnosis = diagnoseTrial(observed, required, { trialId: positional, outcome, feature: operatorId || "unknown" }, []);
+  const diagnosis = diagnoseTrial(observed, required, { trialId: positional, outcome, feature: operatorId || "unknown" }, evidence);
 
   const outPath = join(artifactsDir, "trial-diagnosis.json");
-  await writeFile(
-    outPath,
-    JSON.stringify(
-      {
-        trial_id: diagnosis.trialId,
-        outcome: diagnosis.outcome,
-        feature: diagnosis.feature,
-        observed_probe_shapes: diagnosis.observedProbeShapes,
-        required_probe_shapes: diagnosis.requiredProbeShapes,
-        capability_gaps: diagnosis.capabilityGaps,
-        evidence: diagnosis.evidence
-      },
-      null,
-      2
-    ) + "\n"
-  );
-  console.log(`Wrote ${outPath} (${diagnosis.capabilityGaps.length} capability gap(s): ${diagnosis.capabilityGaps.join(", ") || "none"}).`);
+  await writeFile(outPath, JSON.stringify(encodeTrialDiagnosis(diagnosis), null, 2) + "\n");
+  const gapSummary = evidence.some((e) => e.kind === "required-shape-unavailable")
+    ? "unknown - no required probe shape configured for this operator"
+    : diagnosis.capabilityGaps.length
+      ? diagnosis.capabilityGaps.join(", ")
+      : "none";
+  console.log(`Wrote ${outPath} (capability gaps: ${gapSummary}).`);
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.message : error);
-  process.exitCode = 1;
-});
+// Guards against running main() as a side effect of import - test/tinytable-diagnose.test.ts
+// imports resolveTrialOutcome from this module for direct unit testing, same
+// pattern scripts/dsh-evals-demo.ts already uses (and discovered the same way:
+// while adding that file's own regression test).
+const isMain = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+if (isMain) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  });
+}
