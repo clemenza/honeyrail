@@ -1,8 +1,8 @@
-import { createServer } from "node:net";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { platform } from "node:os";
-import { publishEvent } from "../events.js";
+import { allocatePort, waitForPostgresReady } from "../postgres/runtime.js";
+import { createDbEvidence, createDbFileArtifact, publishArtifactEvent } from "./db-evidence.js";
 import type { Artifact, Evidence, QualityGateDecision } from "../types.js";
 import type { ExecutionHandle, ExecutionState, Executor, StepExecutionContext } from "./types.js";
 
@@ -16,41 +16,12 @@ type QueryObservation = {
 
 type ExecutionMode = "auto" | "docker" | "local-binaries";
 
-async function allocatePort() {
-  const server = createServer();
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => resolve());
-  });
-  const address = server.address();
-  const port = typeof address === "object" && address ? address.port : 0;
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  if (!port) throw new Error("Failed to allocate PostgreSQL test port");
-  return port;
-}
-
 function json(value: unknown) {
   return JSON.stringify(value, null, 2);
 }
 
 function artifactMetadata(phase: string, extra: Record<string, unknown> = {}) {
   return { database: "postgresql", scenario: SCENARIO, phase, ...extra };
-}
-
-async function publishArtifact(ctx: StepExecutionContext, artifact: Artifact) {
-  await publishEvent(ctx.store, ctx.bus, {
-    type: "artifact.created",
-    projectId: ctx.project.id,
-    payload: { runId: ctx.runId, stepId: ctx.step.id, artifactId: artifact.id, kind: artifact.kind, name: artifact.name }
-  });
-}
-
-async function publishEvidence(ctx: StepExecutionContext, evidence: Evidence) {
-  await publishEvent(ctx.store, ctx.bus, {
-    type: "evidence.recorded",
-    projectId: ctx.project.id,
-    payload: { runId: ctx.runId, stepId: ctx.step.id, evidenceId: evidence.id, kind: evidence.kind, claim: evidence.claim }
-  });
 }
 
 async function createFileArtifact(
@@ -63,33 +34,11 @@ async function createFileArtifact(
   phase: string,
   extra: Record<string, unknown> = {}
 ) {
-  const path = join(baseDir, name);
-  await writeFile(path, content);
-  const artifact = await ctx.store.createArtifact({
-    runId: ctx.runId,
-    stepId: ctx.step.id,
-    attempt: ctx.step.attempt,
-    kind,
-    name,
-    path,
-    uri: `honeyrail://runs/${ctx.runId}/steps/${ctx.step.id}/attempts/${ctx.step.attempt}/${name}`,
-    mediaType,
-    metadata: artifactMetadata(phase, extra)
-  });
-  await publishArtifact(ctx, artifact);
-  return artifact;
+  return createDbFileArtifact(ctx, { baseDir, name, content, kind, mediaType, metadata: artifactMetadata(phase, extra) });
 }
 
 async function createEvidence(ctx: StepExecutionContext, input: Omit<Partial<Evidence> & Pick<Evidence, "kind">, "runId" | "stepId" | "attempt">) {
-  const evidence = await ctx.store.createEvidence({
-    runId: ctx.runId,
-    stepId: ctx.step.id,
-    attempt: ctx.step.attempt,
-    source: "postgres",
-    ...input
-  });
-  await publishEvidence(ctx, evidence);
-  return evidence;
+  return createDbEvidence(ctx, { source: "postgres", ...input });
 }
 
 async function commandPath(ctx: StepExecutionContext, name: string) {
@@ -166,31 +115,7 @@ async function runDockerPsql(ctx: StepExecutionContext, cwd: string, containerNa
 }
 
 async function waitReady(ctx: StepExecutionContext, cwd: string, port: number) {
-  const started = Date.now();
-  let lastError = "";
-  for (let attempt = 0; attempt < 80; attempt += 1) {
-    const result = await ctx.runCommand("psql", [
-      "-X",
-      "-h",
-      "127.0.0.1",
-      "-p",
-      String(port),
-      "-U",
-      "postgres",
-      "-d",
-      "postgres",
-      "-t",
-      "-A",
-      "-c",
-      "SELECT 1;"
-    ], { cwd, timeout: 2000 });
-    if (result.ok && result.stdout.trim() === "1") {
-      return { ready: true, latencyMs: Date.now() - started };
-    }
-    lastError = result.stderr || result.stdout;
-    await new Promise((resolve) => setTimeout(resolve, 125));
-  }
-  throw new Error(`PostgreSQL did not become ready: ${lastError}`);
+  return waitForPostgresReady({ runCommand: ctx.runCommand, cwd, port });
 }
 
 async function waitDockerReady(ctx: StepExecutionContext, cwd: string, containerName: string) {
@@ -401,7 +326,7 @@ export class PostgresExecutor implements Executor {
         mediaType: "text/plain",
         metadata: artifactMetadata("postgres-log", { port })
       });
-      await publishArtifact(ctx, logArtifact);
+      await publishArtifactEvent(ctx, logArtifact);
       await createEvidence(ctx, {
         kind: "db.process.health",
         claim: "PostgreSQL process completed scenario before cleanup",
@@ -569,7 +494,7 @@ export class PostgresExecutor implements Executor {
         mediaType: "text/plain",
         metadata: artifactMetadata("postgres-log", { executionMode: "docker", image, containerName, port })
       });
-      await publishArtifact(ctx, logArtifact);
+      await publishArtifactEvent(ctx, logArtifact);
       await createEvidence(ctx, {
         kind: "db.process.health",
         claim: "Docker PostgreSQL process completed scenario before cleanup",
