@@ -30,10 +30,12 @@ have one.
 ## Data flow
 
 ```
-sql-tests/agent/*.test  ─┐
-                          ├─▶ extractProbeShape() ─▶ ProbeShape (observed)
-transcript.ndjson       ─┘                                │
-                                                            ▼
+sql-tests/agent/a.test ─▶ SqlTestScenario ─▶ extractScenarioProbeShape() ─▶ ProbeShape ─┐
+sql-tests/agent/b.test ─▶ SqlTestScenario ─▶ extractScenarioProbeShape() ─▶ ProbeShape ─┼─▶ aggregateProbeShapes() ─▶ ProbeShape (observed)
+...                                                                                     ─┘         ▲
+transcript.ndjson (hasOwnPassingTestRun reinforcement, trial-wide only) ────────────────────────────┘
+                                                                                                     │
+                                                                                                     ▼
 manifest.json (operatorId) ─▶ PRIVATE_REQUIRED_PROBE_SHAPES[operatorId]
                                         │
                                         ▼
@@ -43,14 +45,32 @@ manifest.json (operatorId) ─▶ PRIVATE_REQUIRED_PROBE_SHAPES[operatorId]
                               diagnoseTrial() ─▶ TrialDiagnosis ─▶ trial-diagnosis.json
 ```
 
-`extractProbeShape` is lightweight tokenization (regex + paren-depth
-scanning) over the `.test` grammar in `vendor/tinytable-evals/SPEC.md` -
-deliberately not a real SQL parser/AST (#174 §3). Each entry in its
-`sqlStatements` array is one `.test` *record's* full text (its optional
+`.test` file boundaries are load-bearing, not cosmetic: `run_sql_tests.py`
+gives every `.test` file its own fresh `tinytable.Database()` - there is no
+schema/row/FK/transaction state shared between two `.test` files, ever.
+`extractScenarioProbeShape()` is lightweight tokenization (regex +
+paren-depth scanning) over the `.test` grammar in
+`vendor/tinytable-evals/SPEC.md` - deliberately not a real SQL parser/AST
+(#174 §3) - run once per `SqlTestScenario` (one `.test` file), each with its
+own fresh internal state, never a state shared across files. Each entry in a
+scenario's `records` array is one `.test` *record's* full text (its optional
 `statement ok`/`statement error [substring]` header line, if present,
 followed by the SQL body) - this preserves each statement's pass/fail
-expectation without widening the function's own signature; see the
-doc-comment at the top of `trial-diagnosis.ts` for the full reasoning.
+expectation. `extractProbeShape()` is the trial-level orchestrator: it runs
+`extractScenarioProbeShape()` once per scenario, then folds the results with
+`aggregateProbeShapes()` - presence fields (`checkTested`, `insertPresent`,
+...) OR across scenarios, complexity fields (`tableCount`, `maxFkPerTable`,
+...) take the MAX across scenarios (never a cross-file sum), and interaction
+fields (`crossColumnDependency`, `multiObjectInteraction`,
+`nonLastFkViolationTested`, ...) are already computed scenario-locally by
+`extractScenarioProbeShape` (a single, fresh internal context per scenario),
+so aggregating them is mechanically also OR - the correctness guarantee
+comes from the per-scenario extraction never seeing another scenario's
+state. See `trial-diagnosis.ts`'s own doc-comment and `aggregateProbeShapes`'s
+doc-comment for the full reasoning, including why a `statement error` record
+must never register a successful state transition (an expected-to-fail
+`INSERT`/`CREATE TABLE` didn't actually leave that state behind - see
+`extractScenarioProbeShape`'s handling of `expectation`).
 `diagnoseTrial` is a pure diff: `Required Probe Shape - Observed Probe Shape
 = Capability Gap`, one small named comparator per tag, no ontology or rule
 engine.

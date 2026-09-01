@@ -11,22 +11,51 @@
  * second, unreconciled vocabulary - a "miss" in the issue's own example maps
  * to `task_failed`/`verify_failed`.
  *
- * `sqlStatements: string[]` contents (non-obvious, documented here since the
- * type alone doesn't convey it): each entry is one `.test`-file *record's*
- * full text - i.e. the optional `statement ok` / `statement error
- * [substring]` header line (SPEC.md "Test Script Format") followed by its
- * SQL body, not just the bare SQL. This preserves each statement's pass/fail
+ * `SqlTestScenario` boundaries are load-bearing, not cosmetic (review round
+ * 3 fix): `run_sql_tests.py` gives every `.test` file its own fresh
+ * `tinytable.Database()` - there is no schema/row/FK/transaction state
+ * shared between two `.test` files, ever. A prior version of this module
+ * flattened every `sql-tests/agent/*.test` record into one `string[]` fed
+ * through a single `BuildCtx`, so two *separate* files each declaring an
+ * unrelated table named `emp` with one FK apiece would silently compose
+ * into "`emp` has 2 FKs" - a fabricated cross-file interaction that could
+ * flip `same-kind-multiplicity`/`multi-object-interaction` gaps in either
+ * direction. `extractScenarioProbeShape()` now runs a fresh `BuildCtx` per
+ * scenario (one `.test` file); `extractProbeShape()` is the trial-level
+ * orchestrator that calls it once per `SqlTestScenario` and folds the
+ * results together via `aggregateProbeShapes()` - see that function's own
+ * doc-comment for the three distinct aggregation rules (presence: OR,
+ * complexity: MAX, interaction: OR-of-already-scenario-local-values, never a
+ * cross-scenario recombination). `SqlTestScenario.records` keeps the same
+ * per-record shape the old flattened array used - each entry is one
+ * `.test`-file *record's* full text (the optional `statement ok` /
+ * `statement error [substring]` header line, SPEC.md "Test Script Format",
+ * followed by its SQL body) - preserving each statement's pass/fail
  * *expectation*, the source of `negativeInputTested`/`negativeFkTested`/
- * `negativeObligationTested`, without widening `extractProbeShape`'s
- * signature beyond what #174 specifies. `scripts/tinytable-diagnose.ts`
- * builds this array by splitting `sql-tests/agent/**\/*.test` into
- * blank-line-separated records and keeping each `statement ...` header with
- * its body; `query ...` records (SELECT-only, no schema/constraint signal)
- * are skipped there before this function ever sees them.
+ * `negativeObligationTested`. `scripts/tinytable-diagnose.ts` builds one
+ * `SqlTestScenario` per `sql-tests/agent/*.test` file (`path` is the file
+ * path, kept only as evidence/debug identity, never parsed for meaning);
+ * `query ...` records (SELECT-only, no schema/constraint signal) are
+ * skipped there before this module ever sees them.
  *
  * Extraction is lightweight tokenization (regex + paren-depth scanning) over
  * the SQL grammar in `vendor/tinytable-evals/SPEC.md` - not a real
  * parser/AST, per #174 §3's own scoping.
+ *
+ * A `statement error` record must never register a successful state
+ * transition (review round 3 fix): `parseCreateTable`/`parseCreateIndex`
+ * only run, and `recordInsertedValues` only records a row's values, when
+ * the record's own expectation is NOT `"error"` - an expected-to-fail
+ * `INSERT`/`CREATE TABLE` didn't actually leave that state behind, so
+ * treating it as if it did would let a later probe within the same scenario
+ * (e.g. an FK-satisfaction check) be fooled by a row/table that was never
+ * really created. Fields that record mere attempt/presence (`insertPresent`,
+ * `ddlPresent`, `partialUpdate`, `checkReferencesUnassignedColumn`, ...) are
+ * deliberately NOT gated this way - those are about what shape of statement
+ * the agent constructed and tested, independent of whether the correct
+ * answer was ok or error (the real killing workload for
+ * `check-on-update-sees-only-assigned-columns` is itself a `statement
+ * error` record).
  *
  * Private truth isolation (#174 §5): `PRIVATE_REQUIRED_PROBE_SHAPES` is
  * keyed by the same `operatorId` `scripts/tinytable-seed-root-builder.ts`'s
@@ -139,6 +168,15 @@ export type ProbeShape = {
  * positions" becomes a real v0 signal.
  */
 export type RequiredProbeShape = Partial<Record<keyof ProbeShape | "minFkPerTable", boolean | number>>;
+
+/**
+ * One `.test` file's worth of records - the unit `run_sql_tests.py` gives a
+ * fresh `Database()` to, and therefore the unit `extractScenarioProbeShape()`
+ * runs a fresh `BuildCtx` over. `path` is carried through only as
+ * evidence/debug identity (which file produced this scenario) - never parsed
+ * for semantic meaning.
+ */
+export type SqlTestScenario = { path: string; records: string[] };
 
 export type CapabilityGapTag =
   | "cross-column-dependency"
@@ -634,8 +672,15 @@ function parseInsert(body: string, ctx: BuildCtx, expectation: "ok" | "error" | 
   if (/\bNULL\b/i.test(body)) ctx.nullInputTested = true;
 
   const assignedValues = extractInsertColumnValues(body, table, ctx);
-  if (expectation === "error") evaluateFkSatisfaction(table, assignedValues, ctx);
-  recordInsertedValues(table, assignedValues, ctx);
+  if (expectation === "error") {
+    evaluateFkSatisfaction(table, assignedValues, ctx);
+  } else {
+    // Review round 3 fix: a `statement error` INSERT didn't actually commit
+    // this row - recording its values into the "does this value exist"
+    // ledger would let a later FK-satisfaction check be fooled by a row
+    // that was never really inserted.
+    recordInsertedValues(table, assignedValues, ctx);
+  }
 }
 
 function parseUpdate(body: string, ctx: BuildCtx, updateIdx: number, expectation: "ok" | "error" | null): void {
@@ -688,12 +733,15 @@ function hasOwnPassingTestRun(transcript: TranscriptLine[]): boolean {
 }
 
 /**
- * Test Shape Telemetry extractor (#174 §3): turns an agent's own
- * `sql-tests/agent/*.test` records (`sqlStatements`, see this module's
- * docstring for their exact shape) plus its `transcript.ndjson` into a
- * `ProbeShape`. Deterministic, no LLM.
+ * Test Shape Telemetry extractor (#174 §3) for ONE scenario (one `.test`
+ * file's records - see `SqlTestScenario`'s own doc-comment for why this
+ * boundary matters). Pure, single fresh `BuildCtx`, no transcript - the
+ * transcript-based `positiveObligationTested` reinforcement isn't
+ * meaningfully scenario-scoped (a single `run_sql_tests.py` invocation
+ * covers every scenario at once), so it's applied once, trial-wide, by
+ * `extractProbeShape()` below instead. Deterministic, no LLM.
  */
-export function extractProbeShape(transcript: TranscriptLine[], sqlStatements: string[]): ProbeShape {
+export function extractScenarioProbeShape(records: string[]): ProbeShape {
   const ctx = makeCtx();
   let updateIdx = 0;
   let statementCount = 0;
@@ -701,7 +749,7 @@ export function extractProbeShape(transcript: TranscriptLine[], sqlStatements: s
   let negativeFkTested = false;
   let positiveObligationTested = false;
 
-  for (const raw of sqlStatements) {
+  for (const raw of records) {
     const { expectation, body } = parseRecord(raw);
     const isStatement = /^(CREATE|INSERT|UPDATE|DELETE|SAVEPOINT|ROLLBACK|RELEASE|COMMIT)\b/i.test(body);
     if (!isStatement) continue; // e.g. a bare "query" record - no schema/constraint signal
@@ -710,10 +758,14 @@ export function extractProbeShape(transcript: TranscriptLine[], sqlStatements: s
 
     if (/^CREATE\s+TABLE\b/i.test(body)) {
       ctx.ddlPresent = true;
-      parseCreateTable(body, ctx);
+      // Review round 3 fix: a `statement error CREATE TABLE` never actually
+      // created the table - registering its schema/columns/constraints
+      // anyway would let a later statement in the same scenario be
+      // evaluated against a table that doesn't really exist.
+      if (expectation !== "error") parseCreateTable(body, ctx);
     } else if (/^CREATE\s+(UNIQUE\s+)?INDEX\b/i.test(body)) {
       ctx.ddlPresent = true;
-      parseCreateIndex(body, ctx);
+      if (expectation !== "error") parseCreateIndex(body, ctx);
     } else if (/^INSERT\b/i.test(body)) {
       parseInsert(body, ctx, expectation);
     } else if (/^UPDATE\b/i.test(body)) {
@@ -739,8 +791,6 @@ export function extractProbeShape(transcript: TranscriptLine[], sqlStatements: s
       if (expectation === "ok" && hasConstraint) positiveObligationTested = true;
     }
   }
-
-  if (!positiveObligationTested && hasOwnPassingTestRun(transcript)) positiveObligationTested = true;
 
   const fkValues = [...ctx.fkPerTable.values()];
   const maxFkPerTable = fkValues.length ? Math.max(...fkValues) : 0;
@@ -781,8 +831,8 @@ export function extractProbeShape(transcript: TranscriptLine[], sqlStatements: s
     // v0 simplification: no signal in a synthetic .test-record corpus
     // distinguishes "negative obligation" (an explicit rejection
     // requirement) from "negative input" (any statement error record) - see
-    // this module's docstring on sqlStatements' shape. Revisit once a
-    // richer per-record annotation is available.
+    // this module's docstring on SqlTestScenario's records shape. Revisit
+    // once a richer per-record annotation is available.
     negativeObligationTested: anyErrorRecord,
     transactionUsed: ctx.savepointUsed || ctx.rollbackUsed || ctx.releaseUsed || ctx.commitUsed,
     savepointUsed: ctx.savepointUsed,
@@ -790,6 +840,155 @@ export function extractProbeShape(transcript: TranscriptLine[], sqlStatements: s
     multiObjectInteraction: ctx.touchedTables.size >= 2,
     multiStatementInteraction: statementCount > 1
   };
+}
+
+/** All-zero/all-false `ProbeShape` - `aggregateProbeShapes([])`'s result, e.g. a trial whose agent wrote no `.test` files at all. */
+const ZERO_PROBE_SHAPE: ProbeShape = {
+  tableCount: 0,
+  columnCount: 0,
+  constraintCountByKind: { check: 0, fk: 0, unique: 0, not_null: 0, pk: 0 },
+  fkPerTable: {},
+  checkPerTable: {},
+  indexCount: 0,
+  checkTested: false,
+  updateTested: false,
+  crossColumnDependency: false,
+  multiColumnCheck: false,
+  orComposition: false,
+  checkReferencesUnassignedColumn: false,
+  checkReferencedColumns: {},
+  updateAssignedColumns: {},
+  partialUpdate: false,
+  fkTested: false,
+  negativeFkTested: false,
+  maxFkPerTable: 0,
+  nonLastFkViolationTested: false,
+  insertPresent: false,
+  updatePresent: false,
+  deletePresent: false,
+  ddlPresent: false,
+  statementSequenceLength: 0,
+  nullInputTested: false,
+  duplicateInputTested: false,
+  negativeInputTested: false,
+  positiveObligationTested: false,
+  negativeObligationTested: false,
+  transactionUsed: false,
+  savepointUsed: false,
+  rollbackUsed: false,
+  multiObjectInteraction: false,
+  multiStatementInteraction: false
+};
+
+/** Per-key MAX merge, never a sum - avoids implying a fabricated cross-scenario shared schema (review round 3): two scenarios each independently declaring a table `emp` with 1 FK merge to `{emp: 1}`, not `{emp: 2}`. */
+function mergeRecordCountsByMax(records: Array<Record<string, number>>): Record<string, number> {
+  const merged: Record<string, number> = {};
+  for (const record of records) {
+    for (const [key, value] of Object.entries(record)) {
+      merged[key] = Math.max(merged[key] ?? 0, value);
+    }
+  }
+  return merged;
+}
+
+/**
+ * Folds one `ProbeShape` per `SqlTestScenario` into a single trial-level
+ * `ProbeShape` (review round 3 fix) - three distinct rules, per field
+ * category, never a naive per-field sum:
+ * - **presence / "ever tested"** (`checkTested`, `insertPresent`, ...): OR
+ *   across scenarios - true if any single scenario shows it.
+ * - **complexity within one scenario** (`tableCount`, `maxFkPerTable`, ...):
+ *   MAX across scenarios - the richest single scenario, never a cross-file
+ *   sum (two scenarios each declaring one `CREATE TABLE` is not "2 tables in
+ *   one database").
+ * - **interaction properties** (`crossColumnDependency`,
+ *   `multiObjectInteraction`, `nonLastFkViolationTested`, ...): each is
+ *   already computed scenario-locally by `extractScenarioProbeShape` (a
+ *   single, fresh `BuildCtx` per scenario), so aggregation is mechanically
+ *   also OR - the correctness guarantee comes from the per-scenario
+ *   extraction never seeing another scenario's state, not from a different
+ *   formula here. `multiObjectInteraction` in particular: two scenarios each
+ *   touching one distinct table must aggregate to `false`, because neither
+ *   scenario *itself* touched two objects - only a single scenario touching
+ *   two tables can set it.
+ * `fkPerTable`/`checkPerTable`/`constraintCountByKind` use a per-key MAX
+ * merge (`mergeRecordCountsByMax`) rather than a sum, for the same "no
+ * fabricated shared schema" reason. `checkReferencedColumns`/
+ * `updateAssignedColumns` are scenario-index-qualified on merge (their own
+ * per-scenario keys like `t.check1` can otherwise collide across unrelated
+ * scenarios) - purely for report/evidence readability, not consumed by any
+ * `GAP_CHECKS` comparator.
+ */
+export function aggregateProbeShapes(shapes: ProbeShape[]): ProbeShape {
+  if (shapes.length === 0) return ZERO_PROBE_SHAPE;
+
+  const constraintCountByKind = { check: 0, fk: 0, unique: 0, not_null: 0, pk: 0 };
+  for (const kind of Object.keys(constraintCountByKind) as Array<keyof typeof constraintCountByKind>) {
+    constraintCountByKind[kind] = Math.max(...shapes.map((s) => s.constraintCountByKind[kind]));
+  }
+
+  const checkReferencedColumns: Record<string, string[]> = {};
+  const updateAssignedColumns: Record<string, string[]> = {};
+  shapes.forEach((s, scenarioIndex) => {
+    for (const [key, value] of Object.entries(s.checkReferencedColumns)) checkReferencedColumns[`scenario${scenarioIndex}.${key}`] = value;
+    for (const [key, value] of Object.entries(s.updateAssignedColumns)) updateAssignedColumns[`scenario${scenarioIndex}.${key}`] = value;
+  });
+
+  return {
+    tableCount: Math.max(...shapes.map((s) => s.tableCount)),
+    columnCount: Math.max(...shapes.map((s) => s.columnCount)),
+    constraintCountByKind,
+    fkPerTable: mergeRecordCountsByMax(shapes.map((s) => s.fkPerTable)),
+    checkPerTable: mergeRecordCountsByMax(shapes.map((s) => s.checkPerTable)),
+    indexCount: Math.max(...shapes.map((s) => s.indexCount)),
+    checkTested: shapes.some((s) => s.checkTested),
+    updateTested: shapes.some((s) => s.updateTested),
+    crossColumnDependency: shapes.some((s) => s.crossColumnDependency),
+    multiColumnCheck: shapes.some((s) => s.multiColumnCheck),
+    orComposition: shapes.some((s) => s.orComposition),
+    checkReferencesUnassignedColumn: shapes.some((s) => s.checkReferencesUnassignedColumn),
+    checkReferencedColumns,
+    updateAssignedColumns,
+    partialUpdate: shapes.some((s) => s.partialUpdate),
+    fkTested: shapes.some((s) => s.fkTested),
+    negativeFkTested: shapes.some((s) => s.negativeFkTested),
+    maxFkPerTable: Math.max(...shapes.map((s) => s.maxFkPerTable)),
+    nonLastFkViolationTested: shapes.some((s) => s.nonLastFkViolationTested),
+    insertPresent: shapes.some((s) => s.insertPresent),
+    updatePresent: shapes.some((s) => s.updatePresent),
+    deletePresent: shapes.some((s) => s.deletePresent),
+    ddlPresent: shapes.some((s) => s.ddlPresent),
+    statementSequenceLength: Math.max(...shapes.map((s) => s.statementSequenceLength)),
+    nullInputTested: shapes.some((s) => s.nullInputTested),
+    duplicateInputTested: shapes.some((s) => s.duplicateInputTested),
+    negativeInputTested: shapes.some((s) => s.negativeInputTested),
+    positiveObligationTested: shapes.some((s) => s.positiveObligationTested),
+    negativeObligationTested: shapes.some((s) => s.negativeObligationTested),
+    transactionUsed: shapes.some((s) => s.transactionUsed),
+    savepointUsed: shapes.some((s) => s.savepointUsed),
+    rollbackUsed: shapes.some((s) => s.rollbackUsed),
+    multiObjectInteraction: shapes.some((s) => s.multiObjectInteraction),
+    multiStatementInteraction: shapes.some((s) => s.multiStatementInteraction)
+  };
+}
+
+/**
+ * Test Shape Telemetry extractor (#174 §3), trial level: runs
+ * `extractScenarioProbeShape()` once per `SqlTestScenario` (preserving each
+ * `.test` file's own fresh-`Database()` boundary - see this module's own
+ * docstring), folds the results via `aggregateProbeShapes()`, then applies
+ * the one genuinely trial-wide signal - whether the agent's own
+ * `run_sql_tests.py` run against `sql-tests/agent` came back clean at least
+ * once (`hasOwnPassingTestRun`, sourced from `transcript`, not scenario-
+ * scoped since a single invocation covers every scenario at once).
+ * Deterministic, no LLM.
+ */
+export function extractProbeShape(transcript: TranscriptLine[], scenarios: SqlTestScenario[]): ProbeShape {
+  const aggregated = aggregateProbeShapes(scenarios.map((scenario) => extractScenarioProbeShape(scenario.records)));
+  if (!aggregated.positiveObligationTested && hasOwnPassingTestRun(transcript)) {
+    return { ...aggregated, positiveObligationTested: true };
+  }
+  return aggregated;
 }
 
 // --- capability gap model (#174 §6) -----------------------------------------

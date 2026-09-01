@@ -22,7 +22,7 @@
 import { readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { diagnoseTrial, extractProbeShape, encodeTrialDiagnosis, lookupRequiredProbeShape } from "../server/evals/trial-diagnosis.js";
+import { diagnoseTrial, extractProbeShape, encodeTrialDiagnosis, lookupRequiredProbeShape, type SqlTestScenario } from "../server/evals/trial-diagnosis.js";
 import { classifyDshOutcome, type DshTrialOutcome } from "../server/evals/dsh-report.js";
 import { parseTranscript } from "../server/evals/kill-attribution.js";
 import { auditTranscript, type TranscriptAuditHit } from "../server/evals/transcript-audit.js";
@@ -101,9 +101,9 @@ async function resolveArtifactsDir(positional: string, outDir: string): Promise<
  * blank-line-separated records, `#`-prefixed comment lines, an optional
  * leading `version N` line. Returns each non-empty, comment-stripped record
  * verbatim - including its `statement ok`/`statement error [substring]`
- * header when present - which is exactly the shape
- * `extractProbeShape`'s `sqlStatements` parameter expects (see that
- * function's own doc-comment for why the header must be preserved).
+ * header when present - which is exactly the shape a `SqlTestScenario`'s
+ * `records` expects (see that type's own doc-comment for why the header
+ * must be preserved).
  */
 function splitTestFileRecords(content: string): string[] {
   const withoutVersionLine = content.replace(/^\s*version\s+\d+\s*\r?\n/, "");
@@ -130,7 +130,16 @@ async function walkTestFiles(dir: string): Promise<string[]> {
   return out;
 }
 
-async function collectSqlStatements(artifactsDir: string): Promise<string[]> {
+/**
+ * One `SqlTestScenario` per `sql-tests/agent/*.test` file - review round 3
+ * fix: a prior version flattened every file's records into one shared
+ * `string[]`, which let `extractProbeShape` treat unrelated `.test` files as
+ * one fabricated shared database (see trial-diagnosis.ts's own docstring
+ * for why that's wrong: `run_sql_tests.py` gives each `.test` file its own
+ * fresh `Database()`). `path` is carried through only as evidence/debug
+ * identity, never parsed for meaning.
+ */
+async function collectSqlTestScenarios(artifactsDir: string): Promise<SqlTestScenario[]> {
   // Oracle mode's agent-root is where the agent's own sql-tests/agent live;
   // source/bytecode mode uses seed-root directly - try both, same fallback
   // shape scripts/tinytable-seed-root-builder.ts's own copyBackAgentArtifacts
@@ -140,12 +149,12 @@ async function collectSqlStatements(artifactsDir: string): Promise<string[]> {
     const agentTestsDir = join(root, "sql-tests", "agent");
     const files = await walkTestFiles(agentTestsDir);
     if (files.length > 0) {
-      const statements: string[] = [];
+      const scenarios: SqlTestScenario[] = [];
       for (const file of files) {
         const content = await readFile(file, "utf8");
-        statements.push(...splitTestFileRecords(content));
+        scenarios.push({ path: file, records: splitTestFileRecords(content) });
       }
-      return statements;
+      return scenarios;
     }
   }
   return [];
@@ -192,7 +201,7 @@ async function main(): Promise<void> {
   const transcriptText = await readFile(join(artifactsDir, "transcript.ndjson"), "utf8").catch(() => "");
   const transcript: TranscriptLine[] = transcriptText ? parseTranscript(transcriptText) : [];
 
-  const sqlStatements = await collectSqlStatements(artifactsDir);
+  const scenarios = await collectSqlTestScenarios(artifactsDir);
 
   let outcome: DshTrialOutcome;
   if (trialRecord) {
@@ -219,7 +228,7 @@ async function main(): Promise<void> {
     });
   }
 
-  const observed = extractProbeShape(transcript, sqlStatements);
+  const observed = extractProbeShape(transcript, scenarios);
   const { shape: required, evidence } = lookupRequiredProbeShape(operatorId);
   // "feature" (#174 §7's output contract) has no dedicated field upstream
   // today - operatorId is the closest stable identifier a report reader can
