@@ -1,73 +1,152 @@
 # Roadmap
 
-HoneyRail is an open-source runtime for long-horizon, verifiable engineering work. It does not build another coding agent; it harnesses mature coding agents and deterministic tooling inside a verifiable runtime.
+> HoneyRail is an open-source runtime and evaluation harness for long-horizon, verifiable engineering work. Its flagship near-term workload is AI Database Test Engineering: agents inspect real database systems, design and execute tests, collect evidence, and are evaluated by deterministic truth whenever possible.
 
-The long-term direction: every capability converges on evidence-driven improvement — first of engineering work itself, then of the agent harnesses that perform it.
+> The database roadmap is PG-led: PostgreSQL defines the capabilities that matter; controllable Capability Lab tasks make those capabilities measurable and improvable.
 
 This roadmap is directional, not a feature promise.
 
-## Shipped: v0.1 (M0–M2 + PostgreSQL Harness Alpha)
+## Current shipped foundation
 
-- Execution runtime: atomic `Task` lifecycle, git worktree isolation, tmux-backed sessions, checks, commit, merge, discard, human approval.
-- Orchestration core (alpha): persisted `Run` / `Step` DAGs, `agent-task` / `shell` / `check` / `approval` executors, restart reconciliation, REST/MCP control surfaces.
-- Evidence and quality (alpha): artifact and evidence contracts, deterministic evaluators, async/custom evaluator registry, `QualityGateDecision` records with operator override and rejection.
-- PostgreSQL Database Testing Harness Alpha: Docker or local-binary transaction/restart validation with artifacts, evidence, evaluation, gating, and a final report.
-- Explicit SQLite schema migrations and baseline CI for typecheck, tests, and build.
+The following capabilities are present in HoneyRail today:
 
-## v0.2: Adoption And Developer Experience
+- **Execution runtime:** persisted `Run`/`Step` orchestration, atomic `Task` lifecycle, git worktree isolation, tmux-backed sessions, checks, commit, merge, discard, human approval.
+- **Task and execution isolation:** worktree-per-task, container-based exam rooms, manifest-preflight integrity checks.
+- **Artifacts/evidence/quality gates:** artifact and evidence contracts, deterministic evaluators, async/custom evaluator registry, `QualityGateDecision` records with operator override and rejection.
+- **Agent adapters / DSH eval driver:** multi-agent support, trial sets, comparison reporting.
+- **Transcript/trajectory/session telemetry:** streaming transcripts, turn-level tool-call capture, session metadata.
+- **Tinytable mutation + grading integration:** mutation operators (Gen1 + Gen2), seed-root builder, `grade.py` scoring, differential adjudication.
+- **Truth adjudication:** PostgreSQL differential oracle (`--pg-adjudicate`), SPEC-vs-implementation disagreement tracking.
+- **Engine-access modes:** source-visible, bytecode (research/diagnostic), and real process-boundary oracle mode (`engineAccess=oracle`) via separate engine-service container.
+- **Kill attribution:** discovery-channel classification (test-driven, code-review, bytecode-review, leak).
+- **TrialDiagnosis v0:** deterministic probe-shape extraction, required-vs-observed comparison, diagnosis validity, scenario-local state handling, discriminating shapes for Gen2 operators.
+- **PostgreSQL transaction/restart alpha:** deterministic PostgreSQL lifecycle/evidence plumbing over Docker or local binaries.
+- **Explicit SQLite schema migrations and baseline CI** for typecheck, tests, and build.
 
-Goal: make the shipped runtime usable by people outside the core team. No new concepts; driven by post-launch feedback.
+Not every API above is stable/v1.
 
-- Built-in recipe templates: named, reusable workflow definitions (for example implement → check → gate → approve, and migration-safety verification) selectable from the UI and API, so operators do not hand-write DAG JSON.
-- One-line startup path (for example `npx honeyrail`) alongside the clone-based flow.
-- Rename compatibility surfaces from `AGENT_GATEWAY_*` / `~/.agent-gateway` to `HONEYRAIL_*` / `~/.honeyrail` equivalents with automatic migration. Done — old names still work with a startup warning and will be removed no earlier than v0.4.
-- Platform documentation: macOS/Linux support, Windows via WSL.
-- Quickstart hardening based on real first-run reports.
+## Architecture: three validation layers
 
-## v0.3: Goal-To-DAG And GitHub Integration
+```text
+Capability Lab
+      ↓↑
+Historical PostgreSQL
+      ↓
+PostgreSQL HEAD Frontier
+```
 
-Goal: close the gap between "give it an engineering goal" and "hand-write a DAG".
+- **Capability Lab** = controllability. Cheap, dense, repeatable experiments with full telemetry. tinytable is one provider; others may include PG microtasks, planner metamorphic tests, state-transition tasks, concurrency micro-models. Lab work exists to make a real capability gap measurable and optimizable.
+- **Historical PostgreSQL** = real complexity + deterministic truth. Previously-fixed PostgreSQL bugs provide the bridge between synthetic evals and open-world bug finding. Real source, real subsystem interactions, deterministic hidden ground truth (pre-fix source, fix commit, canonical reproducer).
+- **PostgreSQL HEAD Frontier** = final open-world credibility. Fresh PostgreSQL source, no known injected answer, fixed budget. Goal is validated novel defect discovery, not mutant kill rate.
 
-- Agent-generated DAG drafts from a plain-language goal, always confirmed by a human before execution. Template selection plus parameter filling is an acceptable first implementation.
-- GitHub integration: publish evidence summaries and `QualityGateDecision` outcomes as pull request checks and comments, so verification results appear where teams already review code.
-- Freeze the evaluator and evidence-producer extension contracts ahead of the rest of the API surface. Community extension happens at these points first; they need stability before anyone builds on them.
+## Milestones
 
-## v0.4: Eval Infrastructure And Execution Environments
+### M0 — Eval Science Foundation — mostly shipped
 
-Goal: turn single verified runs into measurable, repeatable evaluation. Prerequisite for everything after it.
+Exam isolation, engine-access modes, truth adjudication, transcript/trajectory, kill attribution, precision/runtime telemetry, TrialDiagnosis v0, PostgreSQL transaction/restart alpha.
 
-- `HarnessProfile`: a versioned, hashable agent configuration package — backend, injected instruction files (for example `CLAUDE.md` / `AGENTS.md`), MCP configuration, launch flags — injectable through the existing agent adapters.
-- `EvalSuite`: curated task sets, each task pairing a prompt and repository fixture with deterministic checks, evaluators, and a gate policy, executed in isolated worktrees.
-- `TrialSet`: N-trial execution of a (profile, task) pair with aggregated metrics — gate pass rate, cost, wall time, human interventions — and a comparison report artifact.
-- Cost and usage capture in agent adapters.
-- Sandboxed execution option (Docker/devcontainer) for agent steps, as an opt-in alternative to host tmux execution.
-- Deepen the PostgreSQL harness as a first-class eval workload: migration testing against schema snapshots, rollback verification, constraint and index regressions. A second database target waits until the PostgreSQL abstraction is proven.
+**Exit condition:** Synthetic trial results are trustworthy enough to use as diagnostic evidence. Remaining tinytable truth hygiene tracked in tinytable-evals#61.
 
-## v0.5: Benchmarking
+### M1 — Historical PostgreSQL Discovery Foundation — current mainline
 
-Goal: credible, repeatable comparison of agent harnesses on real workflows.
+- Generic PostgreSQL research environment v0 ([#179](https://github.com/clemenza/honeyrail/issues/179))
+- Historical PostgreSQL bug corpus v0 ([#178](https://github.com/clemenza/honeyrail/issues/178)), initially 3 bugs, then 5–10
+- Source-visible agent workspace, hidden fix/truth, pre-fix materialization
+- Deterministic buggy-vs-fixed verification
+- No future git history / no answer-key access in default historical mode
+- First end-to-end real-agent historical rediscovery trial
 
-- A/B comparison of `HarnessProfile`s over shared `EvalSuite`s with paired trials and explicit statistical treatment of agent nondeterminism.
-- Run-level budget caps, smoke modes, and early stopping to keep eval cost bounded.
-- Track cost, latency, success rate, evidence quality, and recovery behavior at the workflow level, not per-prompt.
-- Publish reproducible public benchmark results built on this infrastructure.
+**Primary metric:** `Historical Bug Rediscovery Rate @ Budget`
 
-## v0.6: Harness Improvement Loop
+### M2 — PG Discovery Observability
 
-Goal: the flagship capability — HoneyRail improves an agent harness using its own evidence, under the same gates it applies to code.
+- First small pilot over historical PG tasks ([#180](https://github.com/clemenza/honeyrail/issues/180))
+- Trajectory analysis across success + miss
+- Empirical failure-stage taxonomy
+- Only after data exists, define `DiscoveryDiagnosis v1`
 
-- An optimizer step (itself an ordinary `agent-task`) reads failure evidence from baseline trials and proposes a diff to a `HarnessProfile`.
-- Candidate profiles are re-evaluated, compared against baseline with paired statistics, and gated: improvements below the noise band fail, cost regressions fail.
-- Holdout task sets guard against overfitting the eval suite; adoption requires passing the holdout gate.
-- Human approval is required to adopt a new profile version. Every adoption is a recorded, auditable decision.
+### M3 — Capability Lab v1, PG-pulled
 
-## Later
+- Create synthetic/microbench tasks only for gaps observed in M1/M2
+- Possible providers: tinytable, PG subsystem microtasks, planner/metamorphic tasks, state-transition tasks, deterministic concurrency micro-models
+- Revive tinytable MVCC/WAL/planner/etc. only if PG evidence justifies the cost
 
-- Distributed runners, once the single-node runtime is proven at scale.
-- Additional database and environment targets for the testing harness.
-- SDKs for recipes, executors, and evidence producers, abstracted from the built-in templates once real usage exists.
-- Additional agent backends via community-contributed adapters, supported by an adapter authoring guide rather than first-party integrations.
-- Richer integrations with code review, issue trackers, and CI systems.
+### M4 — Self-Improve v1
+
+- Real/synthetic diagnosed evidence → sanitized optimizer input → Candidate DiscoveryPolicy/HarnessProfile → Capability Lab check → unseen Historical PG → promote/reject/inconclusive
+- [#177](https://github.com/clemenza/honeyrail/issues/177) is mechanics v0 only; Historical PG is the principal reality validation for v1
+
+### M5 — Stateful / Systems PostgreSQL Discovery
+
+- Multi-session → locking/deadlock → prepared plans/catalog invalidation → restart/recovery → VACUUM/freeze → replication/multi-node
+- State exploration ([#176](https://github.com/clemenza/honeyrail/issues/176)) becomes implementation-heavy only when this layer produces a concrete need
+
+### M6 — PostgreSQL HEAD Frontier
+
+- Fresh PG source, fixed budget, source-guided exploration, unknown defects
+- Reproducible evidence, minimization, regression test, report
+- **Metric:** `Validated Novel Defect Yield @ Budget`
+
+## Current priorities
+
+### P0
+- [#178](https://github.com/clemenza/honeyrail/issues/178) — Historical PG Corpus v0
+- [#179](https://github.com/clemenza/honeyrail/issues/179) — PostgreSQL Research Environment v0
+- tinytable-evals#61 — generated PG differential oracle (truth hygiene)
+
+### P1
+- [#177](https://github.com/clemenza/honeyrail/issues/177) — Self-Improve Mechanics v0
+- [#180](https://github.com/clemenza/honeyrail/issues/180) — Historical PG Pilot v0
+
+### P2
+- [#172](https://github.com/clemenza/honeyrail/issues/172) — provider abstraction after provisional PG use
+- [#176](https://github.com/clemenza/honeyrail/issues/176) — exploration contract
+- tinytable no-defect/confidence work if capacity exists
+
+### P3 / evidence-gated
+- Large tinytable calibration/statistics work
+- Compound mutants
+- Planner-lite
+- Toy MVCC/WAL/concurrency
+- Large synthetic PG mutation pools
+
+## Contract freeze rule
+
+> Do not freeze `EvalTask`, `TruthBundle`, or `EvalProvider` from tinytable alone. Exercise provisional contracts on tinytable and at least three Historical PG tasks, then extract/freeze the common seam.
+
+## Claim discipline
+
+Tinytable can support:
+- "profile B improved mutant discovery under oracle-mode behavioral testing"
+
+Historical PG can support:
+- "profile B improved rediscovery of unseen real PostgreSQL bugs"
+
+PG HEAD is required for:
+- "HoneyRail helps discover novel PostgreSQL defects"
+
+Self-improvement claims require unseen tasks; TRAIN improvement never counts.
+
+## What we are intentionally not doing now
+
+- Full deterministic hypervisor
+- Arbitrary-system model checking
+- Mass tinytable feature expansion
+- Large IRT/leaderboard infrastructure
+- Large 48-run launch matrix for the old tinytable demo
+- Distributed runners before single-node PG discovery is proven
+- Multi-node PG systems work before single-node historical tasks establish the workflow
+
+## Platform / Adoption (supporting work)
+
+These support the flagship evaluation loop rather than driving the current technical milestone:
+
+- Developer experience: one-line startup, quickstart hardening
+- GitHub integration: publish evidence summaries and gate decisions as PR checks/comments
+- Extension contracts: evaluator/evidence-producer stability for community adoption
+- Distributed runners: after single-node runtime is proven at scale
+- Additional agent backends via community-contributed adapters
+- Richer integrations with code review, issue trackers, and CI systems
 
 ## v1.0
 
