@@ -195,7 +195,8 @@ test("the research agent image resolver records immutable identity fields for a 
     "{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}":
       `example.test/honeyrail/postgres-research@sha256:${"d".repeat(64)}`,
     "{{.Os}}": "linux",
-    "{{.Architecture}}": "arm64"
+    "{{.Architecture}}": "arm64",
+    "{{if .Variant}}{{.Variant}}{{end}}": ""
   };
   const runCommand: RunCommand = async (_command, args = []) => ({
     ok: true,
@@ -212,7 +213,8 @@ test("the research agent image resolver records immutable identity fields for a 
     digest: `example.test/honeyrail/postgres-research@sha256:${"d".repeat(64)}`,
     platform: "linux/arm64",
     os: "linux",
-    architecture: "arm64"
+    architecture: "arm64",
+    variant: null
   });
   assert.deepEqual(JSON.parse(JSON.stringify(identity)), identity, "identity evidence must serialize without losing fields");
 });
@@ -244,7 +246,9 @@ test("a missing research agent image fails before source materialization and nev
       { isolation: { image: "honeyrail-postgres-research:definitely-not-present" } }
     ),
     (error: Error) =>
+      error instanceof PostgresResearchError &&
       error instanceof PostgresResearchAgentContainerError &&
+      error.cause instanceof Error &&
       /is not available to the docker daemon/.test(error.message) &&
       /docker build -t honeyrail-postgres-research:definitely-not-present docker\/postgres-research/.test(error.message)
   );
@@ -278,9 +282,40 @@ test("a scored build rejects an agent image for the wrong platform", () => {
         digest: null,
         platform: "linux/arm64",
         os: "linux",
-        architecture: "arm64"
+        architecture: "arm64",
+        variant: null
       },
       build
+    })
+  );
+
+  assert.doesNotThrow(() =>
+    assertResearchAgentImageCompatible({
+      agentImage: {
+        reference: DEFAULT_RESEARCH_IMAGE,
+        id: `sha256:${"4".repeat(64)}`,
+        digest: null,
+        platform: "linux/arm64/v8",
+        os: "linux",
+        architecture: "aarch64",
+        variant: "8"
+      },
+      build
+    })
+  );
+
+  assert.doesNotThrow(() =>
+    assertResearchAgentImageCompatible({
+      agentImage: {
+        reference: DEFAULT_RESEARCH_IMAGE,
+        id: `sha256:${"5".repeat(64)}`,
+        digest: null,
+        platform: "linux/amd64",
+        os: "linux",
+        architecture: "amd64",
+        variant: null
+      },
+      build: { ...build, scoredEligible: false, arch: "arm64" }
     })
   );
 
@@ -293,7 +328,8 @@ test("a scored build rejects an agent image for the wrong platform", () => {
           digest: null,
           platform: "linux/amd64",
           os: "linux",
-          architecture: "amd64"
+          architecture: "amd64",
+          variant: null
         },
         build
       }),
@@ -312,7 +348,8 @@ test("a scored build rejects an agent image for the wrong platform", () => {
           digest: null,
           platform: "darwin/arm64",
           os: "darwin",
-          architecture: "arm64"
+          architecture: "arm64",
+          variant: null
         },
         build
       }),

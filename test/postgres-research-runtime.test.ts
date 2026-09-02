@@ -38,7 +38,8 @@ const IMAGE = {
   digest: null,
   platform: "linux/arm64",
   os: "linux",
-  architecture: "arm64"
+  architecture: "arm64",
+  variant: null
 };
 
 const MOUNTS = {
@@ -181,7 +182,8 @@ test("the runtime records the image identity the daemon resolved, not the tag it
     "{{.Id}}": `sha256:${"b".repeat(64)}`,
     "{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}": "",
     "{{.Os}}": "linux",
-    "{{.Architecture}}": "arm64"
+    "{{.Architecture}}": "arm64",
+    "{{if .Variant}}{{.Variant}}{{end}}": ""
   };
   const runCommand: RunCommand = async (_command, args = []) => ({
     ok: true,
@@ -199,7 +201,8 @@ test("the runtime records the image identity the daemon resolved, not the tag it
     digest: null,
     platform: "linux/arm64",
     os: "linux",
-    architecture: "arm64"
+    architecture: "arm64",
+    variant: null
   });
 });
 

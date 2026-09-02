@@ -414,6 +414,9 @@ test("two trials over one cached build see the same binaries at the same neutral
   for (const source of [mountA, mountB]) {
     assert.equal(source.includes(a.build.entryId), false, "the cache entry id is visible in the container's mount table");
   }
+  if (a.isolation.mode !== "container" || b.isolation.mode !== "container") {
+    throw new Error("expected both sessions to use container isolation");
+  }
   assert.notEqual(a.isolation.buildViewDir, b.isolation.buildViewDir);
 
   // 3. And none of the grader-side identifiers appear anywhere the agent saw.

@@ -487,8 +487,8 @@ export type PostgresConnectionInfo = {
 };
 
 export class PostgresResearchError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "PostgresResearchError";
   }
 }

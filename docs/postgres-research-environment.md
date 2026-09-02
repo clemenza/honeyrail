@@ -502,7 +502,7 @@ PostgreSQL runs in its own **runtime container** (see [Where the scored cluster 
 
 `PGDATA` is mounted read-write into the agent container on purpose: inspecting and perturbing a cluster's own storage is legitimate database research, and PGDATA holds nothing grader-private — the source ref, commit, tree hash and cache key are written into no file the environment creates. That is a deliberate capability, not an oversight; if a future task class needs it withheld, it becomes an opt-out and the isolation record grows a field for it rather than the default changing silently.
 
-The image is `docker/postgres-research/Dockerfile` (`honeyrail-postgres-research:latest`), deliberately minimal and without an agent CLI — derive from it (`FROM honeyrail-postgres-research:latest`) and point `isolation.image` at the result. HoneyRail resolves that reference with `docker image inspect` before any trial work starts, records the resulting `{ reference, id, digest, os, architecture, platform }`, and starts the agent container from the immutable image id with `--pull=never`. A missing local image is therefore a clear setup error, not a trial side effect that pulls new bytes. The image carries `binutils`, so an agent can `strings`/`nm`/`objdump` a binary it is researching, and so the cache-identity scan below runs in the same container the agent runs in rather than in a grader-side one.
+The image is `docker/postgres-research/Dockerfile` (`honeyrail-postgres-research:latest`), deliberately minimal and without an agent CLI — derive from it (`FROM honeyrail-postgres-research:latest`) and point `isolation.image` at the result. HoneyRail resolves that reference with `docker image inspect` before any trial work starts, records the configured reference in `isolation.image`, records the resolved `{ reference, id, digest, os, architecture, variant, platform }` in `isolation.imageIdentity`, and starts the agent container from the immutable image id with `--pull=never`. A missing local image is therefore a clear setup error, not a trial side effect that pulls new bytes. `digest: null` means Docker has no registry manifest digest for that local image, so comparisons are local-daemon comparisons by image id rather than registry comparisons. The image carries `binutils`, so an agent can `strings`/`nm`/`objdump` a binary it is researching, and so the cache-identity scan below runs in the same container the agent runs in rather than in a grader-side one.
 
 ### 3. Network isolation (a separate guarantee)
 
@@ -532,18 +532,29 @@ Every session result carries an isolation record whose facts are separate becaus
   "buildScoredEligible": true,
   "runtimeScoredEligible": true,
   "scoredEligible": true,
-  "image": {
+  "image": "honeyrail-postgres-research:latest",
+  "imageIdentitySchemaVersion": 1,
+  "imageIdentity": {
     "reference": "honeyrail-postgres-research:latest",
     "id": "sha256:…",
     "digest": null,
     "platform": "linux/arm64",
     "os": "linux",
-    "architecture": "arm64"
+    "architecture": "arm64",
+    "variant": null
   },
   "runtime": {
     "mode": "container",
     "scoredEligible": true,
-    "image": { "reference": "honeyrail-postgres-runtime:latest", "id": "sha256:…", "digest": null, "platform": "linux/arm64" },
+    "image": {
+      "reference": "honeyrail-postgres-runtime:latest",
+      "id": "sha256:…",
+      "digest": null,
+      "platform": "linux/arm64",
+      "os": "linux",
+      "architecture": "arm64",
+      "variant": null
+    },
     "containerName": "honeyrail-pg-runtime-…",
     "containerId": "…",
     "networkMode": "none",
@@ -571,9 +582,9 @@ The full scored-eligibility ledger, all of which must hold:
 | source | history-free materialization (`git archive`, no `.git`) | `PostgresSourceManifest.gitDirPresent: false` |
 | build | approved builder container + neutral prefix | `PostgresBuildManifest.scoredEligible`, `.builderImage`, `.installPrefix` |
 | runtime | approved runtime container | `PostgresRuntimeRecord.scoredEligible`, `.image` |
-| agent | approved agent container, no unisolated escape hatch | `isolation.isolated`, `isolation.image` |
+| agent | approved agent container, no unisolated escape hatch | `isolation.isolated`, `isolation.image`, `isolation.imageIdentity` |
 | network | `none`, for both runtime and agent | `isolation.networkMode`, `runtime.networkMode` |
-| images | reference + content-addressed id + digest + os/arch resolved from the daemon | `builderImage`, `runtime.image`, `isolation.image` |
+| images | reference + content-addressed id + digest + normalized os/arch/variant resolved from the daemon | `builderImage`, `runtime.image`, `isolation.imageIdentity` |
 | cleanup | auditable, ordered, complete | `PostgresCleanupResult` |
 
 ### No silent degradation
@@ -588,7 +599,7 @@ await runAgentInPostgresResearchEnvironment(spec, agent, {
 });
 ```
 
-A session run that way records `isolation: { mode: "unisolated-development", isolated: false, scoredEligible: false, warning: "..." }`, so output produced without a boundary is never indistinguishable from output produced with one. An isolated session instead records the image, the network mode, the scored-eligibility verdict, the container name and the exact `-v` specs.
+A session run that way records `isolation: { mode: "unisolated-development", isolated: false, scoredEligible: false, warning: "..." }`, so output produced without a boundary is never indistinguishable from output produced with one. An isolated session instead records the image reference, the resolved image identity, the network mode, the scored-eligibility verdict, the container name and the exact `-v` specs.
 
 The same rule applies to the build: `build.mode: "host"` never fails over from `container` silently. A missing builder image is an error naming the `docker build` that fixes it, not a quiet downgrade.
 
@@ -658,7 +669,7 @@ RUN npm install -g <your-agent-cli>
 USER pgresearch
 ```
 
-…then pass `isolation.image`. The selected agent image must be locally available and compatible with the mounted PostgreSQL build platform; a scored build for `linux/arm64`, for example, rejects an agent image whose daemon-reported identity is `linux/amd64`. Credentials go in `agent.env`, which is the *only* way anything reaches the container: a container inherits nothing from the host environment, and the injected PostgreSQL coordinates are applied last so a caller cannot override them. Nothing in `agent.env` is echoed into a manifest — the isolation record stores the `-v` mount specs, the resolved image identity, the network mode and the container name, not the `-e` values.
+…then pass `isolation.image`. The selected agent image must be locally available and compatible with the mounted PostgreSQL build platform; a scored build for `linux/arm64`, for example, rejects an agent image whose normalized daemon-reported identity is `linux/amd64`. Credentials go in `agent.env`, which is the *only* way anything reaches the container: a container inherits nothing from the host environment, and the injected PostgreSQL coordinates are applied last so a caller cannot override them. Nothing in `agent.env` is echoed into a manifest — the isolation record stores the `-v` mount specs, the resolved image identity, the network mode and the container name, not the `-e` values.
 
 Note the interaction with the scored network mode: an agent CLI that calls a hosted model API needs egress, and egress today means `bridge`, which means `scoredEligible: false`. A scored trial as currently defined therefore wants an agent that can work offline against the mounted source and the live cluster, or a locally hosted model reachable over a mount rather than a socket. This is the honest state of it, not a workaround.
 
