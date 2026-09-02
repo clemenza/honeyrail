@@ -154,6 +154,7 @@ test("buildResearchContainerArgs hardens the container with the same flags as th
   const args = buildResearchContainerArgs({ mounts: MOUNTS, command: ["true"] }, "c2");
 
   assert.ok(args.includes("--rm"));
+  assert.ok(args.includes("--pull=never"), "the agent docker run must not implicitly pull a mutable tag");
   assert.ok(args.includes("--read-only"));
   assert.ok(args.includes("--cap-drop=ALL"));
   assert.ok(args.includes("no-new-privileges"));

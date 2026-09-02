@@ -470,8 +470,23 @@ test(
       assert.equal(session.isolation.runtimeScoredEligible, true);
       assert.equal(session.isolation.scoredEligible, true, session.isolation.warning ?? "not scored-eligible");
       assert.equal(session.isolation.warning, undefined);
+      assert.equal(session.isolation.image!.reference, DEFAULT_RESEARCH_IMAGE);
+      assert.match(session.isolation.image!.id, /^sha256:[0-9a-f]{64}$/);
+      assert.equal(session.isolation.image!.os, "linux");
+      assert.equal(session.isolation.image!.architecture, session.build.arch);
       assert.equal(session.isolation.runtime!.mode, "container");
       assert.match(session.isolation.runtime!.image!.id, /^sha256:[0-9a-f]{64}$/);
+      const inspectedAgentImage = await runCommandSafe(
+        "docker",
+        ["image", "inspect", "--format", "{{.Id}}|{{.Os}}|{{.Architecture}}", DEFAULT_RESEARCH_IMAGE],
+        { timeout: 30_000 }
+      );
+      assert.equal(inspectedAgentImage.ok, true, inspectedAgentImage.stderr || inspectedAgentImage.stdout);
+      assert.equal(
+        inspectedAgentImage.stdout.trim(),
+        `${session.isolation.image!.id}|${session.isolation.image!.os}|${session.isolation.image!.architecture}`,
+        "the recorded agent image identity must match the image inspected from the daemon"
+      );
       // Ordered teardown, recorded.
       assert.equal(session.runtime.cleanup!.stopped, true);
       assert.equal(session.runtime.cleanup!.runtimeContainerRemoved, true);

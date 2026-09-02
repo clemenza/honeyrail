@@ -4,7 +4,9 @@ import { join, resolve } from "node:path";
 import { runCommandSafe } from "../utils.js";
 import { containerHardeningArgs } from "../containers/hardening.js";
 import { RESEARCH_CONTAINER_PATHS } from "./container-paths.js";
+import { resolveImageIdentity, type ContainerImageIdentity } from "./image-identity.js";
 import type { PostgresConnectionInfo } from "./research-environment.js";
+import type { RunCommand } from "./runtime.js";
 
 /**
  * The isolated launch path for a PostgreSQL research agent (#182).
@@ -57,6 +59,36 @@ import type { PostgresConnectionInfo } from "./research-environment.js";
 export { RESEARCH_CONTAINER_PATHS } from "./container-paths.js";
 
 export const DEFAULT_RESEARCH_IMAGE = "honeyrail-postgres-research:latest";
+
+/** Same shape as builder/runtime image identity, named for the agent axis. */
+export type ResearchAgentImageIdentity = ContainerImageIdentity;
+
+export class PostgresResearchAgentContainerError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PostgresResearchAgentContainerError";
+  }
+}
+
+/**
+ * Resolves the agent image's identity, failing loudly if the image is not
+ * present. There is deliberately no implicit `docker pull`: a scored trial
+ * must not depend on remote availability, and a pull is also how a mutable
+ * tag quietly changes the agent that produced the evidence.
+ */
+export async function resolveResearchAgentImageIdentity(
+  image: string = DEFAULT_RESEARCH_IMAGE,
+  runCommand: RunCommand = runCommandSafe
+): Promise<ResearchAgentImageIdentity> {
+  try {
+    return await resolveImageIdentity(image, {
+      runCommand,
+      buildHint: `Build it first: docker build -t ${image} docker/postgres-research (or pass isolation.image).`
+    });
+  } catch (error) {
+    throw new PostgresResearchAgentContainerError((error as Error).message);
+  }
+}
 
 /**
  * The scored default. `none` gives the agent no network stack beyond its own
@@ -165,7 +197,8 @@ export function buildResearchContainerArgs(options: ResearchContainerOptions, co
       network: options.network ?? DEFAULT_RESEARCH_NETWORK,
       memory: options.memory,
       pidsLimit: options.pidsLimit
-    })
+    }),
+    "--pull=never"
   ];
   if (options.interactive) args.push("-i");
   args.push(
