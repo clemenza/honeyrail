@@ -21,6 +21,7 @@ The following capabilities are present in HoneyRail today:
 - **Kill attribution:** discovery-channel classification (test-driven, code-review, bytecode-review, leak).
 - **TrialDiagnosis v0:** deterministic probe-shape extraction, required-vs-observed comparison, diagnosis validity, scenario-local state handling, discriminating shapes for Gen2 operators.
 - **PostgreSQL transaction/restart alpha:** deterministic PostgreSQL lifecycle/evidence plumbing over Docker or local binaries.
+- **PostgreSQL research environment v0:** exact source snapshots, containerized build/runtime, isolated agent research surface, manifests/evidence, and deterministic cleanup.
 - **Explicit SQLite schema migrations and baseline CI** for typecheck, tests, and build.
 
 Not every API above is stable/v1.
@@ -49,14 +50,26 @@ Exam isolation, engine-access modes, truth adjudication, transcript/trajectory, 
 
 ### M1 — Historical PostgreSQL Discovery Foundation — current mainline
 
-- Generic PostgreSQL research environment v0 ([#179](https://github.com/clemenza/honeyrail/issues/179))
-- Historical PostgreSQL bug corpus v0 ([#178](https://github.com/clemenza/honeyrail/issues/178)), initially 3 bugs, then 5–10
+- Generic PostgreSQL research environment v0 ([#179](https://github.com/clemenza/honeyrail/issues/179)) — validated by [#182](https://github.com/clemenza/honeyrail/pull/182)
+- Historical PostgreSQL bug corpus v0 ([#178](https://github.com/clemenza/honeyrail/issues/178)), initially 3 bugs, then 5–10 only after the task contract survives real trials
+- Bug 1 task-contract and grader vertical slice ([#184](https://github.com/clemenza/honeyrail/issues/184))
+- Bugs 2–3 and frozen Corpus v0 manifest ([#185](https://github.com/clemenza/honeyrail/issues/185))
 - Source-visible agent workspace, hidden fix/truth, pre-fix materialization
 - Deterministic buggy-vs-fixed verification
 - No future git history / no answer-key access in default historical mode
 - First end-to-end real-agent historical rediscovery trial
 
 **Primary metric:** `Historical Bug Rediscovery Rate @ Budget`
+
+**Immediate critical path:**
+
+```text
+#179 PG Research Environment validated
+→ #184 Bug 1 task/grader vertical slice
+→ #185 Bugs 2–3 + frozen Corpus v0
+→ #180 small Historical PG pilot
+→ evidence-derived DiscoveryDiagnosis v1
+```
 
 ### M2 — PG Discovery Observability
 
@@ -91,21 +104,24 @@ Exam isolation, engine-access modes, truth adjudication, transcript/trajectory, 
 
 ### P0
 - [#178](https://github.com/clemenza/honeyrail/issues/178) — Historical PG Corpus v0
-- [#179](https://github.com/clemenza/honeyrail/issues/179) — PostgreSQL Research Environment v0
+- [#184](https://github.com/clemenza/honeyrail/issues/184) — Historical PG Task Contract v0 + Bug 1 vertical slice
+- [#185](https://github.com/clemenza/honeyrail/issues/185) — Historical PG Corpus v0: Bugs 2–3 and frozen corpus manifest
 - tinytable-evals#61 — generated PG differential oracle (truth hygiene)
 
 ### P1
-- [#177](https://github.com/clemenza/honeyrail/issues/177) — Self-Improve Mechanics v0
 - [#180](https://github.com/clemenza/honeyrail/issues/180) — Historical PG Pilot v0
+- [#84](https://github.com/clemenza/honeyrail/issues/84) — `BLOCKED:` classification, if #180 uses the affected DAG/agent-task path
 
 ### P2
 - [#172](https://github.com/clemenza/honeyrail/issues/172) — provider abstraction after provisional PG use
 - [#176](https://github.com/clemenza/honeyrail/issues/176) — exploration contract
+- [#177](https://github.com/clemenza/honeyrail/issues/177) — Self-Improve Mechanics v0, parallel and not Historical PG proof
 - tinytable no-defect/confidence work if capacity exists
 
 ### P3 / evidence-gated
 - Large tinytable calibration/statistics work
 - Compound mutants
+- Multi-agent tinytable exam-room support unless required for the single Historical PG MVP agent
 - Planner-lite
 - Toy MVCC/WAL/concurrency
 - Large synthetic PG mutation pools
@@ -134,6 +150,9 @@ Self-improvement claims require unseen tasks; TRAIN improvement never counts.
 - Mass tinytable feature expansion
 - Large IRT/leaderboard infrastructure
 - Large 48-run launch matrix for the old tinytable demo
+- Generic `EvalProvider` before three Historical PG tasks
+- State explorer before PG evidence
+- Self-improvement claims based on TRAIN or repeated exact cases
 - Distributed runners before single-node PG discovery is proven
 - Multi-node PG systems work before single-node historical tasks establish the workflow
 
