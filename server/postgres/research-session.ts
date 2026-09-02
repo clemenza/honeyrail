@@ -24,6 +24,7 @@ import {
   type ResearchAgentImageIdentity,
   RESEARCH_CONTAINER_PATHS
 } from "./agent-container.js";
+import { containerPlatformsCompatible, normalizedContainerPlatform } from "./image-identity.js";
 import type { PostgresRuntimeRecord } from "./runtime-container.js";
 
 /**
@@ -157,24 +158,29 @@ export type PostgresResearchAgentResult = {
  * `scoredEligible` is the conjunction of all four, and it is the single field
  * a grader should key on. Container *build* alone is explicitly not enough.
  */
-export type PostgresResearchIsolationRecord = {
-  mode: "container" | "unisolated-development";
-  /** False only in the explicitly opted-into development mode. */
-  isolated: boolean;
+export type PostgresResearchContainerIsolationRecord = {
+  mode: "container";
+  isolated: true;
   /**
-   * The configured agent image reference and the immutable identity Docker
-   * resolved before launch. The agent container is started by this image id,
-   * not by the mutable reference, so the recorded identity corresponds to the
-   * image that actually executed the agent.
+   * The configured agent image reference. This stays a string for historical
+   * session-record compatibility; immutable provenance is recorded separately
+   * in imageIdentity.
    */
-  image?: ResearchAgentImageIdentity;
+  image: string;
+  /**
+   * The immutable identity Docker resolved before launch. The agent container
+   * is started by this image id, not by the mutable reference, so the recorded
+   * identity corresponds to the image that actually executed the agent.
+   */
+  imageIdentity: ResearchAgentImageIdentity;
+  imageIdentitySchemaVersion: 1;
   /**
    * The docker network the agent container ran on. `"none"` is the scored
    * default; anything else is recorded verbatim and makes `scoredEligible`
    * false. Absent for an unisolated development run, which had the host's
    * whole network.
    */
-  networkMode?: string;
+  networkMode: string;
   /**
    * True only when all of: a real container boundary, `networkMode: "none"`,
    * and a container-built (scored-eligible) PostgreSQL. Never inferred by a
@@ -187,15 +193,33 @@ export type PostgresResearchIsolationRecord = {
   /** Mirrors PostgresRuntimeRecord.scoredEligible - did the server run in a container? */
   runtimeScoredEligible: boolean;
   /** The runtime sidecar's own record: image identity, container, network, mounts. */
-  runtime?: PostgresRuntimeRecord;
-  containerName?: string;
+  runtime: PostgresRuntimeRecord;
+  containerName: string;
   /** The exact `-v` specs, so a reviewer can see what was and was not exposed. */
-  mounts?: string[];
+  mounts: string[];
   /** Host path of this trial's build view. Grader-side; the agent saw a fixed neutral path. */
-  buildViewDir?: string;
+  buildViewDir: string;
   /** Present, and loud, whenever `scoredEligible` is false. Says which of the three failed. */
   warning?: string;
 };
+
+export type PostgresResearchUnisolatedIsolationRecord = {
+  mode: "unisolated-development";
+  isolated: false;
+  image?: string;
+  imageIdentity?: never;
+  imageIdentitySchemaVersion?: never;
+  networkMode?: never;
+  scoredEligible: false;
+  buildScoredEligible: boolean;
+  runtimeScoredEligible: boolean;
+  runtime: PostgresRuntimeRecord;
+  warning: string;
+};
+
+export type PostgresResearchIsolationRecord =
+  | PostgresResearchContainerIsolationRecord
+  | PostgresResearchUnisolatedIsolationRecord;
 
 /** Why a container-isolated session is nonetheless not scored-eligible. */
 export function unscoredReasons(input: {
@@ -287,17 +311,22 @@ export function assertResearchAgentImageCompatible(input: {
   build: PostgresBuildManifest;
 }) {
   const { agentImage, build } = input;
-  if (agentImage.os !== "linux") {
+  const agentPlatform = normalizedContainerPlatform(agentImage);
+  if (agentPlatform.os !== "linux") {
     throw new PostgresResearchError(
-      `Research agent image "${agentImage.reference}" targets ${agentImage.platform}; isolated PostgreSQL research agents must run on Linux.`
+      `Research agent image "${agentImage.reference}" targets ${agentPlatform.platform}; isolated PostgreSQL research agents must run on Linux.`
     );
   }
+  // Host/development builds are already unscored. They do not give us a
+  // reliable Linux artifact platform to reject against, so the isolation
+  // record carries the unscored build reason instead of inventing one here.
   if (!build.scoredEligible) return;
-  if (agentImage.os !== build.platform || agentImage.architecture !== build.arch) {
+  const buildPlatform = normalizedContainerPlatform({ os: build.platform, architecture: build.arch });
+  if (!containerPlatformsCompatible(agentImage, buildPlatform)) {
     throw new PostgresResearchError(
-      `Research agent image "${agentImage.reference}" targets ${agentImage.platform}, but the mounted PostgreSQL ` +
-        `client/runtime artifacts target ${build.platform}/${build.arch}. Build or select an agent image for ` +
-        `${build.platform}/${build.arch}.`
+      `Research agent image "${agentImage.reference}" targets ${agentPlatform.platform}, but the mounted PostgreSQL ` +
+        `client/runtime artifacts target ${buildPlatform.platform}. Build or select an agent image for ` +
+        `${buildPlatform.platform}.`
     );
   }
 }
@@ -346,6 +375,10 @@ type AgentLaunch = {
   /** Called on timeout, before the SIGTERM/SIGKILL escalation on the client process. */
   stop?: () => void;
 };
+
+type AgentIsolationLaunchConfig =
+  | { mode: "unisolated-development" }
+  | { mode: "container"; imageReference: string; imageIdentity: ResearchAgentImageIdentity };
 
 /**
  * Runs the agent and resolves only once the process has exited. Never rejects
@@ -454,7 +487,7 @@ export async function runAgentInPostgresResearchEnvironment(
     throw new PostgresResearchError("A research agent spec requires a command");
   }
   const isolation = options.isolation ?? {};
-  const runCommand = spec.runCommand ?? undefined;
+  const runCommand = spec.runCommand;
   if (!isolation.allowUnisolatedForDevelopment && !(await dockerAvailable(runCommand))) {
     throw new PostgresResearchError(
       "No docker daemon is reachable, so the research agent cannot be isolated from grader-private state. " +
@@ -462,9 +495,17 @@ export async function runAgentInPostgresResearchEnvironment(
         "host process for local development (its results are marked unisolated and are not a scored trial)."
     );
   }
-  const agentImage = isolation.allowUnisolatedForDevelopment
-    ? null
-    : await resolveResearchAgentImageIdentity(isolation.image ?? DEFAULT_RESEARCH_IMAGE, runCommand);
+  const launchConfig: AgentIsolationLaunchConfig = isolation.allowUnisolatedForDevelopment
+    ? { mode: "unisolated-development" }
+    : {
+        mode: "container",
+        imageReference: isolation.image ?? DEFAULT_RESEARCH_IMAGE,
+        // Resolve before materialization so a missing local image is a setup
+        // error with no trial side effects. Platform compatibility needs the
+        // build manifest, so it is checked inside the environment callback
+        // after build and before starting PostgreSQL or the agent container.
+        imageIdentity: await resolveResearchAgentImageIdentity(isolation.image ?? DEFAULT_RESEARCH_IMAGE, runCommand)
+      };
 
   // Captured from inside the body so the runtime manifest can be taken after
   // cleanup has run - that is the only point at which it records what was
@@ -478,10 +519,9 @@ export async function runAgentInPostgresResearchEnvironment(
       { ...spec, buildViewsRoot: spec.buildViewsRoot ?? isolation.buildViewsRoot },
       async (env) => {
         environment = env;
-        if (agentImage) assertResearchAgentImageCompatible({ agentImage, build: env.buildManifest });
-        await env.start();
 
-        if (isolation.allowUnisolatedForDevelopment) {
+        if (launchConfig.mode === "unisolated-development") {
+          await env.start();
           const injected = env.agentEnvironment(agent.envPrefix);
           const result = await runAgentProcess(unisolatedLaunch(env, agent, injected), agent);
           return {
@@ -489,8 +529,8 @@ export async function runAgentInPostgresResearchEnvironment(
             agentEnvironment: injected,
             isolation: {
               mode: "unisolated-development" as const,
-              isolated: false,
-              scoredEligible: false,
+              isolated: false as const,
+              scoredEligible: false as const,
               buildScoredEligible: env.buildManifest.scoredEligible,
               runtimeScoredEligible: env.runtimeIsolation().scoredEligible,
               runtime: env.runtimeIsolation(),
@@ -501,9 +541,10 @@ export async function runAgentInPostgresResearchEnvironment(
             build: env.buildManifest
           };
         }
-        if (!agentImage) {
-          throw new PostgresResearchError("A container-isolated research agent needs a resolved image identity");
-        }
+
+        const agentImage = launchConfig.imageIdentity;
+        assertResearchAgentImageCompatible({ agentImage, build: env.buildManifest });
+        await env.start();
 
         const scratchDir = await createAgentScratchDir(env.root);
         // Docker creates a *directory* for a bind source that does not exist,
@@ -566,8 +607,10 @@ export async function runAgentInPostgresResearchEnvironment(
           agentEnvironment: injected,
           isolation: {
             mode: "container" as const,
-            isolated: true,
-            image: agentImage,
+            isolated: true as const,
+            image: launchConfig.imageReference,
+            imageIdentity: agentImage,
+            imageIdentitySchemaVersion: 1 as const,
             networkMode,
             scoredEligible: reasons.length === 0,
             buildScoredEligible,

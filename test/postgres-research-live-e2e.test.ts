@@ -470,21 +470,29 @@ test(
       assert.equal(session.isolation.runtimeScoredEligible, true);
       assert.equal(session.isolation.scoredEligible, true, session.isolation.warning ?? "not scored-eligible");
       assert.equal(session.isolation.warning, undefined);
-      assert.equal(session.isolation.image!.reference, DEFAULT_RESEARCH_IMAGE);
-      assert.match(session.isolation.image!.id, /^sha256:[0-9a-f]{64}$/);
-      assert.equal(session.isolation.image!.os, "linux");
-      assert.equal(session.isolation.image!.architecture, session.build.arch);
+      assert.equal(session.isolation.image, DEFAULT_RESEARCH_IMAGE);
+      assert.equal(session.isolation.imageIdentitySchemaVersion, 1);
+      assert.equal(session.isolation.imageIdentity.reference, DEFAULT_RESEARCH_IMAGE);
+      assert.match(session.isolation.imageIdentity.id, /^sha256:[0-9a-f]{64}$/);
+      assert.equal(session.isolation.imageIdentity.os, "linux");
+      assert.equal(session.isolation.imageIdentity.architecture, session.build.arch);
       assert.equal(session.isolation.runtime!.mode, "container");
       assert.match(session.isolation.runtime!.image!.id, /^sha256:[0-9a-f]{64}$/);
       const inspectedAgentImage = await runCommandSafe(
         "docker",
-        ["image", "inspect", "--format", "{{.Id}}|{{.Os}}|{{.Architecture}}", DEFAULT_RESEARCH_IMAGE],
+        [
+          "image",
+          "inspect",
+          "--format",
+          "{{.Id}}|{{.Os}}|{{.Architecture}}|{{if .Variant}}{{.Variant}}{{end}}",
+          DEFAULT_RESEARCH_IMAGE
+        ],
         { timeout: 30_000 }
       );
       assert.equal(inspectedAgentImage.ok, true, inspectedAgentImage.stderr || inspectedAgentImage.stdout);
       assert.equal(
         inspectedAgentImage.stdout.trim(),
-        `${session.isolation.image!.id}|${session.isolation.image!.os}|${session.isolation.image!.architecture}`,
+        `${session.isolation.imageIdentity.id}|${session.isolation.imageIdentity.os}|${session.isolation.imageIdentity.architecture}|${session.isolation.imageIdentity.variant ?? ""}`,
         "the recorded agent image identity must match the image inspected from the daemon"
       );
       // Ordered teardown, recorded.
@@ -579,6 +587,9 @@ test("a real trial's containers, view and ephemeral directories are all gone aft
   // this whole path exists to guarantee - and only then torn down.
   assert.equal(session.runtime.cleanup!.stopped, true);
   assert.equal(session.runtime.cleanup!.runtimeContainerRemoved, true);
+  if (session.isolation.mode !== "container") {
+    throw new Error("expected the timed-out live session to use container isolation");
+  }
   assert.equal(await containerExists(session.isolation.runtime!.containerName!), false);
   assert.equal(await containerExists(session.isolation.containerName!), false);
   assert.equal(await exists(session.isolation.buildViewDir!), false);

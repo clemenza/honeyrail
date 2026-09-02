@@ -5,7 +5,7 @@ import { runCommandSafe } from "../utils.js";
 import { containerHardeningArgs } from "../containers/hardening.js";
 import { RESEARCH_CONTAINER_PATHS } from "./container-paths.js";
 import { resolveImageIdentity, type ContainerImageIdentity } from "./image-identity.js";
-import type { PostgresConnectionInfo } from "./research-environment.js";
+import { PostgresResearchError, type PostgresConnectionInfo } from "./research-environment.js";
 import type { RunCommand } from "./runtime.js";
 
 /**
@@ -63,9 +63,9 @@ export const DEFAULT_RESEARCH_IMAGE = "honeyrail-postgres-research:latest";
 /** Same shape as builder/runtime image identity, named for the agent axis. */
 export type ResearchAgentImageIdentity = ContainerImageIdentity;
 
-export class PostgresResearchAgentContainerError extends Error {
-  constructor(message: string) {
-    super(message);
+export class PostgresResearchAgentContainerError extends PostgresResearchError {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "PostgresResearchAgentContainerError";
   }
 }
@@ -86,7 +86,7 @@ export async function resolveResearchAgentImageIdentity(
       buildHint: `Build it first: docker build -t ${image} docker/postgres-research (or pass isolation.image).`
     });
   } catch (error) {
-    throw new PostgresResearchAgentContainerError((error as Error).message);
+    throw new PostgresResearchAgentContainerError((error as Error).message, { cause: error });
   }
 }
 
