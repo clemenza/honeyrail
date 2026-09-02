@@ -6,9 +6,17 @@ import { test, type TestContext } from "node:test";
 
 import { PostgresResearchError, type PostgresResearchSpec } from "../server/postgres/research-environment.js";
 import {
+  DEFAULT_RESEARCH_IMAGE,
+  PostgresResearchAgentContainerError,
+  resolveResearchAgentImageIdentity
+} from "../server/postgres/agent-container.js";
+import {
+  assertResearchAgentImageCompatible,
   runAgentInPostgresResearchEnvironment,
   type PostgresResearchSessionOptions
 } from "../server/postgres/research-session.js";
+import type { PostgresBuildManifest } from "../server/postgres/research-environment.js";
+import type { RunCommand } from "../server/postgres/runtime.js";
 import { createSyntheticPostgresSourceRepo, hasFixtureToolchain, type SyntheticPostgresSourceRepo } from "./helpers/postgres-source-fixture.js";
 
 // SHOULD FIX 3 (#179 review): the one supported composition where an agent
@@ -178,5 +186,136 @@ test("an unrunnable agent command fails loudly and still cleans up", async (t) =
   await assert.rejects(
     runAgentInPostgresResearchEnvironment(spec, { command: "  " }, DEV_MODE),
     (error: Error) => error instanceof PostgresResearchError && /requires a command/.test(error.message)
+  );
+});
+
+test("the research agent image resolver records immutable identity fields for a mutable tag", async () => {
+  const answers: Record<string, string> = {
+    "{{.Id}}": `sha256:${"c".repeat(64)}`,
+    "{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}":
+      `example.test/honeyrail/postgres-research@sha256:${"d".repeat(64)}`,
+    "{{.Os}}": "linux",
+    "{{.Architecture}}": "arm64"
+  };
+  const runCommand: RunCommand = async (_command, args = []) => ({
+    ok: true,
+    stdout: `${answers[args[3]] ?? ""}\n`,
+    stderr: "",
+    code: 0
+  });
+
+  const identity = await resolveResearchAgentImageIdentity("honeyrail-postgres-research:latest", runCommand);
+
+  assert.deepEqual(identity, {
+    reference: "honeyrail-postgres-research:latest",
+    id: `sha256:${"c".repeat(64)}`,
+    digest: `example.test/honeyrail/postgres-research@sha256:${"d".repeat(64)}`,
+    platform: "linux/arm64",
+    os: "linux",
+    architecture: "arm64"
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(identity)), identity, "identity evidence must serialize without losing fields");
+});
+
+test("a missing research agent image fails before source materialization and never pulls", async (t) => {
+  const tempDir = await mkdtemp(join(tmpdir(), "honeyrail-pg-missing-agent-image-"));
+  t.after(async () => rm(tempDir, { recursive: true, force: true }));
+  const calls: string[][] = [];
+  const runCommand: RunCommand = async (command, args = []) => {
+    calls.push([command, ...args]);
+    if (command === "docker" && args[0] === "version") return { ok: true, stdout: "25.0.0\n", stderr: "", code: 0 };
+    if (command === "docker" && args[0] === "image" && args[1] === "inspect") {
+      return { ok: false, stdout: "", stderr: "Error: No such image", code: 1 };
+    }
+    throw new Error(`unexpected command: ${[command, ...args].join(" ")}`);
+  };
+  const spec: PostgresResearchSpec = {
+    root: join(tempDir, "env"),
+    privateDir: join(tempDir, "private"),
+    source: { repoPath: join(tempDir, "repo"), ref: "HEAD" },
+    build: { mode: "host", cacheRoot: join(tempDir, "cache"), jobs: 1 },
+    runCommand
+  };
+
+  await assert.rejects(
+    runAgentInPostgresResearchEnvironment(
+      spec,
+      { command: "/bin/true" },
+      { isolation: { image: "honeyrail-postgres-research:definitely-not-present" } }
+    ),
+    (error: Error) =>
+      error instanceof PostgresResearchAgentContainerError &&
+      /is not available to the docker daemon/.test(error.message) &&
+      /docker build -t honeyrail-postgres-research:definitely-not-present docker\/postgres-research/.test(error.message)
+  );
+
+  assert.deepEqual(calls, [
+    ["docker", "version", "--format", "{{.Server.Version}}"],
+    [
+      "docker",
+      "image",
+      "inspect",
+      "--format",
+      "{{.Id}}",
+      "honeyrail-postgres-research:definitely-not-present"
+    ]
+  ]);
+  assert.equal(await exists(spec.root), false, "a missing agent image must fail before materializing source");
+});
+
+test("a scored build rejects an agent image for the wrong platform", () => {
+  const build = {
+    scoredEligible: true,
+    platform: "linux",
+    arch: "arm64"
+  } as PostgresBuildManifest;
+
+  assert.doesNotThrow(() =>
+    assertResearchAgentImageCompatible({
+      agentImage: {
+        reference: DEFAULT_RESEARCH_IMAGE,
+        id: `sha256:${"1".repeat(64)}`,
+        digest: null,
+        platform: "linux/arm64",
+        os: "linux",
+        architecture: "arm64"
+      },
+      build
+    })
+  );
+
+  assert.throws(
+    () =>
+      assertResearchAgentImageCompatible({
+        agentImage: {
+          reference: DEFAULT_RESEARCH_IMAGE,
+          id: `sha256:${"2".repeat(64)}`,
+          digest: null,
+          platform: "linux/amd64",
+          os: "linux",
+          architecture: "amd64"
+        },
+        build
+      }),
+    (error: Error) =>
+      error instanceof PostgresResearchError &&
+      /targets linux\/amd64/.test(error.message) &&
+      /artifacts target linux\/arm64/.test(error.message)
+  );
+
+  assert.throws(
+    () =>
+      assertResearchAgentImageCompatible({
+        agentImage: {
+          reference: DEFAULT_RESEARCH_IMAGE,
+          id: `sha256:${"3".repeat(64)}`,
+          digest: null,
+          platform: "darwin/arm64",
+          os: "darwin",
+          architecture: "arm64"
+        },
+        build
+      }),
+    (error: Error) => error instanceof PostgresResearchError && /must run on Linux/.test(error.message)
   );
 });
