@@ -250,6 +250,8 @@ The Database Testing Harness Alpha is implemented for PostgreSQL transaction/res
 
 See [docs/database-testing-harness-alpha.md](docs/database-testing-harness-alpha.md) for the current scope, payloads, artifacts, evidence, quality gate behavior, and limitations.
 
+Its sibling for Historical PostgreSQL work is the PostgreSQL Research Environment: build an exact PostgreSQL source ref, stand up an isolated ephemeral cluster, let an agent run arbitrary local experiments against it, and clean up deterministically. See [docs/postgres-research-environment.md](docs/postgres-research-environment.md).
+
 ```text
 Goal
   -> Run / DAG

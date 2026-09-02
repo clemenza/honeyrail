@@ -54,6 +54,49 @@ export function parseInstructionFile(value: unknown): InstructionFileInput | nul
 }
 
 /**
+ * Parses a step's optional input.environment — the #179 research-environment
+ * hook: a flat map of variables exported into the agent process before
+ * launch and mirrored to $HR_STEP_DIR/environment.json so an agent can also
+ * read them structurally.
+ *
+ * This is deliberately the smallest possible seam rather than an
+ * "environment plugin" abstraction: a driver that stood up a PostgreSQL
+ * research environment already knows the connection coordinates (see
+ * PostgresResearchEnvironment.agentEnvironment()), and the only thing
+ * agent-task was missing was a way to hand a subprocess *any* extra
+ * variables. agent-task itself stays ignorant of PostgreSQL.
+ *
+ * Whatever the driver puts here is agent-visible by construction, so for
+ * historical PostgreSQL work it must carry connection/filesystem
+ * coordinates only — never the bug identity, fixed ref, or source ref.
+ */
+export function parseAgentEnvironment(value: unknown): Record<string, string> | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new ConfigError("environment must be an object of string values");
+  }
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (!entries.length) return null;
+  const parsed: Record<string, string> = {};
+  for (const [key, raw] of entries) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+      throw new ConfigError(`environment key "${key}" must be a valid shell variable name`);
+    }
+    if (raw === null || raw === undefined || typeof raw === "object") {
+      throw new ConfigError(`environment["${key}"] must be a string, number, or boolean`);
+    }
+    const text = String(raw);
+    // The launch command is a single shell line handed to tmux, so a value
+    // containing a newline or NUL could not survive it intact.
+    if (/[\r\n\0]/.test(text)) {
+      throw new ConfigError(`environment["${key}"] must not contain newlines or NUL bytes`);
+    }
+    parsed[key] = text;
+  }
+  return parsed;
+}
+
+/**
  * Compact identity of an injected instruction file for evidence and eval
  * segmentation (label = which variant, sha256 = exactly which content) —
  * the content itself stays out of the store.
@@ -448,6 +491,7 @@ export class AgentTaskExecutor implements Executor {
     // Throws ConfigError on a malformed/unsafe declaration, so a run that
     // could only fail at injection time is rejected before any step starts.
     parseInstructionFile(ctx.step.input?.instructionFile);
+    parseAgentEnvironment(ctx.step.input?.environment);
     // #106: a step can opt into declaring which files (+ hashes) its target
     // fixture must already contain - e.g. #104's buildSeedRoot() manifest
     // for dsh-testengineer-trial. This runs against the *project's*
@@ -503,8 +547,10 @@ export class AgentTaskExecutor implements Executor {
     const interaction = ctx.step.input.interaction === "interactive" ? "interactive" : "autonomous";
     const unattended = interaction === "autonomous";
     const instructionFile = parseInstructionFile(ctx.step.input.instructionFile);
+    const environment = parseAgentEnvironment(ctx.step.input.environment);
     const stepDir = stepDirFor(ctx);
     await mkdir(join(stepDir, "artifacts"), { recursive: true });
+    if (environment) await writeFile(join(stepDir, "environment.json"), `${JSON.stringify(environment, null, 2)}\n`);
     const promptWithConventions = withHarnessConventions(prompt, { stepDir, produces: ctx.step.produces });
     const launchPrompt = unattended ? withUnattendedPreamble(promptWithConventions) : promptWithConventions;
     const task = await ctx.store.createTask({
@@ -546,6 +592,28 @@ export class AgentTaskExecutor implements Executor {
           payload: { runId: ctx.runId, stepId: ctx.step.id, evidenceId: evidence.id, kind: evidence.kind, claim: evidence.claim }
         });
       }
+      if (environment) {
+        // Keys and a content hash, not values: this records *that* a
+        // configured environment was handed to the agent and exactly which
+        // one, without copying the driver's payload into the store.
+        const evidence = await ctx.store.createEvidence({
+          runId: ctx.runId,
+          stepId: ctx.step.id,
+          attempt: ctx.step.attempt,
+          kind: "harness.environment",
+          claim: `Exposed ${Object.keys(environment).length} environment variable${Object.keys(environment).length === 1 ? "" : "s"} to the agent process`,
+          source: "agent-task",
+          value: {
+            keys: Object.keys(environment).sort(),
+            sha256: createHash("sha256").update(JSON.stringify(environment)).digest("hex")
+          }
+        });
+        await publishEvent(ctx.store, ctx.bus, {
+          type: "evidence.recorded",
+          projectId: ctx.project.id,
+          payload: { runId: ctx.runId, stepId: ctx.step.id, evidenceId: evidence.id, kind: evidence.kind, claim: evidence.claim }
+        });
+      }
       worktree = await ctx.store.createWorktree({ ...createdWorktree, taskId: task.id } as Partial<Worktree>);
       const tmuxSessionName = tmuxName("task", title);
       const sessionId = makeId("sess");
@@ -556,8 +624,11 @@ export class AgentTaskExecutor implements Executor {
         // The launch command already runs through the user's shell (tmux
         // executes a lone shell-command argument via $SHELL -c), so a plain
         // leading VAR=value assignment is enough to expose the step's
-        // scratch directory to the agent process - no tmux API changes needed.
-        command: `HR_STEP_DIR=${quoteShellArg(stepDir)} ${adapter.buildLaunchCommand({ prompt: launchPrompt, model, unattended, temperature })}`,
+        // scratch directory - and any declared input.environment - to the
+        // agent process; no tmux API changes needed.
+        command: `HR_STEP_DIR=${quoteShellArg(stepDir)} ${Object.entries(environment ?? {})
+          .map(([key, value]) => `${key}=${quoteShellArg(value)} `)
+          .join("")}${adapter.buildLaunchCommand({ prompt: launchPrompt, model, unattended, temperature })}`,
         logPath
       });
       session = await ctx.store.createSession({

@@ -1,0 +1,154 @@
+name: PostgreSQL Research Integration
+
+# The real-PostgreSQL merge gate for the Historical PostgreSQL research
+# environment (#179/#182).
+#
+# The general CI job is green whether or not any of this runs, because every
+# docker/real-PostgreSQL test in the suite skips cleanly when its images or its
+# source mirror are absent. That is the right behaviour for a contributor's
+# laptop and exactly the wrong behaviour for a merge gate: a skip is not a
+# pass, and the #182 fourth review says so in as many words. This workflow
+# therefore builds the three images, prepares a pinned PostgreSQL ref, runs the
+# real build / runtime / agent end-to-end tests, and **fails if any required
+# test reports itself skipped**.
+#
+# It is a separate workflow rather than a job in ci.yml because it is
+# minutes-not-seconds and needs its own concurrency and caching story.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "server/postgres/**"
+      - "server/executors/postgres-research.ts"
+      - "server/containers/hardening.ts"
+      - "docker/postgres-research/**"
+      - "docker/postgres-research-builder/**"
+      - "docker/postgres-research-runtime/**"
+      - "test/postgres-research-*.ts"
+      - ".github/workflows/pg-research-integration.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: pg-research-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live-postgres:
+    name: Real PostgreSQL build, runtime sidecar and agent boundary
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      # Any resolvable ref proves the property. A release tag is chosen because
+      # it is stable and cheap to fetch; nothing here names the historical
+      # corpus, and nothing may.
+      HONEYRAIL_PG_TEST_REF: REL_16_9
+      HONEYRAIL_PG_TEST_MIRROR: ${{ github.workspace }}/.pg-mirror
+      HONEYRAIL_PG_TEST_CACHE: ${{ github.workspace }}/.pg-build-cache
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build the three research images
+        # Uniquely tagged as well as :latest so the run's evidence names an
+        # exact image, and so a stale :latest cannot be what actually ran.
+        run: |
+          set -euo pipefail
+          for pair in \
+            "honeyrail-postgres-builder docker/postgres-research-builder" \
+            "honeyrail-postgres-runtime docker/postgres-research-runtime" \
+            "honeyrail-postgres-research docker/postgres-research"; do
+            set -- $pair
+            docker build -t "$1:latest" -t "$1:${GITHUB_SHA}" "$2"
+          done
+
+      - name: Record image identities
+        run: |
+          set -euo pipefail
+          for image in honeyrail-postgres-builder honeyrail-postgres-runtime honeyrail-postgres-research; do
+            docker image inspect --format \
+              '{{.RepoTags}} id={{.Id}} os={{.Os}} arch={{.Architecture}}' "$image:${GITHUB_SHA}"
+          done
+
+      - name: Prepare a pinned PostgreSQL ref
+        # Blobless partial clone: enough to resolve and archive one ref, without
+        # dragging the whole history's contents onto the runner. The mirror is
+        # never mounted into any container - the environment materializes a
+        # `.git`-free snapshot from it instead.
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/postgres/postgres.git "$HONEYRAIL_PG_TEST_MIRROR"
+          git -C "$HONEYRAIL_PG_TEST_MIRROR" rev-parse --verify "${HONEYRAIL_PG_TEST_REF}^{commit}"
+          git -C "$HONEYRAIL_PG_TEST_MIRROR" rev-parse --verify "${HONEYRAIL_PG_TEST_REF}^{tree}"
+
+      - name: Runtime sidecar unit tests
+        run: node --import tsx --test test/postgres-research-runtime.test.ts
+
+      - name: Real containerized build and cache-identity scan
+        run: node --import tsx --test test/postgres-research-real-build.test.ts 2>&1 | tee real-build.log
+
+      - name: Real live cluster, isolated agent, restart and cleanup
+        run: node --import tsx --test test/postgres-research-live-e2e.test.ts 2>&1 | tee live-e2e.log
+
+      - name: Isolation and network boundary tests
+        run: |
+          node --import tsx --test test/postgres-research-isolation.test.ts 2>&1 | tee isolation.log
+          node --import tsx --test test/postgres-research-network.test.ts 2>&1 | tee network.log
+
+      - name: Fail if any required test skipped
+        # The point of this job. `node --test`'s TAP-ish summary reports a
+        # skipped count; anything above zero here means the gate did not
+        # actually run, which is a failure and not a pass.
+        run: |
+          set -euo pipefail
+          status=0
+          for log in real-build.log live-e2e.log isolation.log network.log; do
+            # `node --test`'s summary line is "<glyph> skipped <n>"; take the
+            # last field of the last such line so the glyph's encoding is
+            # irrelevant. An unparseable summary counts as a failure, not as a
+            # zero.
+            skipped=$(grep -E 'skipped [0-9]+$' "$log" | tail -1 | awk '{print $NF}')
+            echo "$log: skipped=${skipped:-unparseable}"
+            if [ "${skipped:-1}" != "0" ]; then
+              echo "::error file=$log::a required PostgreSQL research test skipped; a skip is not a pass"
+              grep -nE '^.\s' "$log" | grep -i 'skip' || true
+              status=1
+            fi
+          done
+          exit $status
+
+      - name: No leaked containers or build views
+        if: always()
+        run: |
+          set -euo pipefail
+          leaked=$(docker ps -a --filter name=honeyrail-pg- --format '{{.Names}}\t{{.Status}}')
+          echo "leaked containers: ${leaked:-(none)}"
+          test -z "$leaked"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg-research-integration-logs
+          path: |
+            real-build.log
+            live-e2e.log
+            isolation.log
+            network.log
+          if-no-files-found: warn
