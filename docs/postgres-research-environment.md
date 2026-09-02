@@ -12,9 +12,9 @@ In scope (this is #179):
 
 - exact source ref -> `.git`-free snapshot
 - source build with a correctly-keyed build cache
-- isolated ephemeral cluster: initdb / start / readiness / psql / restart / stop
+- isolated ephemeral cluster in its own runtime container: initdb / start / readiness / psql / restart / stop, driven by `docker exec` and never by a host process in the scored path
 - arbitrary local SQL and shell experiments against the running cluster
-- one agent process driving that live cluster inside a container that bind-mounts only its research surface, with cleanup ordered behind it
+- one agent process driving that live cluster from a *second* container that bind-mounts only its research surface and reaches the server over a shared Unix socket, with cleanup ordered behind it
 - source/build/runtime manifests as artifacts, lifecycle facts as evidence
 - deterministic cleanup on success, throw, and timeout
 
