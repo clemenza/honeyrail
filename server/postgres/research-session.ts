@@ -4,6 +4,7 @@ import { appendFile } from "node:fs/promises";
 import { nowIso } from "../utils.js";
 import {
   PostgresResearchError,
+  PostgresResearchTimeoutError,
   withPostgresResearchEnvironment,
   type PostgresBuildManifest,
   type PostgresConnectionInfo,
@@ -125,8 +126,16 @@ export type PostgresResearchAgentResult = {
   ok: boolean;
   exitCode: number | null;
   signal: string | null;
-  /** True when the agent was killed for exceeding `timeoutMs`. */
+  /** True when the agent was killed for exceeding `timeoutMs`, or for the outer session deadline. */
   timedOut: boolean;
+  /**
+   * Which deadline actually caused the kill, when `timedOut` is true: the
+   * agent's own `timeoutMs`, or the session's outer `options.timeoutMs`
+   * (#188). First cause wins - whichever timer fires first decides this
+   * field, and the other cannot re-fire against an already-killed agent.
+   * Absent when `timedOut` is false.
+   */
+  timeoutSource?: "agent" | "session";
   stdout: string;
   stderr: string;
   startedAt: string;
@@ -384,8 +393,23 @@ type AgentIsolationLaunchConfig =
  * Runs the agent and resolves only once the process has exited. Never rejects
  * on a non-zero exit: an agent that failed is an observation, the same way a
  * failing SQL statement is.
+ *
+ * `signal`, when given, is the *session's* outer deadline
+ * (withPostgresResearchEnvironment()'s AbortSignal, #188) - a second,
+ * independent cause of the same kill sequence `agent.timeoutMs` already
+ * drives. `cancel()` below is the single place either cause goes through, so
+ * the two can never double-kill: the first to fire wins and records which
+ * one it was on `timeoutSource`, and the second is a no-op against an
+ * already-timed-out agent, including when both fire at once.
+ *
+ * Exported for direct, deterministic unit testing of the cancellation
+ * semantics without standing up a full research environment or a container.
  */
-async function runAgentProcess(launch: AgentLaunch, agent: PostgresResearchAgentSpec): Promise<PostgresResearchAgentResult> {
+export async function runAgentProcess(
+  launch: AgentLaunch,
+  agent: PostgresResearchAgentSpec,
+  signal?: AbortSignal
+): Promise<PostgresResearchAgentResult> {
   const limit = agent.maxOutputBytes ?? 1024 * 1024 * 8;
   const startedAt = nowIso();
   const started = Date.now();
@@ -407,32 +431,52 @@ async function runAgentProcess(launch: AgentLaunch, agent: PostgresResearchAgent
   child.stdin?.end(agent.stdin ?? "");
 
   let timedOut = false;
+  let timeoutSource: "agent" | "session" | undefined;
   let killTimer: NodeJS.Timeout | undefined;
   let graceTimer: NodeJS.Timeout | undefined;
-  if (agent.timeoutMs) {
-    killTimer = setTimeout(() => {
-      timedOut = true;
+
+  function cancel(source: "agent" | "session") {
+    if (timedOut) return; // idempotent: whichever cause fires first wins, harmlessly.
+    timedOut = true;
+    timeoutSource = source;
+    try {
       // In isolated mode this is `docker kill`: signalling the client alone
-      // would leave the container - and therefore the agent - running.
+      // would leave the container - and therefore the agent - running. A
+      // throwing stop must not prevent the SIGTERM/SIGKILL escalation below.
       launch.stop?.();
-      killTree(child, "SIGTERM");
-      graceTimer = setTimeout(() => killTree(child, "SIGKILL"), KILL_GRACE_MS);
-      graceTimer.unref?.();
-    }, agent.timeoutMs);
-    killTimer.unref?.();
+    } catch {
+      // Best-effort; the process-level kill sequence is the fallback.
+    }
+    killTree(child, "SIGTERM");
+    graceTimer = setTimeout(() => killTree(child, "SIGKILL"), KILL_GRACE_MS);
+    graceTimer.unref?.();
   }
 
-  const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
-    // "close" rather than "exit": it fires after stdout/stderr have drained,
-    // so nothing the agent printed is lost.
-    child.once("close", (code, signal) => resolve({ code, signal }));
-    child.once("error", reject);
-  }).catch((error: Error) => {
-    throw new PostgresResearchError(`Could not run research agent "${agent.command}": ${error.message}`);
-  });
+  if (agent.timeoutMs) {
+    killTimer = setTimeout(() => cancel("agent"), agent.timeoutMs);
+    killTimer.unref?.();
+  }
+  const onAbort = () => cancel("session");
+  if (signal) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }
 
-  if (killTimer) clearTimeout(killTimer);
-  if (graceTimer) clearTimeout(graceTimer);
+  let exit: { code: number | null; signal: NodeJS.Signals | null };
+  try {
+    exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      // "close" rather than "exit": it fires after stdout/stderr have drained,
+      // so nothing the agent printed is lost.
+      child.once("close", (code, closeSignal) => resolve({ code, signal: closeSignal }));
+      child.once("error", reject);
+    });
+  } catch (error) {
+    throw new PostgresResearchError(`Could not run research agent "${agent.command}": ${(error as Error).message}`);
+  } finally {
+    if (killTimer) clearTimeout(killTimer);
+    if (graceTimer) clearTimeout(graceTimer);
+    if (signal) signal.removeEventListener("abort", onAbort);
+  }
 
   return {
     ...launch.reported,
@@ -440,6 +484,7 @@ async function runAgentProcess(launch: AgentLaunch, agent: PostgresResearchAgent
     exitCode: exit.code,
     signal: exit.signal,
     timedOut,
+    ...(timedOut ? { timeoutSource } : {}),
     stdout: stdout.text(),
     stderr: stderr.text(),
     startedAt,
@@ -511,19 +556,19 @@ export async function runAgentInPostgresResearchEnvironment(
   // cleanup has run - that is the only point at which it records what was
   // actually stopped and removed.
   let environment: PostgresResearchEnvironment | undefined;
-  {
+  try {
     const session = await withPostgresResearchEnvironment(
       // The environment owns this trial's randomized build view now, because
       // the runtime container mounts the same one - so the isolation option
       // has to reach it rather than being applied here.
       { ...spec, buildViewsRoot: spec.buildViewsRoot ?? isolation.buildViewsRoot },
-      async (env) => {
+      async (env, signal) => {
         environment = env;
 
         if (launchConfig.mode === "unisolated-development") {
           await env.start();
           const injected = env.agentEnvironment(agent.envPrefix);
-          const result = await runAgentProcess(unisolatedLaunch(env, agent, injected), agent);
+          const result = await runAgentProcess(unisolatedLaunch(env, agent, injected), agent, signal);
           return {
             agent: result,
             agentEnvironment: injected,
@@ -591,7 +636,8 @@ export async function runAgentInPostgresResearchEnvironment(
             spawn: { command: "docker", args: containerArgs, env: process.env, detached: false },
             stop: () => killResearchContainer(containerName)
           },
-          agent
+          agent,
+          signal
         );
 
         const networkMode = isolation.network ?? DEFAULT_RESEARCH_NETWORK;
@@ -634,5 +680,18 @@ export async function runAgentInPostgresResearchEnvironment(
     // process above has actually exited. That ordering is MUST 4 of the #182
     // fourth review and is not something this function may shortcut.
     return { ...session, runtime: environment!.runtimeManifest() };
+  } catch (error) {
+    // A session timeout rejects rather than resolving (options.timeoutMs is
+    // a hard backstop on the whole call, unlike agent.timeoutMs, which is an
+    // observation on the returned result) - but by the time it is thrown,
+    // withPostgresResearchEnvironment's finally has already run env.cleanup(),
+    // and `environment` was captured from inside the body. Attaching the
+    // manifest here means a session timeout is never an evidence-free
+    // rejection: cleanup.sessionTimedOut and cleanup.errors are still visible
+    // to whatever catches this (#188).
+    if (error instanceof PostgresResearchTimeoutError && environment) {
+      error.runtimeManifest = environment.runtimeManifest();
+    }
+    throw error;
   }
 }

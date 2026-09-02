@@ -389,7 +389,11 @@ merely eventual.
 
 After cleanup the environment is closed: further `psql()`/`exec()` calls throw rather than silently targeting a dead cluster.
 
-A timeout rejects the caller and tears the cluster down immediately. JavaScript cannot abort the body's own in-flight `await`s, but with the cluster stopped anything still running fails fast instead of continuing unobserved.
+### Session timeout vs agent timeout (#188)
+
+`withPostgresResearchEnvironment()`'s `body` receives an `AbortSignal` alongside `env`. When the outer `timeoutMs` elapses, that signal is aborted *before* the caller's promise rejects, and `finally` then waits - bounded by `cancelGraceMs` (default 30s) - for the body to actually settle before running `env.cleanup()`. A body that observes the signal (which `runAgentInPostgresResearchEnvironment()`'s does: it kills the agent process or `docker kill`s the agent container, the same way `agent.timeoutMs` already does, and only then returns) settles well inside that bound, so cleanup runs immediately behind the kill rather than racing it. A body that never looks at `signal` cannot hang cleanup forever either - past `cancelGraceMs`, cleanup proceeds regardless, and `PostgresCleanupResult.cancelGraceExceeded` records that this happened rather than hiding it.
+
+Two independent deadlines can therefore both want to kill the same agent: the session's `options.timeoutMs` and the agent's own `agent.timeoutMs`. Both route through the same idempotent kill sequence in `runAgentProcess()`, so **whichever fires first wins** - there is no separate precedence rule to configure - and the other is a harmless no-op against an already-killed agent, including when both fire at effectively the same moment. Which one actually fired is recorded on `PostgresResearchAgentResult.timeoutSource` (`"agent" | "session"`) when the call resolves normally (an agent-level timeout, like a non-zero exit, is an observation, not a rejection); a session-level timeout instead rejects the caller with `PostgresResearchTimeoutError`, which carries a `runtimeManifest` property (the environment's `runtimeManifest()`, including `cleanup.sessionTimedOut`) so that rejection is not evidence-free.
 
 ## Agent research surface
 
@@ -445,9 +449,10 @@ It materializes, builds, starts PostgreSQL, spawns the agent with `agentEnvironm
 - clean exit;
 - non-zero exit (an observation, not an environment failure — the same rule `psql()` follows);
 - a hang, where `agent.timeoutMs` SIGTERMs then SIGKILLs the agent's whole **process group** (an agent is usually a shell that shells out; killing only the direct child leaves a grandchild holding the pipes) and teardown waits for it to actually exit;
+- the outer session deadline (`options.timeoutMs`) firing instead, or as well — the same kill sequence, driven by the `AbortSignal` `withPostgresResearchEnvironment()` passes to the body, rather than by `agent.timeoutMs`'s own timer; see "Session timeout vs agent timeout" above;
 - an unrunnable command, which throws `PostgresResearchError` with cleanup already done.
 
-A timeout in isolated mode `docker kill`s the container before escalating on the client process — signalling only the local `docker` client would leave the container, and therefore the agent, running.
+A timeout in isolated mode `docker kill`s the container before escalating on the client process — signalling only the local `docker` client would leave the container, and therefore the agent, running. This applies equally whether `agent.timeoutMs` or the outer session deadline is what triggered it.
 
 `PATH` puts `HR_PG_BIN_DIR` first in both modes. In unisolated mode the agent additionally gets the `PG*` hygiene the environment applies to itself (every inherited `PGHOST`/`PGPORT`/`PGDATA` dropped, so an ambient value cannot redirect it at some other server); in isolated mode the question does not arise, because a container inherits no host environment at all.
 
@@ -825,7 +830,7 @@ real PostgreSQL git ref
 
 Inside the real agent container it runs `pg_config --bindir/--configure`, `postgres --version`, `SELECT version()`, and a real `CREATE TABLE`/`INSERT`/`SELECT`, and proves the agent sees the *same server* the grader does. It also asserts no source `.git`; no cache root, key or entry id in the environment, the mount table, `pg_config` or any installed file (including `strings` on the `postgres` binary); grader filesystem sentinels inaccessible; a real host HTTP sentinel unreachable by every enumerable route, with the attempt count asserted; the server log readable; the agent's result file returning to the grader; restart preserving committed data; and `psqlFile()` streaming a grader-side script in over `docker exec -i` without mounting it.
 
-Its negative paths are tests, not prose: a missing runtime image fails before anything is materialized and never falls back to a host cluster; an `initdb` failure removes the runtime container and the build view but not the cache; and an agent timeout kills the agent, *then* stops the server, *then* removes the container, view, PGDATA and socket, with `docker ps -a` proving nothing leaked.
+Its negative paths are tests, not prose: a missing runtime image fails before anything is materialized and never falls back to a host cluster; an `initdb` failure removes the runtime container and the build view but not the cache; an agent timeout kills the agent, *then* stops the server, *then* removes the container, view, PGDATA and socket, with `docker ps -a` proving nothing leaked; and, separately, the outer *session* timeout (`agent.timeoutMs` left unset) does the same against a real ten-minute-sleeping agent container, finishing near its own deadline rather than the agent's, with the thrown `PostgresResearchTimeoutError`'s attached `runtimeManifest` proving `cleanup.sessionTimedOut` and an unexceeded `cancelGraceExceeded` bound (#188).
 
 Like the real-build test it is opt-in on `HONEYRAIL_PG_TEST_MIRROR`, and **a skip does not satisfy the merge gate it exists for** — which is why `.github/workflows/pg-research-integration.yml` fails when the skipped count is not zero.
 
@@ -838,7 +843,7 @@ Validating a *bug* against real PostgreSQL remains a manual step on top of this:
 - The build cache is content-keyed but not garbage-collected; a corpus of many refs will grow it.
 - Build-cache concurrency is safe (staged build + atomic rename) but not coordinated: two environments needing the same cold build may both build it.
 - The cache key covers a declared set of build-environment variables, not a hermetic toolchain fingerprint.
-- `timeoutMs` cancels the caller and tears down the cluster; it cannot abort a JavaScript `await` already in flight. For an agent, prefer `agent.timeoutMs` on the session helper, which kills the agent first and cleans up after.
+- `timeoutMs` cancels the caller and, via the `AbortSignal` passed to the body, actively cancels the body too (#188) — cleanup then waits for the body to settle, bounded by `cancelGraceMs`. That bound exists because JavaScript still cannot force an `await` the body itself is not listening on `signal` for to abort; a body that ignores `signal` gets torn down anyway once `cancelGraceMs` elapses, with `cleanup.cancelGraceExceeded` recording it. `runAgentInPostgresResearchEnvironment()`'s body always observes it, so this bound is not reached on the supported agent path.
 - The agent boundary is a container, so it needs a docker daemon; without one, an agent session fails rather than degrading. It is shared-kernel isolation, not a microVM. The same is now true of the scored *build* and of the scored *cluster*.
 - The scored path needs three images present locally and never pulls them. A missing one is a loud failure naming the `docker build` that fixes it.
 - The runtime container mounts a generated two-line `passwd`/`group` pair over `/etc/passwd` and `/etc/group`, because PostgreSQL calls `getpwuid()` on an effective uid that a stock image has no entry for. It is a per-trial identity shim, not research data, and it is not mounted into the agent container — but it is a mount beyond the four the architecture diagram names, and it is listed in the recorded runtime mounts for that reason.

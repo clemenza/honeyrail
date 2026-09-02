@@ -462,6 +462,22 @@ export type PostgresCleanupResult = {
   dataDirRemoved: boolean;
   socketDirRemoved: boolean;
   sourceDirRemoved: boolean;
+  /**
+   * True when this trial's outer session deadline (`WithPostgresResearchEnvironmentOptions.timeoutMs`)
+   * is what triggered cleanup, as distinct from a plain thrown error or an
+   * `agent.timeoutMs` expiry (which is recorded on `PostgresResearchAgentResult.timeoutSource`
+   * instead, since that path never reaches here as a rejection).
+   */
+  sessionTimedOut?: boolean;
+  /**
+   * True only when `sessionTimedOut` is true and the body did not settle
+   * within `cancelGraceMs` after its `AbortSignal` was aborted - i.e. cleanup
+   * proceeded without confirmation that whatever the body owned (an agent
+   * process, a container) had actually stopped. A conforming body - see
+   * runAgentInPostgresResearchEnvironment() - kills its agent/container on
+   * abort and awaits its exit, so this stays false in the supported path.
+   */
+  cancelGraceExceeded?: boolean;
   errors: string[];
   at: string;
 };
@@ -494,6 +510,15 @@ export class PostgresResearchError extends Error {
 }
 
 export class PostgresResearchTimeoutError extends PostgresResearchError {
+  /**
+   * Best-effort evidence attached by a caller that has partial trial state
+   * when this is thrown - e.g. runAgentInPostgresResearchEnvironment()
+   * attaches its environment's runtimeManifest() - so a session timeout is
+   * not an evidence-free rejection even though the body's own return value
+   * is discarded by the timeout race.
+   */
+  runtimeManifest?: Record<string, unknown>;
+
   constructor(message: string) {
     super(message);
     this.name = "PostgresResearchTimeoutError";
@@ -1600,7 +1625,14 @@ export class PostgresResearchEnvironment {
    * timeout. The server log, the build logs and the manifests stay behind as
    * evidence, and the shared build cache is never touched.
    */
-  async cleanup(options: { retainDataDir?: boolean; removeSourceDir?: boolean } = {}): Promise<PostgresCleanupResult> {
+  async cleanup(
+    options: {
+      retainDataDir?: boolean;
+      removeSourceDir?: boolean;
+      /** Set by withPostgresResearchEnvironment() when the outer session deadline is why cleanup is running. */
+      sessionTimeout?: { timedOut: boolean; cancelGraceExceeded: boolean };
+    } = {}
+  ): Promise<PostgresCleanupResult> {
     if (this.cleanupResult) return this.cleanupResult;
     const errors: string[] = [];
     let stopMode: PostgresCleanupResult["stopMode"] = "already-stopped";
@@ -1660,6 +1692,9 @@ export class PostgresResearchEnvironment {
       dataDirRemoved,
       socketDirRemoved,
       sourceDirRemoved,
+      ...(options.sessionTimeout
+        ? { sessionTimedOut: options.sessionTimeout.timedOut, cancelGraceExceeded: options.sessionTimeout.cancelGraceExceeded }
+        : {}),
       errors,
       at: nowIso()
     };
@@ -1786,9 +1821,27 @@ export async function createPostgresResearchEnvironment(spec: PostgresResearchSp
   });
 }
 
+/** Default upper bound on how long cleanup waits, after a session timeout aborts the body, for it to actually settle. */
+export const DEFAULT_CANCEL_GRACE_MS = 30_000;
+
 export type WithPostgresResearchEnvironmentOptions = {
-  /** Fails the body (and still cleans up) if it has not settled in time. */
+  /**
+   * Fails the body if it has not settled in time. This now *actively
+   * cancels* the body rather than merely abandoning the await: the body's
+   * `AbortSignal` is aborted first, and cleanup waits (up to `cancelGraceMs`)
+   * for the body to actually finish reacting before the cluster is torn
+   * down. See runAgentInPostgresResearchEnvironment(), whose body kills the
+   * agent/container on abort and awaits its exit.
+   */
   timeoutMs?: number;
+  /**
+   * Upper bound on how long cleanup waits for an aborted body to settle
+   * before proceeding regardless. Only matters for a body that does not
+   * observe `signal` - a conforming body settles well inside this. Defaults
+   * to DEFAULT_CANCEL_GRACE_MS. Exceeding it is recorded as
+   * `PostgresCleanupResult.cancelGraceExceeded`, never silently.
+   */
+  cancelGraceMs?: number;
   cleanup?: { retainDataDir?: boolean; removeSourceDir?: boolean };
 };
 
@@ -1799,32 +1852,67 @@ export type WithPostgresResearchEnvironmentOptions = {
  * `try { ... } finally { stop }` guarantee transaction-restart-alpha uses,
  * with the timeout arm added because an agent-driven research step can hang
  * rather than fail.
+ *
+ * The body receives an `AbortSignal` alongside `env`. On a session timeout
+ * that signal is aborted *before* the caller's promise rejects, so a
+ * conforming body can cancel whatever it is waiting on (an agent process, a
+ * container) and this function waits for that cancellation to actually land
+ * - bounded by `cancelGraceMs` - before running `env.cleanup()`. That
+ * ordering, not merely rejecting the caller, is what keeps cleanup from
+ * racing a body that is still running (#188).
  */
 export async function withPostgresResearchEnvironment<T>(
   spec: PostgresResearchSpec,
-  body: (env: PostgresResearchEnvironment) => Promise<T>,
+  body: (env: PostgresResearchEnvironment, signal: AbortSignal) => Promise<T>,
   options: WithPostgresResearchEnvironmentOptions = {}
 ): Promise<T> {
   const env = await createPostgresResearchEnvironment(spec);
+  const controller = new AbortController();
   let timer: NodeJS.Timeout | undefined;
+  let graceTimer: NodeJS.Timeout | undefined;
+  let sessionTimedOut = false;
+  let cancelGraceExceeded = false;
   try {
-    const work = body(env);
+    const work = body(env, controller.signal);
     if (!options.timeoutMs) return await work;
-    // The rejected race arm cannot abort the body's own awaits, but cleanup
-    // below tears the cluster down immediately, so anything still in flight
-    // fails fast against a stopped server instead of running unobserved.
-    work.catch(() => {});
-    return await Promise.race([
-      work,
-      new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(
-          () => reject(new PostgresResearchTimeoutError(`PostgreSQL research environment timed out after ${options.timeoutMs}ms`)),
-          options.timeoutMs
-        );
-      })
-    ]);
+    // Never rejects: lets the finally block wait for the aborted body to
+    // actually finish reacting to cancellation without itself throwing.
+    const settled = work.then(
+      () => undefined,
+      () => undefined
+    );
+    try {
+      return await Promise.race([
+        work,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => {
+            sessionTimedOut = true;
+            const error = new PostgresResearchTimeoutError(`PostgreSQL research environment timed out after ${options.timeoutMs}ms`);
+            // Cancellation, not mere abandonment: a conforming body kills
+            // whatever it owns on this signal and awaits its exit.
+            controller.abort(error);
+            reject(error);
+          }, options.timeoutMs);
+        })
+      ]);
+    } finally {
+      if (sessionTimedOut) {
+        // Bounded: a body that never observes `signal` must not be able to
+        // hang cleanup forever. It is still torn down below regardless, with
+        // that fact recorded rather than hidden.
+        const bodySettled = await Promise.race([
+          settled.then(() => true),
+          new Promise<boolean>((resolve) => {
+            graceTimer = setTimeout(() => resolve(false), options.cancelGraceMs ?? DEFAULT_CANCEL_GRACE_MS);
+            graceTimer.unref?.();
+          })
+        ]);
+        cancelGraceExceeded = !bodySettled;
+      }
+    }
   } finally {
     if (timer) clearTimeout(timer);
-    await env.cleanup(options.cleanup);
+    if (graceTimer) clearTimeout(graceTimer);
+    await env.cleanup({ ...options.cleanup, ...(sessionTimedOut ? { sessionTimeout: { timedOut: true, cancelGraceExceeded } } : {}) });
   }
 }

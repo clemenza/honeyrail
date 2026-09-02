@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 
-import { PostgresResearchError, type PostgresResearchSpec } from "../server/postgres/research-environment.js";
+import { PostgresResearchError, PostgresResearchTimeoutError, type PostgresResearchSpec } from "../server/postgres/research-environment.js";
 import {
   DEFAULT_RESEARCH_IMAGE,
   PostgresResearchAgentContainerError,
@@ -13,6 +13,7 @@ import {
 import {
   assertResearchAgentImageCompatible,
   runAgentInPostgresResearchEnvironment,
+  runAgentProcess,
   type PostgresResearchSessionOptions
 } from "../server/postgres/research-session.js";
 import type { PostgresBuildManifest } from "../server/postgres/research-environment.js";
@@ -66,6 +67,97 @@ async function skipWithoutToolchain(t: TestContext) {
   t.skip("git, make, tar or a C compiler probe is unavailable");
   return true;
 }
+
+// #188: runAgentProcess() is the single place both `agent.timeoutMs` and the
+// session's outer AbortSignal fund the same kill sequence. These tests are
+// deterministic and need neither a research environment nor a docker daemon
+// - they spawn a plain shell process directly, the same way unisolatedLaunch()
+// does - so they exercise the cancellation semantics in isolation from
+// materialize/build/start and from any container boundary.
+async function withShellScript(t: TestContext, body: string) {
+  const dir = await mkdtemp(join(tmpdir(), "honeyrail-pg-agent-process-"));
+  t.after(async () => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, "script.sh");
+  await writeFile(path, `#!/bin/sh\n${body}`);
+  await chmod(path, 0o755);
+  return { command: path, args: [] as string[], cwd: dir, env: process.env, detached: false };
+}
+
+test("the session AbortSignal kills the agent and records timeoutSource \"session\", even without agent.timeoutMs", async (t) => {
+  const launch = await withShellScript(t, "sleep 5\n");
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 150);
+
+  const started = Date.now();
+  const result = await runAgentProcess({ reported: launch, spawn: launch }, { command: launch.command }, controller.signal);
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.timeoutSource, "session");
+  assert.equal(result.ok, false);
+  assert.ok(Date.now() - started < 4000, `the session signal must kill the agent promptly, not wait for its 5s sleep (${result.durationMs}ms)`);
+});
+
+test("agent.timeoutMs kills the agent and records timeoutSource \"agent\" ahead of a later session signal", async (t) => {
+  const launch = await withShellScript(t, "sleep 5\n");
+  const controller = new AbortController();
+
+  const result = await runAgentProcess({ reported: launch, spawn: launch }, { command: launch.command, timeoutMs: 100 }, controller.signal);
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.timeoutSource, "agent");
+  assert.equal(result.ok, false);
+
+  // A session timeout arriving after the agent has already exited must be
+  // harmless: no throw, no double-kill, no listener left registered.
+  assert.doesNotThrow(() => controller.abort());
+});
+
+test("a normal fast exit is not marked timed out even when the session signal aborts moments later", async (t) => {
+  const launch = await withShellScript(t, "exit 0\n");
+  const controller = new AbortController();
+
+  const result = await runAgentProcess({ reported: launch, spawn: launch }, { command: launch.command }, controller.signal);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.timeoutSource, undefined);
+  // Its abort listener must already be detached by the time the process has
+  // closed, so a late abort is a plain no-op rather than an error.
+  assert.doesNotThrow(() => controller.abort());
+});
+
+test("a signal already aborted before the agent is launched kills it immediately, ahead of agent.timeoutMs - repeated cancellation is harmless", async (t) => {
+  const launch = await withShellScript(t, "sleep 5\n");
+  const controller = new AbortController();
+  controller.abort();
+
+  const started = Date.now();
+  // agent.timeoutMs is deliberately shorter still (1ms): if both causes ever
+  // fired, "session" must win because it is observed synchronously at launch,
+  // and the agent-timeout timer firing moments later must be a harmless no-op
+  // rather than a second kill or a crash.
+  const result = await runAgentProcess({ reported: launch, spawn: launch }, { command: launch.command, timeoutMs: 1 }, controller.signal);
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.timeoutSource, "session");
+  assert.ok(Date.now() - started < 3000, `a pre-aborted signal must kill immediately, not wait out the 5s sleep (${result.durationMs}ms)`);
+});
+
+test("a throwing stop() callback does not prevent the kill sequence or crash the caller", async (t) => {
+  const launch = await withShellScript(t, "sleep 5\n");
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 100);
+
+  const result = await runAgentProcess(
+    { reported: launch, spawn: launch, stop: () => { throw new Error("stop() blew up"); } },
+    { command: launch.command },
+    controller.signal
+  );
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.timeoutSource, "session");
+  assert.equal(result.ok, false);
+});
 
 test("an agent process receives the dynamic coordinates and queries the live cluster before cleanup", async (t) => {
   if (await skipWithoutToolchain(t)) return;
@@ -170,6 +262,37 @@ test("an agent that hangs is killed at its timeout and the environment is torn d
   assert.equal(session.runtime.cleanup!.stopped, true);
   assert.equal(await exists(join(spec.root, "pgdata")), false);
   assert.equal(await exists(session.connection.socketDir), false);
+});
+
+test("the outer session timeout kills a hanging agent ahead of an unset agent.timeoutMs, and cleanup waits for it (#188)", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  const fixture = await withFixture(t);
+  const agentPath = await writeAgent(fixture, "agent-hang-session.sh", ['echo "hanging"', "sleep 600", ""].join("\n"));
+
+  const spec = specFor(fixture, "session-timeout");
+  const started = Date.now();
+  // agent.timeoutMs is deliberately unset: only the session backstop
+  // (options.timeoutMs) should be what kills this agent.
+  let caught: unknown;
+  try {
+    await runAgentInPostgresResearchEnvironment(spec, { command: agentPath }, { ...DEV_MODE, timeoutMs: 5000 });
+    assert.fail("expected the session timeout to reject the call");
+  } catch (error) {
+    caught = error;
+  }
+
+  assert.ok(caught instanceof PostgresResearchTimeoutError, `expected PostgresResearchTimeoutError, got ${caught}`);
+  assert.ok(Date.now() - started < 30_000, "the session must finish near its deadline, not wait out the agent's 600s sleep");
+  // A session timeout must not be an evidence-free rejection: the
+  // environment's own runtime manifest is attached to the thrown error.
+  const manifest = (caught as PostgresResearchTimeoutError).runtimeManifest as { cleanup?: Record<string, unknown> } | undefined;
+  assert.ok(manifest, "the thrown timeout must carry the environment's runtime manifest");
+  assert.equal(manifest!.cleanup?.stopped, true);
+  assert.equal(manifest!.cleanup?.sessionTimedOut, true);
+  assert.equal(manifest!.cleanup?.cancelGraceExceeded, false, "a conforming agent kill settles well inside the grace bound");
+  // Teardown only happened after the agent was actually killed, the same
+  // ordering guarantee agent.timeoutMs already gives.
+  assert.equal(await exists(join(spec.root, "pgdata")), false);
 });
 
 test("an unrunnable agent command fails loudly and still cleans up", async (t) => {

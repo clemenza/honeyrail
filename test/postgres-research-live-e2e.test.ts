@@ -11,6 +11,7 @@ import {
   withPostgresResearchEnvironment,
   BUILD_COMPLETE_MARKER,
   PostgresResearchError,
+  PostgresResearchTimeoutError,
   type PostgresResearchSpec
 } from "../server/postgres/research-environment.js";
 import {
@@ -568,8 +569,9 @@ test("a real trial's containers, view and ephemeral directories are all gone aft
   if (!mirror) return;
   const fixture = await withLiveFixture(t, mirror);
 
-  // The timeout arm: the session backstop fires while the agent is still
-  // running, and teardown must still be complete and ordered afterwards.
+  // The agent-timeout arm: `agent.timeoutMs` fires while the session backstop
+  // is not in play at all, and teardown must still be complete and ordered
+  // afterwards. See the next test for the outer session backstop itself.
   const spec = specFor(fixture, "timeout");
   const scratch = join(spec.root, "agent-work");
   await (await import("node:fs/promises")).mkdir(scratch, { recursive: true });
@@ -602,3 +604,63 @@ test("a real trial's containers, view and ephemeral directories are all gone aft
   assert.deepEqual(leaked.stdout.split("\n").filter(Boolean), [], `leaked containers: ${leaked.stdout}`);
   assert.deepEqual(await readdir(fixture.viewsRoot).catch(() => []), [], "a build view survived the trial");
 });
+
+test(
+  "the outer session timeout terminates and awaits the agent container before environment cleanup runs (#188)",
+  { timeout: E2E_TIMEOUT_MS },
+  async (t) => {
+    const mirror = await skipUnlessLiveE2EIsPossible(t);
+    if (!mirror) return;
+    const fixture = await withLiveFixture(t, mirror);
+
+    // The regression case: a short *session* deadline with agent.timeoutMs
+    // left unset, against an agent that would otherwise run for ten minutes.
+    // Before #188, withPostgresResearchEnvironment's timeout arm rejected the
+    // caller and tore the cluster down immediately without ever signalling
+    // this agent - so the container, and whatever it held mounted, would
+    // still have been running when PGDATA and the socket directory were
+    // removed out from under it.
+    const spec = specFor(fixture, "session-timeout");
+    const scratch = join(spec.root, "agent-work");
+    await (await import("node:fs/promises")).mkdir(scratch, { recursive: true });
+    await writeAgentScript(scratch, "sleep.sh", "sleep 600\n");
+
+    const started = Date.now();
+    let caught: unknown;
+    try {
+      await runAgentInPostgresResearchEnvironment(
+        spec,
+        { command: `${RESEARCH_CONTAINER_PATHS.scratch}/sleep.sh` },
+        { isolation: { buildViewsRoot: fixture.viewsRoot }, timeoutMs: 15_000 }
+      );
+      assert.fail("expected the session timeout to reject the call");
+    } catch (error) {
+      caught = error;
+    }
+
+    assert.ok(caught instanceof PostgresResearchTimeoutError, `expected PostgresResearchTimeoutError, got ${caught}`);
+    assert.ok(
+      Date.now() - started < 90_000,
+      "the session must finish near its 15s deadline, not wait out the agent's 600s sleep"
+    );
+
+    const manifest = (caught as PostgresResearchTimeoutError).runtimeManifest as
+      | { cleanup?: Record<string, unknown> & { runtimeContainerRemoved?: boolean } }
+      | undefined;
+    assert.ok(manifest, "the thrown session timeout must carry the environment's runtime manifest as evidence");
+    assert.equal(manifest!.cleanup?.stopped, true);
+    assert.equal(manifest!.cleanup?.runtimeContainerRemoved, true);
+    assert.equal(manifest!.cleanup?.sessionTimedOut, true, "evidence must identify this as a session timeout, not an agent timeout");
+    assert.equal(manifest!.cleanup?.cancelGraceExceeded, false, "the agent container was killed and awaited well inside the grace bound");
+
+    // The proof that actually matters: no leaked runtime or agent container,
+    // and no leaked per-trial filesystem state - the same assertions the
+    // agent-timeout test above makes, now for the session backstop.
+    const leaked = await runCommandSafe("docker", ["ps", "-a", "--filter", "name=honeyrail-pg-", "--format", "{{.Names}}"], {
+      timeout: 30_000
+    });
+    assert.deepEqual(leaked.stdout.split("\n").filter(Boolean), [], `leaked containers: ${leaked.stdout}`);
+    assert.deepEqual(await readdir(fixture.viewsRoot).catch(() => []), [], "a build view survived the trial");
+    assert.equal(await exists(join(spec.root, "pgdata")), false);
+  }
+);
