@@ -29,6 +29,7 @@ import {
   DEFAULT_BUILDER_IMAGE,
   PostgresBuildContainerError
 } from "../server/postgres/build-container.js";
+import { DEFAULT_RUNTIME_IMAGE } from "../server/postgres/runtime-container.js";
 import { JsonStore } from "../server/store.js";
 import { runCommandSafe } from "../server/utils.js";
 import { createSyntheticPostgresSourceRepo, hasFixtureToolchain, type SyntheticPostgresSourceRepo } from "./helpers/postgres-source-fixture.js";
@@ -238,8 +239,16 @@ test("the containerized build mode is the default, publishes a usable cache entr
   if (await skipWithoutToolchain(t)) return;
   const daemon = await runCommandSafe("docker", ["version", "--format", "{{.Server.Version}}"], { timeout: 20_000 });
   const image = await runCommandSafe("docker", ["image", "inspect", DEFAULT_BUILDER_IMAGE], { timeout: 30_000 });
-  if (!daemon.ok || !daemon.stdout.trim() || !image.ok) {
-    t.skip(`${DEFAULT_BUILDER_IMAGE} or a docker daemon is unavailable - docker build -t ${DEFAULT_BUILDER_IMAGE} docker/postgres-research-builder`);
+  // Container build mode now also stands up the runtime sidecar, so its image
+  // has to be present for createPostgresResearchEnvironment() to get as far as
+  // returning an environment at all.
+  const runtimeImage = await runCommandSafe("docker", ["image", "inspect", DEFAULT_RUNTIME_IMAGE], { timeout: 30_000 });
+  if (!daemon.ok || !daemon.stdout.trim() || !image.ok || !runtimeImage.ok) {
+    t.skip(
+      `${DEFAULT_BUILDER_IMAGE}/${DEFAULT_RUNTIME_IMAGE} or a docker daemon is unavailable - ` +
+        `docker build -t ${DEFAULT_BUILDER_IMAGE} docker/postgres-research-builder && ` +
+        `docker build -t ${DEFAULT_RUNTIME_IMAGE} docker/postgres-research-runtime`
+    );
     return;
   }
   const fixture = await withFixture(t);

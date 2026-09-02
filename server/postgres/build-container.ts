@@ -3,6 +3,7 @@ import { userInfo } from "node:os";
 import { resolve } from "node:path";
 import { runCommandSafe } from "../utils.js";
 import { BUILDER_CONTAINER_PATHS } from "./container-paths.js";
+import { resolveImageIdentity, type ContainerImageIdentity } from "./image-identity.js";
 import type { RunCommand } from "./runtime.js";
 
 /**
@@ -42,12 +43,9 @@ export const DEFAULT_BUILDER_TMP_SIZE = "2g";
 
 /**
  * Content identity of the builder image, as the daemon actually resolved it.
- *
- * `id` is the image's content-addressed config digest and is always
- * available, including for an image that was only ever built locally and
- * never pushed. `digest` is the registry manifest digest (`RepoDigests[0]`)
- * and is only present for an image that was pulled from, or pushed to, a
- * registry - a freshly `docker build`-ed local image has none.
+ * The shape is shared with the runtime sidecar image (see
+ * ./image-identity.ts); the alias is kept because "builder image identity" is
+ * what the build manifest and the cache key talk about.
  *
  * The cache key uses `reference` + `id`. `id` is what makes a rebuilt
  * `:latest` invalidate its own cache entries; `digest` is recorded for
@@ -55,34 +53,13 @@ export const DEFAULT_BUILDER_TMP_SIZE = "2g";
  * would mean an entry silently invalidates the first time the same image gets
  * pushed somewhere, which is not a toolchain change.
  */
-export type BuilderImageIdentity = {
-  reference: string;
-  id: string;
-  digest: string | null;
-  /** From the image config, e.g. "linux/arm64" - the platform the build actually targets. */
-  platform: string;
-  os: string;
-  architecture: string;
-};
+export type BuilderImageIdentity = ContainerImageIdentity;
 
 export class PostgresBuildContainerError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "PostgresBuildContainerError";
   }
-}
-
-async function inspect(image: string, format: string, runCommand: RunCommand): Promise<string> {
-  const result = await runCommand("docker", ["image", "inspect", "--format", format, image], { timeout: 30_000 });
-  if (!result.ok) {
-    throw new PostgresBuildContainerError(
-      `Build image "${image}" is not available to the docker daemon. ` +
-        `Build it first: docker build -t ${image} docker/postgres-research-builder ` +
-        `(or pass build.builderImage / set build.mode: "host" for an explicitly unscored local build). ` +
-        `${(result.stderr || result.stdout).trim()}`
-    );
-  }
-  return result.stdout.trim();
 }
 
 /**
@@ -95,12 +72,19 @@ export async function resolveBuilderImageIdentity(
   image: string = DEFAULT_BUILDER_IMAGE,
   runCommand: RunCommand = runCommandSafe
 ): Promise<BuilderImageIdentity> {
-  const id = await inspect(image, "{{.Id}}", runCommand);
-  const digest = await inspect(image, "{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}", runCommand);
-  const os = await inspect(image, "{{.Os}}", runCommand);
-  const architecture = await inspect(image, "{{.Architecture}}", runCommand);
-  if (!id) throw new PostgresBuildContainerError(`Build image "${image}" reported no image id`);
-  return { reference: image, id, digest: digest || null, platform: `${os}/${architecture}`, os, architecture };
+  try {
+    return await resolveImageIdentity(image, {
+      runCommand,
+      buildHint:
+        `Build it first: docker build -t ${image} docker/postgres-research-builder ` +
+        `(or pass build.builderImage / set build.mode: "host" for an explicitly unscored local build).`
+    });
+  } catch (error) {
+    // Re-typed rather than propagated: callers of the *build* path catch
+    // PostgresBuildContainerError, and a missing builder image is a build
+    // failure however it was discovered.
+    throw new PostgresBuildContainerError((error as Error).message);
+  }
 }
 
 /** Delimits the probe's fields so `--version` banners spanning several lines parse unambiguously. */

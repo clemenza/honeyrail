@@ -12,6 +12,24 @@ import {
 } from "./build-container.js";
 import { BUILDER_CONTAINER_PATHS, NEUTRAL_INSTALL_PREFIX } from "./container-paths.js";
 import {
+  BUILD_COMPLETE_MARKER,
+  BUILD_COMPLETE_MARKER_ID,
+  createBuildView,
+  defaultBuildViewsRoot,
+  removeBuildView,
+  type BuildView
+} from "./build-view.js";
+import {
+  alignRuntimeOwnership,
+  resolveRuntimeImageIdentity,
+  runtimeUserIds,
+  writeRuntimeIdentityFiles,
+  HOST_RUNTIME_UNSCORED_REASON,
+  PostgresRuntimeContainer,
+  type PostgresRuntimeRecord
+} from "./runtime-container.js";
+import type { ContainerImageIdentity } from "./image-identity.js";
+import {
   allocatePort,
   isAddressInUseFailure,
   psqlArgs,
@@ -53,6 +71,23 @@ import {
  * research surface and nothing else. Callers driving this module directly
  * (the `postgres-research` executor, tests, scripts) are grader-side code and
  * are trusted with all of it.
+ *
+ * ## Where the server runs (#182, fourth review)
+ *
+ * In the scored path - `build.mode: "container"` - nothing PostgreSQL is
+ * executed by the host at all. The build happens in the builder container and
+ * the *cluster* happens in a runtime sidecar container
+ * (./runtime-container.ts): `initdb`, `pg_ctl`, the postmaster and the
+ * grader's own `psql` are all `docker exec`s into it, and the agent container
+ * reaches the same server over the socket directory both bind-mount from the
+ * same host path. This class orchestrates docker and records evidence; it
+ * executes no Linux ELF binary on a macOS or Windows host, which is what made
+ * the previous round's "live cluster" claims untrue off Linux.
+ *
+ * `build.mode: "host"` keeps the original host-process lifecycle for local
+ * development on a machine without docker. It is permanently un-scored, on
+ * both axes: `PostgresBuildManifest.scoredEligible` and
+ * `PostgresRuntimeRecord.scoredEligible` are both false.
  */
 
 /**
@@ -94,15 +129,12 @@ function defaultBuildMode(): PostgresBuildMode {
 }
 
 /**
- * The only file HoneyRail writes into a cache entry. It exists so an
- * interrupted build is never mistaken for a usable one, and it says nothing
- * else. It carries the `entryId`, which is deterministic, so
- * agent-container.ts's createBuildView() deliberately leaves it out of the
- * view an agent sees. It replaces v0's `honeyrail-build.json`, which carried
- * source ref, commit, tree hash and cache key as well.
+ * The completion marker (and the per-trial build view that deliberately
+ * excludes it) live in ./build-view.ts, which both this module and
+ * agent-container.ts import. Re-exported here because this is where callers
+ * have always imported it from.
  */
-export const BUILD_COMPLETE_MARKER = "honeyrail-build-complete.json";
-export const BUILD_COMPLETE_MARKER_ID = "honeyrail-pg-build-complete";
+export { BUILD_COMPLETE_MARKER, BUILD_COMPLETE_MARKER_ID } from "./build-view.js";
 
 /**
  * How many candidate ports a single start() will try. Bounded recovery from
@@ -263,11 +295,32 @@ export type PostgresResearchSpec = {
   privateDir?: string;
   source: PostgresSourceSpec;
   build?: PostgresBuildSpec;
+  /**
+   * The PostgreSQL runtime sidecar. Only consulted in `build.mode:
+   * "container"`; a host build keeps the host-process lifecycle, which has no
+   * runtime image.
+   */
+  runtime?: PostgresRuntimeSpec;
+  /**
+   * Where this trial's randomized view of the cached build is created. The
+   * *same* view is mounted read-only into the runtime container and into the
+   * agent container, so neither ever sees `<cacheRoot>/<entryId>` in its own
+   * mount table. Defaults next to the build cache.
+   */
+  buildViewsRoot?: string;
   initdbArgs?: readonly string[];
   runCommand?: RunCommand;
   timeouts?: Partial<PostgresResearchTimeouts>;
   /** Free-form label carried into manifests, e.g. a trial id. Never a bug identity. */
   label?: string;
+};
+
+export type PostgresRuntimeSpec = {
+  /** Runtime image for the PostgreSQL sidecar. Defaults to DEFAULT_RUNTIME_IMAGE. */
+  image?: string;
+  memory?: string;
+  pidsLimit?: number;
+  tmpfsSize?: string;
 };
 
 export type PostgresSourceManifest = {
@@ -402,6 +455,10 @@ export type PostgresQueryResult = {
 export type PostgresCleanupResult = {
   stopped: boolean;
   stopMode: "fast" | "immediate" | "already-stopped";
+  /** True when there was no runtime container, or when `docker rm -f` removed it. */
+  runtimeContainerRemoved: boolean;
+  /** True once this trial's randomized build view has been removed. */
+  buildViewRemoved: boolean;
   dataDirRemoved: boolean;
   socketDirRemoved: boolean;
   sourceDirRemoved: boolean;
@@ -981,11 +1038,31 @@ export class PostgresResearchEnvironment {
   readonly sourceManifest: PostgresSourceManifest;
   readonly buildManifest: PostgresBuildManifest;
   readonly binaries: PostgresBinaries;
+  /**
+   * This trial's randomized view of the cached build. Mounted read-only into
+   * the runtime container (here) and into the agent container
+   * (research-session.ts) - the *same* view, so the two containers run
+   * literally the same files and neither mount table names the cache entry.
+   */
+  readonly buildView: BuildView;
+  /**
+   * `container` in the scored path: the cluster lives in a runtime sidecar and
+   * this process only orchestrates docker. `host-process` is the un-scored
+   * development lifecycle that runs `initdb`/`pg_ctl`/`psql` as host children.
+   */
+  readonly runtimeMode: "container" | "host-process";
+  /** The resolved runtime image, in container mode. Recorded, never assumed from a tag. */
+  readonly runtimeImage: ContainerImageIdentity | null;
 
   private readonly runCommand: RunCommand;
   private readonly timeouts: PostgresResearchTimeouts;
   private readonly initdbArgs: string[];
   private readonly events: PostgresLifecycleEvent[] = [];
+  private readonly runtimeSpec: PostgresRuntimeSpec;
+  /** Host paths of the generated /etc/passwd and /etc/group identity shim; container mode only. */
+  private readonly identityDir: string | null;
+  private runtime: PostgresRuntimeContainer | null = null;
+  private runtimeRecord: PostgresRuntimeRecord;
   private currentPort: number;
   private initialized = false;
   private running = false;
@@ -998,6 +1075,10 @@ export class PostgresResearchEnvironment {
     buildLogDir?: string;
     sourceManifest: PostgresSourceManifest;
     buildManifest: PostgresBuildManifest;
+    buildView: BuildView;
+    runtimeImage: ContainerImageIdentity | null;
+    runtimeSpec?: PostgresRuntimeSpec;
+    identityDir?: string | null;
     port: number;
     socketDir: string;
     runCommand: RunCommand;
@@ -1018,6 +1099,15 @@ export class PostgresResearchEnvironment {
     this.socketDir = input.socketDir;
     this.logPath = join(input.root, "postgres.log");
     this.buildLogDir = input.buildLogDir ?? join(input.privateDir, "build");
+    this.buildView = input.buildView;
+    this.runtimeImage = input.runtimeImage;
+    this.runtimeSpec = input.runtimeSpec ?? {};
+    this.identityDir = input.identityDir ?? null;
+    this.runtimeMode = input.runtimeImage ? "container" : "host-process";
+    this.runtimeRecord =
+      this.runtimeMode === "container"
+        ? { mode: "container", scoredEligible: true }
+        : { mode: "host-process", scoredEligible: false, unscoredReason: HOST_RUNTIME_UNSCORED_REASON };
     this.currentPort = input.port;
     this.runCommand = input.runCommand;
     this.timeouts = input.timeouts;
@@ -1081,9 +1171,22 @@ export class PostgresResearchEnvironment {
     return this.running;
   }
 
+  /**
+   * How a client on *this* side reaches the cluster.
+   *
+   * In container mode there is no TCP listener at all - the postmaster is
+   * started with `-h ''` and its container has no network - so the honest
+   * answer is the socket directory, which libpq accepts as a host because it
+   * begins with "/". Claiming 127.0.0.1 there would be a connection string
+   * that cannot connect.
+   */
+  private connectHost(): string {
+    return this.runtimeMode === "container" ? this.socketDir : this.host;
+  }
+
   connectionInfo(): PostgresConnectionInfo {
     return {
-      host: this.host,
+      host: this.connectHost(),
       port: this.port,
       socketDir: this.socketDir,
       user: this.user,
@@ -1092,7 +1195,10 @@ export class PostgresResearchEnvironment {
       sourceDir: this.sourceDir,
       dataDir: this.dataDir,
       logPath: this.logPath,
-      url: `postgresql://${this.user}@${this.host}:${this.port}/${this.database}`
+      url:
+        this.runtimeMode === "container"
+          ? `postgresql://${this.user}@/${this.database}?host=${this.socketDir}&port=${this.port}`
+          : `postgresql://${this.user}@${this.host}:${this.port}/${this.database}`
     };
   }
 
@@ -1142,22 +1248,46 @@ export class PostgresResearchEnvironment {
       database: this.database,
       initdbArgs: this.initdbArgs,
       binaries: this.binaries,
+      /**
+       * Which of the three scored axes this environment is responsible for.
+       * Recorded on the runtime manifest itself, not only folded into the
+       * session verdict, so a `postgres-research` step that runs no agent
+       * still carries the fact that its server was (or was not) contained.
+       */
+      runtime: this.runtimeRecord,
+      buildViewDir: this.buildView.dir,
       lifecycle: this.lifecycleEvents(),
       cleanup: this.cleanupResult
     };
   }
 
+  /** The scored/un-scored runtime axis; see PostgresRuntimeRecord. */
+  runtimeIsolation(): PostgresRuntimeRecord {
+    return this.runtime ? { ...this.runtime.record() } : { ...this.runtimeRecord };
+  }
+
   /**
-   * The one failure mode the containerized build introduces on a non-Linux
-   * host, named rather than left as a bare "Exec format error".
+   * Is the server actually alive? In container mode this is two facts (the
+   * sidecar container, and pg_ctl's view of the postmaster inside it); in host
+   * mode it is what this class last observed.
+   */
+  async health(): Promise<{ containerRunning: boolean; serverRunning: boolean; detail: string }> {
+    if (!this.runtime) {
+      return { containerRunning: false, serverRunning: this.running, detail: "host-process cluster" };
+    }
+    return this.runtime.health();
+  }
+
+  /**
+   * The one failure mode a containerized build introduces if the runtime
+   * sidecar is ever bypassed, named rather than left as a bare "Exec format
+   * error".
    *
-   * A `container`-mode build produces Linux binaries. The *agent* runs them
-   * inside a Linux container on every Docker host, which is the whole point
-   * of building in one - but this class still runs `initdb`/`pg_ctl` as host
-   * processes, and macOS/Windows cannot execute an ELF binary. The scored
-   * server-side path therefore needs a Linux host; a macOS developer wanting
-   * a live cluster from real PostgreSQL sources wants `build.mode: "host"`,
-   * which is explicitly un-scored.
+   * In the scored path this is unreachable: `container` builds run in the
+   * runtime container, which is Linux on every Docker host. It survives for
+   * the case an operator constructs an environment with a `container` build
+   * manifest and no runtime image (host-process lifecycle) on macOS/Windows,
+   * where the host kernel simply cannot execute the artifact.
    */
   private abiHint(detail: string): string {
     const abiFailure = /Exec format error|cannot execute binary file|ENOEXEC/i.test(detail);
@@ -1165,26 +1295,79 @@ export class PostgresResearchEnvironment {
     return (
       `\n\nThis environment's binaries were built for ${this.buildManifest.platform}/${this.buildManifest.arch} inside ` +
       `${this.buildManifest.builderImage?.reference ?? "the build container"}, and this host is ${platform()}/${arch()}, ` +
-      "which cannot execute them. The agent container can (that is why the build is containerized), but the cluster " +
-      'itself still runs as a host process. Run scored trials on a Linux host, or use build.mode: "host" for local ' +
+      "which cannot execute them. The scored path never asks it to: a container build runs its cluster inside the " +
+      "PostgreSQL runtime sidecar (docker/postgres-research-runtime). This environment has no runtime container, so it " +
+      'fell back to the host-process lifecycle. Build the runtime image, or use build.mode: "host" for local ' +
       "development against real PostgreSQL sources - an explicitly un-scored build."
     );
+  }
+
+  /**
+   * Creates the runtime sidecar, once, before anything PostgreSQL runs.
+   * Container mode only; a host build has no runtime image and keeps the
+   * host-process lifecycle.
+   */
+  private async ensureRuntime(): Promise<PostgresRuntimeContainer | null> {
+    if (!this.runtimeImage) return null;
+    if (this.runtime) return this.runtime;
+    const identity = this.identityDir;
+    if (!identity) {
+      throw new PostgresResearchError("A containerized PostgreSQL runtime needs its generated passwd/group identity files");
+    }
+    const started = Date.now();
+    const runtime = new PostgresRuntimeContainer({
+      image: this.runtimeImage,
+      runCommand: this.runCommand,
+      mounts: {
+        buildViewDir: this.buildView.dir,
+        dataDir: this.dataDir,
+        socketDir: this.socketDir,
+        logPath: this.logPath,
+        passwdPath: join(identity, "passwd"),
+        groupPath: join(identity, "group")
+      },
+      memory: this.runtimeSpec.memory,
+      pidsLimit: this.runtimeSpec.pidsLimit,
+      tmpfsSize: this.runtimeSpec.tmpfsSize
+    });
+    await runtime.create({ timeout: this.timeouts.control });
+    this.runtime = runtime;
+    this.runtimeRecord = runtime.record();
+    this.record(
+      "runtime.container.created",
+      {
+        containerName: runtime.containerName,
+        image: this.runtimeImage.reference,
+        imageId: this.runtimeImage.id,
+        platform: this.runtimeImage.platform,
+        networkMode: runtime.networkMode,
+        user: runtime.user,
+        mounts: this.runtimeRecord.mounts
+      },
+      Date.now() - started
+    );
+    return runtime;
   }
 
   private async initdb() {
     if (this.initialized) return;
     const started = Date.now();
-    const result = await this.runCommand(this.binaries.initdb, ["-D", this.dataDir, ...this.initdbArgs], {
-      cwd: this.root,
-      timeout: this.timeouts.initdb,
-      env: this.commandEnv(),
-      maxBuffer: 1024 * 1024 * 8
-    });
-    if (!result.ok) {
-      throw new PostgresResearchError(`initdb failed: ${result.stderr || result.stdout}${this.abiHint(result.stderr || result.stdout)}`);
+    const runtime = await this.ensureRuntime();
+    if (runtime) {
+      await runtime.initdb(this.initdbArgs, { timeout: this.timeouts.initdb });
+    } else {
+      const result = await this.runCommand(this.binaries.initdb, ["-D", this.dataDir, ...this.initdbArgs], {
+        cwd: this.root,
+        timeout: this.timeouts.initdb,
+        env: this.commandEnv(),
+        maxBuffer: 1024 * 1024 * 8
+      });
+      if (!result.ok) {
+        throw new PostgresResearchError(`initdb failed: ${result.stderr || result.stdout}${this.abiHint(result.stderr || result.stdout)}`);
+      }
     }
     this.initialized = true;
-    this.record("cluster.initdb", { dataDir: this.dataDir, args: this.initdbArgs }, Date.now() - started);
+    this.record("cluster.initdb", { dataDir: this.dataDir, args: this.initdbArgs, mode: this.runtimeMode }, Date.now() - started);
   }
 
   private pgCtlOptions() {
@@ -1207,11 +1390,13 @@ export class PostgresResearchEnvironment {
     await this.initdb();
     const started = Date.now();
     for (let attempt = 1; ; attempt += 1) {
-      const result = await this.runCommand(
-        this.binaries.pg_ctl,
-        ["-D", this.dataDir, "-l", this.logPath, "-o", this.pgCtlOptions(), "start", "-w"],
-        { cwd: this.root, timeout: this.timeouts.control, env: this.commandEnv(), maxBuffer: 1024 * 1024 * 8 }
-      );
+      const result = this.runtime
+        ? await this.runtime.start(this.port, { timeout: this.timeouts.control })
+        : await this.runCommand(
+            this.binaries.pg_ctl,
+            ["-D", this.dataDir, "-l", this.logPath, "-o", this.pgCtlOptions(), "start", "-w"],
+            { cwd: this.root, timeout: this.timeouts.control, env: this.commandEnv(), maxBuffer: 1024 * 1024 * 8 }
+          );
       if (result.ok) break;
       // PostgreSQL reports the bind failure in the server log pg_ctl was
       // pointed at, not necessarily on pg_ctl's own stderr, so both count.
@@ -1225,7 +1410,16 @@ export class PostgresResearchEnvironment {
       this.record("cluster.port.retry", { attempt, previousPort: previous, port: this.currentPort });
     }
     this.running = true;
-    this.record("cluster.started", { port: this.port, socketDir: this.socketDir }, Date.now() - started);
+    this.record(
+      "cluster.started",
+      {
+        port: this.port,
+        socketDir: this.socketDir,
+        mode: this.runtimeMode,
+        ...(this.runtime ? { containerName: this.runtime.containerName, listen: "unix-socket-only" } : {})
+      },
+      Date.now() - started
+    );
     if (this.closed) {
       // cleanup() ran while this start was still in flight - the session
       // timeout arm does exactly that. Its data directory is already gone, so
@@ -1239,17 +1433,19 @@ export class PostgresResearchEnvironment {
   }
 
   private async waitReady(): Promise<PostgresReadiness> {
-    const readiness = await waitForPostgresReady({
-      runCommand: this.runCommand,
-      cwd: this.root,
-      psql: this.binaries.psql,
-      port: this.port,
-      host: this.host,
-      user: this.user,
-      database: this.database,
-      env: this.commandEnv()
-    });
-    this.record("cluster.ready", { port: this.port, latencyMs: readiness.latencyMs });
+    const readiness = this.runtime
+      ? await this.runtime.waitReady({ port: this.port, user: this.user, database: this.database })
+      : await waitForPostgresReady({
+          runCommand: this.runCommand,
+          cwd: this.root,
+          psql: this.binaries.psql,
+          port: this.port,
+          host: this.host,
+          user: this.user,
+          database: this.database,
+          env: this.commandEnv()
+        });
+    this.record("cluster.ready", { port: this.port, latencyMs: readiness.latencyMs, mode: this.runtimeMode });
     return readiness;
   }
 
@@ -1257,29 +1453,33 @@ export class PostgresResearchEnvironment {
     this.assertOpen();
     if (!this.running) return this.start();
     const started = Date.now();
-    const result = await this.runCommand(
-      this.binaries.pg_ctl,
-      ["-D", this.dataDir, "restart", "-m", "fast", "-w", "-l", this.logPath, "-o", this.pgCtlOptions()],
-      { cwd: this.root, timeout: this.timeouts.control, env: this.commandEnv(), maxBuffer: 1024 * 1024 * 8 }
-    );
+    const result = this.runtime
+      ? await this.runtime.restart(this.port, { timeout: this.timeouts.control })
+      : await this.runCommand(
+          this.binaries.pg_ctl,
+          ["-D", this.dataDir, "restart", "-m", "fast", "-w", "-l", this.logPath, "-o", this.pgCtlOptions()],
+          { cwd: this.root, timeout: this.timeouts.control, env: this.commandEnv(), maxBuffer: 1024 * 1024 * 8 }
+        );
     if (!result.ok) {
       throw new PostgresResearchError(`pg_ctl restart failed: ${result.stderr || result.stdout}`);
     }
-    this.record("cluster.restarted", { port: this.port }, Date.now() - started);
+    this.record("cluster.restarted", { port: this.port, mode: this.runtimeMode }, Date.now() - started);
     return this.waitReady();
   }
 
   async stop(mode: "fast" | "immediate" = "fast"): Promise<boolean> {
     if (!this.running) return true;
     const started = Date.now();
-    const result = await this.runCommand(this.binaries.pg_ctl, ["-D", this.dataDir, "stop", "-m", mode, "-w"], {
-      cwd: this.root,
-      timeout: this.timeouts.control,
-      env: this.commandEnv(),
-      maxBuffer: 1024 * 1024 * 8
-    });
+    const result = this.runtime
+      ? await this.runtime.stop(mode, { timeout: this.timeouts.control })
+      : await this.runCommand(this.binaries.pg_ctl, ["-D", this.dataDir, "stop", "-m", mode, "-w"], {
+          cwd: this.root,
+          timeout: this.timeouts.control,
+          env: this.commandEnv(),
+          maxBuffer: 1024 * 1024 * 8
+        });
     if (result.ok) this.running = false;
-    this.record("cluster.stopped", { mode, ok: result.ok }, Date.now() - started);
+    this.record("cluster.stopped", { mode, ok: result.ok, runtimeMode: this.runtimeMode }, Date.now() - started);
     return result.ok;
   }
 
@@ -1293,20 +1493,45 @@ export class PostgresResearchEnvironment {
     return this.runPsql(sql, ["-v", "ON_ERROR_STOP=1", "-c", sql]);
   }
 
-  /** Same, for a SQL script an agent (or driver) wrote to disk. */
+  /**
+   * Same, for a SQL script an agent (or driver) wrote to disk.
+   *
+   * `path` is a **host** path. In container mode the runtime sidecar cannot
+   * see it - deliberately, since it could be anywhere, including under the
+   * grader-private tree - so the file is staged onto the container's own
+   * tmpfs with `docker cp` rather than by adding a bind mount for it.
+   */
   async psqlFile(path: string): Promise<PostgresQueryResult> {
     this.assertOpen();
     if (!isAbsolute(path)) throw new PostgresResearchError(`psqlFile requires an absolute path, got "${path}"`);
+    if (this.runtime) {
+      const started = Date.now();
+      const result = await this.runtime.psqlFile(
+        { port: this.port, user: this.user, database: this.database },
+        path,
+        { timeout: this.timeouts.psql, maxBuffer: 1024 * 1024 * 32 }
+      );
+      return this.observe(`\\i ${path}`, result, started);
+    }
     return this.runPsql(`\\i ${path}`, ["-v", "ON_ERROR_STOP=1", "-f", path]);
   }
 
   private async runPsql(sql: string, tail: string[]): Promise<PostgresQueryResult> {
     const started = Date.now();
-    const result = await this.runCommand(
-      this.binaries.psql,
-      psqlArgs({ host: this.host, port: this.port, user: this.user, database: this.database }, tail),
-      { cwd: this.root, timeout: this.timeouts.psql, env: this.commandEnv(), maxBuffer: 1024 * 1024 * 32 }
-    );
+    const result = this.runtime
+      ? await this.runtime.psql({ port: this.port, user: this.user, database: this.database }, tail, {
+          timeout: this.timeouts.psql,
+          maxBuffer: 1024 * 1024 * 32
+        })
+      : await this.runCommand(
+          this.binaries.psql,
+          psqlArgs({ host: this.host, port: this.port, user: this.user, database: this.database }, tail),
+          { cwd: this.root, timeout: this.timeouts.psql, env: this.commandEnv(), maxBuffer: 1024 * 1024 * 32 }
+        );
+    return this.observe(sql, result, started);
+  }
+
+  private observe(sql: string, result: { ok: boolean; stdout: string; stderr: string; code?: number | string }, started: number) {
     const observation: PostgresQueryResult = {
       sql,
       ok: result.ok,
@@ -1323,9 +1548,29 @@ export class PostgresResearchEnvironment {
    * Escape hatch for experiments the environment itself has no opinion about
    * - grepping the snapshot, running a shell repro, invoking a built binary
    * directly - with PATH and the PG* hygiene above already applied.
+   *
+   * `inRuntime` runs the command inside the runtime sidecar instead, which is
+   * what a caller wants for anything that touches the *built PostgreSQL* in
+   * container mode: those are Linux binaries and the host may not be Linux.
+   * It is an error to ask for it when there is no runtime container, rather
+   * than silently running on the host and producing an `exec format error`
+   * that looks like the experiment failed.
    */
-  async exec(command: string, args: string[] = [], options: { cwd?: string; timeout?: number } = {}) {
+  async exec(
+    command: string,
+    args: string[] = [],
+    options: { cwd?: string; timeout?: number; inRuntime?: boolean } = {}
+  ) {
     this.assertOpen();
+    if (options.inRuntime) {
+      const runtime = await this.ensureRuntime();
+      if (!runtime) {
+        throw new PostgresResearchError(
+          'exec({ inRuntime: true }) needs a containerized cluster; this environment is build.mode: "host"'
+        );
+      }
+      return runtime.exec([command, ...args], { timeout: options.timeout ?? this.timeouts.psql, maxBuffer: 1024 * 1024 * 32 });
+    }
     return this.runCommand(command, args, {
       cwd: options.cwd ?? this.root,
       timeout: options.timeout ?? this.timeouts.psql,
@@ -1336,10 +1581,24 @@ export class PostgresResearchEnvironment {
 
   /**
    * Idempotent and non-throwing: cleanup runs from `finally` blocks where
-   * throwing would mask the original failure. Stops the server (escalating
-   * to immediate), then removes the ephemeral runtime state. The log file,
-   * build logs and manifests stay behind as evidence; the shared build cache
-   * is never touched.
+   * throwing would mask the original failure.
+   *
+   * The order is the contract (MUST 4 of the #182 fourth review), and every
+   * step is unconditional so a failure earlier in the sequence cannot leak a
+   * later resource:
+   *
+   *   PostgreSQL fast stop
+   *     -> immediate stop if fast did not take
+   *     -> runtime container removed
+   *     -> PGDATA / socket directory removed per the retention policy
+   *     -> the identity shim removed
+   *     -> this trial's randomized build view removed
+   *
+   * The agent is already gone by the time this runs: research-session.ts only
+   * reaches `withPostgresResearchEnvironment`'s finally after the agent
+   * process has exited, including when it was killed for exceeding its
+   * timeout. The server log, the build logs and the manifests stay behind as
+   * evidence, and the shared build cache is never touched.
    */
   async cleanup(options: { retainDataDir?: boolean; removeSourceDir?: boolean } = {}): Promise<PostgresCleanupResult> {
     if (this.cleanupResult) return this.cleanupResult;
@@ -1360,6 +1619,21 @@ export class PostgresResearchEnvironment {
     }
     this.closed = true;
 
+    // The container goes away whether or not the stop above succeeded - a
+    // wedged postmaster must not keep a container (and its write handles on
+    // the directories below) alive past the trial.
+    let runtimeRemoved = true;
+    if (this.runtime) {
+      try {
+        runtimeRemoved = await this.runtime.cleanup();
+        if (!runtimeRemoved) errors.push(`runtime container ${this.runtime.containerName} could not be removed`);
+      } catch (error) {
+        runtimeRemoved = false;
+        errors.push(`runtime container: ${(error as Error).message}`);
+      }
+      this.runtimeRecord = this.runtime.record();
+    }
+
     async function remove(path: string, label: string) {
       try {
         await rm(path, { recursive: true, force: true });
@@ -1373,10 +1647,16 @@ export class PostgresResearchEnvironment {
     const dataDirRemoved = options.retainDataDir ? false : await remove(this.dataDir, "pgdata");
     const socketDirRemoved = await remove(this.socketDir, "socket");
     const sourceDirRemoved = options.removeSourceDir ? await remove(this.sourceDir, "source") : false;
+    if (this.identityDir) await remove(this.identityDir, "runtime-identity");
+    // Per-trial artifact of the boundary, not part of the shared cache: it
+    // goes away with the trial, on every exit path.
+    await removeBuildView(this.buildView);
 
     this.cleanupResult = {
       stopped,
       stopMode,
+      runtimeContainerRemoved: runtimeRemoved,
+      buildViewRemoved: true,
       dataDirRemoved,
       socketDirRemoved,
       sourceDirRemoved,
@@ -1405,6 +1685,15 @@ export async function createPostgresResearchEnvironment(spec: PostgresResearchSp
   // Grader-private: configure/make logs quote the source path and every
   // build flag, so they stay out of the agent-visible root.
   const buildLogDir = spec.build?.logDir ?? join(privateDir, "build");
+
+  // Resolved *first*, before anything is materialized or built: a missing
+  // runtime image must fail in seconds rather than after a cold PostgreSQL
+  // build. There is deliberately no fallback to the host lifecycle - a scored
+  // trial that quietly ran its server on the host would be exactly the
+  // untruth this round exists to remove.
+  const mode = spec.build?.mode ?? defaultBuildMode();
+  const runtimeImage = mode === "container" ? await resolveRuntimeImageIdentity(spec.runtime?.image, runCommand) : null;
+
   await mkdir(spec.root, { recursive: true });
   await mkdir(privateDir, { recursive: true });
 
@@ -1433,9 +1722,49 @@ export async function createPostgresResearchEnvironment(spec: PostgresResearchSp
     detail: { cacheKey: buildManifest.cacheKey, cacheHit: buildManifest.cacheHit, installDir: buildManifest.installDir }
   });
 
+  if (runtimeImage && (runtimeImage.os !== buildManifest.platform || runtimeImage.architecture !== buildManifest.arch)) {
+    // Tags agreeing is not the same as images agreeing. Caught here rather
+    // than as a loader error inside the container, where it would look like a
+    // PostgreSQL failure instead of an image-pairing mistake.
+    throw new PostgresResearchError(
+      `The PostgreSQL runtime image ${runtimeImage.reference} is ${runtimeImage.platform}, but this build targets ` +
+        `${buildManifest.platform}/${buildManifest.arch} (built in ${buildManifest.builderImage?.reference ?? "the build container"}). ` +
+        "The builder and runtime images must be rebuilt together."
+    );
+  }
+
+  // One view, mounted read-only into both containers. Created here rather
+  // than by the agent launcher because the *runtime* needs it first: the
+  // server binaries themselves are what it runs.
+  const buildView = await createBuildView(
+    buildManifest.installDir,
+    spec.buildViewsRoot ?? defaultBuildViewsRoot(buildManifest.cacheRoot)
+  );
+  events.push({ phase: "build.view.created", at: nowIso(), detail: { viewDir: buildView.dir } });
+
   await mkdir(socketRoot(), { recursive: true }).catch(() => {});
   const socketDir = await mkdtemp(join(socketRoot(), "hrpg-"));
   const port = await allocatePort();
+  const dataDir = join(spec.root, "pgdata");
+  const logPath = join(spec.root, "postgres.log");
+  await mkdir(dataDir, { recursive: true });
+  // Docker creates a *directory* for a bind source that does not exist, which
+  // would make `pg_ctl -l` fail inside the runtime container.
+  await writeFile(logPath, "", { flag: "a" });
+
+  let identityDir: string | null = null;
+  if (runtimeImage) {
+    // Its own temp directory, not a subdirectory of privateDir: the two files
+    // are bind-mounted into the runtime container, and a mount whose source
+    // path is inside the grader-private tree would publish that tree's
+    // location in the container's own mount table for no reason. It holds
+    // nothing but the generated uid/gid entries and is removed by cleanup().
+    identityDir = await mkdtemp(join(socketRoot(), "hrpg-id-"));
+    await writeRuntimeIdentityFiles(identityDir, runtimeUserIds());
+    // No-op unless the host user is root, in which case the runtime runs as a
+    // non-root uid (PostgreSQL refuses uid 0) that has to own these first.
+    await alignRuntimeOwnership([dataDir, socketDir, logPath]);
+  }
 
   return new PostgresResearchEnvironment({
     root: spec.root,
@@ -1443,6 +1772,10 @@ export async function createPostgresResearchEnvironment(spec: PostgresResearchSp
     buildLogDir,
     sourceManifest,
     buildManifest,
+    buildView,
+    runtimeImage,
+    runtimeSpec: spec.runtime,
+    identityDir,
     port,
     socketDir,
     runCommand,

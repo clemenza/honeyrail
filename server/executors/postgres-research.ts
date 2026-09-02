@@ -42,6 +42,8 @@ type ExperimentSpec = { name: string; sql: string };
 export type PostgresResearchInput = {
   source: { repoPath: string; ref: string };
   build: { configureArgs: string[]; jobs?: number; cacheRoot?: string; mode?: PostgresBuildMode; builderImage?: string };
+  /** The PostgreSQL runtime sidecar. Only used by the scored `container` build mode. */
+  runtime: { image?: string };
   experiments: ExperimentSpec[];
   restart: boolean;
   timeoutMs?: number;
@@ -92,6 +94,11 @@ export function parsePostgresResearchInput(input: Record<string, unknown> | unde
   if (mode !== undefined && mode !== "container" && mode !== "host") {
     throw new ConfigError('postgres-research input.build.mode must be "container" (scored) or "host" (development only)');
   }
+  const runtimeValue = record.runtime;
+  if (runtimeValue !== undefined && (typeof runtimeValue !== "object" || runtimeValue === null || Array.isArray(runtimeValue))) {
+    throw new ConfigError("postgres-research input.runtime must be an object");
+  }
+  const runtime = (runtimeValue ?? {}) as Record<string, unknown>;
   const experimentsValue = record.experiments;
   if (experimentsValue !== undefined && !Array.isArray(experimentsValue)) {
     throw new ConfigError("postgres-research input.experiments must be an array of { name, sql }");
@@ -122,6 +129,7 @@ export function parsePostgresResearchInput(input: Record<string, unknown> | unde
       mode: mode as PostgresBuildMode | undefined,
       builderImage: build.builderImage === undefined ? undefined : String(build.builderImage)
     },
+    runtime: { image: runtime.image === undefined ? undefined : String(runtime.image) },
     experiments,
     restart: record.restart === true,
     timeoutMs,
@@ -170,6 +178,7 @@ export class PostgresResearchExecutor implements Executor {
       privateDir: join(attemptDir, "env-private"),
       source: input.source,
       build: input.build,
+      runtime: input.runtime,
       runCommand: ctx.runCommand,
       label: input.label
     };
@@ -253,6 +262,23 @@ export class PostgresResearchExecutor implements Executor {
           }
 
           const readiness = await env.start();
+          const runtimeIsolation = env.runtimeIsolation();
+          await createDbEvidence(ctx, {
+            kind: "db.runtime.isolation",
+            source: "postgres-research",
+            claim:
+              runtimeIsolation.mode === "container"
+                ? `PostgreSQL ran inside the pinned Linux runtime container ${runtimeIsolation.image?.reference}`
+                : "PostgreSQL ran as host processes (development mode, not a scored trial)",
+            value: {
+              ...runtimeIsolation,
+              // The step-level verdict: a research step runs no agent, so its
+              // scored axes are the build and the runtime. A reader must not
+              // have to infer the conjunction.
+              stepScoredEligible: env.buildManifest.scoredEligible && runtimeIsolation.scoredEligible
+            },
+            metadata: metadata("runtime-isolation", { port: env.port })
+          });
           await createDbEvidence(ctx, {
             kind: "db.server.ready",
             source: "postgres-research",
@@ -296,11 +322,22 @@ export class PostgresResearchExecutor implements Executor {
             });
           }
 
+          // Observed, not assumed: in container mode this asks docker whether
+          // the sidecar is up and pg_ctl whether the postmaster is, rather
+          // than reporting what this process last did.
+          const health = await env.health();
           await createDbEvidence(ctx, {
             kind: "db.process.health",
             source: "postgres-research",
             claim: "PostgreSQL research cluster completed its experiments before cleanup",
-            value: { alive: env.isRunning(), exitCode: null },
+            value: {
+              alive: env.isRunning(),
+              runtimeMode: env.runtimeMode,
+              containerRunning: health.containerRunning,
+              serverRunning: health.serverRunning,
+              detail: health.detail,
+              exitCode: null
+            },
             metadata: metadata("process-health", { port: env.port })
           });
 

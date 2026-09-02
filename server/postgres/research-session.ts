@@ -16,16 +16,13 @@ import {
   buildResearchContainerArgs,
   containerAgentEnvironment,
   createAgentScratchDir,
-  createBuildView,
-  defaultBuildViewsRoot,
   dockerAvailable,
   killResearchContainer,
-  removeBuildView,
   DEFAULT_RESEARCH_IMAGE,
   DEFAULT_RESEARCH_NETWORK,
-  RESEARCH_CONTAINER_PATHS,
-  type BuildView
+  RESEARCH_CONTAINER_PATHS
 } from "./agent-container.js";
+import type { PostgresRuntimeRecord } from "./runtime-container.js";
 
 /**
  * The one supported way to have an agent drive a *live* PostgreSQL research
@@ -149,9 +146,14 @@ export type PostgresResearchAgentResult = {
  *   *fetch* the same truth from a local HoneyRail service.
  * - `buildScoredEligible` - were the binaries produced by the pinned Linux
  *   build container, or by an un-scored host build?
+ * - `runtimeScoredEligible` - did the *server* run inside the pinned Linux
+ *   runtime container, or as host processes? A containerized build whose
+ *   cluster then ran on the host is not a scored trial either: on a non-Linux
+ *   host it cannot even happen, and on a Linux host it is a different
+ *   confinement story from the one the scored path describes.
  *
- * `scoredEligible` is the conjunction, and it is the single field a grader
- * should key on.
+ * `scoredEligible` is the conjunction of all four, and it is the single field
+ * a grader should key on. Container *build* alone is explicitly not enough.
  */
 export type PostgresResearchIsolationRecord = {
   mode: "container" | "unisolated-development";
@@ -174,6 +176,10 @@ export type PostgresResearchIsolationRecord = {
   scoredEligible: boolean;
   /** Mirrors PostgresBuildManifest.scoredEligible, so this record stands alone. */
   buildScoredEligible: boolean;
+  /** Mirrors PostgresRuntimeRecord.scoredEligible - did the server run in a container? */
+  runtimeScoredEligible: boolean;
+  /** The runtime sidecar's own record: image identity, container, network, mounts. */
+  runtime?: PostgresRuntimeRecord;
   containerName?: string;
   /** The exact `-v` specs, so a reviewer can see what was and was not exposed. */
   mounts?: string[];
@@ -184,7 +190,11 @@ export type PostgresResearchIsolationRecord = {
 };
 
 /** Why a container-isolated session is nonetheless not scored-eligible. */
-export function unscoredReasons(input: { networkMode: string; buildScoredEligible: boolean }): string[] {
+export function unscoredReasons(input: {
+  networkMode: string;
+  buildScoredEligible: boolean;
+  runtimeScoredEligible?: boolean;
+}): string[] {
   const reasons: string[] = [];
   if (input.networkMode !== "none") {
     reasons.push(
@@ -197,6 +207,12 @@ export function unscoredReasons(input: { networkMode: string; buildScoredEligibl
     reasons.push(
       'The PostgreSQL under research was not built by the pinned Linux build container (build.mode: "host"), ' +
         "so the agent did not exercise the artifact a scored trial produces."
+    );
+  }
+  if (input.runtimeScoredEligible === false) {
+    reasons.push(
+      "The PostgreSQL server the agent queried ran as host processes rather than inside the pinned Linux runtime " +
+        "container, so the cluster under research was not confined the way a scored trial's is."
     );
   }
   return reasons;
@@ -422,10 +438,12 @@ export async function runAgentInPostgresResearchEnvironment(
   // cleanup has run - that is the only point at which it records what was
   // actually stopped and removed.
   let environment: PostgresResearchEnvironment | undefined;
-  let buildView: BuildView | undefined;
-  try {
+  {
     const session = await withPostgresResearchEnvironment(
-      spec,
+      // The environment owns this trial's randomized build view now, because
+      // the runtime container mounts the same one - so the isolation option
+      // has to reach it rather than being applied here.
+      { ...spec, buildViewsRoot: spec.buildViewsRoot ?? isolation.buildViewsRoot },
       async (env) => {
         environment = env;
         await env.start();
@@ -441,6 +459,8 @@ export async function runAgentInPostgresResearchEnvironment(
               isolated: false,
               scoredEligible: false,
               buildScoredEligible: env.buildManifest.scoredEligible,
+              runtimeScoredEligible: env.runtimeIsolation().scoredEligible,
+              runtime: env.runtimeIsolation(),
               warning: UNISOLATED_WARNING
             },
             connection: env.connectionInfo(),
@@ -451,13 +471,9 @@ export async function runAgentInPostgresResearchEnvironment(
 
         const scratchDir = await createAgentScratchDir(env.root);
         // Docker creates a *directory* for a bind source that does not exist,
-        // which would break pg_ctl's own -l target; the server has already
-        // created this, but make it explicit rather than assumed.
+        // which would break pg_ctl's own -l target; the environment has
+        // already created this, but make it explicit rather than assumed.
         await appendFile(env.logPath, "");
-        buildView = await createBuildView(
-          env.installDir,
-          isolation.buildViewsRoot ?? defaultBuildViewsRoot(env.buildManifest.cacheRoot)
-        );
 
         const injected = containerAgentEnvironment(env.connectionInfo(), agent.envPrefix);
         const containerName = `honeyrail-pg-research-${randomUUID()}`;
@@ -469,7 +485,9 @@ export async function runAgentInPostgresResearchEnvironment(
               socketDir: env.socketDir,
               logPath: env.logPath,
               scratchDir,
-              buildViewDir: buildView.dir
+              // The same view the runtime container is running, so the agent
+              // inspects literally the files the server is executing.
+              buildViewDir: env.buildView.dir
             },
             command: [agent.command, ...(agent.args ?? [])],
             image: isolation.image,
@@ -501,7 +519,12 @@ export async function runAgentInPostgresResearchEnvironment(
 
         const networkMode = isolation.network ?? DEFAULT_RESEARCH_NETWORK;
         const buildScoredEligible = env.buildManifest.scoredEligible;
-        const reasons = unscoredReasons({ networkMode, buildScoredEligible });
+        const runtimeRecord = env.runtimeIsolation();
+        const reasons = unscoredReasons({
+          networkMode,
+          buildScoredEligible,
+          runtimeScoredEligible: runtimeRecord.scoredEligible
+        });
         return {
           agent: result,
           agentEnvironment: injected,
@@ -512,9 +535,11 @@ export async function runAgentInPostgresResearchEnvironment(
             networkMode,
             scoredEligible: reasons.length === 0,
             buildScoredEligible,
+            runtimeScoredEligible: runtimeRecord.scoredEligible,
+            runtime: runtimeRecord,
             containerName,
             mounts: containerArgs.filter((_value, index) => containerArgs[index - 1] === "-v"),
-            buildViewDir: buildView.dir,
+            buildViewDir: env.buildView.dir,
             ...(reasons.length ? { warning: `Not a scored trial. ${reasons.join(" ")}` } : {})
           },
           connection: env.connectionInfo(),
@@ -524,10 +549,11 @@ export async function runAgentInPostgresResearchEnvironment(
       },
       options
     );
+    // The build view, the runtime container, PGDATA and the socket directory
+    // are all torn down by env.cleanup(), in that order, from
+    // withPostgresResearchEnvironment's finally - i.e. only after the agent
+    // process above has actually exited. That ordering is MUST 4 of the #182
+    // fourth review and is not something this function may shortcut.
     return { ...session, runtime: environment!.runtimeManifest() };
-  } finally {
-    // The view is a per-trial artifact of the boundary, not part of the
-    // shared cache, so it goes away with the trial - on every exit path.
-    await removeBuildView(buildView);
   }
 }

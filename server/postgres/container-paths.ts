@@ -58,6 +58,37 @@ export const RESEARCH_CONTAINER_PATHS = {
 export const NEUTRAL_INSTALL_PREFIX = RESEARCH_CONTAINER_PATHS.postgres;
 
 /**
+ * Where the PostgreSQL *runtime* sidecar sees the cluster it is running
+ * (#182, fourth review). Same discipline as the other two: the server never
+ * learns a host path, so nothing a host path could identify can end up in
+ * PGDATA's `postgresql.conf`, in the server log, or in a `SHOW data_directory`
+ * an agent runs.
+ *
+ * `postgres` is deliberately the *same* constant the build is compiled with
+ * and the agent container mounts, so the binaries' RUNPATH resolves in the
+ * runtime container with no library-path override at all - the runtime is
+ * running the artifact at exactly the prefix it was configured for.
+ *
+ * `passwd`/`group` are the identity shim, not research data: PostgreSQL calls
+ * getpwuid() on its effective uid before it does anything else, and an
+ * arbitrary host uid (this repository's own developer machine reports
+ * 71393735) has no entry in any stock image. The runner generates a
+ * single-entry pair per trial and mounts them read-only. They contain the
+ * trial's own uid/gid and nothing else; the agent container never sees them.
+ */
+export const RUNTIME_CONTAINER_PATHS = {
+  runtime: "/runtime",
+  data: "/runtime/pgdata",
+  socket: "/runtime/socket",
+  log: "/runtime/postgres.log",
+  postgres: RESEARCH_CONTAINER_PATHS.postgres,
+  bin: RESEARCH_CONTAINER_PATHS.bin,
+  lib: RESEARCH_CONTAINER_PATHS.lib,
+  passwd: "/etc/passwd",
+  group: "/etc/group"
+} as const;
+
+/**
  * Where the build container sees its inputs and outputs. Neutral for the same
  * reason as the prefix: `configure` records its own path and its build
  * directory in `config.log`, `Makefile.global` and (for some paths) the

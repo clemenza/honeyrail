@@ -24,16 +24,39 @@ Out of scope (tracked elsewhere): cross-step DAG composition of a live environme
 
 ```text
 materialize snapshot (git archive @ ref, no .git)
-  -> build in a Linux container, configure --prefix=/opt/honeyrail/postgres
+  -> build in a Linux *builder* container, configure --prefix=/opt/honeyrail/postgres
      -> make install DESTDIR=<staging>, publish <staging>/opt/honeyrail/postgres
         into the content-keyed cache (or reuse an existing entry)
-  -> initdb -> pg_ctl start -> readiness poll
-  -> arbitrary SQL / scripts / binaries, or one agent process in a container
-     with --network none and only its research surface mounted
+  -> randomized per-trial view of that cache entry
+  -> start a Linux *runtime* container holding the cluster
+     -> docker exec initdb -> pg_ctl start -> readiness poll
+  -> arbitrary SQL / scripts / binaries (docker exec into the runtime), or one
+     *agent* container with --network none and only its research surface mounted,
+     reaching the server over the shared Unix-socket directory
   -> restart / stop
   -> artifacts + evidence
-  -> guaranteed cleanup
+  -> ordered cleanup
 ```
+
+Three containers, and the distinction between them is the whole architecture:
+
+| Container | Image | What it does | What it must never see |
+| --- | --- | --- | --- |
+| builder | `docker/postgres-research-builder` | `configure` / `make` / `make install` with the neutral prefix | anything but the snapshot and the DESTDIR staging root |
+| runtime | `docker/postgres-research-runtime` | `initdb`, the postmaster, grader-driven `psql` | the source mirror, the cache root, grader manifests, the agent's scratch |
+| agent | `docker/postgres-research` | whatever the research agent is | the cache root/entry id, grader manifests, sibling trials, the mirror, any `.git` |
+
+The runtime and the agent communicate only through the trial's Unix-socket
+directory, which both bind-mount from the same host path. Nothing else is
+shared, and both run on `--network none`.
+
+**In the scored path the host executes no PostgreSQL binary at all.** It builds
+images, starts containers, `docker exec`s into them and records evidence. That
+is what makes macOS and Windows real scored hosts: before the runtime
+container existed, a container-mode build produced Linux ELF binaries and
+`start()` then tried to run them on the host kernel, which on macOS is not a
+degradation but an `exec format error`. See
+[Platform support](#platform-support).
 
 The pieces:
 
@@ -41,6 +64,9 @@ The pieces:
 - `server/postgres/research-environment.ts` — the environment itself. Store-agnostic and executor-agnostic, so it can be driven from a script, a test, or an executor.
 - `server/postgres/container-paths.ts` — the fixed in-container paths, and with them the single definition of `/opt/honeyrail/postgres`, which is *both* the compiled-in `configure --prefix` and the mount target the build is exposed at. A leaf module so both sides can import it without an ESM cycle. See [Why the configure prefix is a constant](#why-the-configure-prefix-is-a-constant).
 - `server/postgres/build-container.ts` — the Linux build container: what a build step's `docker run` looks like, and how the builder image's identity is read back so it can key the build cache.
+- `server/postgres/runtime-container.ts` — the PostgreSQL **runtime sidecar**: a long-lived container created with `docker run -d --network none`, driven with `docker exec` for `initdb`, `pg_ctl`, `psql` and health, and removed with `docker rm -f`. PostgreSQL-specific and store/executor agnostic; deliberately not a generic container/lease abstraction. See [Where the scored cluster runs](#where-the-scored-cluster-runs).
+- `server/postgres/image-identity.ts` — one `docker image inspect`, for the builder and the runtime alike: reference, content-addressed id, registry digest (when there is one), os and architecture. A leaf module, because both consumers need the identical fact and neither may import the other. There is deliberately no implicit `docker pull`.
+- `server/postgres/build-view.ts` — the randomized per-trial hard-link view of a cache entry, and the completion marker it excludes. A leaf module for the same reason: the runtime container and the agent container mount the *same* view, so both `research-environment.ts` and `agent-container.ts` import it.
 - `server/postgres/research-session.ts` — `runAgentInPostgresResearchEnvironment()`: the one supported composition where an agent process drives a *live* cluster. See [Agent research surface](#agent-research-surface).
 - `server/postgres/agent-container.ts` — the isolated launch path for that agent: which host paths are bind-mounted, at which in-container paths, and how the selected build is exposed without its identity. See [Agent execution boundary](#agent-execution-boundary).
 - `server/executors/postgres-research.ts` — the `postgres-research` executor: a thin wrapper that turns one environment into the runtime's standard Artifact/Evidence record.
@@ -70,7 +96,9 @@ const groupCount = await withPostgresResearchEnvironment(
 
 `createPostgresResearchEnvironment(spec)` is available if a caller needs the environment without the `try/finally`, but `withPostgresResearchEnvironment()` is the intended entry point: cleanup is the default rather than caller discipline.
 
-An environment exposes `root`, `privateDir`, `sourceDir`, `installDir`, `dataDir`, `socketDir`, `logPath`, `port`, `binaries`, plus `start()`, `stop()`, `restart()`, `psql()`, `psqlFile()`, `exec()`, `cleanup()`, `connectionInfo()`, `agentEnvironment()`, `lifecycleEvents()` and `runtimeManifest()`.
+An environment exposes `root`, `privateDir`, `sourceDir`, `installDir`, `dataDir`, `socketDir`, `logPath`, `port`, `binaries`, `buildView`, `runtimeMode`, `runtimeImage`, plus `start()`, `stop()`, `restart()`, `psql()`, `psqlFile()`, `exec()`, `health()`, `cleanup()`, `connectionInfo()`, `agentEnvironment()`, `runtimeIsolation()`, `lifecycleEvents()` and `runtimeManifest()`.
+
+In the scored (`container`) mode every one of the PostgreSQL-touching methods is a `docker exec` into the runtime sidecar rather than a host process; `exec()` takes `{ inRuntime: true }` for anything that has to run against the built binaries themselves.
 
 `root` and `privateDir` are two different sides of the eval boundary, not two scratch directories — see [Agent execution boundary](#agent-execution-boundary). `createPostgresResearchEnvironment()` refuses a `privateDir` nested inside `root`.
 
@@ -247,6 +275,75 @@ Every command against a cluster runs with the built binaries first on `PATH` and
 
 Readiness is the same `SELECT 1` poll the alpha scenario uses (80 attempts, 125ms apart).
 
+### Where the scored cluster runs
+
+`build.mode: "container"` (the default, and the only scored mode) runs the
+cluster inside the runtime sidecar. Nothing PostgreSQL is executed by the host:
+
+```text
+docker run -d --network none ... honeyrail-postgres-runtime <inert PID 1>
+docker exec <rt> /opt/honeyrail/postgres/bin/initdb  -D /runtime/pgdata ...
+docker exec <rt> /opt/honeyrail/postgres/bin/pg_ctl  -D /runtime/pgdata -l /runtime/postgres.log \
+                                                     -o "-p <port> -h '' -k /runtime/socket" start -w
+docker exec <rt> /opt/honeyrail/postgres/bin/psql    -h /runtime/socket -p <port> ...
+docker exec <rt> /opt/honeyrail/postgres/bin/pg_ctl  -D /runtime/pgdata stop -m fast -w
+docker rm -f <rt>
+```
+
+The long-lived container with an inert PID 1 is load-bearing, not stylistic.
+`pg_ctl start` daemonizes: the postmaster is reparented to PID 1 and outlives
+the `docker exec` that launched it — but only for as long as the container
+lives. A `docker run --rm` whose controlling process exits would take the
+cluster down with it or orphan it, which is why the container is created once
+and every lifecycle step is an `exec` into it.
+
+Mounts, and nothing else:
+
+```text
+randomized per-trial build view -> /opt/honeyrail/postgres  ro
+PGDATA                          -> /runtime/pgdata          rw
+socket directory                -> /runtime/socket          rw
+server log                      -> /runtime/postgres.log    rw
+generated passwd / group        -> /etc/passwd, /etc/group  ro
+(tmpfs)                         -> /tmp                     rw
+```
+
+Never mounted into the runtime: the source snapshot or mirror, any `.git`,
+HoneyRail's attachment tree, the grader-private directory, the shared build
+cache root, a sibling trial's directories, the HoneyRail checkout, the home
+directory, or the docker socket.
+
+`-h ''` is an empty `listen_addresses`: the postmaster does not listen on TCP
+at all, in its own network namespace or anywhere else, and no host port is
+published. The port number survives only as the socket file's name
+(`.s.PGSQL.<port>`).
+
+Both containers run as the **host** uid/gid, so `PGDATA`, the socket directory
+and the log are owned by the user that has to clean them up afterwards, with
+nothing pre-chowned. That creates one problem worth naming: PostgreSQL calls
+`getpwuid()` on its effective uid before it does anything else, and an
+arbitrary host uid has no entry in any stock image —
+
+```text
+initdb: could not look up effective user ID 71393735: user does not exist
+```
+
+— so the runner generates a two-line `passwd`/`group` pair per trial and
+bind-mounts them read-only over `/etc/passwd` and `/etc/group`. They contain
+the trial's own uid/gid and nothing else, they live in their own temp
+directory (not under `privateDir`, so no grader path lands in the runtime's
+mount table), and they are removed by cleanup. Baking a fixed user into the
+image would only work for hosts that happen to share its uid. The mirror-image
+case is a host running as root: PostgreSQL refuses uid 0, so the runtime runs
+as a fixed non-root uid and the trial's ephemeral directories are chowned to it
+first — root can still remove them afterwards.
+
+`build.mode: "host"` keeps the original host-process lifecycle for local
+development on a machine without docker. It is permanently unscored on **two**
+axes now: `PostgresBuildManifest.scoredEligible` and
+`PostgresRuntimeRecord.scoredEligible` are both `false`, exactly the way
+`isolation.allowUnisolatedForDevelopment` marks an unisolated agent run.
+
 ### Port isolation
 
 `allocatePort()` binds port 0 on `127.0.0.1`, reads back the port the kernel assigned, and closes the listener. What that buys is a *candidate* port nothing else is currently using — not a reservation. The listener is released before PostgreSQL binds the same number, so there is a real time-of-check/time-of-use window in which another process can take it.
@@ -259,13 +356,36 @@ What is actually guaranteed: two environments get distinct `PGDATA`, socket dire
 
 `withPostgresResearchEnvironment()` cleans up in a `finally`, so cleanup runs after normal completion, after a thrown error, and after the optional `timeoutMs` elapses. `cleanup()` is idempotent and never throws — it is called from `finally` blocks where throwing would mask the original failure; problems are collected into the returned result instead.
 
-Cleanup:
+Cleanup, in this order — the order is the contract, and every step runs
+unconditionally so a failure earlier in the sequence cannot leak a later
+resource:
 
-- stops the server with `pg_ctl stop -m fast`, escalating to `-m immediate`;
-- removes `PGDATA` (unless `retainDataDir`) and the socket directory;
-- removes the source snapshot only if `removeSourceDir` is set (it is kept by default for post-hoc inspection);
-- never touches the shared build cache;
-- keeps the PostgreSQL log, the build logs and all manifests — those are evidence.
+```text
+agent finishes, or is killed for exceeding its timeout
+  -> agent container exits / is `docker kill`ed
+  -> PostgreSQL `pg_ctl stop -m fast`
+  -> escalate to `-m immediate` if fast did not take
+  -> runtime container `docker rm -f`
+  -> PGDATA (unless `retainDataDir`) and the socket directory removed
+  -> the generated passwd/group identity shim removed
+  -> this trial's randomized build view removed
+```
+
+- the source snapshot is removed only if `removeSourceDir` is set (it is kept by default for post-hoc inspection);
+- the shared build cache is never touched — its entry, including the completion marker, survives every trial;
+- the PostgreSQL log, the build logs and all manifests are kept: they are evidence.
+
+`PostgresCleanupResult` records `runtimeContainerRemoved` and
+`buildViewRemoved` alongside the existing fields, so "nothing leaked" is an
+assertion a reviewer can read rather than infer.
+
+The agent is already gone before any of this runs:
+`runAgentInPostgresResearchEnvironment()` only reaches
+`withPostgresResearchEnvironment()`'s `finally` after the agent process has
+actually exited, including when it was killed for exceeding `agent.timeoutMs`.
+An agent whose server disappears mid-experiment produces garbage evidence
+rather than a failed trial, which is why the ordering is fixed rather than
+merely eventual.
 
 After cleanup the environment is closed: further `psql()`/`exec()` calls throw rather than silently targeting a dead cluster.
 
@@ -378,7 +498,9 @@ Nothing else is ever mounted. `attachmentRoot`, `<privateDir>`, the PostgreSQL s
 
 Container posture comes from `containerHardeningArgs()` (shared with the exam room): `--rm`, `--cap-drop=ALL`, `--security-opt no-new-privileges`, `--read-only` root, `--pids-limit`, `--memory`, `--user <host uid:gid>` (so the agent writes into its mounts without them being pre-chowned), `--tmpfs /tmp` with `HOME=/tmp`. Plus `--network none` by default — see [3. Network isolation](#3-network-isolation-a-separate-guarantee).
 
-PostgreSQL itself keeps running as a **host** process. The agent reaches that cluster through the bind-mounted socket directory, because AF_UNIX filesystem-path sockets are resolved through the mount namespace rather than the network namespace — which is also why `--network none` costs the agent nothing it actually needs. Containerizing the *server* as well is a larger change and is not attempted here; see [Platform support](#platform-support).
+PostgreSQL runs in its own **runtime container** (see [Where the scored cluster runs](#where-the-scored-cluster-runs)). The agent reaches it through the socket directory both containers bind-mount from the same host path, because AF_UNIX filesystem-path sockets are resolved through the mount namespace rather than the network namespace — which is also why `--network none` costs the agent nothing it actually needs. The runtime container and the agent container share that directory and nothing else; the agent is given no way to control the server (no docker socket, no `pg_ctl` target, no runtime container name).
+
+`PGDATA` is mounted read-write into the agent container on purpose: inspecting and perturbing a cluster's own storage is legitimate database research, and PGDATA holds nothing grader-private — the source ref, commit, tree hash and cache key are written into no file the environment creates. That is a deliberate capability, not an oversight; if a future task class needs it withheld, it becomes an opt-out and the isolation record grows a field for it rather than the default changing silently.
 
 The image is `docker/postgres-research/Dockerfile` (`honeyrail-postgres-research:latest`), deliberately minimal and without an agent CLI — derive from it (`FROM honeyrail-postgres-research:latest`) and point `isolation.image` at the result. It carries `binutils`, so an agent can `strings`/`nm`/`objdump` a binary it is researching, and so the cache-identity scan below runs in the same container the agent runs in rather than in a grader-side one.
 
@@ -400,7 +522,7 @@ There is deliberately **no `restricted-egress` mode**. A real one means blocking
 
 ### Recorded isolation and scored eligibility
 
-Every session result carries an isolation record whose three facts are separate because they fail separately:
+Every session result carries an isolation record whose facts are separate because they fail separately:
 
 ```json
 {
@@ -408,15 +530,43 @@ Every session result carries an isolation record whose three facts are separate 
   "isolated": true,
   "networkMode": "none",
   "buildScoredEligible": true,
-  "scoredEligible": true
+  "runtimeScoredEligible": true,
+  "scoredEligible": true,
+  "runtime": {
+    "mode": "container",
+    "scoredEligible": true,
+    "image": { "reference": "honeyrail-postgres-runtime:latest", "id": "sha256:…", "digest": null, "platform": "linux/arm64" },
+    "containerName": "honeyrail-pg-runtime-…",
+    "containerId": "…",
+    "networkMode": "none",
+    "user": "<host uid>:<host gid>",
+    "mounts": ["…:/opt/honeyrail/postgres:ro", "…:/runtime/pgdata:rw", "…"]
+  }
 }
 ```
 
 - `isolated` — was there a filesystem boundary at all, or was this `allowUnisolatedForDevelopment`?
 - `networkMode` — could the agent have reached a grader/host service?
 - `buildScoredEligible` — did the pinned Linux build container produce the binaries, or was this a `host` build?
+- `runtimeScoredEligible` — did the *server* run inside the pinned Linux runtime container, or as host processes?
 
-`scoredEligible` is the conjunction of all three, and it is the single field a grader should key on. Whenever it is false, `warning` says which of the three failed and why; a `bridge` run over a host build reports both reasons, not just the first. An unisolated development run records `scoredEligible: false` and no `networkMode` at all, because an unconfined host process had the host's whole network.
+`scoredEligible` is the conjunction of all four, and it is the single field a grader should key on. **A containerized build alone is explicitly not sufficient**: that was exactly the claim the #182 fourth review rejected, because a container-built PostgreSQL whose cluster then ran on the host either could not run at all (macOS/Windows) or ran under a different confinement story from the one the scored path describes.
+
+Whenever `scoredEligible` is false, `warning` names every failing axis rather than the first — a `bridge` run over a host build over a host-process cluster reports three reasons. An unisolated development run records `scoredEligible: false` and no `networkMode` at all, because an unconfined host process had the host's whole network.
+
+A `postgres-research` executor step runs no agent, so it has only two axes; it records them on a `db.runtime.isolation` evidence record with an explicit `stepScoredEligible` conjunction, and `runtimeManifest().runtime` carries the same `PostgresRuntimeRecord`.
+
+The full scored-eligibility ledger, all of which must hold:
+
+| Layer | Requirement | Where it is recorded |
+| --- | --- | --- |
+| source | history-free materialization (`git archive`, no `.git`) | `PostgresSourceManifest.gitDirPresent: false` |
+| build | approved builder container + neutral prefix | `PostgresBuildManifest.scoredEligible`, `.builderImage`, `.installPrefix` |
+| runtime | approved runtime container | `PostgresRuntimeRecord.scoredEligible`, `.image` |
+| agent | approved agent container, no unisolated escape hatch | `isolation.isolated`, `isolation.image` |
+| network | `none`, for both runtime and agent | `isolation.networkMode`, `runtime.networkMode` |
+| images | reference + content-addressed id + os/arch resolved from the daemon | `builderImage`, `runtime.image` |
+| cleanup | auditable, ordered, complete | `PostgresCleanupResult` |
 
 ### No silent degradation
 
@@ -466,23 +616,28 @@ Shared-kernel caveat, as in the exam room: this is Docker's namespace + cgroup +
 
 ### Platform support
 
-Containerizing the build removed the ABI dead end this section used to describe. Docker Desktop's containers are a Linux VM regardless of host OS, so a build performed *in* the builder container is a Linux build on **every** Docker host, and the research-agent container — also Linux, also bookworm — can execute it. Real PostgreSQL binaries now run inside the boundary on macOS and Windows hosts, which was previously impossible.
+Containerizing the build removed the ABI dead end this section used to describe; containerizing the *server* removed the one that replaced it.
 
-What is still host-dependent is the *server*, because the cluster runs as a host process:
+Docker Desktop's containers are a Linux VM regardless of host OS, so a build performed in the builder container is a Linux build on **every** Docker host — but until the fourth review, `PostgresResearchEnvironment.start()` still ran `initdb`/`pg_ctl`/`postgres` as *host* processes. On macOS or Windows that was not a degradation: it was `exec format error` on the first call. Every green "cluster lifecycle" run on a developer machine had in fact been the synthetic `#!/bin/sh` fixture, whose "binaries" are text and therefore execute anywhere. **Containerizing the build alone did not make the system cross-platform, and this document previously implied it did.**
 
-| | build (containerized) | agent container | live cluster (host process) |
+With the runtime sidecar, all three stages are containers and the host runs no PostgreSQL binary at all:
+
+| | builder container | runtime container (live cluster) | agent container |
 | --- | --- | --- | --- |
-| **Linux host** | ✅ | ✅ real PostgreSQL | ✅ — full scored trial end to end |
-| **macOS / Windows (Docker Desktop)** | ✅ | ✅ real PostgreSQL | ❌ the host cannot execute a Linux ELF binary |
+| **Linux host** | ✅ | ✅ real PostgreSQL | ✅ real PostgreSQL |
+| **macOS (Docker Desktop)** | ✅ | ✅ real PostgreSQL | ✅ real PostgreSQL |
+| **Windows (Docker Desktop)** | ✅ | expected ✅ (same mechanism) | expected ✅ (same mechanism) |
 
-So:
+macOS is proven, not assumed: `docs/validation/pr-182-local-integration.md` records a full local run on Apple Silicon macOS with Docker Desktop — real ref, cold containerized build, live PostgreSQL 16.9 in the runtime container, an isolated agent querying it over the shared socket, restart with data preserved, ordered cleanup, and a second run hitting the cache. The one property that had to be established empirically rather than argued is that a container can `bind()` a Unix socket in a macOS bind mount and a second container can `connect()` to it; it can, on Docker Desktop's VirtioFS.
 
-- **Linux host** is the target for a complete scored trial: containerized build, real binaries inside the agent boundary, and a live cluster the agent drives over the mounted socket.
-- **macOS/Windows host** can build, cache, and hand a real PostgreSQL installation to a real isolated agent — everything MUST 1 of the third review asks for is verifiable there, and was verified there. What it cannot do is `pg_ctl start` those binaries as a host process. `initdb` fails with a named error rather than a bare `Exec format error` (see `abiHint()`), pointing at the two options: run scored trials on Linux, or use `build.mode: "host"` for local development against real PostgreSQL sources — an explicitly un-scored build.
+Windows is marked *expected* rather than proven: nothing in the mechanism is macOS-specific, but no Windows host was available, so this document does not claim it.
 
-Containerizing the server too would close that last cell. It is a real follow-up, not a defect in the isolation, and it is deliberately out of scope here.
+`build.mode: "host"` still exists for a machine with no docker daemon at all. It is unscored on both the build and runtime axes. `abiHint()` survives for the one remaining way to reach a host-process cluster with container-built binaries — constructing an environment with a `container` build manifest and no runtime image — and names the mismatch instead of leaving a bare `Exec format error`.
 
-One further limitation, stated because it is real: the snapshot is a genuine PostgreSQL tree, so it reveals the *version* under study even though it reveals nothing about the bug.
+Two further limitations, stated because they are real:
+
+- The snapshot is a genuine PostgreSQL tree, so it reveals the *version* under study even though it reveals nothing about the bug.
+- A scored trial's containers have `--network none`, so **a cloud-backed agent CLI cannot run in one**. There is no restricted-egress mode yet; see [3. Network isolation](#3-network-isolation-a-separate-guarantee). This is a blocker for [#180](https://github.com/clemenza/honeyrail/issues/180) and is tracked as its own piece of work rather than being papered over here — a `bridge` trial is honest but unscored, and a half-built egress filter would be worse than the label.
 
 ### Supplying an agent CLI and model credentials
 
@@ -551,16 +706,20 @@ Reusing the existing `db.*` taxonomy where one fits, plus three new kinds for fa
 
 - `db.source.snapshot` — exact ref materialized, no `.git`
 - `db.build` — build mode and scored eligibility, builder image identity, neutral install prefix, cache key, cache hit, compiler, install dir
-- `db.server.ready`, `db.query.result`, `db.restart`, `db.process.health` — as in the alpha
-- `db.environment.cleanup` — what cleanup stopped and removed
+- `db.runtime.isolation` — runtime mode, runtime image identity, container name/id, network mode, the exact runtime mounts, and the step-level `stepScoredEligible` conjunction of the build and runtime axes
+- `db.server.ready`, `db.query.result`, `db.restart` — as in the alpha
+- `db.process.health` — observed rather than assumed: whether the runtime container is up and what `pg_ctl status` says inside it
+- `db.environment.cleanup` — what cleanup stopped and removed, including the runtime container and the build view
 
 ## Testing
 
 ```sh
 docker build -t honeyrail-postgres-builder:latest  docker/postgres-research-builder
+docker build -t honeyrail-postgres-runtime:latest  docker/postgres-research-runtime
 docker build -t honeyrail-postgres-research:latest docker/postgres-research
 
 node --import tsx --test test/postgres-research-environment.test.ts
+node --import tsx --test test/postgres-research-runtime.test.ts
 node --import tsx --test test/postgres-research-session.test.ts
 node --import tsx --test test/postgres-research-isolation.test.ts
 node --import tsx --test test/postgres-research-network.test.ts
@@ -570,7 +729,11 @@ node --import tsx --test test/agent-task-environment.test.ts
 git clone --filter=blob:none https://github.com/postgres/postgres.git /tmp/pg-mirror
 HONEYRAIL_PG_TEST_MIRROR=/tmp/pg-mirror \
   node --import tsx --test test/postgres-research-real-build.test.ts
+HONEYRAIL_PG_TEST_MIRROR=/tmp/pg-mirror \
+  node --import tsx --test test/postgres-research-live-e2e.test.ts
 ```
+
+`.github/workflows/pg-research-integration.yml` runs the last two as a **merge gate** and fails if either reports a skipped test. That job exists because every docker/real-PostgreSQL test here skips cleanly when its images or mirror are absent — correct on a contributor's laptop, and exactly wrong for a gate.
 
 The suite runs against a synthetic source fixture (`test/helpers/postgres-source-fixture.ts`): a git repository whose `configure`/`make`/`make install` install four stub binaries that emulate just enough of `initdb`/`pg_ctl`/`psql`/`postgres` to exercise the real lifecycle in seconds. That keeps the whole matrix — no-`.git` snapshots, exact-ref resolution, snapshot publication and rollback, cache-key composition, cache hits, build-environment keying, concurrent isolation, port-collision recovery, the agent execution boundary, lifecycle, restart, live agent composition, and all the cleanup paths — runnable in CI without a PostgreSQL checkout or a C toolchain, and keeps the real corpus out of committed test code. Tests skip with a clear message when `git`, `make`, `tar` or a `cc` probe is unavailable, and the container tests skip when no docker daemon or research image is present.
 
@@ -622,6 +785,31 @@ Two further tests cover cache reuse and per-trial view distinctness with the rea
 
 It is opt-in on `HONEYRAIL_PG_TEST_MIRROR` and skips with a message naming exactly what is missing (mirror, daemon, builder image, research image). **A skip does not satisfy the merge gate it exists for.**
 
+### Runtime sidecar tests
+
+`test/postgres-research-runtime.test.ts` needs no docker daemon, and asserts what the sidecar *asks* docker for: the exact six-entry mount list (build view ro, PGDATA rw, socket rw, log rw, generated passwd/group ro) and nothing else; `-d`, `--network none`, the shared hardening flags, no `-p`/`--publish` anywhere, and an inert PID 1; an environment with no `PG*` variable and nothing inherited from the host; `-h ''` in the postmaster options; the generated identity shim for an arbitrary host uid and the non-root fallback for a root host; a missing runtime image failing loudly with the `docker build` that fixes it; the resolved image identity coming from the daemon rather than the tag; the runtime axis in `unscoredReasons()`; and the create/cleanup failure paths (a container that cannot start is force-removed; an already-removed container is success, not a leak; cleanup is idempotent).
+
+### Live end-to-end test
+
+`test/postgres-research-live-e2e.test.ts` is the composed proof, and it is the one no other test in this repository can give. The real-build test proves *build → binaries execute in a probe container*; the isolation test proves *synthetic host build → stub cluster + agent container*. Neither proves what a scored trial actually is:
+
+```text
+real PostgreSQL git ref
+  -> exact .git-free materialization
+  -> Linux builder container -> neutral-prefix cache artifact
+  -> randomized per-trial view
+  -> runtime container -> real initdb -> real postmaster -> readiness
+  -> isolated agent container -> real SQL over the shared Unix socket
+  -> restart -> post-restart SQL proving data persisted
+  -> ordered cleanup -> second run hitting the cache
+```
+
+Inside the real agent container it runs `pg_config --bindir/--configure`, `postgres --version`, `SELECT version()`, and a real `CREATE TABLE`/`INSERT`/`SELECT`, and proves the agent sees the *same server* the grader does. It also asserts no source `.git`; no cache root, key or entry id in the environment, the mount table, `pg_config` or any installed file (including `strings` on the `postgres` binary); grader filesystem sentinels inaccessible; a real host HTTP sentinel unreachable by every enumerable route, with the attempt count asserted; the server log readable; the agent's result file returning to the grader; restart preserving committed data; and `psqlFile()` streaming a grader-side script in over `docker exec -i` without mounting it.
+
+Its negative paths are tests, not prose: a missing runtime image fails before anything is materialized and never falls back to a host cluster; an `initdb` failure removes the runtime container and the build view but not the cache; and an agent timeout kills the agent, *then* stops the server, *then* removes the container, view, PGDATA and socket, with `docker ps -a` proving nothing leaked.
+
+Like the real-build test it is opt-in on `HONEYRAIL_PG_TEST_MIRROR`, and **a skip does not satisfy the merge gate it exists for** — which is why `.github/workflows/pg-research-integration.yml` fails when the skipped count is not zero.
+
 Validating a *bug* against real PostgreSQL remains a manual step on top of this: populate a mirror, then drive `withPostgresResearchEnvironment()` over a pre-fix ref and its fix ref with the same build profile and the same reproducer, and confirm the two disagree. The build cache keys them apart automatically because their source hashes differ.
 
 ## Known limitations
@@ -632,9 +820,11 @@ Validating a *bug* against real PostgreSQL remains a manual step on top of this:
 - Build-cache concurrency is safe (staged build + atomic rename) but not coordinated: two environments needing the same cold build may both build it.
 - The cache key covers a declared set of build-environment variables, not a hermetic toolchain fingerprint.
 - `timeoutMs` cancels the caller and tears down the cluster; it cannot abort a JavaScript `await` already in flight. For an agent, prefer `agent.timeoutMs` on the session helper, which kills the agent first and cleans up after.
-- The agent boundary is a container, so it needs a docker daemon; without one, an agent session fails rather than degrading. It is shared-kernel isolation, not a microVM. The same is now true of the scored *build*.
-- The live cluster still runs as a host process, so a complete scored trial needs a Linux host. macOS/Windows hosts can build, cache and hand real PostgreSQL to a real isolated agent, but cannot `pg_ctl start` it. See [Platform support](#platform-support).
-- There is no `restricted-egress` network mode. A trial whose agent needs a hosted model API must run on `bridge` and is recorded `scoredEligible: false`. Building a real egress policy (RFC1918/link-local/loopback/metadata/host-gateway, IPv4 **and** IPv6, from inside a `--cap-drop=ALL` container) is a separate change.
+- The agent boundary is a container, so it needs a docker daemon; without one, an agent session fails rather than degrading. It is shared-kernel isolation, not a microVM. The same is now true of the scored *build* and of the scored *cluster*.
+- The scored path needs three images present locally and never pulls them. A missing one is a loud failure naming the `docker build` that fixes it.
+- The runtime container mounts a generated two-line `passwd`/`group` pair over `/etc/passwd` and `/etc/group`, because PostgreSQL calls `getpwuid()` on an effective uid that a stock image has no entry for. It is a per-trial identity shim, not research data, and it is not mounted into the agent container — but it is a mount beyond the four the architecture diagram names, and it is listed in the recorded runtime mounts for that reason.
+- Windows hosts are expected to work by the same mechanism as macOS but are **not proven**: no Windows host was available for the local validation.
+- There is no `restricted-egress` network mode. A trial whose agent needs a hosted model API must run on `bridge` and is recorded `scoredEligible: false`. Building a real egress policy (RFC1918/link-local/loopback/metadata/host-gateway, IPv4 **and** IPv6, from inside a `--cap-drop=ALL` container) is a separate change, and it is a **blocker for [#180](https://github.com/clemenza/honeyrail/issues/180)**: a scored trial today cannot run a cloud-backed agent CLI at all.
 - The build is reproducible-ish, not hermetic: the container fixes the toolchain, locale and environment, but the builder image is itself built from a moving package index. The image's content ID is in the cache key so that a rebuilt image invalidates rather than mixes; bit-for-bit reproducibility is not claimed.
 - `build.mode: "host"` still exists and still works, but nothing produced by it is scored-eligible, by construction.
 - The `postgres-research` executor itself does not run an agent, so nothing about it is isolated; it is a grader-side environment driver.

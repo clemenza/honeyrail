@@ -1,12 +1,9 @@
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { copyFile, link, mkdir, mkdtemp, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { runCommandSafe } from "../utils.js";
 import { containerHardeningArgs } from "../containers/hardening.js";
 import { RESEARCH_CONTAINER_PATHS } from "./container-paths.js";
-import { BUILD_COMPLETE_MARKER } from "./research-environment.js";
 import type { PostgresConnectionInfo } from "./research-environment.js";
 
 /**
@@ -21,21 +18,20 @@ import type { PostgresConnectionInfo } from "./research-environment.js";
  * bind-mounts *only* its research surface, so every other host path is not
  * "unmentioned" but absent from its mount namespace.
  *
- * PostgreSQL itself keeps running as a host process. The agent reaches that
- * cluster through the bind-mounted socket directory: AF_UNIX filesystem-path
- * sockets are resolved through the mount namespace, not the network
- * namespace, which is the same mechanism that makes mounting
+ * The agent reaches the cluster through the bind-mounted socket directory:
+ * AF_UNIX filesystem-path sockets are resolved through the mount namespace,
+ * not the network namespace, which is the same mechanism that makes mounting
  * `/var/run/docker.sock` into a container work - and it is why the scored
  * default `--network none` costs the agent nothing it actually needs.
  *
- * The *build* is containerized as of the third review (#182): it runs in
- * docker/postgres-research-builder with the neutral prefix
- * RESEARCH_CONTAINER_PATHS.postgres, so the binaries mounted here are Linux
- * binaries this container can execute on any Docker host, and nothing in them
- * names the grader's cache. Containerizing the *server* as well is still a
- * larger change and is not attempted here; the consequence is that the
- * cluster-side of a scored trial wants a Linux host. See
- * research-environment.ts's abiHint().
+ * As of the third review (#182) the *build* is containerized
+ * (docker/postgres-research-builder, neutral prefix
+ * RESEARCH_CONTAINER_PATHS.postgres), and as of the fourth the *server* is too
+ * (docker/postgres-research-runtime, server/postgres/runtime-container.ts).
+ * So the socket directory this module mounts is now shared between two
+ * containers rather than between a container and a host process, and a scored
+ * trial executes no Linux PostgreSQL binary on the host at all - which is what
+ * makes macOS and Windows real scored hosts rather than build-only ones.
  *
  * The agent-visible surface, and nothing else:
  *
@@ -216,82 +212,18 @@ export function killResearchContainer(containerName: string): void {
 }
 
 /**
- * Where per-trial build views live: a sibling of the build cache rather than
- * a directory inside it, so that the cache root's own path never appears in
- * the container's mount table either. A sibling is also guaranteed to be on
- * the same filesystem, which is what makes the hard-link view below possible.
+ * The per-trial build view moved to ./build-view.ts when the runtime sidecar
+ * started needing the same view for its own read-only mount: agent-container
+ * imports research-environment, so research-environment cannot import these
+ * back from here without closing an ESM cycle. Re-exported so every existing
+ * import path still resolves.
  */
-export function defaultBuildViewsRoot(cacheRoot?: string): string {
-  if (process.env.HONEYRAIL_PG_BUILD_VIEWS) return process.env.HONEYRAIL_PG_BUILD_VIEWS;
-  if (cacheRoot) return join(dirname(cacheRoot), "pg-research-build-views");
-  return join(homedir(), ".honeyrail", "pg-research-build-views");
-}
-
-async function linkTree(src: string, dest: string, skip: ReadonlySet<string>) {
-  await mkdir(dest, { recursive: true });
-  for (const entry of await readdir(src, { withFileTypes: true })) {
-    if (skip.has(entry.name)) continue;
-    const from = join(src, entry.name);
-    const to = join(dest, entry.name);
-    if (entry.isDirectory()) {
-      await linkTree(from, to, new Set());
-    } else if (entry.isSymbolicLink()) {
-      await symlink(await readlink(from), to);
-    } else {
-      // Hard links share the cached build's data - this is a second *view* of
-      // one build, not a second copy of it. A cross-device or link-hostile
-      // filesystem falls back to a real copy rather than failing the trial.
-      await link(from, to).catch(async (error: NodeJS.ErrnoException) => {
-        if (error.code === "EXDEV" || error.code === "EPERM" || error.code === "EMLINK" || error.code === "ENOTSUP") {
-          await copyFile(from, to);
-          return;
-        }
-        throw error;
-      });
-    }
-  }
-}
-
-export type BuildView = {
-  /** Host path of this trial's view. Grader-side only; the agent sees it as /opt/honeyrail/postgres. */
-  dir: string;
-  /** Random, per-trial, uncorrelatable across trials. */
-  id: string;
-};
-
-/**
- * Builds this trial's private, randomly-named hard-link view of a cached
- * build, and mounts *that* rather than the cache entry itself.
- *
- * This is what actually closes the deterministic-identity hole, and the
- * reason it is needed even though the container already exposes the build at
- * a fixed neutral path: a bind mount's source path is visible inside the
- * container in `/proc/self/mountinfo`. Verified directly - mounting
- * `<cacheRoot>/<entryId>` at `/opt/honeyrail/postgres` puts the literal
- * `entryId` in the container's own mount table, where an agent that can
- * enumerate a bounded set of candidate refs could recompute and match it.
- * Mounting a per-trial random directory puts a random string there instead.
- *
- * The build itself is not duplicated (hard links), and the cache stays
- * deterministic and shared grader-side, so cache reuse is unaffected.
- *
- * The completion marker is deliberately left out of the view: it carries the
- * deterministic `entryId`, which is exactly what must not reach the agent.
- */
-export async function createBuildView(installDir: string, viewsRoot: string): Promise<BuildView> {
-  await mkdir(viewsRoot, { recursive: true });
-  const parent = await mkdtemp(join(viewsRoot, "view-"));
-  const id = randomBytes(16).toString("hex");
-  const dir = join(parent, id);
-  await linkTree(installDir, dir, new Set([BUILD_COMPLETE_MARKER]));
-  return { dir, id };
-}
-
-/** Removes a build view. Never throws: it runs from cleanup paths. */
-export async function removeBuildView(view: BuildView | undefined): Promise<void> {
-  if (!view) return;
-  await rm(dirname(view.dir), { recursive: true, force: true }).catch(() => {});
-}
+export {
+  createBuildView,
+  removeBuildView,
+  defaultBuildViewsRoot,
+  type BuildView
+} from "./build-view.js";
 
 /**
  * Creates the per-trial scratch directory the agent writes into, and drops a

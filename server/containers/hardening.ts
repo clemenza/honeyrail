@@ -49,6 +49,16 @@ export type ContainerHardeningOptions = {
   memory?: string;
   pidsLimit?: number;
   tmpfsSize?: string;
+  /**
+   * `--user`, as `uid:gid`. Defaults to the host user, which is what makes
+   * caller-supplied bind mounts writable without pre-chowning them.
+   *
+   * Overridden by exactly one call site: the PostgreSQL runtime sidecar
+   * (server/postgres/runtime-container.ts), because PostgreSQL refuses to run
+   * as root, so a host that *is* root (a Linux CI runner) has to be given a
+   * different, non-zero uid to run the server as.
+   */
+  user?: string;
 };
 
 /**
@@ -74,7 +84,7 @@ export function containerHardeningArgs(options: ContainerHardeningOptions): stri
     "--memory",
     options.memory ?? DEFAULT_MEMORY,
     "--user",
-    `${uid}:${gid}`,
+    options.user ?? `${uid}:${gid}`,
     "--tmpfs",
     `/tmp:size=${options.tmpfsSize ?? DEFAULT_TMP_SIZE}`,
     "-e",
