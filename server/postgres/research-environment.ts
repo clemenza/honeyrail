@@ -4,6 +4,14 @@ import { arch, cpus, homedir, platform, tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { nowIso, runCommandSafe } from "../utils.js";
 import {
+  DEFAULT_BUILDER_IMAGE,
+  probeBuildContainerToolchain,
+  resolveBuilderImageIdentity,
+  runBuildContainerStep,
+  type BuilderImageIdentity
+} from "./build-container.js";
+import { BUILDER_CONTAINER_PATHS, NEUTRAL_INSTALL_PREFIX } from "./container-paths.js";
+import {
   allocatePort,
   isAddressInUseFailure,
   psqlArgs,
@@ -47,8 +55,43 @@ import {
  * are trusted with all of it.
  */
 
-/** Bumped when the build recipe itself changes; participates in the cache key. */
-export const BUILD_PROFILE_VERSION = "pg-research-env-v1";
+/**
+ * Bumped when the build recipe itself changes; participates in the cache key.
+ *
+ * v2: the neutral `--prefix=/opt/honeyrail/postgres` plus DESTDIR-subtree
+ * publication, and the containerized build mode. Every v1 entry was compiled
+ * with its own cache path as the prefix and must never be reused.
+ */
+export const BUILD_PROFILE_VERSION = "pg-research-env-v2";
+
+/**
+ * Where `configure`/`make`/`make install` run.
+ *
+ * - `container` (default, and the only **scored** mode): inside the pinned
+ *   Linux build image, `docker/postgres-research-builder/Dockerfile`. This is
+ *   what makes the produced binaries executable inside the research-agent
+ *   container on any Docker host - including macOS and Windows, where Docker
+ *   Desktop's containers are a Linux VM and a natively built Mach-O/PE binary
+ *   could not run at all.
+ * - `host`: `configure`/`make` run as ordinary host processes, as v0 did.
+ *   Kept for local development and for hosts without a docker daemon. It is
+ *   **permanently un-scored**: a manifest produced this way carries
+ *   `scoredEligible: false`, exactly the way
+ *   `isolation.allowUnisolatedForDevelopment` marks an unisolated agent run.
+ */
+export type PostgresBuildMode = "container" | "host";
+
+export const DEFAULT_BUILD_MODE: PostgresBuildMode = "container";
+
+export const HOST_BUILD_UNSCORED_REASON =
+  'This build ran as a host process (build.mode: "host"). Its binaries carry the host toolchain and ABI ' +
+  "rather than the pinned Linux build image's, so they are not the artifact a scored trial's agent container " +
+  "executes. Development only - not a scored trial.";
+
+function defaultBuildMode(): PostgresBuildMode {
+  const raw = String(process.env.HONEYRAIL_PG_BUILD_MODE || "").trim();
+  return raw === "host" || raw === "container" ? raw : DEFAULT_BUILD_MODE;
+}
 
 /**
  * The only file HoneyRail writes into a cache entry. It exists so an
@@ -156,6 +199,16 @@ export type PostgresSourceSpec = {
 };
 
 export type PostgresBuildSpec = {
+  /**
+   * Where the build runs. Defaults to `container` (the scored path), or to
+   * `HONEYRAIL_PG_BUILD_MODE` when it names a valid mode. See
+   * PostgresBuildMode.
+   */
+  mode?: PostgresBuildMode;
+  /** Build image for `mode: "container"`. Defaults to DEFAULT_BUILDER_IMAGE. */
+  builderImage?: string;
+  /** `--memory` for the build container. */
+  builderMemory?: string;
   /** Defaults to DEFAULT_CONFIGURE_ARGS. Order is significant to the cache key. */
   configureArgs?: readonly string[];
   jobs?: number;
@@ -239,18 +292,36 @@ export type PostgresCompilerIdentity = {
 export type BuildCacheKeyInput = {
   sourceHash: string;
   configureArgs: readonly string[];
+  /**
+   * The platform/arch the build **targets**, not necessarily the host's. In
+   * `container` mode these are the build image's (`linux`/`arm64`), because
+   * that is what the binaries are for: two different hosts driving the same
+   * builder image produce interchangeable binaries and must share one cache
+   * entry. In `host` mode they are the host's, as before.
+   */
   platform: string;
   arch: string;
+  /** Observed inside the build container in `container` mode; on the host in `host` mode. */
   compiler: PostgresCompilerIdentity;
   /** Resolved BUILD_ENV_VARS pass-through; see resolveBuildEnv(). */
   buildEnv?: Record<string, string>;
   profileVersion?: string;
+  /** Which build mode produced the entry. A host build must never satisfy a container lookup. */
+  mode?: PostgresBuildMode;
+  /**
+   * The build image's configured reference and content-addressed id, in
+   * `container` mode. The id is what stops a mutable `:latest` from silently
+   * serving a cache entry that a different toolchain produced.
+   */
+  builderImage?: { reference: string; id: string } | null;
 };
 
 export type PostgresBuildCommandRecord = {
   name: string;
   command: string;
   args: string[];
+  /** Where this step ran. In `container` mode `command`/`args` are the in-container argv. */
+  mode: PostgresBuildMode;
   durationMs: number;
   logName?: string;
 };
@@ -260,11 +331,35 @@ export type PostgresBuildManifest = {
   sourceCommit: string;
   sourceHash: string;
   configureArgs: string[];
+  /**
+   * Always NEUTRAL_INSTALL_PREFIX (`/opt/honeyrail/postgres`), in every build
+   * mode. Recorded explicitly because it is the fact MUST 1 of the #182 third
+   * review turns on: what `pg_config` reports and what `strings` finds inside
+   * the binaries is this, never `installDir`.
+   */
+  installPrefix: string;
+  buildMode: PostgresBuildMode;
+  /** Present in `container` mode: exactly which image produced these binaries. */
+  builderImage: BuilderImageIdentity | null;
+  /**
+   * False for a `host` build. The scored path is a containerized build whose
+   * output the agent container can actually execute; a host build is a
+   * development convenience and its evidence must not be mistaken for a
+   * scored trial's. See also PostgresResearchIsolationRecord.scoredEligible,
+   * which folds this together with the agent-side network/filesystem facts.
+   */
+  scoredEligible: boolean;
+  /** Present, and loud, whenever `scoredEligible` is false. */
+  unscoredReason?: string;
   compiler: PostgresCompilerIdentity;
   /** Informational, not part of the cache key: which make drove the build. */
   make: string;
+  /** The platform/arch the binaries target - the build image's in `container` mode. */
   platform: string;
   arch: string;
+  /** The machine that drove the build. Informational; deliberately not in the cache key. */
+  hostPlatform: string;
+  hostArch: string;
   buildEnv: Record<string, string>;
   profileVersion: string;
   /** Grader-private: identifies the source. Never written into the cache tree. */
@@ -412,10 +507,20 @@ async function pathExists(path: string) {
  */
 export function computeBuildCacheKey(input: BuildCacheKeyInput): string {
   const buildEnv = input.buildEnv ?? {};
+  const mode = input.mode ?? DEFAULT_BUILD_MODE;
   const canonical = JSON.stringify({
     profileVersion: input.profileVersion ?? BUILD_PROFILE_VERSION,
     sourceHash: input.sourceHash,
     configureArgs: [...input.configureArgs],
+    // The prefix is invariant across every entry, so it carries no
+    // information - but it is in the key anyway, because the day it stops
+    // being invariant is the day entries built with two different prefixes
+    // must not be interchangeable.
+    installPrefix: NEUTRAL_INSTALL_PREFIX,
+    buildMode: mode,
+    // Not just the image reference: `:latest` is mutable, and the whole point
+    // is that rebuilding the builder image invalidates what it produced.
+    builderImage: input.builderImage ? { reference: input.builderImage.reference, id: input.builderImage.id } : null,
     platform: input.platform,
     arch: input.arch,
     compiler: {
@@ -628,13 +733,43 @@ export type BuildPostgresInput = {
  * configure + make + make install into a cache entry named by
  * computeBuildEntryId(computeBuildCacheKey(...)).
  *
- * The install is staged through DESTDIR and renamed into place only once
- * `make install` succeeded and the completion marker was written, so an
- * interrupted build can never be mistaken for a cache hit. DESTDIR rather
- * than a staging --prefix because the two are not equivalent: a PostgreSQL
- * install is only partly relocatable (binaries find share/ relative to
- * argv[0], but macOS bakes an absolute install_name for libpq into every
- * client program), so --prefix must already be the final path.
+ * ## The prefix is a constant, and that is the point
+ *
+ * `configure --prefix=` is compiled *into* the installation. `pg_config
+ * --bindir/--libdir/--sharedir/--configure` report it verbatim, and it also
+ * lands in `lib/pgxs/src/Makefile.global`, in pkg-config metadata, and inside
+ * binaries where `strings` finds it. v0/v1 passed the real cache entry path,
+ * `<cacheRoot>/<entryId>`, which handed the deterministic entry id straight to
+ * any agent that ran the `pg_config` it was given - no filesystem escape
+ * needed, and no amount of randomizing the *mount* could take it back, because
+ * those strings were compiled in long before the mount existed.
+ *
+ * So the prefix is now always the neutral literal `/opt/honeyrail/postgres`
+ * (NEUTRAL_INSTALL_PREFIX - the same constant agent-container.ts mounts the
+ * build at, imported rather than repeated), and `make install DESTDIR=` puts
+ * the files where the cache actually keeps them. DESTDIR prepends the prefix
+ * under the staging root, so the finished tree is at
+ * `<staging>/opt/honeyrail/postgres`, and *that subtree* - not the staging
+ * root - is what gets renamed into `<cacheRoot>/<entryId>`.
+ *
+ * PostgreSQL tolerates the resulting prefix/location mismatch because its
+ * programs locate `share/` relative to `argv[0]` rather than by the compiled
+ * prefix. Shared-library lookup does not: RUNPATH still names the neutral
+ * prefix. The agent container mounts the build there so it simply resolves;
+ * host-side execution gets LD_LIBRARY_PATH/DYLD_LIBRARY_PATH pointed at the
+ * real lib directory instead (see commandEnv()).
+ *
+ * Staging is also what keeps an interrupted build from being mistaken for a
+ * usable one: the rename happens only after `make install` succeeded and the
+ * completion marker was written.
+ *
+ * ## Where it runs
+ *
+ * `build.mode: "container"` (the default, and the only scored mode) runs all
+ * three steps inside the pinned Linux build image, with only the source
+ * snapshot and the staging directory mounted and no host environment
+ * inherited. `"host"` runs them as host processes and marks the manifest
+ * `scoredEligible: false`.
  *
  * Nothing identifying is written into the cache tree: the entry directory is
  * named by the one-way entry id and the marker file says only "this build
@@ -650,15 +785,33 @@ export async function buildPostgres(input: BuildPostgresInput): Promise<Postgres
   const cacheRoot = input.build?.cacheRoot || defaultCacheRoot();
   const jobs = Math.max(1, input.build?.jobs ?? Math.min(8, cpus().length || 1));
   const buildEnv = resolveBuildEnv(process.env, input.build?.env ?? {});
-  const compiler = await detectCompilerIdentity({ runCommand, buildEnv });
-  const makeVersion = await runCommand("make", ["--version"], { timeout: 15000 });
+  const mode = input.build?.mode ?? defaultBuildMode();
+  const builderImageRef = input.build?.builderImage ?? DEFAULT_BUILDER_IMAGE;
+
+  // In container mode every identity input is read back out of the image and
+  // out of a container started from it, never assumed from the host: the host
+  // compiler is not the compiler, and the host arch is not the target.
+  const builderImage = mode === "container" ? await resolveBuilderImageIdentity(builderImageRef, runCommand) : null;
+  const toolchain =
+    mode === "container"
+      ? await probeBuildContainerToolchain({ image: builderImageRef, runCommand, buildEnv })
+      : {
+          compiler: await detectCompilerIdentity({ runCommand, buildEnv }),
+          make: firstLine((await runCommand("make", ["--version"], { timeout: 15000 })).stdout)
+        };
+  const compiler = toolchain.compiler;
+  const targetPlatform = builderImage ? builderImage.os : platform();
+  const targetArch = builderImage ? builderImage.architecture : arch();
+
   const cacheKey = computeBuildCacheKey({
     sourceHash: input.source.sourceHash,
     configureArgs,
-    platform: platform(),
-    arch: arch(),
+    platform: targetPlatform,
+    arch: targetArch,
     compiler,
-    buildEnv
+    buildEnv,
+    mode,
+    builderImage: builderImage && { reference: builderImage.reference, id: builderImage.id }
   });
   const entryId = computeBuildEntryId(cacheKey);
   const installDir = join(cacheRoot, entryId);
@@ -668,10 +821,17 @@ export async function buildPostgres(input: BuildPostgresInput): Promise<Postgres
     sourceCommit: input.source.resolvedCommit,
     sourceHash: input.source.sourceHash,
     configureArgs,
+    installPrefix: NEUTRAL_INSTALL_PREFIX,
+    buildMode: mode,
+    builderImage,
+    scoredEligible: mode === "container",
+    ...(mode === "container" ? {} : { unscoredReason: HOST_BUILD_UNSCORED_REASON }),
     compiler,
-    make: firstLine(makeVersion.stdout),
-    platform: platform(),
-    arch: arch(),
+    make: toolchain.make,
+    platform: targetPlatform,
+    arch: targetArch,
+    hostPlatform: platform(),
+    hostArch: arch(),
     buildEnv,
     profileVersion: BUILD_PROFILE_VERSION,
     cacheKey,
@@ -680,9 +840,10 @@ export async function buildPostgres(input: BuildPostgresInput): Promise<Postgres
     installDir,
     jobs
   };
-  // The build steps see the ambient environment plus the declared overrides,
-  // and every variable that can change the output is in `buildEnv`, hence in
-  // the cache key above.
+  // Host mode only: the build steps see the ambient environment plus the
+  // declared overrides, and every variable that can change the output is in
+  // `buildEnv`, hence in the cache key above. A build *container* inherits
+  // nothing and is passed `buildEnv` explicitly.
   const commandEnv: NodeJS.ProcessEnv = { ...process.env, ...(input.build?.env ?? {}) };
 
   const cached = await readFile(markerPath, "utf8").catch(() => "");
@@ -703,19 +864,44 @@ export async function buildPostgres(input: BuildPostgresInput): Promise<Postgres
   await mkdir(cacheRoot, { recursive: true });
   await mkdir(input.logDir, { recursive: true });
   const staging = join(cacheRoot, `.staging-${randomBytes(8).toString("hex")}`);
+  // Docker creates a missing bind source itself, but as a directory owned by
+  // whoever the daemon runs as; create it first so the staged install is
+  // owned by the user that owns the cache.
+  await mkdir(staging, { recursive: true });
   const commands: PostgresBuildCommandRecord[] = [];
 
-  async function step(name: string, command: string, args: string[], timeout: number, logName: string) {
+  /**
+   * One build step, in whichever mode is active. `argv` is the logical
+   * command: in host mode it is run directly with cwd = the snapshot, in
+   * container mode it is run inside the build image with the snapshot mounted
+   * at BUILDER_CONTAINER_PATHS.source and that as the working directory. The
+   * recorded command is the logical one either way, so the manifest reads the
+   * same in both modes.
+   */
+  async function step(name: string, argv: string[], timeout: number, logName: string) {
     const stepStarted = Date.now();
-    const result = await runCommand(command, args, {
-      cwd: input.source.sourceDir,
-      timeout,
-      env: commandEnv,
-      maxBuffer: 1024 * 1024 * 64
-    });
+    const result =
+      mode === "container"
+        ? await runBuildContainerStep(
+            {
+              sourceDir: input.source.sourceDir,
+              stagingDir: staging,
+              image: builderImageRef,
+              command: argv,
+              buildEnv,
+              memory: input.build?.builderMemory
+            },
+            { runCommand, timeout }
+          )
+        : await runCommand(argv[0], argv.slice(1), {
+            cwd: input.source.sourceDir,
+            timeout,
+            env: commandEnv,
+            maxBuffer: 1024 * 1024 * 64
+          });
     const durationMs = Date.now() - stepStarted;
-    await writeFile(join(input.logDir, logName), `$ ${command} ${args.join(" ")}\n\n${result.stdout}\n${result.stderr}\n`);
-    commands.push({ name, command, args, durationMs, logName });
+    await writeFile(join(input.logDir, logName), `$ ${argv.join(" ")}\n\n${result.stdout}\n${result.stderr}\n`);
+    commands.push({ name, command: argv[0], args: argv.slice(1), mode, durationMs, logName });
     if (!result.ok) {
       throw new PostgresResearchError(
         `PostgreSQL ${name} failed (see ${logName}): ${(result.stderr || result.stdout).trim().split("\n").slice(-8).join("\n")}`
@@ -723,19 +909,22 @@ export async function buildPostgres(input: BuildPostgresInput): Promise<Postgres
     }
   }
 
-  // DESTDIR prepends the (absolute) prefix inside the staging root, so the
-  // finished tree sits at staging + installDir and one rename publishes it.
-  const stagedInstall = join(staging, installDir);
+  // DESTDIR prepends the (absolute, and now neutral) prefix under the staging
+  // root, so the finished tree sits at `<staging>/opt/honeyrail/postgres` and
+  // *that* subtree is what one rename publishes as the cache entry.
+  const stagedInstall = join(staging, NEUTRAL_INSTALL_PREFIX);
+  const configurePath = mode === "container" ? `${BUILDER_CONTAINER_PATHS.source}/configure` : join(input.source.sourceDir, "configure");
+  const destdir = mode === "container" ? BUILDER_CONTAINER_PATHS.staging : staging;
   try {
-    await step(
-      "configure",
-      join(input.source.sourceDir, "configure"),
-      [`--prefix=${installDir}`, ...configureArgs],
-      timeouts.configure,
-      "configure.log"
-    );
-    await step("make", "make", [`-j${jobs}`], timeouts.make, "make.log");
-    await step("make install", "make", ["install", `DESTDIR=${staging}`], timeouts.install, "make-install.log");
+    await step("configure", [configurePath, `--prefix=${NEUTRAL_INSTALL_PREFIX}`, ...configureArgs], timeouts.configure, "configure.log");
+    await step("make", ["make", `-j${jobs}`], timeouts.make, "make.log");
+    await step("make install", ["make", "install", `DESTDIR=${destdir}`], timeouts.install, "make-install.log");
+    if (!(await pathExists(stagedInstall))) {
+      throw new PostgresResearchError(
+        `make install did not populate ${NEUTRAL_INSTALL_PREFIX} under the staging root - ` +
+          `expected ${stagedInstall}. The build did not honour DESTDIR, or configure used a different prefix.`
+      );
+    }
     // Completion marker only. Source ref, commit, tree hash and cache key
     // stay out of the cache tree - see the module header on the eval
     // boundary; the caller records them grader-side from the returned
@@ -851,6 +1040,15 @@ export class PostgresResearchEnvironment {
    * binaries first on PATH, and every inherited PG* variable dropped so an
    * operator's ambient PGHOST/PGPORT/PGDATA cannot silently redirect a
    * research experiment at some other server.
+   *
+   * The library-path variables are the host-side counterpart of the neutral
+   * `--prefix=/opt/honeyrail/postgres` every build is now configured with:
+   * the binaries' RUNPATH (and, on macOS, libpq's baked-in `install_name`)
+   * names that prefix, which on the host is not where the files are. Both
+   * loaders search these variables ahead of the recorded path, so pointing
+   * them at the cache entry's real `lib/` is what makes a host-run `psql`
+   * resolve libpq. The agent container needs no equivalent - it mounts the
+   * build at exactly the prefix it was compiled with.
    */
   private commandEnv(): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = {};
@@ -859,6 +1057,9 @@ export class PostgresResearchEnvironment {
       env[key] = value;
     }
     env.PATH = `${this.binDir}:${process.env.PATH ?? ""}`;
+    const libDir = join(this.installDir, "lib");
+    env.LD_LIBRARY_PATH = env.LD_LIBRARY_PATH ? `${libDir}:${env.LD_LIBRARY_PATH}` : libDir;
+    env.DYLD_LIBRARY_PATH = env.DYLD_LIBRARY_PATH ? `${libDir}:${env.DYLD_LIBRARY_PATH}` : libDir;
     return env;
   }
 
@@ -946,6 +1147,30 @@ export class PostgresResearchEnvironment {
     };
   }
 
+  /**
+   * The one failure mode the containerized build introduces on a non-Linux
+   * host, named rather than left as a bare "Exec format error".
+   *
+   * A `container`-mode build produces Linux binaries. The *agent* runs them
+   * inside a Linux container on every Docker host, which is the whole point
+   * of building in one - but this class still runs `initdb`/`pg_ctl` as host
+   * processes, and macOS/Windows cannot execute an ELF binary. The scored
+   * server-side path therefore needs a Linux host; a macOS developer wanting
+   * a live cluster from real PostgreSQL sources wants `build.mode: "host"`,
+   * which is explicitly un-scored.
+   */
+  private abiHint(detail: string): string {
+    const abiFailure = /Exec format error|cannot execute binary file|ENOEXEC/i.test(detail);
+    if (!abiFailure || this.buildManifest.buildMode !== "container" || platform() === "linux") return "";
+    return (
+      `\n\nThis environment's binaries were built for ${this.buildManifest.platform}/${this.buildManifest.arch} inside ` +
+      `${this.buildManifest.builderImage?.reference ?? "the build container"}, and this host is ${platform()}/${arch()}, ` +
+      "which cannot execute them. The agent container can (that is why the build is containerized), but the cluster " +
+      'itself still runs as a host process. Run scored trials on a Linux host, or use build.mode: "host" for local ' +
+      "development against real PostgreSQL sources - an explicitly un-scored build."
+    );
+  }
+
   private async initdb() {
     if (this.initialized) return;
     const started = Date.now();
@@ -956,7 +1181,7 @@ export class PostgresResearchEnvironment {
       maxBuffer: 1024 * 1024 * 8
     });
     if (!result.ok) {
-      throw new PostgresResearchError(`initdb failed: ${result.stderr || result.stdout}`);
+      throw new PostgresResearchError(`initdb failed: ${result.stderr || result.stdout}${this.abiHint(result.stderr || result.stdout)}`);
     }
     this.initialized = true;
     this.record("cluster.initdb", { dataDir: this.dataDir, args: this.initdbArgs }, Date.now() - started);

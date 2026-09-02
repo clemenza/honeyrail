@@ -4,6 +4,7 @@ import {
   createAgentEnvRoot,
   DEFAULT_CONFIGURE_ARGS,
   withPostgresResearchEnvironment,
+  type PostgresBuildMode,
   type PostgresQueryResult,
   type PostgresResearchEnvironment,
   type PostgresResearchSpec
@@ -40,7 +41,7 @@ type ExperimentSpec = { name: string; sql: string };
 
 export type PostgresResearchInput = {
   source: { repoPath: string; ref: string };
-  build: { configureArgs: string[]; jobs?: number; cacheRoot?: string };
+  build: { configureArgs: string[]; jobs?: number; cacheRoot?: string; mode?: PostgresBuildMode; builderImage?: string };
   experiments: ExperimentSpec[];
   restart: boolean;
   timeoutMs?: number;
@@ -84,6 +85,13 @@ export function parsePostgresResearchInput(input: Record<string, unknown> | unde
   if (jobs !== undefined && (!Number.isFinite(jobs) || jobs < 1)) {
     throw new ConfigError("postgres-research input.build.jobs must be a positive number");
   }
+  // Validated here rather than discovered at build time: a typo'd mode would
+  // otherwise silently fall through to the default and produce a manifest
+  // claiming a build path the step author did not ask for.
+  const mode = build.mode === undefined ? undefined : String(build.mode);
+  if (mode !== undefined && mode !== "container" && mode !== "host") {
+    throw new ConfigError('postgres-research input.build.mode must be "container" (scored) or "host" (development only)');
+  }
   const experimentsValue = record.experiments;
   if (experimentsValue !== undefined && !Array.isArray(experimentsValue)) {
     throw new ConfigError("postgres-research input.experiments must be an array of { name, sql }");
@@ -110,7 +118,9 @@ export function parsePostgresResearchInput(input: Record<string, unknown> | unde
     build: {
       configureArgs: stringArray(build.configureArgs, "postgres-research input.build.configureArgs") ?? [...DEFAULT_CONFIGURE_ARGS],
       jobs,
-      cacheRoot: build.cacheRoot === undefined ? undefined : String(build.cacheRoot)
+      cacheRoot: build.cacheRoot === undefined ? undefined : String(build.cacheRoot),
+      mode: mode as PostgresBuildMode | undefined,
+      builderImage: build.builderImage === undefined ? undefined : String(build.builderImage)
     },
     experiments,
     restart: record.restart === true,
@@ -213,9 +223,20 @@ export class PostgresResearchExecutor implements Executor {
               cacheKey: env.buildManifest.cacheKey,
               cacheHit: env.buildManifest.cacheHit,
               configureArgs: env.buildManifest.configureArgs,
+              // Recorded on the evidence itself, not only in the manifest
+              // artifact: a reader deciding whether a result is trustworthy
+              // must be able to see that a host build is not a scored build
+              // without opening a second file.
+              buildMode: env.buildManifest.buildMode,
+              scoredEligible: env.buildManifest.scoredEligible,
+              unscoredReason: env.buildManifest.unscoredReason,
+              installPrefix: env.buildManifest.installPrefix,
+              builderImage: env.buildManifest.builderImage,
               compiler: env.buildManifest.compiler,
               platform: env.buildManifest.platform,
               arch: env.buildManifest.arch,
+              hostPlatform: env.buildManifest.hostPlatform,
+              hostArch: env.buildManifest.hostArch,
               installDir: env.buildManifest.installDir,
               binaries: env.buildManifest.binaries,
               durationMs: env.buildManifest.durationMs

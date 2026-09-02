@@ -77,7 +77,7 @@ function specFor(fixture: Fixture, name: string): PostgresResearchSpec {
     root: join(fixture.tempDir, "envs", name),
     privateDir: join(fixture.tempDir, "private", name),
     source: { repoPath: fixture.repo.repoPath, ref: fixture.repo.ref },
-    build: { cacheRoot: fixture.cacheRoot, jobs: 1 }
+    build: { mode: "host" as const, cacheRoot: fixture.cacheRoot, jobs: 1 }
   };
 }
 
@@ -145,7 +145,9 @@ test("buildResearchContainerArgs mounts the research surface and nothing else", 
   // No attachment root, no private directory, no source mirror, no cache root.
   assert.equal(mounts.length, 6);
   assert.ok(!args.includes("--network=host"));
-  assert.equal(args[args.indexOf("--network") + 1], "bridge");
+  // The scored default; test/postgres-research-network.test.ts owns the rest
+  // of that story.
+  assert.equal(args[args.indexOf("--network") + 1], "none");
 });
 
 test("buildResearchContainerArgs hardens the container with the same flags as the exam room", () => {

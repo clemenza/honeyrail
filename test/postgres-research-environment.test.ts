@@ -10,6 +10,7 @@ import { OrchestrationService } from "../server/orchestration/service.js";
 import {
   BUILD_COMPLETE_MARKER,
   BUILD_PROFILE_VERSION,
+  DEFAULT_CONFIGURE_ARGS,
   computeBuildCacheKey,
   computeBuildEntryId,
   createPostgresResearchEnvironment,
@@ -21,6 +22,13 @@ import {
   type PostgresResearchEnvironment,
   type PostgresResearchSpec
 } from "../server/postgres/research-environment.js";
+import {
+  buildContainerStepArgs,
+  resolveBuilderImageIdentity,
+  BUILDER_CONTAINER_PATH,
+  DEFAULT_BUILDER_IMAGE,
+  PostgresBuildContainerError
+} from "../server/postgres/build-container.js";
 import { JsonStore } from "../server/store.js";
 import { runCommandSafe } from "../server/utils.js";
 import { createSyntheticPostgresSourceRepo, hasFixtureToolchain, type SyntheticPostgresSourceRepo } from "./helpers/postgres-source-fixture.js";
@@ -49,7 +57,7 @@ function specFor(fixture: Fixture, name: string, overrides: Partial<PostgresRese
   return {
     root: join(fixture.tempDir, name),
     source: { repoPath: fixture.repo.repoPath, ref: fixture.repo.ref },
-    build: { cacheRoot: fixture.cacheRoot, jobs: 1 },
+    build: { mode: "host" as const, cacheRoot: fixture.cacheRoot, jobs: 1 },
     ...overrides
   };
 }
@@ -159,6 +167,147 @@ test("build cache key changes with source hash, configure args, platform, arch, 
   }
 });
 
+test("build cache key separates build modes and builder images, not just host toolchains", () => {
+  // Once compilation moved into a container (#182 third review), the host's
+  // compiler is no longer what produced the binaries. What must key them
+  // apart instead is the build mode and the image's *content* identity - a
+  // mutable `:latest` that got rebuilt must not serve entries produced by
+  // its predecessor.
+  const compiler = { command: "cc", version: "cc (Debian 12.2.0-14+deb12u1) 12.2.0", target: "aarch64-linux-gnu" };
+  const image = { reference: "honeyrail-postgres-builder:latest", id: `sha256:${"a".repeat(64)}` };
+  const base = {
+    sourceHash: "c".repeat(40),
+    configureArgs: [...DEFAULT_CONFIGURE_ARGS],
+    platform: "linux",
+    arch: "arm64",
+    compiler,
+    mode: "container" as const,
+    builderImage: image
+  };
+  const key = computeBuildCacheKey(base);
+  assert.equal(computeBuildCacheKey({ ...base }), key);
+
+  for (const variant of [
+    { ...base, mode: "host" as const, builderImage: null },
+    { ...base, builderImage: { ...image, id: `sha256:${"b".repeat(64)}` } },
+    { ...base, builderImage: { ...image, reference: "honeyrail-postgres-builder:pinned" } },
+    { ...base, builderImage: null },
+    { ...base, compiler: { ...compiler, version: "cc (Debian 12.2.0-15) 12.2.1" } }
+  ]) {
+    assert.notEqual(computeBuildCacheKey(variant), key, `cache key must change for ${JSON.stringify(variant)}`);
+  }
+
+  // A host build on a machine that merely *happens* to look like the
+  // container must not collide with a container build.
+  assert.notEqual(
+    computeBuildCacheKey({ ...base, mode: "host", builderImage: null }),
+    computeBuildCacheKey({ ...base, mode: "container", builderImage: null })
+  );
+});
+
+test("a build container mounts only the snapshot and the staging root, and inherits no host environment", () => {
+  const args = buildContainerStepArgs({
+    sourceDir: "/host/env/source",
+    stagingDir: "/host/cache/.staging-abc",
+    image: DEFAULT_BUILDER_IMAGE,
+    command: ["make", "-j4"],
+    buildEnv: { CFLAGS: "-O0" },
+    containerName: "b1"
+  });
+
+  const mounts = args.filter((_value, index) => args[index - 1] === "-v");
+  assert.deepEqual(mounts, ["/host/env/source:/build/source:rw", "/host/cache/.staging-abc:/build/staging:rw"]);
+  // Not mounted: the cache root itself, the source mirror, the private dir.
+  assert.equal(mounts.length, 2);
+
+  assert.equal(args[args.indexOf("--network") + 1], "none", "a build must not need the network");
+  assert.ok(args.includes("--cap-drop=ALL"));
+  assert.ok(args.includes("no-new-privileges"));
+  assert.ok(args.includes("--rm"));
+  assert.equal(args[args.indexOf("-w") + 1], "/build/source");
+  assert.equal(args[args.length - 3], DEFAULT_BUILDER_IMAGE);
+  assert.deepEqual(args.slice(-2), ["make", "-j4"]);
+
+  // Exactly the declared variables, plus the fixed ones. In particular no
+  // ambient PATH, HOME or locale from the operator's shell.
+  const env = args.filter((_value, index) => args[index - 1] === "-e");
+  assert.deepEqual(env.sort(), ["CFLAGS=-O0", "HOME=/tmp", "LANG=C", "LC_ALL=C", `PATH=${BUILDER_CONTAINER_PATH}`].sort());
+});
+
+test("the containerized build mode is the default, publishes a usable cache entry, and reuses it", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  const daemon = await runCommandSafe("docker", ["version", "--format", "{{.Server.Version}}"], { timeout: 20_000 });
+  const image = await runCommandSafe("docker", ["image", "inspect", DEFAULT_BUILDER_IMAGE], { timeout: 30_000 });
+  if (!daemon.ok || !daemon.stdout.trim() || !image.ok) {
+    t.skip(`${DEFAULT_BUILDER_IMAGE} or a docker daemon is unavailable - docker build -t ${DEFAULT_BUILDER_IMAGE} docker/postgres-research-builder`);
+    return;
+  }
+  const fixture = await withFixture(t);
+
+  // No build.mode here: this asserts the *default* is the containerized
+  // scored path. The rest of this file pins mode: "host" so it stays
+  // runnable without a docker daemon; the real-PostgreSQL end of container
+  // mode is test/postgres-research-real-build.test.ts.
+  const spec = specFor(fixture, "container-build", { build: { cacheRoot: fixture.cacheRoot, jobs: 1 } });
+  const first = await createPostgresResearchEnvironment(spec);
+  t.after(async () => first.cleanup());
+
+  assert.equal(first.buildManifest.buildMode, "container");
+  assert.equal(first.buildManifest.scoredEligible, true);
+  assert.equal(first.buildManifest.unscoredReason, undefined);
+  assert.equal(first.buildManifest.installPrefix, "/opt/honeyrail/postgres");
+  assert.equal(first.buildManifest.platform, "linux", "a containerized build targets the image, not the host");
+  assert.equal(first.buildManifest.hostPlatform, process.platform, "the host is still recorded, separately");
+  assert.match(first.buildManifest.builderImage!.id, /^sha256:[0-9a-f]{64}$/);
+  assert.match(first.buildManifest.compiler.version, /./, "the compiler must be probed inside the build container");
+  assert.deepEqual(
+    first.buildManifest.commands.map((command) => [command.name, command.mode]),
+    [
+      ["configure", "container"],
+      ["make", "container"],
+      ["make install", "container"]
+    ]
+  );
+  // configure ran with the neutral prefix and the install came out of the
+  // DESTDIR subtree, not the staging root.
+  assert.ok(first.buildManifest.commands[0].args.includes("--prefix=/opt/honeyrail/postgres"));
+  assert.ok(first.buildManifest.commands[2].args.includes("DESTDIR=/build/staging"));
+  assert.equal(await exists(join(first.installDir, "bin", "initdb")), true);
+  assert.equal(await exists(join(first.installDir, "opt")), false, "the staging root must not be published as the entry");
+
+  // A host build of the same source must land in a *different* entry.
+  const hostBuilt = await createPostgresResearchEnvironment(specFor(fixture, "host-build"));
+  t.after(async () => hostBuilt.cleanup());
+  assert.equal(hostBuilt.buildManifest.buildMode, "host");
+  assert.equal(hostBuilt.buildManifest.scoredEligible, false);
+  assert.match(hostBuilt.buildManifest.unscoredReason ?? "", /not a scored trial/i);
+  assert.notEqual(hostBuilt.buildManifest.entryId, first.buildManifest.entryId);
+
+  // ...and a second container build reuses the first one's entry.
+  const second = await createPostgresResearchEnvironment(
+    specFor(fixture, "container-build-2", { build: { cacheRoot: fixture.cacheRoot, jobs: 1 } })
+  );
+  t.after(async () => second.cleanup());
+  assert.equal(second.buildManifest.cacheHit, true);
+  assert.equal(second.buildManifest.entryId, first.buildManifest.entryId);
+  assert.deepEqual(second.buildManifest.commands, []);
+});
+
+test("a missing build image fails loudly with the command that would create it", async () => {
+  await assert.rejects(
+    resolveBuilderImageIdentity("honeyrail-postgres-builder:definitely-not-present", async () => ({
+      ok: false,
+      stdout: "",
+      stderr: "Error: No such image",
+      code: 1
+    })),
+    (error: Error) =>
+      error instanceof PostgresBuildContainerError &&
+      /is not available to the docker daemon/.test(error.message) &&
+      /docker build -t honeyrail-postgres-builder:definitely-not-present docker\/postgres-research-builder/.test(error.message)
+  );
+});
+
 test("an identical build hits the cache and a different configure profile does not", async (t) => {
   if (await skipWithoutToolchain(t)) return;
   const fixture = await withFixture(t);
@@ -177,7 +326,7 @@ test("an identical build hits the cache and a different configure profile does n
   assert.deepEqual(second.buildManifest.commands, [], "a cache hit must not rerun configure or make");
 
   const third = await createPostgresResearchEnvironment(
-    specFor(fixture, "cache-c", { build: { cacheRoot: fixture.cacheRoot, jobs: 1, configureArgs: ["--without-readline"] } })
+    specFor(fixture, "cache-c", { build: { mode: "host" as const, cacheRoot: fixture.cacheRoot, jobs: 1, configureArgs: ["--without-readline"] } })
   );
   t.after(async () => third.cleanup());
   assert.equal(third.buildManifest.cacheHit, false, "a different configure profile must not reuse another build");
@@ -353,7 +502,7 @@ test("the postgres-research executor records source, build and runtime manifests
         executor: "postgres-research",
         input: {
           source: { repoPath: fixture.repo.repoPath, ref: fixture.repo.ref },
-          build: { cacheRoot: fixture.cacheRoot, jobs: 1 },
+          build: { mode: "host" as const, cacheRoot: fixture.cacheRoot, jobs: 1 },
           restart: true,
           experiments: [
             { name: "seed", sql: "INSERT observed" },
@@ -531,7 +680,7 @@ test("the executor keeps full provenance grader-side and out of every agent-visi
         executor: "postgres-research",
         input: {
           source: { repoPath: fixture.repo.repoPath, ref: fixture.repo.ref },
-          build: { cacheRoot: fixture.cacheRoot, jobs: 1 },
+          build: { mode: "host" as const, cacheRoot: fixture.cacheRoot, jobs: 1 },
           experiments: [{ name: "probe", sql: "SELECT 1;" }]
         }
       }
@@ -769,11 +918,11 @@ test("a different CFLAGS cannot reuse another profile's cached build", async (t)
   const fixture = await withFixture(t);
 
   const unoptimized = await createPostgresResearchEnvironment(
-    specFor(fixture, "cflags-o0", { build: { cacheRoot: fixture.cacheRoot, jobs: 1, env: { CFLAGS: "-O0" } } })
+    specFor(fixture, "cflags-o0", { build: { mode: "host" as const, cacheRoot: fixture.cacheRoot, jobs: 1, env: { CFLAGS: "-O0" } } })
   );
   t.after(async () => unoptimized.cleanup());
   const optimized = await createPostgresResearchEnvironment(
-    specFor(fixture, "cflags-o2", { build: { cacheRoot: fixture.cacheRoot, jobs: 1, env: { CFLAGS: "-O2" } } })
+    specFor(fixture, "cflags-o2", { build: { mode: "host" as const, cacheRoot: fixture.cacheRoot, jobs: 1, env: { CFLAGS: "-O2" } } })
   );
   t.after(async () => optimized.cleanup());
 
@@ -786,7 +935,7 @@ test("a different CFLAGS cannot reuse another profile's cached build", async (t)
 
   // ...and an identical declared environment still hits.
   const again = await createPostgresResearchEnvironment(
-    specFor(fixture, "cflags-o2-again", { build: { cacheRoot: fixture.cacheRoot, jobs: 1, env: { CFLAGS: "-O2" } } })
+    specFor(fixture, "cflags-o2-again", { build: { mode: "host" as const, cacheRoot: fixture.cacheRoot, jobs: 1, env: { CFLAGS: "-O2" } } })
   );
   t.after(async () => again.cleanup());
   assert.equal(again.buildManifest.cacheHit, true);

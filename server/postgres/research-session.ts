@@ -22,6 +22,7 @@ import {
   killResearchContainer,
   removeBuildView,
   DEFAULT_RESEARCH_IMAGE,
+  DEFAULT_RESEARCH_NETWORK,
   RESEARCH_CONTAINER_PATHS,
   type BuildView
 } from "./agent-container.js";
@@ -136,21 +137,70 @@ export type PostgresResearchAgentResult = {
  * How the agent process was actually confined. Recorded on every session so
  * evidence produced without a real boundary can never be mistaken for
  * evidence produced with one.
+ *
+ * The three facts are deliberately separate, because they fail separately:
+ *
+ * - `isolated` - was there a filesystem boundary at all (a container, versus
+ *   `allowUnisolatedForDevelopment`)?
+ * - `networkMode` - could the agent have reached a grader/host service? Mount
+ *   isolation says nothing about this: on Docker Desktop a `bridge` container
+ *   has `host.docker.internal`, and on Linux it has the default gateway, so
+ *   an agent that cannot *read* `source-manifest.json` may still be able to
+ *   *fetch* the same truth from a local HoneyRail service.
+ * - `buildScoredEligible` - were the binaries produced by the pinned Linux
+ *   build container, or by an un-scored host build?
+ *
+ * `scoredEligible` is the conjunction, and it is the single field a grader
+ * should key on.
  */
 export type PostgresResearchIsolationRecord = {
   mode: "container" | "unisolated-development";
   /** False only in the explicitly opted-into development mode. */
   isolated: boolean;
   image?: string;
-  network?: string;
+  /**
+   * The docker network the agent container ran on. `"none"` is the scored
+   * default; anything else is recorded verbatim and makes `scoredEligible`
+   * false. Absent for an unisolated development run, which had the host's
+   * whole network.
+   */
+  networkMode?: string;
+  /**
+   * True only when all of: a real container boundary, `networkMode: "none"`,
+   * and a container-built (scored-eligible) PostgreSQL. Never inferred by a
+   * consumer from the other fields - it is written here so an artifact that
+   * carries this record carries the verdict with it.
+   */
+  scoredEligible: boolean;
+  /** Mirrors PostgresBuildManifest.scoredEligible, so this record stands alone. */
+  buildScoredEligible: boolean;
   containerName?: string;
   /** The exact `-v` specs, so a reviewer can see what was and was not exposed. */
   mounts?: string[];
   /** Host path of this trial's build view. Grader-side; the agent saw a fixed neutral path. */
   buildViewDir?: string;
-  /** Present, and loud, whenever `isolated` is false. */
+  /** Present, and loud, whenever `scoredEligible` is false. Says which of the three failed. */
   warning?: string;
 };
+
+/** Why a container-isolated session is nonetheless not scored-eligible. */
+export function unscoredReasons(input: { networkMode: string; buildScoredEligible: boolean }): string[] {
+  const reasons: string[] = [];
+  if (input.networkMode !== "none") {
+    reasons.push(
+      `The agent container ran on docker network "${input.networkMode}" rather than "none", so it had a route to ` +
+        "the host and to private networks (on Docker Desktop, host.docker.internal; on Linux, the bridge gateway). " +
+        "Filesystem isolation does not constrain what an HTTP request can retrieve from a grader-side service."
+    );
+  }
+  if (!input.buildScoredEligible) {
+    reasons.push(
+      'The PostgreSQL under research was not built by the pinned Linux build container (build.mode: "host"), ' +
+        "so the agent did not exercise the artifact a scored trial produces."
+    );
+  }
+  return reasons;
+}
 
 export type PostgresResearchSessionResult = {
   agent: PostgresResearchAgentResult;
@@ -167,10 +217,19 @@ export type PostgresResearchSessionResult = {
 export type PostgresResearchIsolationOptions = {
   image?: string;
   /**
-   * "bridge" (default) so a research agent can reach its own model API. The
-   * container has its own network namespace and therefore no route to the
-   * host's loopback: the research cluster is reachable only through the
-   * bind-mounted Unix socket. "none" removes outbound access as well.
+   * Defaults to "none" - the scored mode. The container gets no network stack
+   * beyond its own loopback, so there is no gateway, no bridge and no
+   * `host.docker.internal` through which a grader-side HTTP service could be
+   * queried. The research cluster is unaffected: it is reached over the
+   * bind-mounted Unix socket, which resolves through the mount namespace.
+   *
+   * "bridge" (or any other docker network) is allowed - a real research agent
+   * usually needs outbound model-API access - but it is an explicit opt-in
+   * and the resulting session records `scoredEligible: false`. There is
+   * deliberately no restricted-egress mode here: a real one needs NET_ADMIN
+   * inside a `--cap-drop=ALL` container plus IPv4+IPv6 policy, which is a
+   * larger change than this round, and a half-built one would be worse than
+   * an honest label.
    */
   network?: "none" | "bridge" | (string & {});
   memory?: string;
@@ -380,6 +439,8 @@ export async function runAgentInPostgresResearchEnvironment(
             isolation: {
               mode: "unisolated-development" as const,
               isolated: false,
+              scoredEligible: false,
+              buildScoredEligible: env.buildManifest.scoredEligible,
               warning: UNISOLATED_WARNING
             },
             connection: env.connectionInfo(),
@@ -438,6 +499,9 @@ export async function runAgentInPostgresResearchEnvironment(
           agent
         );
 
+        const networkMode = isolation.network ?? DEFAULT_RESEARCH_NETWORK;
+        const buildScoredEligible = env.buildManifest.scoredEligible;
+        const reasons = unscoredReasons({ networkMode, buildScoredEligible });
         return {
           agent: result,
           agentEnvironment: injected,
@@ -445,10 +509,13 @@ export async function runAgentInPostgresResearchEnvironment(
             mode: "container" as const,
             isolated: true,
             image: isolation.image ?? DEFAULT_RESEARCH_IMAGE,
-            network: isolation.network ?? "bridge",
+            networkMode,
+            scoredEligible: reasons.length === 0,
+            buildScoredEligible,
             containerName,
             mounts: containerArgs.filter((_value, index) => containerArgs[index - 1] === "-v"),
-            buildViewDir: buildView.dir
+            buildViewDir: buildView.dir,
+            ...(reasons.length ? { warning: `Not a scored trial. ${reasons.join(" ")}` } : {})
           },
           connection: env.connectionInfo(),
           source: env.sourceManifest,

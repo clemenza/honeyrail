@@ -15,12 +15,14 @@
 # image that adds one (`FROM honeyrail-postgres-research:latest`, then install
 # it) rather than growing this one.
 #
-# The base matters for one non-obvious reason: PostgreSQL is built natively on
-# the host and executed inside this container, so the image's libc must be
-# able to run those binaries. bookworm (glibc 2.36) covers a Debian/Ubuntu
-# build host of the same or older vintage. A musl host, or a host with a newer
-# glibc than the image, needs a matching base - override with
-# `isolation.image`.
+# The base matters for one non-obvious reason: the PostgreSQL this container
+# executes is built by docker/postgres-research-builder, so the two images'
+# libc versions have to agree. Both are bookworm (glibc 2.36), and they are
+# meant to be changed together - the builder image's identity is part of the
+# build cache key, so a mismatch shows up as a rebuild rather than as a
+# mysterious loader failure. Before the build was containerized this pairing
+# was image-vs-*host*, which is why real scored trials used to be impossible
+# on macOS and Windows.
 #
 # Build:
 #   docker build -t honeyrail-postgres-research:latest docker/postgres-research
@@ -31,6 +33,15 @@ FROM node:24-bookworm-slim
 # image should not have to reinstall a runtime. The shell utilities a research
 # agent actually needs to grep a source tree and drive psql (sh, grep, find,
 # sed, awk, diff) are all in the base already.
+#
+# binutils adds `strings`/`nm`/`objdump`. Two reasons, and the first is the
+# smaller one: an agent researching a PostgreSQL bug legitimately wants to
+# look inside a binary. The second is that the cache-identity scan #182's
+# third review requires (`strings /opt/honeyrail/postgres/bin/postgres | grep
+# <cache root>`) has to run in *this* container to prove anything about it -
+# running it from a grader-side image would only prove something about the
+# grader's view. See test/postgres-research-real-build.test.ts.
+RUN apt-get update && apt-get install -y --no-install-recommends binutils && rm -rf /var/lib/apt/lists/*
 
 # Non-root by default; the runner overrides --user to the host uid/gid that
 # owns the bind-mounted trial directories, so the agent can write into its

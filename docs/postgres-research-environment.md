@@ -24,18 +24,23 @@ Out of scope (tracked elsewhere): cross-step DAG composition of a live environme
 
 ```text
 materialize snapshot (git archive @ ref, no .git)
-  -> build/reuse cache (configure + make + make install)
+  -> build in a Linux container, configure --prefix=/opt/honeyrail/postgres
+     -> make install DESTDIR=<staging>, publish <staging>/opt/honeyrail/postgres
+        into the content-keyed cache (or reuse an existing entry)
   -> initdb -> pg_ctl start -> readiness poll
-  -> arbitrary SQL / scripts / binaries, or one agent process
+  -> arbitrary SQL / scripts / binaries, or one agent process in a container
+     with --network none and only its research surface mounted
   -> restart / stop
   -> artifacts + evidence
   -> guaranteed cleanup
 ```
 
-Four pieces:
+The pieces:
 
 - `server/postgres/runtime.ts` — the low-level PostgreSQL mechanics shared with the alpha executor: `allocatePort()` (bind port 0 on loopback, read the port back), `isAddressInUseFailure()` and `waitForPostgresReady()` (poll `SELECT 1`). Extracted from `server/executors/postgres.ts`; its defaults reproduce the original behavior exactly.
 - `server/postgres/research-environment.ts` — the environment itself. Store-agnostic and executor-agnostic, so it can be driven from a script, a test, or an executor.
+- `server/postgres/container-paths.ts` — the fixed in-container paths, and with them the single definition of `/opt/honeyrail/postgres`, which is *both* the compiled-in `configure --prefix` and the mount target the build is exposed at. A leaf module so both sides can import it without an ESM cycle. See [Why the configure prefix is a constant](#why-the-configure-prefix-is-a-constant).
+- `server/postgres/build-container.ts` — the Linux build container: what a build step's `docker run` looks like, and how the builder image's identity is read back so it can key the build cache.
 - `server/postgres/research-session.ts` — `runAgentInPostgresResearchEnvironment()`: the one supported composition where an agent process drives a *live* cluster. See [Agent research surface](#agent-research-surface).
 - `server/postgres/agent-container.ts` — the isolated launch path for that agent: which host paths are bind-mounted, at which in-container paths, and how the selected build is exposed without its identity. See [Agent execution boundary](#agent-execution-boundary).
 - `server/executors/postgres-research.ts` — the `postgres-research` executor: a thin wrapper that turns one environment into the runtime's standard Artifact/Evidence record.
@@ -114,9 +119,63 @@ Staging directory, tarball and backup are cleaned up on every path, and all thre
 
 All three rows are regression-tested (`re-materializing an earlier ref over a later snapshot leaves no file from the later ref`, `a failed extraction publishes nothing and leaves an existing snapshot untouched`, `a failure at the publish rename rolls the previous snapshot back into place`). The last one injects the failure at the rename itself through `materializePostgresSource`'s `publishRename` seam, because a mocked `tar` failure cannot reach that stage.
 
-## Build and cache key
+## Build
 
 The default profile is `--without-readline --without-zlib --without-icu`, and only the top-level `make` target is built — no contrib, no docs.
+
+### Where the scored build runs
+
+`configure`, `make` and `make install` run **inside a pinned Linux container**, `docker/postgres-research-builder/Dockerfile` (`honeyrail-postgres-builder:latest`: Debian bookworm plus `build-essential`, `bison`, `flex`, `perl`). This is `build.mode: "container"`, the default and the only **scored** mode.
+
+```sh
+docker build -t honeyrail-postgres-builder:latest docker/postgres-research-builder
+```
+
+Each of the three steps is one `docker run` with:
+
+```text
+--network none              a build must not depend on, or reach, the network
+--cap-drop=ALL --security-opt no-new-privileges
+--user <host uid:gid>       the staged install is owned by the user that owns the cache
+--tmpfs /tmp                the compiler's scratch space; the root fs is otherwise untouched
+-v <snapshot>:/build/source:rw     PostgreSQL builds in-tree, so the snapshot is writable
+-v <staging>:/build/staging:rw     the DESTDIR target
+-e PATH=... -e HOME=/tmp -e LC_ALL=C -e LANG=C  plus the declared build variables
+```
+
+Nothing else is mounted and **nothing of the host environment is inherited** — the same discipline the agent container uses. A build that silently picked up the operator's `CFLAGS` would produce binaries the cache key does not describe. A step that fails or times out is followed by a `docker kill` on the named container, because a step timeout kills the local `docker` client and not the container behind it.
+
+`build.mode: "host"` runs the same three steps as ordinary host processes. It exists for local development and for hosts without a docker daemon, and it is **permanently un-scored**: its manifest carries `scoredEligible: false` and an `unscoredReason`, and a session over it records `isolation.scoredEligible: false` — exactly the way `allowUnisolatedForDevelopment` marks an unisolated agent run. `HONEYRAIL_PG_BUILD_MODE=host` sets it globally for a development machine.
+
+### Why the configure prefix is a constant
+
+Every build, in every mode, is configured with the fixed literal:
+
+```text
+configure --prefix=/opt/honeyrail/postgres
+```
+
+That string is `RESEARCH_CONTAINER_PATHS.postgres` in `server/postgres/container-paths.ts`, imported by both the build and the agent launcher, so the compiled-in prefix and the mount target are provably the same string rather than two literals that happen to agree.
+
+It has to be a constant because `--prefix` is **compiled into the installation**. `pg_config --bindir`, `--libdir`, `--sharedir` and `--configure` report it verbatim; it also lands in `lib/pgxs/src/Makefile.global`, in `pkg-config` metadata, and inside binaries where `strings` finds it. Earlier revisions configured with the real cache path, `<cacheRoot>/<entryId>` — so an agent recovered the deterministic entry ID by running the `pg_config` it was handed. No filesystem escape was needed, and randomizing the *mount source* could not take it back: those strings were compiled in long before the mount existed.
+
+The cache entry still lives at `<cacheRoot>/<entryId>`. `make install DESTDIR=<staging>` is what puts the files there without the binaries ever learning about it: `DESTDIR` prepends the prefix under the staging root, so the finished tree is at `<staging>/opt/honeyrail/postgres`, and **that subtree** — not the staging root — is renamed into the cache entry. If it is missing, the build fails loudly rather than publishing a wrong tree.
+
+Two consequences worth stating:
+
+- PostgreSQL tolerates the resulting prefix/location mismatch because its programs locate `share/` relative to `argv[0]`, not by the compiled prefix. Shared-library lookup does *not*: `RUNPATH` (and, on macOS, libpq's baked-in `install_name`) still names the neutral prefix. Inside the agent container that simply resolves, because the build is mounted exactly there. For **host**-side execution the environment sets `LD_LIBRARY_PATH`/`DYLD_LIBRARY_PATH` to the cache entry's real `lib/` — see `commandEnv()` in `research-environment.ts`.
+- `installPrefix` is recorded in every build manifest, so a reviewer can see the fact rather than infer it.
+
+What `pg_config` reports inside the agent container, verbatim from `test/postgres-research-real-build.test.ts` against a real PostgreSQL 16.9 build:
+
+```text
+$ pg_config --bindir     -> /opt/honeyrail/postgres/bin
+$ pg_config --libdir     -> /opt/honeyrail/postgres/lib
+$ pg_config --sharedir   -> /opt/honeyrail/postgres/share
+$ pg_config --configure  ->  '--prefix=/opt/honeyrail/postgres' '--without-readline' '--without-zlib' '--without-icu'
+```
+
+### Cache key
 
 The cache key is `sha256` over a canonical JSON of:
 
@@ -125,15 +184,32 @@ The cache key is `sha256` over a canonical JSON of:
 | build profile version | changing the build recipe must invalidate every existing entry |
 | source tree hash | different source must never share binaries |
 | configure args (in order) | different flags produce different binaries |
-| platform + arch | binaries are not portable across them |
-| compiler command, version string, and `-dumpmachine` target | a different compiler produces different binaries |
+| install prefix | invariant today; in the key so that the day it stops being invariant, entries do not silently mix |
+| build mode (`container`/`host`) | a host build must never satisfy a container lookup |
+| builder image reference **and content-addressed image ID** | `:latest` is mutable — a rebuilt builder image must invalidate what it produced, not silently serve it |
+| target platform + arch | binaries are not portable across them. In container mode these are the *image's* (`linux`/`arm64`), not the host's: two different hosts driving the same builder image produce interchangeable binaries and should share one entry |
+| compiler command, version string, and `-dumpmachine` target — **observed inside the build container** | once compilation moved into a container, the host's `cc` is not the compiler that produced anything |
 | the declared build environment (below) | `CFLAGS=-O0` and `CFLAGS=-O2` are not interchangeable builds |
 
 Configure args are hashed in the order given rather than sorted: reordering can change meaning for later-wins options, so the conservative choice is an occasional redundant rebuild rather than a possible wrong reuse. Build-environment variables *are* sorted — they are a map, and order carries no meaning.
 
+### Build-image identity and cache invalidation
+
+`resolveBuilderImageIdentity()` reads the image back from the daemon rather than trusting the tag, and **fails loudly if the image is absent** — with the `docker build` command that would create it. There is deliberately no implicit `docker pull`: a scored build must not depend on remote availability, and a pull is also exactly how a mutable tag quietly changes toolchains underneath a cache.
+
+It records three things, and keys on two:
+
+- `reference` — the configured tag (keyed).
+- `id` — the content-addressed image config digest, always available (keyed). This is what makes a rebuilt `:latest` invalidate its own entries.
+- `digest` — `RepoDigests[0]`, the registry manifest digest. **`null` for an image that was only ever built locally and never pushed**, which is the normal case for `honeyrail-postgres-builder:latest` built from this repository; the local validation run for this change recorded `digest: null` and `id: sha256:d86e4ba0…`. Recorded for reviewers and for reproducing a build elsewhere, but not keyed: keying on it would invalidate an entry the first time the same image got pushed somewhere, which is not a toolchain change.
+
+The builder image and the agent image (`docker/postgres-research/Dockerfile`) are a **pair** — the first compiles against glibc 2.36, the second runs against glibc 2.36, and both are bookworm. Change one and change the other; the cache key notices the builder half automatically.
+
+This is not bit-for-bit hermeticity and is not claimed as such. The build container fixes the toolchain, the locale and the environment, but the image itself is built from a Debian package index that moves, so two `docker build`s a month apart can differ — which is precisely why the image *ID* is in the key rather than only its tag.
+
 ### Build environment inputs
 
-`configure` and `make` inherit the operator's environment, so variables in it can change the binaries without changing anything else in the key. HoneyRail therefore declares which of them are build inputs, records their values in `build-manifest.json`, and hashes them into the cache key (`BUILD_ENV_VARS` / `BUILD_ENV_PREFIXES` in `research-environment.ts`):
+In `host` mode `configure` and `make` inherit the operator's environment, so variables in it can change the binaries without changing anything else in the key. HoneyRail therefore declares which of them are build inputs, records their values in `build-manifest.json`, and hashes them into the cache key (`BUILD_ENV_VARS` / `BUILD_ENV_PREFIXES` in `research-environment.ts`):
 
 ```text
 AR  CC  CFLAGS  CPP  CPPFLAGS  CXX  CXXFLAGS  LD  LDFLAGS  LIBS
@@ -145,9 +221,9 @@ RANLIB  SDKROOT  STRIP        plus every  pgac_cv_*  autoconf cache override
 
 A spec can also declare `build.env`, which is applied to `configure`/`make` *and* hashed, so two profiles that differ only there cannot share an entry.
 
-This is a declared pass-through, not a hermetic toolchain fingerprint. A machine-level toolchain change that none of those variables mentions (a system header update, a relinked `/usr/bin/ld`) is still invisible to the key; the compiler version and target cover the common case of that. Scope limit accepted for v0.
+In `container` mode the picture is stronger: the build container inherits **nothing** from the host, so the same list is not a pass-through but an allow-list — those variables are the only ones passed in with `-e`, alongside a fixed `PATH`, `HOME` and `LC_ALL`/`LANG`. The "a system header update is invisible to the key" caveat that applied to host builds is covered instead by the builder image's content ID, which changes whenever the image's contents do.
 
-`configure --prefix` is the final path `cacheRoot/<entryId>`, but `make install` stages through `DESTDIR` and the finished tree is renamed into place only after the install succeeded and the completion marker was written, so an interrupted build can never be mistaken for a cache hit. `DESTDIR` rather than a staging prefix because the two are not equivalent: a PostgreSQL install is only partly relocatable — binaries find `share/` relative to `argv[0]`, but macOS bakes an absolute `install_name` for `libpq` into every client program, so a build installed under a temporary prefix and moved afterwards fails at `dyld` load time. If two environments race on the same key, the loser drops its staging copy and uses the winner's — by definition an equivalent build.
+The staged tree is renamed into place only after `make install` succeeded and the completion marker was written, so an interrupted build can never be mistaken for a cache hit. If two environments race on the same key, the loser drops its staging copy and uses the winner's — by definition an equivalent build.
 
 The cache root defaults to `~/.honeyrail/pg-research-build-cache`, overridable per spec or with `HONEYRAIL_PG_BUILD_CACHE`.
 
@@ -157,7 +233,7 @@ The cache root, the entry directory and the `entryId` that names it are **never*
 
 An agent gets the *binaries*, at a fixed neutral path, through a per-trial view — see [Exposing the build without its identity](#exposing-the-build-without-its-identity).
 
-**Apple Silicon build note:** near-HEAD PostgreSQL sources may fail `make` on arm64 macOS with `error: call to undeclared function 'x86_feature_available'`. This is a known clang cross-detection artifact — `configure`'s AVX2 attribute probe compiles and links cleanly on arm64 without ever emitting an AVX2 instruction, so it wrongly enables `USE_AVX2_WITH_RUNTIME_CHECK`, whose runtime check is x86-only. Work around it by exporting the autoconf cache variable before building: `export pgac_cv_avx2_support=no`. This does not touch PostgreSQL source and is unrelated to whatever bug is under research.
+**Apple Silicon build note (host mode only):** near-HEAD PostgreSQL sources may fail `make` on arm64 macOS with `error: call to undeclared function 'x86_feature_available'`. This is a known clang cross-detection artifact — `configure`'s AVX2 attribute probe compiles and links cleanly on arm64 without ever emitting an AVX2 instruction, so it wrongly enables `USE_AVX2_WITH_RUNTIME_CHECK`, whose runtime check is x86-only. Work around it by exporting the autoconf cache variable before building: `export pgac_cv_avx2_support=no`. This does not touch PostgreSQL source and is unrelated to whatever bug is under research. It does **not** apply to the default containerized build, which compiles with Debian gcc inside a Linux container regardless of the host.
 
 ## Cluster lifecycle and isolation
 
@@ -237,7 +313,7 @@ const session = await runAgentInPostgresResearchEnvironment(
 
 session.agent;             // exit code, stdout/stderr, timedOut, duration
 session.agentEnvironment;  // exactly what the agent process was given
-session.isolation;         // how it was confined: mode, image, network, mounts
+session.isolation;         // mode, image, networkMode, scoredEligible, mounts
 session.source;            // grader-side provenance the agent never saw
 session.build;
 ```
@@ -300,11 +376,47 @@ host                                    in container            mode
 
 Nothing else is ever mounted. `attachmentRoot`, `<privateDir>`, the PostgreSQL source mirror and its `.git`, the shared build-cache root, and every sibling trial's directory are not "unmentioned" — they do not exist inside the container's mount namespace, so no amount of searching finds them.
 
-Container posture comes from `containerHardeningArgs()` (shared with the exam room): `--rm`, `--cap-drop=ALL`, `--security-opt no-new-privileges`, `--read-only` root, `--pids-limit`, `--memory`, `--user <host uid:gid>` (so the agent writes into its mounts without them being pre-chowned), `--tmpfs /tmp` with `HOME=/tmp`.
+Container posture comes from `containerHardeningArgs()` (shared with the exam room): `--rm`, `--cap-drop=ALL`, `--security-opt no-new-privileges`, `--read-only` root, `--pids-limit`, `--memory`, `--user <host uid:gid>` (so the agent writes into its mounts without them being pre-chowned), `--tmpfs /tmp` with `HOME=/tmp`. Plus `--network none` by default — see [3. Network isolation](#3-network-isolation-a-separate-guarantee).
 
-PostgreSQL itself keeps running as a **host** process. Containerizing the server would mean containerizing the build too, which is a much larger change (see [Platform limitation](#platform-limitation-container-architecture-must-match-the-build-host)). The agent reaches the host cluster through the bind-mounted socket directory, because AF_UNIX filesystem-path sockets are resolved through the mount namespace rather than the network namespace.
+PostgreSQL itself keeps running as a **host** process. The agent reaches that cluster through the bind-mounted socket directory, because AF_UNIX filesystem-path sockets are resolved through the mount namespace rather than the network namespace — which is also why `--network none` costs the agent nothing it actually needs. Containerizing the *server* as well is a larger change and is not attempted here; see [Platform support](#platform-support).
 
-The image is `docker/postgres-research/Dockerfile` (`honeyrail-postgres-research:latest`), deliberately minimal and without an agent CLI — derive from it (`FROM honeyrail-postgres-research:latest`) and point `isolation.image` at the result.
+The image is `docker/postgres-research/Dockerfile` (`honeyrail-postgres-research:latest`), deliberately minimal and without an agent CLI — derive from it (`FROM honeyrail-postgres-research:latest`) and point `isolation.image` at the result. It carries `binutils`, so an agent can `strings`/`nm`/`objdump` a binary it is researching, and so the cache-identity scan below runs in the same container the agent runs in rather than in a grader-side one.
+
+### 3. Network isolation (a separate guarantee)
+
+Mount isolation protects host *files*. It says nothing about what an HTTP request can retrieve. A `bridge`-networked container has a default gateway to the host on Linux and `host.docker.internal` on Docker Desktop, so an agent that cannot read `source-manifest.json` off the filesystem may still be able to `GET` the same fact from a local HoneyRail API, dashboard or artifact endpoint. "The sentinel was not found in the mounted files" is not a network test.
+
+The scored default is therefore **`network: "none"`**: the container gets no interface but its own loopback, no default route in either address family, and no DNS to resolve `host.docker.internal` against.
+
+| Mode | Meaning | Scored? |
+| --- | --- | --- |
+| `none` (default) | no network stack beyond the container's own loopback | **yes** |
+| `bridge` | unrestricted Docker bridge networking, with a route to the host gateway | no |
+| any other docker network name | passed through verbatim | no |
+
+`bridge` remains available — a real research agent usually needs outbound model-API access — but it has to be asked for by name, and the resulting session is recorded `scoredEligible: false` with a warning that names the reason.
+
+There is deliberately **no `restricted-egress` mode**. A real one means blocking RFC1918, link-local, loopback, metadata and host-gateway destinations over both IPv4 and IPv6 from inside a running container, which needs `NET_ADMIN` inside a `--cap-drop=ALL` container plus a policy engine. That is a larger and riskier change than this round, and a half-built version of it would be worse than an honest label. Until it exists, a trial that needs model-API egress is a `bridge` trial and is not scored.
+
+### Recorded isolation and scored eligibility
+
+Every session result carries an isolation record whose three facts are separate because they fail separately:
+
+```json
+{
+  "mode": "container",
+  "isolated": true,
+  "networkMode": "none",
+  "buildScoredEligible": true,
+  "scoredEligible": true
+}
+```
+
+- `isolated` — was there a filesystem boundary at all, or was this `allowUnisolatedForDevelopment`?
+- `networkMode` — could the agent have reached a grader/host service?
+- `buildScoredEligible` — did the pinned Linux build container produce the binaries, or was this a `host` build?
+
+`scoredEligible` is the conjunction of all three, and it is the single field a grader should key on. Whenever it is false, `warning` says which of the three failed and why; a `bridge` run over a host build reports both reasons, not just the first. An unisolated development run records `scoredEligible: false` and no `networkMode` at all, because an unconfined host process had the host's whole network.
 
 ### No silent degradation
 
@@ -318,7 +430,9 @@ await runAgentInPostgresResearchEnvironment(spec, agent, {
 });
 ```
 
-A session run that way records `isolation: { mode: "unisolated-development", isolated: false, warning: "..." }`, so output produced without a boundary is never indistinguishable from output produced with one. An isolated session instead records the image, the network, the container name and the exact `-v` specs.
+A session run that way records `isolation: { mode: "unisolated-development", isolated: false, scoredEligible: false, warning: "..." }`, so output produced without a boundary is never indistinguishable from output produced with one. An isolated session instead records the image, the network mode, the scored-eligibility verdict, the container name and the exact `-v` specs.
+
+The same rule applies to the build: `build.mode: "host"` never fails over from `container` silently. A missing builder image is an error naming the `docker build` that fixes it, not a quiet downgrade.
 
 ### Exposing the build without its identity
 
@@ -328,6 +442,8 @@ Both halves are necessary:
 
 - The fixed in-container path means the pathname, `realpath`, and every exported variable are identical across trials and carry no identity.
 - The per-trial random *host* directory is needed because a bind mount publishes its source path inside the container, in `/proc/self/mountinfo`. Mounting `<cacheRoot>/<entryId>` directly puts the literal `entryId` in the container's own mount table — verified directly, which is why this is not theoretical. An agent with a bounded candidate set of refs could recompute candidate entry IDs and match. Mounting a per-trial random directory puts a random string there instead.
+
+Neither of them is sufficient on its own, and neither addresses what is *inside* the files — that is what the [neutral configure prefix](#why-the-configure-prefix-is-a-constant) is for. All three together are what make the claim below true.
 
 The view is built with hard links, so this is a second *view* of one build, not a second copy of it — no expensive build is duplicated to randomize identity. It is removed when the trial ends. The completion marker (`honeyrail-build-complete.json`, which carries the `entryId`) is deliberately excluded from the view. `HONEYRAIL_PG_BUILD_VIEWS` or `isolation.buildViewsRoot` overrides where views live; the default is a sibling of the cache root, so the cache root's own name never appears in the mount table either.
 
@@ -339,23 +455,49 @@ What a scored trial's agent can and cannot do, stated exactly:
 | --- | --- |
 | **Inaccessible host paths** | everything not in the mount table above: `attachmentRoot` and all grader artifacts, `<privateDir>` and the build logs, the PostgreSQL source mirror and any `.git`, the build-cache root and its entries, other trials' directories, the HoneyRail checkout, the operator's home directory |
 | **Accessible** | the `.git`-free snapshot (rw), PGDATA (rw), the socket directory (rw), the server log (ro), its own scratch directory (rw), the build view (ro) |
-| **Network** | on by default (`network: "bridge"`) so an agent can reach its own model API. Its own network namespace means no route to the host's loopback — the cluster is reachable only through the mounted socket. Egress is otherwise **unrestricted**: an internet-connected agent can still fingerprint a PostgreSQL version against public sources. Set `isolation.network: "none"` for a trial policy that forbids that |
+| **Network (scored)** | `none` by default: no interface but loopback, no IPv4 or IPv6 route, no DNS. No host service, private address, link-local address or metadata endpoint is reachable, because there is no network stack to reach them with. Verified live against a real host HTTP server serving a sentinel — see [Network isolation test](#network-isolation-test) |
+| **Network (`bridge`, opt-in)** | unrestricted egress *and* a route to the host gateway / `host.docker.internal`. Grader-side HTTP services are reachable, and an internet-connected agent can fingerprint a PostgreSQL version against public sources. Recorded `scoredEligible: false` |
+| **Public-source fingerprinting** | with `none`, impossible — there is no egress. The snapshot itself is still a genuine PostgreSQL tree, so an agent can read the version out of `configure`/`PG_VERSION` offline; that is inherent to giving it the source and is not a network question |
 | **Process listing / `/proc`** | the container has its own PID namespace, so it sees only its own processes — not the host's `postgres`, not HoneyRail. `/proc/self/mountinfo` **is** readable and does disclose the *host pathnames of the six mounted directories* (this is why the build view is randomized). It does not disclose any unmounted path |
 | **Concurrency** | yes. Trials get distinct ports, PGDATA, socket directories, snapshots and build views; each container is `--rm` and named per trial. `--pids-limit`/`--memory` bound one container, not the aggregate — many concurrent trials are a driver-level concern |
-| **Cached binaries** | exposed through a per-trial hard-link view at a fixed neutral path, with no stable source identity in the path, in `realpath`, in the environment, in the mount table, or in any file below it |
+| **Cached binaries** | exposed through a per-trial hard-link view at a fixed neutral path, with no stable source identity in the path, in `realpath`, in the environment, in the mount table, **or compiled into any installed file** — the last one verified with `pg_config`, recursive `grep -a -F` and `strings` against a real PostgreSQL build |
 
 Shared-kernel caveat, as in the exam room: this is Docker's namespace + cgroup + capability model, not gVisor or a microVM. A kernel or runtime vulnerability could in principle allow an escape. This is a boundary sized to the actual threat (an agent reading host files that a lenient in-process sandbox does not restrict), not a defense against a kernel exploit. Deployments should also run HoneyRail as a non-root user: `--user` maps the host uid, so a root host process maps to an in-container root, which weakens (though `--cap-drop=ALL` does not eliminate) the benefit of the read-only root.
 
-### Platform limitation: container architecture must match the build host
+### Platform support
 
-PostgreSQL is built **natively on the host** and executed **inside a Linux container**. On a Linux host those agree and the whole path works end to end with real PostgreSQL binaries. On macOS or Windows they do not: Docker Desktop runs containers inside a Linux VM, and a natively-built Mach-O or PE binary cannot execute there. This is a genuine, unavoidable property of building natively and running in a Linux container — not a defect in the isolation, and not something a flag fixes.
+Containerizing the build removed the ABI dead end this section used to describe. Docker Desktop's containers are a Linux VM regardless of host OS, so a build performed *in* the builder container is a Linux build on **every** Docker host, and the research-agent container — also Linux, also bookworm — can execute it. Real PostgreSQL binaries now run inside the boundary on macOS and Windows hosts, which was previously impossible.
 
-Consequences, stated plainly:
+What is still host-dependent is the *server*, because the cluster runs as a host process:
 
-- **Linux host (the expected deployment and CI target):** full end-to-end operation, real PostgreSQL binaries inside the boundary. The container image's libc must be able to run the host's build — `docker/postgres-research/Dockerfile` uses bookworm; override `isolation.image` for a different build host.
-- **macOS/Windows host:** the isolation mechanism itself works and is tested (see [Testing](#testing) — the synthetic fixture's "binaries" are `#!/bin/sh` scripts, which are architecture-portable text and run correctly inside a Linux container), but a *real* PostgreSQL build made on the host cannot be executed by the agent. Use `allowUnisolatedForDevelopment` for local development against real PostgreSQL, and understand that such a run is not a scored trial.
+| | build (containerized) | agent container | live cluster (host process) |
+| --- | --- | --- | --- |
+| **Linux host** | ✅ | ✅ real PostgreSQL | ✅ — full scored trial end to end |
+| **macOS / Windows (Docker Desktop)** | ✅ | ✅ real PostgreSQL | ❌ the host cannot execute a Linux ELF binary |
+
+So:
+
+- **Linux host** is the target for a complete scored trial: containerized build, real binaries inside the agent boundary, and a live cluster the agent drives over the mounted socket.
+- **macOS/Windows host** can build, cache, and hand a real PostgreSQL installation to a real isolated agent — everything MUST 1 of the third review asks for is verifiable there, and was verified there. What it cannot do is `pg_ctl start` those binaries as a host process. `initdb` fails with a named error rather than a bare `Exec format error` (see `abiHint()`), pointing at the two options: run scored trials on Linux, or use `build.mode: "host"` for local development against real PostgreSQL sources — an explicitly un-scored build.
+
+Containerizing the server too would close that last cell. It is a real follow-up, not a defect in the isolation, and it is deliberately out of scope here.
 
 One further limitation, stated because it is real: the snapshot is a genuine PostgreSQL tree, so it reveals the *version* under study even though it reveals nothing about the bug.
+
+### Supplying an agent CLI and model credentials
+
+The research image carries no agent CLI on purpose. Derive one:
+
+```dockerfile
+FROM honeyrail-postgres-research:latest
+USER root
+RUN npm install -g <your-agent-cli>
+USER pgresearch
+```
+
+…then pass `isolation.image`. Credentials go in `agent.env`, which is the *only* way anything reaches the container: a container inherits nothing from the host environment, and the injected PostgreSQL coordinates are applied last so a caller cannot override them. Nothing in `agent.env` is echoed into a manifest — the isolation record stores the `-v` mount specs, the image, the network mode and the container name, not the `-e` values.
+
+Note the interaction with the scored network mode: an agent CLI that calls a hosted model API needs egress, and egress today means `bridge`, which means `scoredEligible: false`. A scored trial as currently defined therefore wants an agent that can work offline against the mounted source and the live cluster, or a locally hosted model reachable over a mount rather than a socket. This is the honest state of it, not a workaround.
 
 ## Executor
 
@@ -372,7 +514,7 @@ One further limitation, stated because it is real: the snapshot is a genuine Pos
       "executor": "postgres-research",
       "input": {
         "source": { "repoPath": "/var/cache/honeyrail/pg-mirror", "ref": "<exact sha>" },
-        "build": { "configureArgs": ["--without-readline", "--without-zlib", "--without-icu"], "jobs": 8 },
+        "build": { "mode": "container", "configureArgs": ["--without-readline", "--without-zlib", "--without-icu"], "jobs": 8 },
         "restart": true,
         "timeoutMs": 1800000,
         "experiments": [
@@ -395,7 +537,7 @@ The step succeeds only if the environment itself did: an unresolvable ref, a fai
 ### Artifacts
 
 - `source-manifest.json` — repo path, ref, resolved commit, source hash, `gitDirPresent: false`
-- `build-manifest.json` — configure args, compiler identity, declared build environment, make version, platform/arch, cache key, entry id, cache hit, install dir, binary paths, per-command durations
+- `build-manifest.json` — build mode, builder image identity (reference/ID/digest), the neutral install prefix, scored eligibility, configure args, compiler identity (observed inside the build container), declared build environment, make version, target and host platform/arch, cache key, entry id, cache hit, install dir, binary paths, per-command durations
 - `runtime-manifest.json` — ports/paths (including `root` and `privateDir`), initdb args, the full lifecycle event list, cleanup result
 - `experiments.json` — the SQL that ran and what it returned
 - `configure.log`, `make.log`, `make-install.log` — on a cold build
@@ -408,18 +550,26 @@ All of these are grader-side. `source-manifest.json` and `build-manifest.json` i
 Reusing the existing `db.*` taxonomy where one fits, plus three new kinds for facts the alpha never had:
 
 - `db.source.snapshot` — exact ref materialized, no `.git`
-- `db.build` — cache key, cache hit, compiler, install dir
+- `db.build` — build mode and scored eligibility, builder image identity, neutral install prefix, cache key, cache hit, compiler, install dir
 - `db.server.ready`, `db.query.result`, `db.restart`, `db.process.health` — as in the alpha
 - `db.environment.cleanup` — what cleanup stopped and removed
 
 ## Testing
 
 ```sh
+docker build -t honeyrail-postgres-builder:latest  docker/postgres-research-builder
 docker build -t honeyrail-postgres-research:latest docker/postgres-research
+
 node --import tsx --test test/postgres-research-environment.test.ts
 node --import tsx --test test/postgres-research-session.test.ts
 node --import tsx --test test/postgres-research-isolation.test.ts
+node --import tsx --test test/postgres-research-network.test.ts
 node --import tsx --test test/agent-task-environment.test.ts
+
+# real PostgreSQL, opt-in on a locally provided mirror
+git clone --filter=blob:none https://github.com/postgres/postgres.git /tmp/pg-mirror
+HONEYRAIL_PG_TEST_MIRROR=/tmp/pg-mirror \
+  node --import tsx --test test/postgres-research-real-build.test.ts
 ```
 
 The suite runs against a synthetic source fixture (`test/helpers/postgres-source-fixture.ts`): a git repository whose `configure`/`make`/`make install` install four stub binaries that emulate just enough of `initdb`/`pg_ctl`/`psql`/`postgres` to exercise the real lifecycle in seconds. That keeps the whole matrix — no-`.git` snapshots, exact-ref resolution, snapshot publication and rollback, cache-key composition, cache hits, build-environment keying, concurrent isolation, port-collision recovery, the agent execution boundary, lifecycle, restart, live agent composition, and all the cleanup paths — runnable in CI without a PostgreSQL checkout or a C toolchain, and keeps the real corpus out of committed test code. Tests skip with a clear message when `git`, `make`, `tar` or a `cc` probe is unavailable, and the container tests skip when no docker daemon or research image is present.
@@ -437,21 +587,56 @@ The three race-shaped properties (a port collision, a failed `tar`, a failed pub
 - `two trials over one cached build see the same binaries at the same neutral path and no stable host identity` — same `cacheKey`/`entryId` grader-side and a genuine cache hit, identical binaries at `/opt/honeyrail/postgres/bin`, but different mount sources and no `ref`/`resolvedCommit`/`sourceHash`/`cacheKey`/`entryId` anywhere the agent could see.
 - `docker being unavailable fails loudly instead of running the agent unisolated`, plus static assertions on the exact mount list, the hardening flags, the in-container-only environment, and the marker-free build view.
 
-Because the fixture's binaries are shell scripts, these run and enforce real container isolation on a macOS host too — docker's namespaces do not care what is inside the mount. What a macOS host *cannot* test is a real PostgreSQL build executing inside the container; see [Platform limitation](#platform-limitation-container-architecture-must-match-the-build-host).
+Because the fixture's binaries are shell scripts, these run and enforce real container isolation on a macOS host too — docker's namespaces do not care what is inside the mount.
 
-Validating against real PostgreSQL is a manual step: populate a mirror as shown above, then drive `withPostgresResearchEnvironment()` over a pre-fix ref and its fix ref with the same build profile and the same reproducer, and confirm the two disagree. The build cache keys them apart automatically because their source hashes differ.
+### Network isolation test
+
+`test/postgres-research-network.test.ts` is built the other way round from a filesystem test, because "the sentinel was not found in the mounted files" proves nothing about the network:
+
+- a **real host HTTP server** binds `0.0.0.0` on an ephemeral port and serves a unique sentinel. The test first fetches it from the host, so a later failure means "blocked", not "nothing was there";
+- the agent, in the scored container with the **default** network mode, actually attempts to retrieve it from `host.docker.internal`, `gateway.docker.internal`, `127.0.0.1`, `localhost`, the Docker bridge gateway `172.17.0.1`, and every real non-loopback IPv4 the host has — using bash's `/dev/tcp` pseudo-device, so no networking client needs to be installed;
+- every attempt must fail, the attempt *count* is asserted so a test that never tried cannot pass, and the sentinel must not appear anywhere in the agent's output;
+- both route tables must be empty (`/proc/net/route` and `/proc/net/ipv6_route`) — an IPv4-only story would leave an IPv6 path open — and no `eth0` may be attached;
+- the same container must still `INSERT` and `SELECT` against the live cluster over the bind-mounted Unix socket;
+- cleanup must still have stopped the server and removed the socket directory.
+
+It also asserts the recorded verdict directly: a default run records `networkMode: "none"`, a `bridge` run records `scoredEligible: false` with a warning naming `host.docker.internal`, and an `allowUnisolatedForDevelopment` run records `scoredEligible: false` with no `networkMode` at all.
+
+### Real-PostgreSQL test
+
+`test/postgres-research-real-build.test.ts` is the one thing the synthetic fixture structurally cannot cover. A `#!/bin/sh` stand-in has no `pg_config`, no `Makefile.global` and no ELF `.rodata`, so the compiled-in-prefix hole is invisible to it. This test materializes a real PostgreSQL ref from a locally provided mirror, builds it through the containerized scored path, mounts a per-trial view into the *actual* research-agent container, and from inside it runs:
+
+```sh
+pg_config --bindir / --libdir / --sharedir / --configure / --version
+postgres --version ; psql --version ; initdb --version
+grep -R -a -F "<cacheRoot>" /opt/honeyrail/postgres
+grep -R -a -F "<entryId>"   /opt/honeyrail/postgres
+grep -R -a -F "<cacheKey>"  /opt/honeyrail/postgres
+strings /opt/honeyrail/postgres/bin/postgres  | grep -F "<cacheRoot>" -e "<entryId>"
+strings /opt/honeyrail/postgres/bin/pg_config | grep -F "<cacheRoot>" -e "<entryId>"
+```
+
+`pg_config` must report only `/opt/honeyrail/postgres/...`, all four programs must run, and every scan must come back empty. As a control that the greps are not inert, the same `entryId` scan run host-side over the whole cache entry must find it in exactly one place — the completion marker that is deliberately withheld from the view.
+
+Two further tests cover cache reuse and per-trial view distinctness with the real build (a second trial must be a cache hit, run no build commands, see byte-identical binaries at the same neutral path, and reach them through a *different* mount source), and that the grader-side build logs do still name the staging paths.
+
+It is opt-in on `HONEYRAIL_PG_TEST_MIRROR` and skips with a message naming exactly what is missing (mirror, daemon, builder image, research image). **A skip does not satisfy the merge gate it exists for.**
+
+Validating a *bug* against real PostgreSQL remains a manual step on top of this: populate a mirror, then drive `withPostgresResearchEnvironment()` over a pre-fix ref and its fix ref with the same build profile and the same reproducer, and confirm the two disagree. The build cache keys them apart automatically because their source hashes differ.
 
 ## Known limitations
 
-- PostgreSQL only; local source builds only (no Docker path, no cross-compilation, no remote execution).
+- PostgreSQL only; local source builds only (no cross-compilation, no remote execution). The build runs in a local Linux container; it is not a distributed or remote build service.
 - One cluster per environment: no replication, no multi-node topology, no fault injection.
 - The build cache is content-keyed but not garbage-collected; a corpus of many refs will grow it.
 - Build-cache concurrency is safe (staged build + atomic rename) but not coordinated: two environments needing the same cold build may both build it.
 - The cache key covers a declared set of build-environment variables, not a hermetic toolchain fingerprint.
 - `timeoutMs` cancels the caller and tears down the cluster; it cannot abort a JavaScript `await` already in flight. For an agent, prefer `agent.timeoutMs` on the session helper, which kills the agent first and cleans up after.
-- The agent boundary is a container, so it needs a docker daemon; without one, an agent session fails rather than degrading. It is shared-kernel isolation, not a microVM.
-- A real PostgreSQL build can only execute inside the boundary when the container's architecture and libc match the build host — in practice, a Linux host. See [Platform limitation](#platform-limitation-container-architecture-must-match-the-build-host).
-- Container egress is unrestricted by default, so an internet-connected agent can still fingerprint a PostgreSQL version against public sources. `isolation.network: "none"` closes that off if the trial policy requires it.
+- The agent boundary is a container, so it needs a docker daemon; without one, an agent session fails rather than degrading. It is shared-kernel isolation, not a microVM. The same is now true of the scored *build*.
+- The live cluster still runs as a host process, so a complete scored trial needs a Linux host. macOS/Windows hosts can build, cache and hand real PostgreSQL to a real isolated agent, but cannot `pg_ctl start` it. See [Platform support](#platform-support).
+- There is no `restricted-egress` network mode. A trial whose agent needs a hosted model API must run on `bridge` and is recorded `scoredEligible: false`. Building a real egress policy (RFC1918/link-local/loopback/metadata/host-gateway, IPv4 **and** IPv6, from inside a `--cap-drop=ALL` container) is a separate change.
+- The build is reproducible-ish, not hermetic: the container fixes the toolchain, locale and environment, but the builder image is itself built from a moving package index. The image's content ID is in the cache key so that a rebuilt image invalidates rather than mixes; bit-for-bit reproducibility is not claimed.
+- `build.mode: "host"` still exists and still works, but nothing produced by it is scored-eligible, by construction.
 - The `postgres-research` executor itself does not run an agent, so nothing about it is isolated; it is a grader-side environment driver.
 - Live agent research is composed by `runAgentInPostgresResearchEnvironment()`, not by the DAG; a `postgres-research` step cannot hand a running cluster to a later step.
 - The agent-visible root defaults to a temp root and, like v0, keeps the source snapshot after cleanup unless `removeSourceDir` is set. Long campaigns should set it, or point `HONEYRAIL_PG_ENV_ROOT` somewhere with room.

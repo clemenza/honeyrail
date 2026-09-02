@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { runCommandSafe } from "../utils.js";
 import { containerHardeningArgs } from "../containers/hardening.js";
+import { RESEARCH_CONTAINER_PATHS } from "./container-paths.js";
 import { BUILD_COMPLETE_MARKER } from "./research-environment.js";
 import type { PostgresConnectionInfo } from "./research-environment.js";
 
@@ -20,14 +21,21 @@ import type { PostgresConnectionInfo } from "./research-environment.js";
  * bind-mounts *only* its research surface, so every other host path is not
  * "unmentioned" but absent from its mount namespace.
  *
- * PostgreSQL itself keeps running as a host process. Containerizing the
- * server would mean containerizing the *build* too - binaries produced
- * natively on the host cannot execute inside a Linux container on a non-Linux
- * host - and that is a different, much larger change. The agent reaches the
- * host cluster through the bind-mounted socket directory: AF_UNIX
- * filesystem-path sockets are resolved through the mount namespace, not the
- * network namespace, which is the same mechanism that makes mounting
- * `/var/run/docker.sock` into a container work.
+ * PostgreSQL itself keeps running as a host process. The agent reaches that
+ * cluster through the bind-mounted socket directory: AF_UNIX filesystem-path
+ * sockets are resolved through the mount namespace, not the network
+ * namespace, which is the same mechanism that makes mounting
+ * `/var/run/docker.sock` into a container work - and it is why the scored
+ * default `--network none` costs the agent nothing it actually needs.
+ *
+ * The *build* is containerized as of the third review (#182): it runs in
+ * docker/postgres-research-builder with the neutral prefix
+ * RESEARCH_CONTAINER_PATHS.postgres, so the binaries mounted here are Linux
+ * binaries this container can execute on any Docker host, and nothing in them
+ * names the grader's cache. Containerizing the *server* as well is still a
+ * larger change and is not attempted here; the consequence is that the
+ * cluster-side of a scored trial wants a Linux host. See
+ * research-environment.ts's abiHint().
  *
  * The agent-visible surface, and nothing else:
  *
@@ -43,21 +51,35 @@ import type { PostgresConnectionInfo } from "./research-environment.js";
  * any sibling trial's directories.
  */
 
-/** Fixed, neutral in-container paths. These, not host paths, are what the agent is told. */
-export const RESEARCH_CONTAINER_PATHS = {
-  workspace: "/workspace",
-  source: "/workspace/source",
-  runtime: "/workspace/runtime",
-  data: "/workspace/runtime/pgdata",
-  socket: "/workspace/runtime/socket",
-  log: "/workspace/runtime/postgres.log",
-  scratch: "/workspace/agent",
-  postgres: "/opt/honeyrail/postgres",
-  bin: "/opt/honeyrail/postgres/bin",
-  lib: "/opt/honeyrail/postgres/lib"
-} as const;
+/**
+ * Fixed, neutral in-container paths. These, not host paths, are what the
+ * agent is told - and `RESEARCH_CONTAINER_PATHS.postgres` is additionally the
+ * literal `configure --prefix=` every build is compiled with, which is why it
+ * is defined in the leaf module both sides import rather than here. See
+ * ./container-paths.ts.
+ */
+export { RESEARCH_CONTAINER_PATHS } from "./container-paths.js";
 
 export const DEFAULT_RESEARCH_IMAGE = "honeyrail-postgres-research:latest";
+
+/**
+ * The scored default. `none` gives the agent no network stack beyond its own
+ * loopback, so there is no bridge, no default gateway and no
+ * `host.docker.internal` to reach a grader/host service through - the gap the
+ * #182 third review identified in `bridge`, where mount isolation says
+ * nothing about what an HTTP request can retrieve.
+ *
+ * `bridge` remains available for an agent that genuinely needs outbound model
+ * API access, but it has to be asked for by name, and a session that asks for
+ * it is recorded `scoredEligible: false`. See
+ * PostgresResearchIsolationRecord.
+ */
+export const DEFAULT_RESEARCH_NETWORK = "none";
+
+/** True only for a network mode that carries no route to host or private services. */
+export function isScoredNetworkMode(network: string | undefined): boolean {
+  return (network ?? DEFAULT_RESEARCH_NETWORK) === "none";
+}
 
 /** No host PATH is inherited: a container gets exactly what is passed with `-e`. */
 const CONTAINER_PATH = `${RESEARCH_CONTAINER_PATHS.bin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
@@ -86,11 +108,15 @@ export type ResearchContainerOptions = {
   command: string[];
   image?: string;
   /**
-   * Defaults to "bridge": the agent gets its own network namespace with
-   * outbound access, which a research agent generally needs for its own model
-   * API. It has no route to the host's loopback, so it can reach the research
-   * cluster only through the bind-mounted Unix socket. "none" removes
-   * outbound access entirely.
+   * Defaults to DEFAULT_RESEARCH_NETWORK ("none"): no network stack beyond
+   * the container's own loopback, so no host or private service is reachable
+   * at all. The research cluster is still reachable, through the bind-mounted
+   * Unix socket - AF_UNIX filesystem sockets resolve through the mount
+   * namespace, not the network namespace.
+   *
+   * "bridge" is available for an agent that needs outbound model-API access,
+   * but it is not scored: a bridge-networked container has a default gateway
+   * to the host and, on Docker Desktop, `host.docker.internal`.
    */
   network?: "none" | "bridge" | (string & {});
   memory?: string;
@@ -137,7 +163,10 @@ export function buildResearchContainerArgs(options: ResearchContainerOptions, co
   const args = [
     ...containerHardeningArgs({
       containerName,
-      network: options.network,
+      // Explicit rather than relying on the shared helper's default: the exam
+      // room's default is its own decision, and this path's scored default
+      // must not move if that one does.
+      network: options.network ?? DEFAULT_RESEARCH_NETWORK,
       memory: options.memory,
       pidsLimit: options.pidsLimit
     })
@@ -156,9 +185,11 @@ export function buildResearchContainerArgs(options: ResearchContainerOptions, co
     "-v", `${resolve(m.buildViewDir)}:${paths.postgres}:ro`,
     "-w", paths.scratch,
     "-e", `PATH=${CONTAINER_PATH}`,
-    // configure --prefix was the cache entry, so the binaries' RUNPATH points
-    // at a directory that does not exist in here. LD_LIBRARY_PATH is searched
-    // before DT_RUNPATH, so this makes libpq resolvable at the neutral path.
+    // Redundant now that configure --prefix *is* paths.postgres and the build
+    // is mounted exactly there - RUNPATH already resolves. Kept because it
+    // costs nothing and keeps a build made with a different prefix (an
+    // operator-supplied cache entry, a future profile) loadable rather than
+    // failing at dyld/ld.so time.
     "-e", `LD_LIBRARY_PATH=${paths.lib}`
   );
   for (const [key, value] of Object.entries(options.env ?? {})) {

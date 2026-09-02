@@ -42,7 +42,7 @@ function specFor(fixture: Fixture, name: string): PostgresResearchSpec {
     root: join(fixture.tempDir, "envs", name),
     privateDir: join(fixture.tempDir, "private", name),
     source: { repoPath: fixture.repo.repoPath, ref: fixture.repo.ref },
-    build: { cacheRoot: fixture.cacheRoot, jobs: 1 }
+    build: { mode: "host" as const, cacheRoot: fixture.cacheRoot, jobs: 1 }
   };
 }
 
