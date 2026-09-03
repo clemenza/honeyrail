@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, readdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -124,7 +125,15 @@ test("historical task materialization keeps the scored tree and grader-private t
 
 test("historical task truth bundle hash covers the bug identity and both revisions, not just shape", async () => {
   const { root, spec } = await fixture();
-  const repo2 = await createSyntheticPostgresSourceRepo(await mkdtemp(join(tmpdir(), "honeyrail-historical-task-repo2-")));
+  // A second synthetic repo built from byte-identical fixture content, so
+  // its commit hashes could otherwise coincide with the first repo's (git
+  // commit hashes have only second-resolution timestamps, and this helper's
+  // author/committer/message are fixed) - a real flake seen on a fast CI
+  // runner. A unique marker file staged before the helper's own commit rules
+  // that out unconditionally, regardless of timing.
+  const repo2Root = await mkdtemp(join(tmpdir(), "honeyrail-historical-task-repo2-"));
+  await writeFile(join(repo2Root, "UNIQUE_MARKER.txt"), `${randomUUID()}\n`);
+  const repo2 = await createSyntheticPostgresSourceRepo(repo2Root);
   const baseline = await materializeHistoricalPostgresTask(spec, join(root, "baseline"));
 
   const bugChanged = await materializeHistoricalPostgresTask({ ...spec, truth: { ...spec.truth, upstreamBug: "a completely different bug" } }, join(root, "bug-changed"));
