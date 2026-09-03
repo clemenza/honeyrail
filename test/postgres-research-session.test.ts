@@ -4,8 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 
-import { PostgresResearchError, PostgresResearchTimeoutError, type PostgresResearchSpec } from "../server/postgres/research-environment.js";
 import {
+  DEFAULT_CANCEL_GRACE_MS,
+  PostgresResearchError,
+  PostgresResearchTimeoutError,
+  type PostgresResearchSpec
+} from "../server/postgres/research-environment.js";
+import {
+  CONTAINER_TERMINATION_TIMEOUT_MS,
   DEFAULT_RESEARCH_IMAGE,
   PostgresResearchAgentContainerError,
   resolveResearchAgentImageIdentity
@@ -14,6 +20,7 @@ import {
   assertResearchAgentImageCompatible,
   runAgentInPostgresResearchEnvironment,
   runAgentProcess,
+  KILL_GRACE_MS,
   type PostgresResearchSessionOptions
 } from "../server/postgres/research-session.js";
 import type { PostgresBuildManifest } from "../server/postgres/research-environment.js";
@@ -222,6 +229,98 @@ test("runAgentProcess does not resolve while an async termination operation is s
   assert.equal(result.terminationError, undefined, "a termination that eventually succeeds must not be recorded as an error");
 });
 
+/** Polls rather than sleeping a fixed duration, so this is robust under a loaded/contended test machine rather than merely "usually enough time." */
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await stat(path).catch(() => null)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return false;
+}
+
+test("an independently-exiting child does not bypass a still-pending termination request (#188, second round, Blocking 1)", async (t) => {
+  // The child exits entirely on its own - not from our SIGTERM, which never
+  // fires because stop() below is deliberately left pending - simulating the
+  // container/process dying (or the docker CLI exiting) for a reason that
+  // has nothing to do with our own termination request. This is the race the
+  // first round's fix missed: cancel() awaited stop() before escalating, but
+  // runAgentProcess itself only awaited child-close, so an independent close
+  // could still let it resolve while stop() was still in flight.
+  //
+  // The script writes a marker file as its very last action before exiting,
+  // and the test polls for it rather than sleeping a fixed duration - a
+  // fixed short sleep is exactly what made an earlier version of this test
+  // flake under a loaded machine, where `exit 0` did not get scheduled in
+  // time and the fallback kill (not the independent exit) is what actually
+  // closed the child, which does not exercise the race this test exists for.
+  const launch = await withShellScript(t, 'touch exited.marker\nexit 0\n');
+  const markerPath = join(launch.cwd, "exited.marker");
+  const controller = new AbortController();
+
+  let stopCalled = false;
+  let resolveTermination!: () => void;
+  const terminationGate = new Promise<void>((resolve) => {
+    resolveTermination = resolve;
+  });
+
+  const resultPromise = runAgentProcess(
+    {
+      reported: launch,
+      spawn: launch,
+      stop: async () => {
+        stopCalled = true;
+        await terminationGate; // left pending until the test resolves it
+      }
+    },
+    { command: launch.command },
+    controller.signal
+  );
+
+  controller.abort();
+  assert.ok(
+    await waitForFile(markerPath, 10_000),
+    "the child must actually have exited on its own before this test can prove anything about that race"
+  );
+  assert.equal(stopCalled, true, "cancellation must call stop() promptly once the signal aborts");
+
+  // The core assertion: even though the child has already closed on its own
+  // (confirmed above, not merely assumed), runAgentProcess must not resolve
+  // while the termination request it made is still pending. An
+  // implementation that awaits only child-close - not also the cancellation
+  // promise, once one has started - would fail this by resolving early.
+  const settledWhilePending = await Promise.race([
+    resultPromise.then(() => "settled" as const),
+    new Promise<"still-pending">((resolve) => setTimeout(() => resolve("still-pending"), 500))
+  ]);
+  assert.equal(
+    settledWhilePending,
+    "still-pending",
+    "runAgentProcess must not resolve while its termination request is still pending, even after the child has already closed independently"
+  );
+
+  resolveTermination();
+  const result = await resultPromise;
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.timeoutSource, "session");
+  // The child died on its own (`exit 0`), not from our signal - the marker
+  // wait above is what makes this true rather than merely likely.
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.signal, null);
+});
+
+test("the supported cancellation path's worst-case duration stays strictly below the outer cancelGraceMs budget (#188, second round, Blocking 2)", () => {
+  const worstCase = CONTAINER_TERMINATION_TIMEOUT_MS + KILL_GRACE_MS;
+  assert.ok(
+    worstCase < DEFAULT_CANCEL_GRACE_MS,
+    `CONTAINER_TERMINATION_TIMEOUT_MS (${CONTAINER_TERMINATION_TIMEOUT_MS}) + KILL_GRACE_MS (${KILL_GRACE_MS}) = ` +
+      `${worstCase}ms must stay strictly below DEFAULT_CANCEL_GRACE_MS (${DEFAULT_CANCEL_GRACE_MS}), or a slow-but-` +
+      "successful agent cancellation could be mistaken for cancelGraceExceeded - the supported agent path is not " +
+      "designed to overrun the outer session's grace budget merely because its own internal timeout is too large"
+  );
+});
+
 test("an agent process receives the dynamic coordinates and queries the live cluster before cleanup", async (t) => {
   if (await skipWithoutToolchain(t)) return;
   const fixture = await withFixture(t);
@@ -353,6 +452,15 @@ test("the outer session timeout kills a hanging agent ahead of an unset agent.ti
   assert.equal(manifest!.cleanup?.stopped, true);
   assert.equal(manifest!.cleanup?.sessionTimedOut, true);
   assert.equal(manifest!.cleanup?.cancelGraceExceeded, false, "a conforming agent kill settles well inside the grace bound");
+  // The agent's own cancellation outcome survives the timeout race too
+  // (#188, second round, Blocking 3) - unisolated mode has no stop() to
+  // fail, so terminationError is absent, but timeoutSource must still be
+  // there, proving the wiring from inside the discarded body to the thrown
+  // error works even without docker involved.
+  const agentTermination = (caught as PostgresResearchTimeoutError).agentTermination;
+  assert.ok(agentTermination, "the thrown timeout must carry the agent's own cancellation diagnostics");
+  assert.equal(agentTermination!.timeoutSource, "session");
+  assert.equal(agentTermination!.terminationError, undefined);
   // Teardown only happened after the agent was actually killed, the same
   // ordering guarantee agent.timeoutMs already gives.
   assert.equal(await exists(join(spec.root, "pgdata")), false);

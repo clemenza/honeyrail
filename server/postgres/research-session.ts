@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { appendFile } from "node:fs/promises";
 import { nowIso, runCommandSafe } from "../utils.js";
 import {
+  DEFAULT_CANCEL_GRACE_MS,
   PostgresResearchError,
   PostgresResearchTimeoutError,
   withPostgresResearchEnvironment,
@@ -19,6 +20,7 @@ import {
   createAgentScratchDir,
   dockerAvailable,
   terminateResearchContainer,
+  CONTAINER_TERMINATION_TIMEOUT_MS,
   DEFAULT_RESEARCH_IMAGE,
   DEFAULT_RESEARCH_NETWORK,
   resolveResearchAgentImageIdentity,
@@ -60,7 +62,33 @@ import type { PostgresRuntimeRecord } from "./runtime-container.js";
  */
 
 /** How long a killed agent gets to exit on SIGTERM before SIGKILL. */
-const KILL_GRACE_MS = 5000;
+export const KILL_GRACE_MS = 5000;
+
+/**
+ * #188 review (second round), Blocking 2: the supported cancellation path's
+ * own worst case - an unresponsive Docker daemon exhausting
+ * `CONTAINER_TERMINATION_TIMEOUT_MS`, then the local client needing the full
+ * `KILL_GRACE_MS` to die - must stay strictly below
+ * `withPostgresResearchEnvironment()`'s `DEFAULT_CANCEL_GRACE_MS`. Otherwise a
+ * cancellation that is merely slow, not stuck, could be indistinguishable
+ * from `cancelGraceExceeded`, which is supposed to mean the body never
+ * observed cancellation at all.
+ *
+ * Asserted at import time rather than only documented, so the three
+ * constants - two of them defined in other modules - cannot silently drift
+ * out of this relationship. This says nothing about a caller-supplied
+ * `cancelGraceMs` override, which is a deliberate per-call choice (e.g. a
+ * fast test) rather than the supported path this budget describes.
+ */
+const WORST_CASE_CANCELLATION_MS = CONTAINER_TERMINATION_TIMEOUT_MS + KILL_GRACE_MS;
+if (WORST_CASE_CANCELLATION_MS >= DEFAULT_CANCEL_GRACE_MS) {
+  throw new Error(
+    `research-session.ts: CONTAINER_TERMINATION_TIMEOUT_MS (${CONTAINER_TERMINATION_TIMEOUT_MS}) + KILL_GRACE_MS ` +
+      `(${KILL_GRACE_MS}) = ${WORST_CASE_CANCELLATION_MS}ms must stay strictly below DEFAULT_CANCEL_GRACE_MS ` +
+      `(${DEFAULT_CANCEL_GRACE_MS}), or a slow-but-successful agent cancellation can be mistaken for ` +
+      "cancelGraceExceeded (#188)"
+  );
+}
 
 /** POSIX only: a detached child leads its own process group, so it can be killed as a tree. */
 const GROUP_KILL = process.platform !== "win32";
@@ -416,10 +444,11 @@ type AgentIsolationLaunchConfig =
  * `signal`, when given, is the *session's* outer deadline
  * (withPostgresResearchEnvironment()'s AbortSignal, #188) - a second,
  * independent cause of the same kill sequence `agent.timeoutMs` already
- * drives. `cancel()` below is the single place either cause goes through, so
- * the two can never double-kill: the first to fire wins and records which
- * one it was on `timeoutSource`, and the second is a no-op against an
- * already-timed-out agent, including when both fire at once.
+ * drives. `requestCancel()` below is the single place either cause goes
+ * through, so the two can never double-kill: the first to fire wins, records
+ * which one it was on `timeoutSource`, and hands the second (including one
+ * arriving at the same tick) the same in-flight cancellation promise rather
+ * than starting a second one.
  *
  * Exported for direct, deterministic unit testing of the cancellation
  * semantics without standing up a full research environment or a container.
@@ -454,27 +483,14 @@ export async function runAgentProcess(
   let terminationError: string | undefined;
   let killTimer: NodeJS.Timeout | undefined;
   let graceTimer: NodeJS.Timeout | undefined;
+  let cancellationPromise: Promise<void> | undefined;
 
   /**
-   * The single place either timeout cause routes through, so the two can
-   * never double-kill. `timedOut` is set *synchronously*, before the first
-   * `await`, so a second call - the other cause firing moments later, or at
-   * the same tick - sees it already true and returns immediately: harmless,
-   * not a second kill.
-   *
-   * The ordering below is the fix for #188's review: `launch.stop()` is
-   * awaited to completion before the SIGTERM/SIGKILL escalation on the local
-   * client process runs. In isolated mode that means `docker kill` has
-   * already been requested *and confirmed* (or confirmed failed - see
-   * below) before this function does anything that could make the local
-   * `docker run` client exit on its own; the client closing early because it
-   * independently noticed its container die is a stronger, not weaker,
-   * version of the same guarantee. Either way, `runAgentProcess` cannot
-   * resolve - and therefore `withPostgresResearchEnvironment`'s cleanup
-   * cannot begin - until this has run to completion.
+   * Awaits `launch.stop()` (in isolated mode, `terminateResearchContainer()`)
+   * to completion, then escalates SIGTERM/SIGKILL on the local client
+   * process. Never called directly - always through `requestCancel()` below.
    */
-  async function cancel(source: "agent" | "session") {
-    if (timedOut) return;
+  async function cancel(source: "agent" | "session"): Promise<void> {
     timedOut = true;
     timeoutSource = source;
     try {
@@ -490,16 +506,33 @@ export async function runAgentProcess(
     graceTimer.unref?.();
   }
 
-  // Neither call site awaits cancel() itself - agent.timeoutMs's timer and
-  // the abort listener are both synchronous callbacks - but that is fine:
-  // the process only actually resolves once the "close" listener below
-  // fires, and that cannot happen from *our* action until cancel()'s await
-  // on launch.stop() has completed.
+  /**
+   * The single entry point either timeout cause calls, and the single place
+   * that can never double-kill: only the *first* call actually starts
+   * `cancel()` - `cancellationPromise` is assigned once, synchronously,
+   * before any `await` - and every caller, including one arriving after
+   * cancellation is already under way, gets back that same promise.
+   *
+   * That shared promise is also the fix for #188's second review: the local
+   * child closing does not, by itself, prove a *requested* cancellation has
+   * settled - the agent can exit at the same moment as the timeout, the
+   * docker CLI can die for an unrelated reason, or the container can exit on
+   * its own while `launch.stop()` is still resolving. `runAgentProcess` below
+   * awaits `cancellationPromise`, if one was started, in addition to waiting
+   * for the child to close - not instead of it - so cleanup can never begin
+   * while a termination request this function made is still in flight,
+   * regardless of which of the two settles last.
+   */
+  function requestCancel(source: "agent" | "session"): Promise<void> {
+    if (!cancellationPromise) cancellationPromise = cancel(source);
+    return cancellationPromise;
+  }
+
   if (agent.timeoutMs) {
-    killTimer = setTimeout(() => void cancel("agent"), agent.timeoutMs);
+    killTimer = setTimeout(() => void requestCancel("agent"), agent.timeoutMs);
     killTimer.unref?.();
   }
-  const onAbort = () => void cancel("session");
+  const onAbort = () => void requestCancel("session");
   if (signal) {
     if (signal.aborted) onAbort();
     else signal.addEventListener("abort", onAbort, { once: true });
@@ -513,6 +546,13 @@ export async function runAgentProcess(
       child.once("close", (code, closeSignal) => resolve({ code, signal: closeSignal }));
       child.once("error", reject);
     });
+    if (cancellationPromise) {
+      // The child closing (above) is not proof that our own cancellation
+      // request has settled - see requestCancel()'s doc comment. Awaiting it
+      // here, after the close event and not merely alongside it, closes that
+      // race regardless of which of the two actually finishes last.
+      await cancellationPromise;
+    }
   } catch (error) {
     throw new PostgresResearchError(`Could not run research agent "${agent.command}": ${(error as Error).message}`);
   } finally {
@@ -600,6 +640,11 @@ export async function runAgentInPostgresResearchEnvironment(
   // cleanup has run - that is the only point at which it records what was
   // actually stopped and removed.
   let environment: PostgresResearchEnvironment | undefined;
+  // Captured the moment runAgentProcess() resolves, from inside the body -
+  // i.e. before a session timeout's Promise.race can discard the body's own
+  // return value - so a failed termination request survives even when the
+  // outer call rejects (#188 review, second round, Blocking 3).
+  let agentTermination: { timeoutSource: "agent" | "session"; terminationError?: string } | undefined;
   try {
     const session = await withPostgresResearchEnvironment(
       // The environment owns this trial's randomized build view now, because
@@ -613,6 +658,7 @@ export async function runAgentInPostgresResearchEnvironment(
           await env.start();
           const injected = env.agentEnvironment(agent.envPrefix);
           const result = await runAgentProcess(unisolatedLaunch(env, agent, injected), agent, signal);
+          if (result.timedOut) agentTermination = { timeoutSource: result.timeoutSource!, terminationError: result.terminationError };
           return {
             agent: result,
             agentEnvironment: injected,
@@ -688,6 +734,7 @@ export async function runAgentInPostgresResearchEnvironment(
           agent,
           signal
         );
+        if (result.timedOut) agentTermination = { timeoutSource: result.timeoutSource!, terminationError: result.terminationError };
 
         const networkMode = isolation.network ?? DEFAULT_RESEARCH_NETWORK;
         const buildScoredEligible = env.buildManifest.scoredEligible;
@@ -738,8 +785,13 @@ export async function runAgentInPostgresResearchEnvironment(
     // manifest here means a session timeout is never an evidence-free
     // rejection: cleanup.sessionTimedOut and cleanup.errors are still visible
     // to whatever catches this (#188).
-    if (error instanceof PostgresResearchTimeoutError && environment) {
-      error.runtimeManifest = environment.runtimeManifest();
+    if (error instanceof PostgresResearchTimeoutError) {
+      if (environment) error.runtimeManifest = environment.runtimeManifest();
+      // Likewise for the agent's own cancellation outcome: absent when no
+      // agent cancellation was ever observed to start (e.g. the timeout hit
+      // before runAgentProcess() was even reached), present - including a
+      // failed terminationError - whenever one was.
+      if (agentTermination) error.agentTermination = agentTermination;
     }
     throw error;
   }

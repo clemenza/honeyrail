@@ -519,6 +519,18 @@ export class PostgresResearchTimeoutError extends PostgresResearchError {
    */
   runtimeManifest?: Record<string, unknown>;
 
+  /**
+   * Diagnostic snapshot of the agent's own cancellation outcome, attached by
+   * runAgentInPostgresResearchEnvironment() when an agent cancellation was
+   * observed to have started (#188 review, second round). The session
+   * timeout is always the primary cause this error represents - this field
+   * exists so a failed Docker/agent termination request attempted underneath
+   * it is not lost just because the agent's full result was itself discarded
+   * by the timeout race. `timeoutSource` reflects what actually happened at
+   * the agent level, which is usually - but is not required to be - "session".
+   */
+  agentTermination?: { timeoutSource: "agent" | "session"; terminationError?: string };
+
   constructor(message: string) {
     super(message);
     this.name = "PostgresResearchTimeoutError";

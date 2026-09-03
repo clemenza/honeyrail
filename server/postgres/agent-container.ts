@@ -253,11 +253,22 @@ export type ContainerTerminationResult =
  * non-zero result is returned as a diagnostic rather than swallowed, so a
  * caller cannot report an ordered termination that did not really happen.
  */
+/**
+ * Bound on the `docker kill` command itself. Kept well below
+ * `DEFAULT_CANCEL_GRACE_MS` (research-environment.ts) together with
+ * `KILL_GRACE_MS` (research-session.ts) - see the budget assertion in
+ * research-session.ts - so a stalled Docker daemon cannot make the supported
+ * agent-cancellation path consume the entire outer session grace budget
+ * (#188 review, second round).
+ */
+export const CONTAINER_TERMINATION_TIMEOUT_MS = 10_000;
+
 export async function terminateResearchContainer(
   containerName: string,
-  runCommand: RunCommand = runCommandSafe
+  runCommand: RunCommand = runCommandSafe,
+  timeoutMs: number = CONTAINER_TERMINATION_TIMEOUT_MS
 ): Promise<ContainerTerminationResult> {
-  const result = await runCommand("docker", ["kill", containerName], { timeout: 30_000 });
+  const result = await runCommand("docker", ["kill", containerName], { timeout: timeoutMs });
   if (result.ok) return { ok: true, alreadyGone: false };
   const message = (result.stderr || result.stdout || `docker kill exited with code ${result.code}`).trim();
   if (/no such container/i.test(message)) return { ok: true, alreadyGone: true };
