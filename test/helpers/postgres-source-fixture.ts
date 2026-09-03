@@ -266,6 +266,24 @@ export async function createSyntheticPostgresSourceRepo(repoPath: string): Promi
   return { repoPath, ref, laterRef, laterFile };
 }
 
+/**
+ * Adds one more commit on top of whatever is currently `HEAD` in `repoPath`
+ * and returns its SHA - for tests that need a revision guaranteed distinct
+ * from another ref in the *same* repo (e.g. asserting a hash changes when a
+ * pinned revision changes). Deterministic regardless of timing: unlike two
+ * independently created repos (whose initial commits share no parent and can
+ * coincide if content, author/committer and even the timestamp's second all
+ * happen to match), a child commit's hash is chained through its parent's
+ * hash, so it can never collide with a commit from a different lineage.
+ */
+export async function createAdditionalSyntheticCommit(repoPath: string, label: string): Promise<string> {
+  const marker = `ADDITIONAL_COMMIT_${label.replace(/[^a-zA-Z0-9_-]/g, "_")}.txt`;
+  await writeFile(join(repoPath, marker), `${label}\n`);
+  await git(repoPath, ["add", "-A"]);
+  await git(repoPath, ["commit", "-q", "-m", `additional synthetic commit: ${label}`]);
+  return git(repoPath, ["rev-parse", "HEAD"]);
+}
+
 /** The fixture only needs git, a POSIX shell and make - no C toolchain, no PostgreSQL. */
 export async function hasFixtureToolchain(): Promise<boolean> {
   for (const [command, args] of [["git", ["--version"]], ["make", ["--version"]], ["tar", ["--help"]]] as const) {
