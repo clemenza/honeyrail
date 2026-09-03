@@ -715,43 +715,109 @@ test(
 );
 
 test(
-  "a failed agent-container termination during a session timeout is not lost, and does not mask the primary timeout (#188, second round, Blocking 3)",
+  "a docker kill failure that the rm -f fallback recovers from is a confirmed termination, and cleanup proceeds normally (#188, third round, Blocking 2, case A)",
   { timeout: E2E_TIMEOUT_MS },
   async (t) => {
     const mirror = await skipUnlessLiveE2EIsPossible(t);
     if (!mirror) return;
     const fixture = await withLiveFixture(t, mirror);
 
-    // Short and bounded, not the usual 600s: `docker kill` defaults to
-    // SIGKILL, which the kernel delivers unconditionally - but this test
-    // deliberately makes that explicit request fail, and the fallback
-    // (SIGTERM proxied to the container's PID 1 by the local `docker run`
-    // client) is not immune to a shell blocked in a foreground `sleep`
-    // deferring signal handling until that command completes. A short sleep
-    // bounds the worst case rather than depending on that fallback landing
-    // promptly, which this test is not the place to require.
-    const spec = specFor(fixture, "session-timeout-termination-failure");
+    const spec = specFor(fixture, "termination-escalation-recovers");
     const scratch = join(spec.root, "agent-work");
     await (await import("node:fs/promises")).mkdir(scratch, { recursive: true });
-    await writeAgentScript(scratch, "sleep.sh", "sleep 8\n");
+    await writeAgentScript(scratch, "sleep.sh", "sleep 600\n");
 
-    let agentContainerName: string | undefined;
+    // Only the explicit `docker kill` this trial issues is made to fail;
+    // `docker rm -f` (terminateResearchContainer()'s fallback) and every
+    // other docker command go through the real daemon - so this is a real
+    // Docker/PostgreSQL run proving the *escalation itself* recovers, not a
+    // fully faked docker.
+    const failingKillOnly: RunCommand = async (command, args = [], options) => {
+      if (command === "docker" && args[0] === "kill") {
+        return { ok: false, stdout: "", stderr: "Error response from daemon: simulated transient kill failure", code: 1 };
+      }
+      return runCommandSafe(command, args, options);
+    };
+
+    const started = Date.now();
+    let caught: unknown;
+    try {
+      await runAgentInPostgresResearchEnvironment(
+        { ...spec, runCommand: failingKillOnly },
+        { command: `${RESEARCH_CONTAINER_PATHS.scratch}/sleep.sh` },
+        { isolation: { buildViewsRoot: fixture.viewsRoot }, timeoutMs: 15_000 }
+      );
+      assert.fail("expected the session timeout to reject the call");
+    } catch (error) {
+      caught = error;
+    }
+
+    assert.ok(caught instanceof PostgresResearchTimeoutError, `expected PostgresResearchTimeoutError, got ${caught}`);
+    assert.ok(Date.now() - started < 90_000, "recovering via the rm -f fallback must not itself blow the deadline");
+
+    const error = caught as PostgresResearchTimeoutError;
+    // Confirmed via the fallback, not merely requested - no terminationError,
+    // confirmedStopped true, and (below) a completely normal cleanup, exactly
+    // as if the first `docker kill` had simply succeeded.
+    assert.ok(error.agentTermination, "the thrown timeout must carry the agent's own cancellation diagnostics");
+    assert.equal(error.agentTermination!.timeoutSource, "session");
+    assert.equal(error.agentTermination!.confirmedStopped, true);
+    assert.equal(error.agentTermination!.terminationError, undefined);
+
+    const manifest = error.runtimeManifest as { cleanup?: Record<string, unknown> } | undefined;
+    assert.ok(manifest, "the thrown session timeout must still carry the environment's runtime manifest");
+    assert.equal(manifest!.cleanup?.sessionTimedOut, true);
+    assert.equal(manifest!.cleanup?.agentTerminationUnconfirmed, undefined, "a confirmed termination must not be marked unconfirmed");
+    assert.equal(manifest!.cleanup?.stopped, true);
+    assert.equal(manifest!.cleanup?.runtimeContainerRemoved, true);
+    assert.equal(await exists(join(spec.root, "pgdata")), false);
+
+    const leaked = await runCommandSafe("docker", ["ps", "-a", "--filter", "name=honeyrail-pg-", "--format", "{{.Names}}"], {
+      timeout: 30_000
+    });
+    assert.deepEqual(leaked.stdout.split("\n").filter(Boolean), [], `leaked containers: ${leaked.stdout}`);
+  }
+);
+
+test(
+  "agent termination that cannot be confirmed after every escalation fails closed: destructive cleanup is skipped and evidence is preserved (#188, third round, Blocking 2, case B)",
+  { timeout: E2E_TIMEOUT_MS },
+  async (t) => {
+    const mirror = await skipUnlessLiveE2EIsPossible(t);
+    if (!mirror) return;
+    const fixture = await withLiveFixture(t, mirror);
+
+    // Short and bounded: this test deliberately makes every
+    // container-termination command fail, so the agent (and, per the
+    // fail-closed behavior under test, the runtime container and PGDATA too)
+    // are expected to still exist when the call returns. A short sleep
+    // bounds how long that state persists rather than depending on any
+    // fallback landing promptly, which is not what this test is about.
+    const spec = specFor(fixture, "unconfirmed-termination-fails-closed");
+    const scratch = join(spec.root, "agent-work");
+    await (await import("node:fs/promises")).mkdir(scratch, { recursive: true });
+    await writeAgentScript(scratch, "sleep.sh", "sleep 15\n");
+
+    // Safety net: everything this trial owns is expected to survive the call
+    // itself, by design, so sweep it up afterwards using the real docker CLI
+    // directly - not through the faked runCommand below.
     t.after(async () => {
-      // Safety net: this test intentionally breaks the primary termination
-      // path, so clean up defensively rather than relying on it.
-      if (agentContainerName) {
-        await runCommandSafe("docker", ["rm", "-f", agentContainerName], { timeout: 15_000 }).catch(() => {});
+      const listing = await runCommandSafe("docker", ["ps", "-a", "--filter", "name=honeyrail-pg-", "--format", "{{.Names}}"], {
+        timeout: 15_000
+      }).catch(() => ({ ok: false, stdout: "", stderr: "", code: 1 }));
+      for (const name of listing.stdout.split("\n").filter(Boolean)) {
+        await runCommandSafe("docker", ["rm", "-f", name], { timeout: 15_000 }).catch(() => {});
       }
     });
 
-    // Every other docker command (image checks, container run, build/runtime
-    // container lifecycle) goes through the real daemon; only the explicit
-    // agent-container `docker kill` this trial issues is made to fail, so
-    // this is a real Docker/PostgreSQL run with one deterministically
-    // injected termination failure - not a fully faked docker.
-    const failingKill: RunCommand = async (command, args = [], options) => {
-      if (command === "docker" && args[0] === "kill") {
-        agentContainerName = String(args[1] ?? "");
+    // Every container-termination command fails, deterministically: kill,
+    // the rm -f fallback, and the independent inspect confirmation all
+    // report failure, so terminateResearchContainer() cannot confirm
+    // absence - the true "everything failed" case, not merely the first
+    // attempt. Every other docker command (image checks, container run,
+    // build/runtime container lifecycle) goes through the real daemon.
+    const failingTermination: RunCommand = async (command, args = [], options) => {
+      if (command === "docker" && (args[0] === "kill" || args[0] === "rm" || args[0] === "inspect")) {
         return { ok: false, stdout: "", stderr: "Error response from daemon: simulated termination failure", code: 1 };
       }
       return runCommandSafe(command, args, options);
@@ -761,7 +827,7 @@ test(
     let caught: unknown;
     try {
       await runAgentInPostgresResearchEnvironment(
-        { ...spec, runCommand: failingKill },
+        { ...spec, runCommand: failingTermination },
         { command: `${RESEARCH_CONTAINER_PATHS.scratch}/sleep.sh` },
         { isolation: { buildViewsRoot: fixture.viewsRoot }, timeoutMs: 3000 }
       );
@@ -770,28 +836,33 @@ test(
       caught = error;
     }
 
-    // The primary cause must survive intact: a failed termination request is
-    // a diagnostic, not a replacement for the timeout that drove this call.
+    // The primary cause must survive intact: an unconfirmed termination is a
+    // diagnostic, not a replacement for the timeout that drove this call.
     assert.ok(caught instanceof PostgresResearchTimeoutError, `expected PostgresResearchTimeoutError, got ${caught}`);
     assert.match((caught as Error).message, /timed out/);
-    assert.ok(Date.now() - started < 90_000, "the session must still finish near its deadline despite the failed termination");
+    assert.ok(Date.now() - started < 60_000, "even a fail-closed session must still finish near its deadline");
 
     const error = caught as PostgresResearchTimeoutError;
-    // ...while the termination failure itself remains visible, not swallowed.
     assert.ok(error.agentTermination, "the thrown timeout must carry the agent's own cancellation diagnostics");
     assert.equal(error.agentTermination!.timeoutSource, "session");
-    assert.match(error.agentTermination!.terminationError ?? "", /simulated termination failure/);
+    assert.equal(error.agentTermination!.confirmedStopped, false, "an unconfirmed termination must never be reported as confirmed");
+    assert.match(error.agentTermination!.terminationError ?? "", /could not be confirmed/);
 
-    // ...and cleanup evidence - including that cleanup itself still ran and
-    // still classifies this as a session timeout - remains attached too.
     const manifest = error.runtimeManifest as { cleanup?: Record<string, unknown> } | undefined;
     assert.ok(manifest, "the thrown session timeout must still carry the environment's runtime manifest");
-    assert.equal(manifest!.cleanup?.sessionTimedOut, true);
-
-    // The runtime container and per-trial filesystem state are unaffected by
-    // this injected agent-container failure - only the explicit agent `docker
-    // kill` was made to fail - and must still be gone.
-    assert.equal(manifest!.cleanup?.runtimeContainerRemoved, true);
-    assert.equal(await exists(join(spec.root, "pgdata")), false);
+    assert.equal(manifest!.cleanup?.agentTerminationUnconfirmed, true);
+    assert.equal(manifest!.cleanup?.sessionTimedOut, true, "session-timeout classification must survive the fail-closed branch too");
+    // Fail closed: nothing destructive was even attempted, not merely that
+    // an attempt failed.
+    assert.equal(manifest!.cleanup?.stopped, false);
+    assert.equal(manifest!.cleanup?.runtimeContainerRemoved, false);
+    assert.equal(manifest!.cleanup?.dataDirRemoved, false);
+    assert.equal(manifest!.cleanup?.socketDirRemoved, false);
+    assert.equal(manifest!.cleanup?.buildViewRemoved, false);
+    assert.equal(
+      await exists(join(spec.root, "pgdata")),
+      true,
+      "PGDATA must be retained, not removed, while agent-container termination is unconfirmed"
+    );
   }
 );

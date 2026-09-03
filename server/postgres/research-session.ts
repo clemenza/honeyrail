@@ -20,7 +20,7 @@ import {
   createAgentScratchDir,
   dockerAvailable,
   terminateResearchContainer,
-  CONTAINER_TERMINATION_TIMEOUT_MS,
+  CONTAINER_TERMINATION_WORST_CASE_MS,
   DEFAULT_RESEARCH_IMAGE,
   DEFAULT_RESEARCH_NETWORK,
   resolveResearchAgentImageIdentity,
@@ -65,28 +65,42 @@ import type { PostgresRuntimeRecord } from "./runtime-container.js";
 export const KILL_GRACE_MS = 5000;
 
 /**
- * #188 review (second round), Blocking 2: the supported cancellation path's
- * own worst case - an unresponsive Docker daemon exhausting
- * `CONTAINER_TERMINATION_TIMEOUT_MS`, then the local client needing the full
- * `KILL_GRACE_MS` to die - must stay strictly below
- * `withPostgresResearchEnvironment()`'s `DEFAULT_CANCEL_GRACE_MS`. Otherwise a
- * cancellation that is merely slow, not stuck, could be indistinguishable
- * from `cancelGraceExceeded`, which is supposed to mean the body never
- * observed cancellation at all.
- *
- * Asserted at import time rather than only documented, so the three
- * constants - two of them defined in other modules - cannot silently drift
- * out of this relationship. This says nothing about a caller-supplied
- * `cancelGraceMs` override, which is a deliberate per-call choice (e.g. a
- * fast test) rather than the supported path this budget describes.
+ * Headroom added on top of the mechanical worst case below, absorbing
+ * ordinary JS/process scheduling overhead across several sequential awaits
+ * rather than assuming they cost nothing (#188 review, third round).
  */
-const WORST_CASE_CANCELLATION_MS = CONTAINER_TERMINATION_TIMEOUT_MS + KILL_GRACE_MS;
-if (WORST_CASE_CANCELLATION_MS >= DEFAULT_CANCEL_GRACE_MS) {
+export const CANCELLATION_SAFETY_MARGIN_MS = 5000;
+
+/**
+ * The floor `runAgentInPostgresResearchEnvironment()` enforces on a
+ * caller-supplied `cancelGraceMs` (#188 review, third round): the supported
+ * agent-cancellation path's own worst case - `terminateResearchContainer()`
+ * exhausting all three of its sequential kill/rm/inspect attempts, then the
+ * local client needing the full `KILL_GRACE_MS` to die - plus a safety
+ * margin. Below this, a merely-slow-but-successful cancellation could be
+ * mistaken for `cancelGraceExceeded`, which is supposed to mean the body
+ * never settled at all - recreating the #188 race this whole file exists to
+ * close, just with a caller-chosen deadline instead of the default one.
+ *
+ * `withPostgresResearchEnvironment()` itself enforces no such floor - it is
+ * generic and cannot know what an arbitrary body needs - so this validation
+ * belongs here, in the one place that knows this path's own budget.
+ */
+export const MIN_AGENT_CANCEL_GRACE_MS = CONTAINER_TERMINATION_WORST_CASE_MS + KILL_GRACE_MS + CANCELLATION_SAFETY_MARGIN_MS;
+
+/**
+ * Asserted at import time rather than only documented, so
+ * `DEFAULT_CANCEL_GRACE_MS` (research-environment.ts) and this module's own
+ * constants cannot silently drift apart: the *default* budget must itself
+ * satisfy the minimum this module requires of an explicit override.
+ */
+if (DEFAULT_CANCEL_GRACE_MS < MIN_AGENT_CANCEL_GRACE_MS) {
   throw new Error(
-    `research-session.ts: CONTAINER_TERMINATION_TIMEOUT_MS (${CONTAINER_TERMINATION_TIMEOUT_MS}) + KILL_GRACE_MS ` +
-      `(${KILL_GRACE_MS}) = ${WORST_CASE_CANCELLATION_MS}ms must stay strictly below DEFAULT_CANCEL_GRACE_MS ` +
-      `(${DEFAULT_CANCEL_GRACE_MS}), or a slow-but-successful agent cancellation can be mistaken for ` +
-      "cancelGraceExceeded (#188)"
+    `research-session.ts: DEFAULT_CANCEL_GRACE_MS (${DEFAULT_CANCEL_GRACE_MS}) must be at least ` +
+      `MIN_AGENT_CANCEL_GRACE_MS (${MIN_AGENT_CANCEL_GRACE_MS} = CONTAINER_TERMINATION_WORST_CASE_MS ` +
+      `${CONTAINER_TERMINATION_WORST_CASE_MS} + KILL_GRACE_MS ${KILL_GRACE_MS} + CANCELLATION_SAFETY_MARGIN_MS ` +
+      `${CANCELLATION_SAFETY_MARGIN_MS}), or the default itself would not satisfy the floor this module enforces ` +
+      "on an explicit cancelGraceMs override (#188)"
   );
 }
 
@@ -175,6 +189,17 @@ export type PostgresResearchAgentResult = {
    * local client eventually exited too.
    */
   terminationError?: string;
+  /**
+   * Set when `timedOut` is true: `false` specifically means a container
+   * termination was requested but could not be *confirmed* (`launch.stop()`
+   * threw - see `terminationError`) - not merely that a first attempt
+   * failed, since `terminateResearchContainer()` itself escalates before
+   * giving up (#188 review, third round). `true` when cancellation is
+   * confirmed complete - a container termination that succeeded, or
+   * unisolated mode, which has no separate container to confirm and whose
+   * "close" event *is* the confirmation.
+   */
+  confirmedStopped?: boolean;
   stdout: string;
   stderr: string;
   startedAt: string;
@@ -481,26 +506,35 @@ export async function runAgentProcess(
   let timedOut = false;
   let timeoutSource: "agent" | "session" | undefined;
   let terminationError: string | undefined;
+  let confirmedStopped: boolean | undefined;
   let killTimer: NodeJS.Timeout | undefined;
   let graceTimer: NodeJS.Timeout | undefined;
   let cancellationPromise: Promise<void> | undefined;
 
   /**
-   * Awaits `launch.stop()` (in isolated mode, `terminateResearchContainer()`)
+   * Awaits `launch.stop()` (in isolated mode, `terminateResearchContainer()`,
+   * which only resolves successfully once container absence is *confirmed*)
    * to completion, then escalates SIGTERM/SIGKILL on the local client
-   * process. Never called directly - always through `requestCancel()` below.
+   * process regardless of whether it succeeded. Never called directly -
+   * always through `requestCancel()` below.
    */
   async function cancel(source: "agent" | "session"): Promise<void> {
     timedOut = true;
     timeoutSource = source;
     try {
       await launch.stop?.();
+      confirmedStopped = true;
     } catch (error) {
       // Recorded, not swallowed (#188 review): a failed termination request
       // must not be indistinguishable from a successful one just because the
       // local client eventually exits too, from the escalation below.
       terminationError = (error as Error).message;
+      confirmedStopped = false;
     }
+    // Still escalated even when unconfirmed: this is a best-effort nudge at
+    // the local client, not a claim that the underlying container is gone -
+    // markAgentTerminationUnconfirmed() (research-session.ts's caller) is
+    // what actually keeps cleanup from proceeding destructively.
     killTree(child, "SIGTERM");
     graceTimer = setTimeout(() => killTree(child, "SIGKILL"), KILL_GRACE_MS);
     graceTimer.unref?.();
@@ -567,7 +601,7 @@ export async function runAgentProcess(
     exitCode: exit.code,
     signal: exit.signal,
     timedOut,
-    ...(timedOut ? { timeoutSource } : {}),
+    ...(timedOut ? { timeoutSource, confirmedStopped } : {}),
     ...(terminationError ? { terminationError } : {}),
     stdout: stdout.text(),
     stderr: stderr.text(),
@@ -615,6 +649,21 @@ export async function runAgentInPostgresResearchEnvironment(
   if (!String(agent.command || "").trim()) {
     throw new PostgresResearchError("A research agent spec requires a command");
   }
+  // Rejected before any side effect (no environment created, no docker
+  // reachability check), same as the command check above: an unsafe
+  // cancelGraceMs is a configuration error, not a trial outcome (#188
+  // review, third round). withPostgresResearchEnvironment() enforces no
+  // floor of its own - it is generic and cannot know what an arbitrary body
+  // needs - so this is the one place that can validate it against this
+  // path's own supported cancellation budget.
+  if (options.cancelGraceMs !== undefined && options.cancelGraceMs < MIN_AGENT_CANCEL_GRACE_MS) {
+    throw new PostgresResearchError(
+      `cancelGraceMs=${options.cancelGraceMs}ms is too small for the supported agent cancellation path; minimum is ` +
+        `${MIN_AGENT_CANCEL_GRACE_MS}ms (container termination escalation up to ${CONTAINER_TERMINATION_WORST_CASE_MS}ms, ` +
+        `local-process kill grace ${KILL_GRACE_MS}ms, safety margin ${CANCELLATION_SAFETY_MARGIN_MS}ms). Omit ` +
+        "cancelGraceMs to use the default, or raise it to at least this value."
+    );
+  }
   const isolation = options.isolation ?? {};
   const runCommand = spec.runCommand;
   if (!isolation.allowUnisolatedForDevelopment && !(await dockerAvailable(runCommand))) {
@@ -644,7 +693,7 @@ export async function runAgentInPostgresResearchEnvironment(
   // i.e. before a session timeout's Promise.race can discard the body's own
   // return value - so a failed termination request survives even when the
   // outer call rejects (#188 review, second round, Blocking 3).
-  let agentTermination: { timeoutSource: "agent" | "session"; terminationError?: string } | undefined;
+  let agentTermination: { timeoutSource: "agent" | "session"; terminationError?: string; confirmedStopped?: boolean } | undefined;
   try {
     const session = await withPostgresResearchEnvironment(
       // The environment owns this trial's randomized build view now, because
@@ -658,7 +707,17 @@ export async function runAgentInPostgresResearchEnvironment(
           await env.start();
           const injected = env.agentEnvironment(agent.envPrefix);
           const result = await runAgentProcess(unisolatedLaunch(env, agent, injected), agent, signal);
-          if (result.timedOut) agentTermination = { timeoutSource: result.timeoutSource!, terminationError: result.terminationError };
+          // Unisolated mode has no separate container to confirm - the
+          // process closing *is* the confirmation - so confirmedStopped is
+          // always true here and markAgentTerminationUnconfirmed() is never
+          // reached on this branch.
+          if (result.timedOut) {
+            agentTermination = {
+              timeoutSource: result.timeoutSource!,
+              terminationError: result.terminationError,
+              confirmedStopped: result.confirmedStopped
+            };
+          }
           return {
             agent: result,
             agentEnvironment: injected,
@@ -727,14 +786,28 @@ export async function runAgentInPostgresResearchEnvironment(
             stop: async () => {
               const termination = await terminateResearchContainer(containerName, runCommand ?? runCommandSafe);
               if (!termination.ok) {
-                throw new PostgresResearchError(`docker kill ${containerName} failed: ${termination.error}`);
+                throw new PostgresResearchError(`agent container ${containerName}: ${termination.error}`);
               }
             }
           },
           agent,
           signal
         );
-        if (result.timedOut) agentTermination = { timeoutSource: result.timeoutSource!, terminationError: result.terminationError };
+        if (result.timedOut) {
+          agentTermination = {
+            timeoutSource: result.timeoutSource!,
+            terminationError: result.terminationError,
+            confirmedStopped: result.confirmedStopped
+          };
+          // Fail closed (#188 review, third round): the container's own
+          // absence could not be confirmed, so PGDATA, the socket directory,
+          // the build view and the runtime container - all bind-mounted into
+          // it too - must not be torn down out from under it. env.cleanup()
+          // (called from withPostgresResearchEnvironment's finally, after
+          // this body has settled) checks this and skips its destructive
+          // steps entirely rather than reporting a normal teardown.
+          if (result.confirmedStopped === false) env.markAgentTerminationUnconfirmed();
+        }
 
         const networkMode = isolation.network ?? DEFAULT_RESEARCH_NETWORK;
         const buildScoredEligible = env.buildManifest.scoredEligible;

@@ -454,7 +454,12 @@ export type PostgresQueryResult = {
 
 export type PostgresCleanupResult = {
   stopped: boolean;
-  stopMode: "fast" | "immediate" | "already-stopped";
+  /**
+   * `"skipped-unconfirmed-termination"`: cleanup did not run at all, because
+   * `markAgentTerminationUnconfirmed()` was called first - see that method
+   * and `agentTerminationUnconfirmed` below.
+   */
+  stopMode: "fast" | "immediate" | "already-stopped" | "skipped-unconfirmed-termination";
   /** True when there was no runtime container, or when `docker rm -f` removed it. */
   runtimeContainerRemoved: boolean;
   /** True once this trial's randomized build view has been removed. */
@@ -470,14 +475,27 @@ export type PostgresCleanupResult = {
    */
   sessionTimedOut?: boolean;
   /**
-   * True only when `sessionTimedOut` is true and the body did not settle
-   * within `cancelGraceMs` after its `AbortSignal` was aborted - i.e. cleanup
-   * proceeded without confirmation that whatever the body owned (an agent
-   * process, a container) had actually stopped. A conforming body - see
-   * runAgentInPostgresResearchEnvironment() - kills its agent/container on
-   * abort and awaits its exit, so this stays false in the supported path.
+   * True when the body did not settle within `cancelGraceMs` after its
+   * `AbortSignal` was aborted - the body ignored the signal entirely, *or* it
+   * observed cancellation but whatever it was waiting on (an agent process,
+   * a container) stalled past the grace bound. Either way, cleanup proceeded
+   * without confirmation that the body's own resources had actually stopped.
+   * A conforming body - see runAgentInPostgresResearchEnvironment() - kills
+   * its agent/container on abort and awaits its exit within the grace bound,
+   * so this stays false in the supported path.
    */
   cancelGraceExceeded?: boolean;
+  /**
+   * True when `markAgentTerminationUnconfirmed()` was called before cleanup
+   * ran (#188 review, third round): an isolated agent's container could not
+   * be shown gone even after `terminateResearchContainer()`'s kill/rm/inspect
+   * escalation, so cleanup failed closed instead of removing PGDATA, the
+   * socket directory, the build view, or the runtime container - any of
+   * which the agent container may still be using. `errors` carries the
+   * explanation; `stopped`/`*Removed` all stay `false` because nothing was
+   * actually attempted, not because an attempt failed.
+   */
+  agentTerminationUnconfirmed?: boolean;
   errors: string[];
   at: string;
 };
@@ -529,7 +547,21 @@ export class PostgresResearchTimeoutError extends PostgresResearchError {
    * by the timeout race. `timeoutSource` reflects what actually happened at
    * the agent level, which is usually - but is not required to be - "session".
    */
-  agentTermination?: { timeoutSource: "agent" | "session"; terminationError?: string };
+  agentTermination?: {
+    timeoutSource: "agent" | "session";
+    terminationError?: string;
+    /**
+     * False when a container termination request was made but could not be
+     * *confirmed* - the container was not shown absent even after
+     * `terminateResearchContainer()`'s escalation (#188 review, third round).
+     * When this is false, `PostgresCleanupResult.agentTerminationUnconfirmed`
+     * is also true, and cleanup deliberately did not remove PGDATA, the
+     * socket directory, the build view or the runtime container. Absent for
+     * unisolated mode, which has no separate container to confirm; `true`
+     * whenever a container termination was requested and confirmed.
+     */
+    confirmedStopped?: boolean;
+  };
 
   constructor(message: string) {
     super(message);
@@ -1105,6 +1137,7 @@ export class PostgresResearchEnvironment {
   private running = false;
   private closed = false;
   private cleanupResult: PostgresCleanupResult | null = null;
+  private agentTerminationUnconfirmed = false;
 
   constructor(input: {
     root: string;
@@ -1617,6 +1650,27 @@ export class PostgresResearchEnvironment {
   }
 
   /**
+   * Called by a caller driving an isolated agent (research-session.ts) when
+   * that agent's container termination could not be *confirmed* - not merely
+   * requested (#188 review, third round). `cleanup()` checks this first and
+   * fails closed: PGDATA, the socket directory, the build view and the
+   * runtime container are all bind-mounted into the agent container too, so
+   * none of them are touched while that container may still be alive and
+   * using them. The cleanup result records why nothing was removed rather
+   * than reporting a normal, complete teardown.
+   *
+   * A no-op once `cleanup()` has already run - the same idempotency
+   * `cleanup()` itself has - so a caller that calls this after cleanup has
+   * already completed (which should not happen on the supported path, since
+   * research-session.ts calls it from inside the body `cleanup()` awaits)
+   * cannot retroactively invalidate a teardown that already happened.
+   */
+  markAgentTerminationUnconfirmed(): void {
+    if (this.cleanupResult) return;
+    this.agentTerminationUnconfirmed = true;
+  }
+
+  /**
    * Idempotent and non-throwing: cleanup runs from `finally` blocks where
    * throwing would mask the original failure.
    *
@@ -1636,6 +1690,9 @@ export class PostgresResearchEnvironment {
    * process has exited, including when it was killed for exceeding its
    * timeout. The server log, the build logs and the manifests stay behind as
    * evidence, and the shared build cache is never touched.
+   *
+   * Unless `markAgentTerminationUnconfirmed()` was called first, in which
+   * case none of the above runs at all - see that method.
    */
   async cleanup(
     options: {
@@ -1646,6 +1703,30 @@ export class PostgresResearchEnvironment {
     } = {}
   ): Promise<PostgresCleanupResult> {
     if (this.cleanupResult) return this.cleanupResult;
+    if (this.agentTerminationUnconfirmed) {
+      this.closed = true;
+      this.cleanupResult = {
+        stopped: false,
+        stopMode: "skipped-unconfirmed-termination",
+        runtimeContainerRemoved: false,
+        buildViewRemoved: false,
+        dataDirRemoved: false,
+        socketDirRemoved: false,
+        sourceDirRemoved: false,
+        agentTerminationUnconfirmed: true,
+        ...(options.sessionTimeout
+          ? { sessionTimedOut: options.sessionTimeout.timedOut, cancelGraceExceeded: options.sessionTimeout.cancelGraceExceeded }
+          : {}),
+        errors: [
+          "agent container termination could not be confirmed; destructive cleanup was skipped rather than removing " +
+            "PGDATA, the socket directory, the build view or the runtime container while the agent container may " +
+            "still be using them (#188)"
+        ],
+        at: nowIso()
+      };
+      this.record("cleanup.skipped-unconfirmed-termination", { ...this.cleanupResult });
+      return this.cleanupResult;
+    }
     const errors: string[] = [];
     let stopMode: PostgresCleanupResult["stopMode"] = "already-stopped";
     let stopped = !this.running;
@@ -1833,8 +1914,21 @@ export async function createPostgresResearchEnvironment(spec: PostgresResearchSp
   });
 }
 
-/** Default upper bound on how long cleanup waits, after a session timeout aborts the body, for it to actually settle. */
-export const DEFAULT_CANCEL_GRACE_MS = 30_000;
+/**
+ * Default upper bound on how long cleanup waits, after a session timeout
+ * aborts the body, for it to actually settle.
+ *
+ * 45s, not 30s: research-session.ts's `MIN_AGENT_CANCEL_GRACE_MS` - the
+ * worst case for the supported isolated-agent path, where
+ * `terminateResearchContainer()` can make up to three sequential docker
+ * calls before giving up - is 40s, and this constant is asserted at import
+ * time to stay above that (#188 review, third round). It is defined here
+ * rather than derived from research-session.ts's constants because this
+ * module must not depend on that one (the reverse dependency already
+ * exists); research-session.ts's own assertion is what keeps the two from
+ * silently drifting apart.
+ */
+export const DEFAULT_CANCEL_GRACE_MS = 45_000;
 
 export type WithPostgresResearchEnvironmentOptions = {
   /**

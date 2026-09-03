@@ -11,16 +11,19 @@ import {
   type PostgresResearchSpec
 } from "../server/postgres/research-environment.js";
 import {
-  CONTAINER_TERMINATION_TIMEOUT_MS,
+  CONTAINER_TERMINATION_WORST_CASE_MS,
   DEFAULT_RESEARCH_IMAGE,
   PostgresResearchAgentContainerError,
-  resolveResearchAgentImageIdentity
+  resolveResearchAgentImageIdentity,
+  terminateResearchContainer
 } from "../server/postgres/agent-container.js";
 import {
   assertResearchAgentImageCompatible,
   runAgentInPostgresResearchEnvironment,
   runAgentProcess,
+  CANCELLATION_SAFETY_MARGIN_MS,
   KILL_GRACE_MS,
+  MIN_AGENT_CANCEL_GRACE_MS,
   type PostgresResearchSessionOptions
 } from "../server/postgres/research-session.js";
 import type { PostgresBuildManifest } from "../server/postgres/research-environment.js";
@@ -310,15 +313,126 @@ test("an independently-exiting child does not bypass a still-pending termination
   assert.equal(result.signal, null);
 });
 
-test("the supported cancellation path's worst-case duration stays strictly below the outer cancelGraceMs budget (#188, second round, Blocking 2)", () => {
-  const worstCase = CONTAINER_TERMINATION_TIMEOUT_MS + KILL_GRACE_MS;
-  assert.ok(
-    worstCase < DEFAULT_CANCEL_GRACE_MS,
-    `CONTAINER_TERMINATION_TIMEOUT_MS (${CONTAINER_TERMINATION_TIMEOUT_MS}) + KILL_GRACE_MS (${KILL_GRACE_MS}) = ` +
-      `${worstCase}ms must stay strictly below DEFAULT_CANCEL_GRACE_MS (${DEFAULT_CANCEL_GRACE_MS}), or a slow-but-` +
-      "successful agent cancellation could be mistaken for cancelGraceExceeded - the supported agent path is not " +
-      "designed to overrun the outer session's grace budget merely because its own internal timeout is too large"
+test("MIN_AGENT_CANCEL_GRACE_MS reflects the full kill/rm/inspect escalation, and the default budget satisfies it (#188, third round, Blocking 1)", () => {
+  assert.equal(
+    MIN_AGENT_CANCEL_GRACE_MS,
+    CONTAINER_TERMINATION_WORST_CASE_MS + KILL_GRACE_MS + CANCELLATION_SAFETY_MARGIN_MS,
+    "MIN_AGENT_CANCEL_GRACE_MS must be built from the escalation's actual worst case (all three attempts), not a single attempt's timeout"
   );
+  assert.ok(
+    DEFAULT_CANCEL_GRACE_MS >= MIN_AGENT_CANCEL_GRACE_MS,
+    `DEFAULT_CANCEL_GRACE_MS (${DEFAULT_CANCEL_GRACE_MS}) must be at least MIN_AGENT_CANCEL_GRACE_MS ` +
+      `(${MIN_AGENT_CANCEL_GRACE_MS}), or the default itself would violate the floor this module enforces on an ` +
+      "explicit cancelGraceMs override - the supported agent path is not designed to overrun the outer session's " +
+      "grace budget merely because its own internal termination escalation is too large"
+  );
+});
+
+test("runAgentInPostgresResearchEnvironment rejects a cancelGraceMs below the supported minimum before any trial side effect (#188, third round, Blocking 1)", async () => {
+  const unsafe = MIN_AGENT_CANCEL_GRACE_MS - 1;
+  await assert.rejects(
+    runAgentInPostgresResearchEnvironment(
+      { root: "/dev/null/never-created", source: { repoPath: "/dev/null/never-created", ref: "HEAD" } },
+      { command: "/bin/true" },
+      { cancelGraceMs: unsafe }
+    ),
+    (error: Error) =>
+      error instanceof PostgresResearchError &&
+      error.message.includes(`cancelGraceMs=${unsafe}ms`) &&
+      error.message.includes(`minimum is ${MIN_AGENT_CANCEL_GRACE_MS}ms`)
+  );
+});
+
+test("an explicit cancelGraceMs at or above the supported minimum is accepted (#188, third round, Blocking 1)", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  const fixture = await withFixture(t);
+  const agentPath = await writeAgent(fixture, "agent-quick.sh", ["exit 0", ""].join("\n"));
+  const spec = specFor(fixture, "cancel-grace-safe");
+
+  // Exactly the minimum, not comfortably above it - proving the boundary
+  // itself is accepted (>=), not just values well clear of it.
+  const session = await runAgentInPostgresResearchEnvironment(spec, { command: agentPath, timeoutMs: 60_000 }, {
+    ...DEV_MODE,
+    cancelGraceMs: MIN_AGENT_CANCEL_GRACE_MS
+  });
+  assert.equal(session.agent.ok, true);
+});
+
+// #188, third round, Blocking 2: terminateResearchContainer() must only
+// report success once container absence is *confirmed* - never merely
+// requested. These are deterministic and need no real docker daemon: a fake
+// runCommand stands in for the daemon's responses at each of the up to three
+// steps (kill, the `rm -f` fallback, an independent `inspect` confirmation).
+
+test("terminateResearchContainer confirms success on the first docker kill", async () => {
+  const calls: string[][] = [];
+  const runCommand: RunCommand = async (command, args = []) => {
+    calls.push([command, ...args]);
+    return { ok: true, stdout: "", stderr: "", code: 0 };
+  };
+  const result = await terminateResearchContainer("trial-container", runCommand);
+  assert.deepEqual(result, { ok: true, alreadyGone: false });
+  assert.deepEqual(calls, [["docker", "kill", "trial-container"]], "a successful kill must need no escalation");
+});
+
+test("terminateResearchContainer treats \"No such container\" as confirmed success at any step, not a failure", async () => {
+  const alreadyGoneAtKill: RunCommand = async (_command, args = []) => {
+    if (args[0] === "kill") return { ok: false, stdout: "", stderr: "Error response from daemon: No such container: trial-container", code: 1 };
+    throw new Error(`unexpected escalation: ${args.join(" ")}`);
+  };
+  assert.deepEqual(await terminateResearchContainer("trial-container", alreadyGoneAtKill), { ok: true, alreadyGone: true });
+
+  const alreadyGoneAtRm: RunCommand = async (_command, args = []) => {
+    if (args[0] === "kill") return { ok: false, stdout: "", stderr: "Error: some transient kill failure", code: 1 };
+    if (args[0] === "rm") return { ok: false, stdout: "", stderr: "Error: No such container: trial-container", code: 1 };
+    throw new Error(`unexpected escalation: ${args.join(" ")}`);
+  };
+  assert.deepEqual(await terminateResearchContainer("trial-container", alreadyGoneAtRm), { ok: true, alreadyGone: true });
+});
+
+test("terminateResearchContainer escalates to `docker rm -f` when kill fails, and confirms that success (#188 Blocking 2, case A)", async () => {
+  const calls: string[][] = [];
+  const runCommand: RunCommand = async (command, args = []) => {
+    calls.push([command, ...args]);
+    if (args[0] === "kill") return { ok: false, stdout: "", stderr: "Error: signal delivery failed", code: 1 };
+    if (args[0] === "rm") return { ok: true, stdout: "", stderr: "", code: 0 };
+    throw new Error(`unexpected command: ${args.join(" ")}`);
+  };
+  const result = await terminateResearchContainer("trial-container", runCommand);
+  assert.deepEqual(result, { ok: true, alreadyGone: false });
+  assert.deepEqual(calls, [
+    ["docker", "kill", "trial-container"],
+    ["docker", "rm", "-f", "trial-container"]
+  ]);
+});
+
+test("terminateResearchContainer confirms success via an independent docker inspect when both kill and rm -f error (#188 Blocking 2, case A)", async () => {
+  const calls: string[][] = [];
+  const runCommand: RunCommand = async (command, args = []) => {
+    calls.push([command, ...args]);
+    if (args[0] === "kill") return { ok: false, stdout: "", stderr: "context deadline exceeded", code: 1 };
+    if (args[0] === "rm") return { ok: false, stdout: "", stderr: "context deadline exceeded", code: 1 };
+    if (args[0] === "inspect") return { ok: true, stdout: "false\n", stderr: "", code: 0 }; // present, not running
+    throw new Error(`unexpected command: ${args.join(" ")}`);
+  };
+  const result = await terminateResearchContainer("trial-container", runCommand);
+  assert.deepEqual(result, { ok: true, alreadyGone: true });
+  assert.equal(calls.length, 3, "confirmation must only be consulted once both direct attempts have failed");
+});
+
+test("terminateResearchContainer reports an unconfirmed failure only once kill, rm -f AND an independent inspect have all failed (#188 Blocking 2, case B)", async () => {
+  const calls: string[][] = [];
+  const runCommand: RunCommand = async (command, args = []) => {
+    calls.push([command, ...args]);
+    if (args[0] === "kill") return { ok: false, stdout: "", stderr: "Error: daemon unavailable", code: 1 };
+    if (args[0] === "rm") return { ok: false, stdout: "", stderr: "Error: daemon unavailable", code: 1 };
+    if (args[0] === "inspect") return { ok: true, stdout: "true\n", stderr: "", code: 0 }; // still running
+    throw new Error(`unexpected command: ${args.join(" ")}`);
+  };
+  const result = await terminateResearchContainer("trial-container", runCommand);
+  assert.equal(result.ok, false);
+  assert.match((result as { ok: false; error: string }).error, /could not be confirmed/);
+  assert.equal(calls.length, 3, "every escalation step must actually have been attempted before giving up");
 });
 
 test("an agent process receives the dynamic coordinates and queries the live cluster before cleanup", async (t) => {
