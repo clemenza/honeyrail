@@ -1,9 +1,11 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { appendFile } from "node:fs/promises";
-import { nowIso } from "../utils.js";
+import { nowIso, runCommandSafe } from "../utils.js";
 import {
+  DEFAULT_CANCEL_GRACE_MS,
   PostgresResearchError,
+  PostgresResearchTimeoutError,
   withPostgresResearchEnvironment,
   type PostgresBuildManifest,
   type PostgresConnectionInfo,
@@ -17,7 +19,8 @@ import {
   containerAgentEnvironment,
   createAgentScratchDir,
   dockerAvailable,
-  killResearchContainer,
+  terminateResearchContainer,
+  CONTAINER_TERMINATION_WORST_CASE_MS,
   DEFAULT_RESEARCH_IMAGE,
   DEFAULT_RESEARCH_NETWORK,
   resolveResearchAgentImageIdentity,
@@ -59,7 +62,47 @@ import type { PostgresRuntimeRecord } from "./runtime-container.js";
  */
 
 /** How long a killed agent gets to exit on SIGTERM before SIGKILL. */
-const KILL_GRACE_MS = 5000;
+export const KILL_GRACE_MS = 5000;
+
+/**
+ * Headroom added on top of the mechanical worst case below, absorbing
+ * ordinary JS/process scheduling overhead across several sequential awaits
+ * rather than assuming they cost nothing (#188 review, third round).
+ */
+export const CANCELLATION_SAFETY_MARGIN_MS = 5000;
+
+/**
+ * The floor `runAgentInPostgresResearchEnvironment()` enforces on a
+ * caller-supplied `cancelGraceMs` (#188 review, third round): the supported
+ * agent-cancellation path's own worst case - `terminateResearchContainer()`
+ * exhausting all three of its sequential kill/rm/inspect attempts, then the
+ * local client needing the full `KILL_GRACE_MS` to die - plus a safety
+ * margin. Below this, a merely-slow-but-successful cancellation could be
+ * mistaken for `cancelGraceExceeded`, which is supposed to mean the body
+ * never settled at all - recreating the #188 race this whole file exists to
+ * close, just with a caller-chosen deadline instead of the default one.
+ *
+ * `withPostgresResearchEnvironment()` itself enforces no such floor - it is
+ * generic and cannot know what an arbitrary body needs - so this validation
+ * belongs here, in the one place that knows this path's own budget.
+ */
+export const MIN_AGENT_CANCEL_GRACE_MS = CONTAINER_TERMINATION_WORST_CASE_MS + KILL_GRACE_MS + CANCELLATION_SAFETY_MARGIN_MS;
+
+/**
+ * Asserted at import time rather than only documented, so
+ * `DEFAULT_CANCEL_GRACE_MS` (research-environment.ts) and this module's own
+ * constants cannot silently drift apart: the *default* budget must itself
+ * satisfy the minimum this module requires of an explicit override.
+ */
+if (DEFAULT_CANCEL_GRACE_MS < MIN_AGENT_CANCEL_GRACE_MS) {
+  throw new Error(
+    `research-session.ts: DEFAULT_CANCEL_GRACE_MS (${DEFAULT_CANCEL_GRACE_MS}) must be at least ` +
+      `MIN_AGENT_CANCEL_GRACE_MS (${MIN_AGENT_CANCEL_GRACE_MS} = CONTAINER_TERMINATION_WORST_CASE_MS ` +
+      `${CONTAINER_TERMINATION_WORST_CASE_MS} + KILL_GRACE_MS ${KILL_GRACE_MS} + CANCELLATION_SAFETY_MARGIN_MS ` +
+      `${CANCELLATION_SAFETY_MARGIN_MS}), or the default itself would not satisfy the floor this module enforces ` +
+      "on an explicit cancelGraceMs override (#188)"
+  );
+}
 
 /** POSIX only: a detached child leads its own process group, so it can be killed as a tree. */
 const GROUP_KILL = process.platform !== "win32";
@@ -125,8 +168,38 @@ export type PostgresResearchAgentResult = {
   ok: boolean;
   exitCode: number | null;
   signal: string | null;
-  /** True when the agent was killed for exceeding `timeoutMs`. */
+  /** True when the agent was killed for exceeding `timeoutMs`, or for the outer session deadline. */
   timedOut: boolean;
+  /**
+   * Which deadline actually caused the kill, when `timedOut` is true: the
+   * agent's own `timeoutMs`, or the session's outer `options.timeoutMs`
+   * (#188). First cause wins - whichever timer fires first decides this
+   * field, and the other cannot re-fire against an already-killed agent.
+   * Absent when `timedOut` is false.
+   */
+  timeoutSource?: "agent" | "session";
+  /**
+   * Set when `timedOut` is true in isolated mode and the explicit
+   * `docker kill` request (see `AgentLaunch.stop`, `terminateResearchContainer()`)
+   * did not succeed - a daemon/client failure, or an unexpected non-zero
+   * result other than "already gone" (#188 review). This is recorded rather
+   * than swallowed: cancellation still escalates to the local client process
+   * regardless (see `runAgentProcess`), but a failed termination request
+   * must not be indistinguishable from a successful one just because the
+   * local client eventually exited too.
+   */
+  terminationError?: string;
+  /**
+   * Set when `timedOut` is true: `false` specifically means a container
+   * termination was requested but could not be *confirmed* (`launch.stop()`
+   * threw - see `terminationError`) - not merely that a first attempt
+   * failed, since `terminateResearchContainer()` itself escalates before
+   * giving up (#188 review, third round). `true` when cancellation is
+   * confirmed complete - a container termination that succeeded, or
+   * unisolated mode, which has no separate container to confirm and whose
+   * "close" event *is* the confirmation.
+   */
+  confirmedStopped?: boolean;
   stdout: string;
   stderr: string;
   startedAt: string;
@@ -372,8 +445,16 @@ type AgentLaunch = {
   /** Reported to the caller: the agent's own view of what it ran and where. */
   reported: { command: string; args: string[]; cwd: string };
   spawn: { command: string; args: string[]; cwd?: string; env: NodeJS.ProcessEnv; detached: boolean };
-  /** Called on timeout, before the SIGTERM/SIGKILL escalation on the client process. */
-  stop?: () => void;
+  /**
+   * Called on timeout and *awaited* before the SIGTERM/SIGKILL escalation on
+   * the client process (#188 review). In isolated mode this is
+   * `terminateResearchContainer()`: awaiting it, rather than firing it and
+   * moving on, is what makes "the agent container has stopped" an observed
+   * fact by the time cancellation proceeds, rather than an assumption resting
+   * on the local `docker run` client happening to exit soon after. A
+   * rejection is caught by the caller and recorded, not swallowed.
+   */
+  stop?: () => Promise<void> | void;
 };
 
 type AgentIsolationLaunchConfig =
@@ -384,8 +465,24 @@ type AgentIsolationLaunchConfig =
  * Runs the agent and resolves only once the process has exited. Never rejects
  * on a non-zero exit: an agent that failed is an observation, the same way a
  * failing SQL statement is.
+ *
+ * `signal`, when given, is the *session's* outer deadline
+ * (withPostgresResearchEnvironment()'s AbortSignal, #188) - a second,
+ * independent cause of the same kill sequence `agent.timeoutMs` already
+ * drives. `requestCancel()` below is the single place either cause goes
+ * through, so the two can never double-kill: the first to fire wins, records
+ * which one it was on `timeoutSource`, and hands the second (including one
+ * arriving at the same tick) the same in-flight cancellation promise rather
+ * than starting a second one.
+ *
+ * Exported for direct, deterministic unit testing of the cancellation
+ * semantics without standing up a full research environment or a container.
  */
-async function runAgentProcess(launch: AgentLaunch, agent: PostgresResearchAgentSpec): Promise<PostgresResearchAgentResult> {
+export async function runAgentProcess(
+  launch: AgentLaunch,
+  agent: PostgresResearchAgentSpec,
+  signal?: AbortSignal
+): Promise<PostgresResearchAgentResult> {
   const limit = agent.maxOutputBytes ?? 1024 * 1024 * 8;
   const startedAt = nowIso();
   const started = Date.now();
@@ -407,32 +504,96 @@ async function runAgentProcess(launch: AgentLaunch, agent: PostgresResearchAgent
   child.stdin?.end(agent.stdin ?? "");
 
   let timedOut = false;
+  let timeoutSource: "agent" | "session" | undefined;
+  let terminationError: string | undefined;
+  let confirmedStopped: boolean | undefined;
   let killTimer: NodeJS.Timeout | undefined;
   let graceTimer: NodeJS.Timeout | undefined;
-  if (agent.timeoutMs) {
-    killTimer = setTimeout(() => {
-      timedOut = true;
-      // In isolated mode this is `docker kill`: signalling the client alone
-      // would leave the container - and therefore the agent - running.
-      launch.stop?.();
-      killTree(child, "SIGTERM");
-      graceTimer = setTimeout(() => killTree(child, "SIGKILL"), KILL_GRACE_MS);
-      graceTimer.unref?.();
-    }, agent.timeoutMs);
-    killTimer.unref?.();
+  let cancellationPromise: Promise<void> | undefined;
+
+  /**
+   * Awaits `launch.stop()` (in isolated mode, `terminateResearchContainer()`,
+   * which only resolves successfully once container absence is *confirmed*)
+   * to completion, then escalates SIGTERM/SIGKILL on the local client
+   * process regardless of whether it succeeded. Never called directly -
+   * always through `requestCancel()` below.
+   */
+  async function cancel(source: "agent" | "session"): Promise<void> {
+    timedOut = true;
+    timeoutSource = source;
+    try {
+      await launch.stop?.();
+      confirmedStopped = true;
+    } catch (error) {
+      // Recorded, not swallowed (#188 review): a failed termination request
+      // must not be indistinguishable from a successful one just because the
+      // local client eventually exits too, from the escalation below.
+      terminationError = (error as Error).message;
+      confirmedStopped = false;
+    }
+    // Still escalated even when unconfirmed: this is a best-effort nudge at
+    // the local client, not a claim that the underlying container is gone -
+    // markAgentTerminationUnconfirmed() (research-session.ts's caller) is
+    // what actually keeps cleanup from proceeding destructively.
+    killTree(child, "SIGTERM");
+    graceTimer = setTimeout(() => killTree(child, "SIGKILL"), KILL_GRACE_MS);
+    graceTimer.unref?.();
   }
 
-  const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
-    // "close" rather than "exit": it fires after stdout/stderr have drained,
-    // so nothing the agent printed is lost.
-    child.once("close", (code, signal) => resolve({ code, signal }));
-    child.once("error", reject);
-  }).catch((error: Error) => {
-    throw new PostgresResearchError(`Could not run research agent "${agent.command}": ${error.message}`);
-  });
+  /**
+   * The single entry point either timeout cause calls, and the single place
+   * that can never double-kill: only the *first* call actually starts
+   * `cancel()` - `cancellationPromise` is assigned once, synchronously,
+   * before any `await` - and every caller, including one arriving after
+   * cancellation is already under way, gets back that same promise.
+   *
+   * That shared promise is also the fix for #188's second review: the local
+   * child closing does not, by itself, prove a *requested* cancellation has
+   * settled - the agent can exit at the same moment as the timeout, the
+   * docker CLI can die for an unrelated reason, or the container can exit on
+   * its own while `launch.stop()` is still resolving. `runAgentProcess` below
+   * awaits `cancellationPromise`, if one was started, in addition to waiting
+   * for the child to close - not instead of it - so cleanup can never begin
+   * while a termination request this function made is still in flight,
+   * regardless of which of the two settles last.
+   */
+  function requestCancel(source: "agent" | "session"): Promise<void> {
+    if (!cancellationPromise) cancellationPromise = cancel(source);
+    return cancellationPromise;
+  }
 
-  if (killTimer) clearTimeout(killTimer);
-  if (graceTimer) clearTimeout(graceTimer);
+  if (agent.timeoutMs) {
+    killTimer = setTimeout(() => void requestCancel("agent"), agent.timeoutMs);
+    killTimer.unref?.();
+  }
+  const onAbort = () => void requestCancel("session");
+  if (signal) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }
+
+  let exit: { code: number | null; signal: NodeJS.Signals | null };
+  try {
+    exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      // "close" rather than "exit": it fires after stdout/stderr have drained,
+      // so nothing the agent printed is lost.
+      child.once("close", (code, closeSignal) => resolve({ code, signal: closeSignal }));
+      child.once("error", reject);
+    });
+    if (cancellationPromise) {
+      // The child closing (above) is not proof that our own cancellation
+      // request has settled - see requestCancel()'s doc comment. Awaiting it
+      // here, after the close event and not merely alongside it, closes that
+      // race regardless of which of the two actually finishes last.
+      await cancellationPromise;
+    }
+  } catch (error) {
+    throw new PostgresResearchError(`Could not run research agent "${agent.command}": ${(error as Error).message}`);
+  } finally {
+    if (killTimer) clearTimeout(killTimer);
+    if (graceTimer) clearTimeout(graceTimer);
+    if (signal) signal.removeEventListener("abort", onAbort);
+  }
 
   return {
     ...launch.reported,
@@ -440,6 +601,8 @@ async function runAgentProcess(launch: AgentLaunch, agent: PostgresResearchAgent
     exitCode: exit.code,
     signal: exit.signal,
     timedOut,
+    ...(timedOut ? { timeoutSource, confirmedStopped } : {}),
+    ...(terminationError ? { terminationError } : {}),
     stdout: stdout.text(),
     stderr: stderr.text(),
     startedAt,
@@ -486,6 +649,21 @@ export async function runAgentInPostgresResearchEnvironment(
   if (!String(agent.command || "").trim()) {
     throw new PostgresResearchError("A research agent spec requires a command");
   }
+  // Rejected before any side effect (no environment created, no docker
+  // reachability check), same as the command check above: an unsafe
+  // cancelGraceMs is a configuration error, not a trial outcome (#188
+  // review, third round). withPostgresResearchEnvironment() enforces no
+  // floor of its own - it is generic and cannot know what an arbitrary body
+  // needs - so this is the one place that can validate it against this
+  // path's own supported cancellation budget.
+  if (options.cancelGraceMs !== undefined && options.cancelGraceMs < MIN_AGENT_CANCEL_GRACE_MS) {
+    throw new PostgresResearchError(
+      `cancelGraceMs=${options.cancelGraceMs}ms is too small for the supported agent cancellation path; minimum is ` +
+        `${MIN_AGENT_CANCEL_GRACE_MS}ms (container termination escalation up to ${CONTAINER_TERMINATION_WORST_CASE_MS}ms, ` +
+        `local-process kill grace ${KILL_GRACE_MS}ms, safety margin ${CANCELLATION_SAFETY_MARGIN_MS}ms). Omit ` +
+        "cancelGraceMs to use the default, or raise it to at least this value."
+    );
+  }
   const isolation = options.isolation ?? {};
   const runCommand = spec.runCommand;
   if (!isolation.allowUnisolatedForDevelopment && !(await dockerAvailable(runCommand))) {
@@ -511,19 +689,35 @@ export async function runAgentInPostgresResearchEnvironment(
   // cleanup has run - that is the only point at which it records what was
   // actually stopped and removed.
   let environment: PostgresResearchEnvironment | undefined;
-  {
+  // Captured the moment runAgentProcess() resolves, from inside the body -
+  // i.e. before a session timeout's Promise.race can discard the body's own
+  // return value - so a failed termination request survives even when the
+  // outer call rejects (#188 review, second round, Blocking 3).
+  let agentTermination: { timeoutSource: "agent" | "session"; terminationError?: string; confirmedStopped?: boolean } | undefined;
+  try {
     const session = await withPostgresResearchEnvironment(
       // The environment owns this trial's randomized build view now, because
       // the runtime container mounts the same one - so the isolation option
       // has to reach it rather than being applied here.
       { ...spec, buildViewsRoot: spec.buildViewsRoot ?? isolation.buildViewsRoot },
-      async (env) => {
+      async (env, signal) => {
         environment = env;
 
         if (launchConfig.mode === "unisolated-development") {
           await env.start();
           const injected = env.agentEnvironment(agent.envPrefix);
-          const result = await runAgentProcess(unisolatedLaunch(env, agent, injected), agent);
+          const result = await runAgentProcess(unisolatedLaunch(env, agent, injected), agent, signal);
+          // Unisolated mode has no separate container to confirm - the
+          // process closing *is* the confirmation - so confirmedStopped is
+          // always true here and markAgentTerminationUnconfirmed() is never
+          // reached on this branch.
+          if (result.timedOut) {
+            agentTermination = {
+              timeoutSource: result.timeoutSource!,
+              terminationError: result.terminationError,
+              confirmedStopped: result.confirmedStopped
+            };
+          }
           return {
             agent: result,
             agentEnvironment: injected,
@@ -589,10 +783,31 @@ export async function runAgentInPostgresResearchEnvironment(
               cwd: agent.cwd ?? RESEARCH_CONTAINER_PATHS.scratch
             },
             spawn: { command: "docker", args: containerArgs, env: process.env, detached: false },
-            stop: () => killResearchContainer(containerName)
+            stop: async () => {
+              const termination = await terminateResearchContainer(containerName, runCommand ?? runCommandSafe);
+              if (!termination.ok) {
+                throw new PostgresResearchError(`agent container ${containerName}: ${termination.error}`);
+              }
+            }
           },
-          agent
+          agent,
+          signal
         );
+        if (result.timedOut) {
+          agentTermination = {
+            timeoutSource: result.timeoutSource!,
+            terminationError: result.terminationError,
+            confirmedStopped: result.confirmedStopped
+          };
+          // Fail closed (#188 review, third round): the container's own
+          // absence could not be confirmed, so PGDATA, the socket directory,
+          // the build view and the runtime container - all bind-mounted into
+          // it too - must not be torn down out from under it. env.cleanup()
+          // (called from withPostgresResearchEnvironment's finally, after
+          // this body has settled) checks this and skips its destructive
+          // steps entirely rather than reporting a normal teardown.
+          if (result.confirmedStopped === false) env.markAgentTerminationUnconfirmed();
+        }
 
         const networkMode = isolation.network ?? DEFAULT_RESEARCH_NETWORK;
         const buildScoredEligible = env.buildManifest.scoredEligible;
@@ -634,5 +849,23 @@ export async function runAgentInPostgresResearchEnvironment(
     // process above has actually exited. That ordering is MUST 4 of the #182
     // fourth review and is not something this function may shortcut.
     return { ...session, runtime: environment!.runtimeManifest() };
+  } catch (error) {
+    // A session timeout rejects rather than resolving (options.timeoutMs is
+    // a hard backstop on the whole call, unlike agent.timeoutMs, which is an
+    // observation on the returned result) - but by the time it is thrown,
+    // withPostgresResearchEnvironment's finally has already run env.cleanup(),
+    // and `environment` was captured from inside the body. Attaching the
+    // manifest here means a session timeout is never an evidence-free
+    // rejection: cleanup.sessionTimedOut and cleanup.errors are still visible
+    // to whatever catches this (#188).
+    if (error instanceof PostgresResearchTimeoutError) {
+      if (environment) error.runtimeManifest = environment.runtimeManifest();
+      // Likewise for the agent's own cancellation outcome: absent when no
+      // agent cancellation was ever observed to start (e.g. the timeout hit
+      // before runAgentProcess() was even reached), present - including a
+      // failed terminationError - whenever one was.
+      if (agentTermination) error.agentTermination = agentTermination;
+    }
+    throw error;
   }
 }

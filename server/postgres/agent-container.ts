@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { runCommandSafe } from "../utils.js";
@@ -234,14 +233,92 @@ export async function dockerAvailable(runCommand = runCommandSafe): Promise<bool
   return result.ok && Boolean(result.stdout.trim());
 }
 
-/** Best-effort stop of a named container; used when an agent exceeds its timeout. */
-export function killResearchContainer(containerName: string): void {
-  try {
-    spawn("docker", ["kill", containerName], { stdio: "ignore" }).on("error", () => {});
-  } catch {
-    // The daemon is gone or the container already exited; the client process
-    // is killed separately, so there is nothing further to do here.
+export type ContainerTerminationResult =
+  | { ok: true; alreadyGone: boolean }
+  | { ok: false; error: string };
+
+/**
+ * Bound on each individual docker command `terminateResearchContainer()`
+ * issues (kill, the `rm -f` fallback, and the `inspect` confirmation).
+ */
+export const CONTAINER_TERMINATION_TIMEOUT_MS = 10_000;
+
+/**
+ * The worst case across `terminateResearchContainer()`'s up to three
+ * sequential attempts, if every single one independently exhausts its own
+ * timeout. `research-session.ts` builds `MIN_AGENT_CANCEL_GRACE_MS` from this
+ * - not from `CONTAINER_TERMINATION_TIMEOUT_MS` alone - so that constant is
+ * the single source of truth for how many attempts this function can make
+ * (#188 review, third round).
+ */
+export const CONTAINER_TERMINATION_WORST_CASE_MS = CONTAINER_TERMINATION_TIMEOUT_MS * 3;
+
+async function attemptTermination(
+  args: string[],
+  containerName: string,
+  runCommand: RunCommand,
+  timeoutMs: number
+): Promise<ContainerTerminationResult> {
+  const result = await runCommand("docker", args, { timeout: timeoutMs });
+  if (result.ok) return { ok: true, alreadyGone: false };
+  const message = (result.stderr || result.stdout || `docker ${args.join(" ")} exited with code ${result.code}`).trim();
+  if (/no such (container|object)/i.test(message)) return { ok: true, alreadyGone: true };
+  return { ok: false, error: message };
+}
+
+/** True only once docker itself confirms the container is not running (or is gone outright) - never inferred from a command's exit code alone. */
+async function confirmContainerAbsent(containerName: string, runCommand: RunCommand, timeoutMs: number): Promise<boolean> {
+  const inspect = await runCommand("docker", ["inspect", "--format", "{{.State.Running}}", containerName], { timeout: timeoutMs });
+  if (!inspect.ok) {
+    const message = (inspect.stderr || inspect.stdout || "").trim();
+    return /no such (container|object)/i.test(message);
   }
+  return inspect.stdout.trim() !== "true";
+}
+
+/**
+ * Terminates a named research container and does not resolve until the
+ * outcome is *confirmed*, not merely requested - never fire-and-forget, and
+ * never satisfied by the *local* `docker run` client's own exit, which is a
+ * different process with different exit timing and can close for reasons
+ * that have nothing to do with the container actually stopping (#188
+ * review).
+ *
+ * Escalates rather than reporting the first failure: `docker kill` (SIGKILL
+ * by default - already the strongest signal, but the command or the daemon
+ * connection can still fail transiently) is followed by `docker rm -f` if it
+ * did not succeed, and if neither reports success, by an independent
+ * `docker inspect` check before finally giving up - because "our command
+ * failed" and "the container is still there" are different facts, and only
+ * the second one is what this function exists to establish. This keeps the
+ * common case to one round trip; only a genuinely stuck container or daemon
+ * pays for all three.
+ *
+ * "No such container"/"No such object" is success at any step: every
+ * research container runs `--rm`, so one already gone has already been
+ * removed by docker, and the agent is gone either way - the actual goal, not
+ * the specific command that got there. A confirmed failure - the container
+ * could not be shown absent after every attempt - is returned as a
+ * diagnostic, never swallowed and never silently treated as success.
+ */
+export async function terminateResearchContainer(
+  containerName: string,
+  runCommand: RunCommand = runCommandSafe,
+  timeoutMs: number = CONTAINER_TERMINATION_TIMEOUT_MS
+): Promise<ContainerTerminationResult> {
+  const killed = await attemptTermination(["kill", containerName], containerName, runCommand, timeoutMs);
+  if (killed.ok) return killed;
+
+  const removed = await attemptTermination(["rm", "-f", containerName], containerName, runCommand, timeoutMs);
+  if (removed.ok) return removed;
+
+  if (await confirmContainerAbsent(containerName, runCommand, timeoutMs)) {
+    return { ok: true, alreadyGone: true };
+  }
+  return {
+    ok: false,
+    error: `container ${containerName} termination could not be confirmed after kill and rm -f both failed: ${killed.error}; ${removed.error}`
+  };
 }
 
 /**

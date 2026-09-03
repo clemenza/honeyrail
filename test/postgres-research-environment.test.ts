@@ -459,23 +459,131 @@ test("cleanup runs after success, after a thrown error, and after a timeout", as
   assert.equal(await exists(failed!.dataDir), false, "PGDATA must be removed after a thrown error");
   assert.equal(await exists(failed!.socketDir), false);
 
+  // The session deadline actively cancels the body (#188) rather than merely
+  // abandoning the await: a body that observes its AbortSignal settles
+  // promptly, and cleanup - which waits for it - finishes near the deadline
+  // rather than after whatever the body happened to be doing.
   let timedOut: PostgresResearchEnvironment | undefined;
+  let cancelObserved = false;
+  const timeoutStarted = Date.now();
   await assert.rejects(
     withPostgresResearchEnvironment(
       specFor(fixture, "cleanup-timeout"),
-      async (env) => {
+      async (env, signal) => {
         timedOut = env;
         await env.start();
-        await new Promise((resolve) => setTimeout(resolve, 30_000));
+        await new Promise<void>((_resolve, reject) => {
+          const onAbort = () => {
+            cancelObserved = true;
+            reject(signal.reason);
+          };
+          if (signal.aborted) return onAbort();
+          signal.addEventListener("abort", onAbort, { once: true });
+        });
       },
       { timeoutMs: 250 }
     ),
     PostgresResearchTimeoutError
   );
+  assert.equal(cancelObserved, true, "the body must be told to cancel via AbortSignal, not merely abandoned");
+  assert.ok(
+    Date.now() - timeoutStarted < 15_000,
+    "cleanup must not wait anywhere near cancelGraceMs for a body that cancels promptly"
+  );
   assert.equal(timedOut!.isRunning(), false);
   assert.equal(await exists(timedOut!.dataDir), false, "PGDATA must be removed after a timeout");
   assert.equal(await exists(timedOut!.socketDir), false);
   assert.equal(timedOut!.runtimeManifest().cleanup?.stopped, true);
+  assert.equal(timedOut!.runtimeManifest().cleanup?.sessionTimedOut, true, "cleanup evidence must identify a session timeout");
+  assert.equal(timedOut!.runtimeManifest().cleanup?.cancelGraceExceeded, false, "the body settled well inside the grace bound");
+});
+
+test("a body that never observes the session AbortSignal cannot block cleanup past cancelGraceMs", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  const fixture = await withFixture(t);
+
+  let env: PostgresResearchEnvironment | undefined;
+  const started = Date.now();
+  await assert.rejects(
+    withPostgresResearchEnvironment(
+      specFor(fixture, "ignores-signal"),
+      async (e) => {
+        env = e;
+        await e.start();
+        // Deliberately does not look at `signal` - the non-conforming body
+        // this bound exists to protect against.
+        await new Promise((resolve) => setTimeout(resolve, 60_000));
+      },
+      { timeoutMs: 250, cancelGraceMs: 500 }
+    ),
+    PostgresResearchTimeoutError
+  );
+  assert.ok(
+    Date.now() - started < 10_000,
+    "cleanup must proceed once cancelGraceMs elapses, regardless of whether the body ever settled"
+  );
+  assert.equal(await exists(env!.dataDir), false, "cleanup still runs even though the body never observed cancellation");
+  assert.equal(env!.runtimeManifest().cleanup?.sessionTimedOut, true);
+  assert.equal(
+    env!.runtimeManifest().cleanup?.cancelGraceExceeded,
+    true,
+    "exceeding the grace bound must be recorded, not hidden"
+  );
+});
+
+test("a cleanup failure during a session timeout does not mask the timeout as the primary cause (#188)", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  const fixture = await withFixture(t);
+
+  // Throws rather than returning { ok: false }: cleanup()'s stop() call is
+  // itself unguarded (stop() returning false is an ordinary escalation from
+  // fast to immediate, not a cleanup *failure*), so this exercises the
+  // catch block that actually populates cleanupResult.errors - a real
+  // cleanup failure, not merely a slow one - while the session timeout is
+  // what is driving this call.
+  const brokenStop: typeof runCommandSafe = async (command, args, options) => {
+    if (command.endsWith("pg_ctl") && (args ?? []).includes("stop")) {
+      throw new Error("pg_ctl stop: connection to the postmaster's control socket was refused");
+    }
+    return runCommandSafe(command, args, options);
+  };
+
+  let env: PostgresResearchEnvironment | undefined;
+  let caught: unknown;
+  try {
+    await withPostgresResearchEnvironment(
+      specFor(fixture, "cleanup-fails-under-timeout", { runCommand: brokenStop }),
+      async (e, signal) => {
+        env = e;
+        await e.start();
+        await new Promise<void>((_resolve, reject) => {
+          const onAbort = () => reject(signal.reason);
+          if (signal.aborted) return onAbort();
+          signal.addEventListener("abort", onAbort, { once: true });
+        });
+      },
+      { timeoutMs: 250 }
+    );
+    assert.fail("expected the session timeout to reject the call");
+  } catch (error) {
+    caught = error;
+  }
+
+  // The primary cause must survive intact: a cleanup-step failure must not
+  // replace it, wrap it, or otherwise obscure that this was a timeout.
+  assert.ok(caught instanceof PostgresResearchTimeoutError, `expected PostgresResearchTimeoutError, got ${caught}`);
+  assert.match((caught as Error).message, /timed out/);
+
+  // ...while the cleanup failure itself remains visible as a diagnostic,
+  // alongside the correct session-timeout classification - neither hides
+  // the other.
+  const cleanup = env!.runtimeManifest().cleanup;
+  assert.equal(cleanup?.sessionTimedOut, true);
+  assert.equal(cleanup?.stopped, false, "the injected failure must actually have failed cleanup's stop step");
+  assert.ok(
+    cleanup?.errors.some((message) => /control socket was refused/.test(message)),
+    `expected a stop failure in cleanup.errors, got ${JSON.stringify(cleanup?.errors)}`
+  );
 });
 
 test("the postgres-research executor records source, build and runtime manifests as artifacts and evidence", async (t) => {

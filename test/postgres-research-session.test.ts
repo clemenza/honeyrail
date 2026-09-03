@@ -4,15 +4,26 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 
-import { PostgresResearchError, type PostgresResearchSpec } from "../server/postgres/research-environment.js";
 import {
+  DEFAULT_CANCEL_GRACE_MS,
+  PostgresResearchError,
+  PostgresResearchTimeoutError,
+  type PostgresResearchSpec
+} from "../server/postgres/research-environment.js";
+import {
+  CONTAINER_TERMINATION_WORST_CASE_MS,
   DEFAULT_RESEARCH_IMAGE,
   PostgresResearchAgentContainerError,
-  resolveResearchAgentImageIdentity
+  resolveResearchAgentImageIdentity,
+  terminateResearchContainer
 } from "../server/postgres/agent-container.js";
 import {
   assertResearchAgentImageCompatible,
   runAgentInPostgresResearchEnvironment,
+  runAgentProcess,
+  CANCELLATION_SAFETY_MARGIN_MS,
+  KILL_GRACE_MS,
+  MIN_AGENT_CANCEL_GRACE_MS,
   type PostgresResearchSessionOptions
 } from "../server/postgres/research-session.js";
 import type { PostgresBuildManifest } from "../server/postgres/research-environment.js";
@@ -66,6 +77,363 @@ async function skipWithoutToolchain(t: TestContext) {
   t.skip("git, make, tar or a C compiler probe is unavailable");
   return true;
 }
+
+// #188: runAgentProcess() is the single place both `agent.timeoutMs` and the
+// session's outer AbortSignal fund the same kill sequence. These tests are
+// deterministic and need neither a research environment nor a docker daemon
+// - they spawn a plain shell process directly, the same way unisolatedLaunch()
+// does (detached: true, so killTree()'s process-group signal reaches a
+// grandchild like `sleep` directly rather than only the wrapper shell - a
+// non-interactive shell blocked on a foreground command can defer acting on
+// its own SIGTERM until that command exits on its own, so `detached: false`
+// here would make these tests flaky-slow rather than deterministic) - so they
+// exercise the cancellation semantics in isolation from materialize/build/start
+// and from any container boundary.
+async function withShellScript(t: TestContext, body: string) {
+  const dir = await mkdtemp(join(tmpdir(), "honeyrail-pg-agent-process-"));
+  t.after(async () => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, "script.sh");
+  await writeFile(path, `#!/bin/sh\n${body}`);
+  await chmod(path, 0o755);
+  return { command: path, args: [] as string[], cwd: dir, env: process.env, detached: true };
+}
+
+test("the session AbortSignal kills the agent and records timeoutSource \"session\", even without agent.timeoutMs", async (t) => {
+  const launch = await withShellScript(t, "sleep 5\n");
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 150);
+
+  const started = Date.now();
+  const result = await runAgentProcess({ reported: launch, spawn: launch }, { command: launch.command }, controller.signal);
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.timeoutSource, "session");
+  assert.equal(result.ok, false);
+  assert.ok(Date.now() - started < 4000, `the session signal must kill the agent promptly, not wait for its 5s sleep (${result.durationMs}ms)`);
+});
+
+test("agent.timeoutMs kills the agent and records timeoutSource \"agent\" ahead of a later session signal", async (t) => {
+  const launch = await withShellScript(t, "sleep 5\n");
+  const controller = new AbortController();
+
+  const result = await runAgentProcess({ reported: launch, spawn: launch }, { command: launch.command, timeoutMs: 100 }, controller.signal);
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.timeoutSource, "agent");
+  assert.equal(result.ok, false);
+
+  // A session timeout arriving after the agent has already exited must be
+  // harmless: no throw, no double-kill, no listener left registered.
+  assert.doesNotThrow(() => controller.abort());
+});
+
+test("a normal fast exit is not marked timed out even when the session signal aborts moments later", async (t) => {
+  const launch = await withShellScript(t, "exit 0\n");
+  const controller = new AbortController();
+
+  const result = await runAgentProcess({ reported: launch, spawn: launch }, { command: launch.command }, controller.signal);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.timeoutSource, undefined);
+  // Its abort listener must already be detached by the time the process has
+  // closed, so a late abort is a plain no-op rather than an error.
+  assert.doesNotThrow(() => controller.abort());
+});
+
+test("a signal already aborted before the agent is launched kills it immediately, ahead of agent.timeoutMs - repeated cancellation is harmless", async (t) => {
+  const launch = await withShellScript(t, "sleep 5\n");
+  const controller = new AbortController();
+  controller.abort();
+
+  const started = Date.now();
+  // agent.timeoutMs is deliberately shorter still (1ms): if both causes ever
+  // fired, "session" must win because it is observed synchronously at launch,
+  // and the agent-timeout timer firing moments later must be a harmless no-op
+  // rather than a second kill or a crash.
+  const result = await runAgentProcess({ reported: launch, spawn: launch }, { command: launch.command, timeoutMs: 1 }, controller.signal);
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.timeoutSource, "session");
+  assert.ok(Date.now() - started < 3000, `a pre-aborted signal must kill immediately, not wait out the 5s sleep (${result.durationMs}ms)`);
+});
+
+test("a throwing/rejecting stop() is recorded as terminationError, not swallowed, and still does not prevent the kill sequence (#188)", async (t) => {
+  const launch = await withShellScript(t, "sleep 5\n");
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 100);
+
+  const result = await runAgentProcess(
+    { reported: launch, spawn: launch, stop: async () => { throw new Error("docker kill failed: no such container"); } },
+    { command: launch.command },
+    controller.signal
+  );
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.timeoutSource, "session");
+  assert.equal(result.ok, false);
+  assert.match(
+    result.terminationError ?? "",
+    /docker kill failed/,
+    "a failed termination request must be recorded, not indistinguishable from a successful one"
+  );
+});
+
+test("runAgentProcess does not resolve while an async termination operation is still pending, and resolves once it settles (#188)", async (t) => {
+  const launch = await withShellScript(t, "sleep 30\n");
+  const controller = new AbortController();
+
+  let stopCalled = false;
+  let resolveTermination!: () => void;
+  const terminationGate = new Promise<void>((resolve) => {
+    resolveTermination = resolve;
+  });
+
+  const resultPromise = runAgentProcess(
+    {
+      reported: launch,
+      spawn: launch,
+      stop: async () => {
+        stopCalled = true;
+        // Deliberately left unresolved until the test resolves it below -
+        // simulating a still-in-flight `docker kill` (or an async
+        // terminate() the reviewer's minimal-design alternatives suggest).
+        await terminationGate;
+      }
+    },
+    { command: launch.command },
+    controller.signal
+  );
+
+  controller.abort();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(stopCalled, true, "cancellation must call stop() promptly once the signal aborts");
+
+  // The core assertion: with termination still pending, the local child has
+  // not been signalled yet (cancel() awaits stop() before escalating), so
+  // runAgentProcess must not have resolved either. An implementation that
+  // merely waits for the local docker-run client - without gating on the
+  // termination operation itself - would fail this by resolving early.
+  const settledWhilePending = await Promise.race([
+    resultPromise.then(() => "settled" as const),
+    new Promise<"still-pending">((resolve) => setTimeout(() => resolve("still-pending"), 500))
+  ]);
+  assert.equal(
+    settledWhilePending,
+    "still-pending",
+    "runAgentProcess must not resolve while agent-container termination is still pending"
+  );
+
+  resolveTermination();
+  const result = await resultPromise;
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.timeoutSource, "session");
+  assert.equal(result.terminationError, undefined, "a termination that eventually succeeds must not be recorded as an error");
+});
+
+/** Polls rather than sleeping a fixed duration, so this is robust under a loaded/contended test machine rather than merely "usually enough time." */
+async function waitForFile(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await stat(path).catch(() => null)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return false;
+}
+
+test("an independently-exiting child does not bypass a still-pending termination request (#188, second round, Blocking 1)", async (t) => {
+  // The child exits entirely on its own - not from our SIGTERM, which never
+  // fires because stop() below is deliberately left pending - simulating the
+  // container/process dying (or the docker CLI exiting) for a reason that
+  // has nothing to do with our own termination request. This is the race the
+  // first round's fix missed: cancel() awaited stop() before escalating, but
+  // runAgentProcess itself only awaited child-close, so an independent close
+  // could still let it resolve while stop() was still in flight.
+  //
+  // The script writes a marker file as its very last action before exiting,
+  // and the test polls for it rather than sleeping a fixed duration - a
+  // fixed short sleep is exactly what made an earlier version of this test
+  // flake under a loaded machine, where `exit 0` did not get scheduled in
+  // time and the fallback kill (not the independent exit) is what actually
+  // closed the child, which does not exercise the race this test exists for.
+  const launch = await withShellScript(t, 'touch exited.marker\nexit 0\n');
+  const markerPath = join(launch.cwd, "exited.marker");
+  const controller = new AbortController();
+
+  let stopCalled = false;
+  let resolveTermination!: () => void;
+  const terminationGate = new Promise<void>((resolve) => {
+    resolveTermination = resolve;
+  });
+
+  const resultPromise = runAgentProcess(
+    {
+      reported: launch,
+      spawn: launch,
+      stop: async () => {
+        stopCalled = true;
+        await terminationGate; // left pending until the test resolves it
+      }
+    },
+    { command: launch.command },
+    controller.signal
+  );
+
+  controller.abort();
+  assert.ok(
+    await waitForFile(markerPath, 10_000),
+    "the child must actually have exited on its own before this test can prove anything about that race"
+  );
+  assert.equal(stopCalled, true, "cancellation must call stop() promptly once the signal aborts");
+
+  // The core assertion: even though the child has already closed on its own
+  // (confirmed above, not merely assumed), runAgentProcess must not resolve
+  // while the termination request it made is still pending. An
+  // implementation that awaits only child-close - not also the cancellation
+  // promise, once one has started - would fail this by resolving early.
+  const settledWhilePending = await Promise.race([
+    resultPromise.then(() => "settled" as const),
+    new Promise<"still-pending">((resolve) => setTimeout(() => resolve("still-pending"), 500))
+  ]);
+  assert.equal(
+    settledWhilePending,
+    "still-pending",
+    "runAgentProcess must not resolve while its termination request is still pending, even after the child has already closed independently"
+  );
+
+  resolveTermination();
+  const result = await resultPromise;
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.timeoutSource, "session");
+  // The child died on its own (`exit 0`), not from our signal - the marker
+  // wait above is what makes this true rather than merely likely.
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.signal, null);
+});
+
+test("MIN_AGENT_CANCEL_GRACE_MS reflects the full kill/rm/inspect escalation, and the default budget satisfies it (#188, third round, Blocking 1)", () => {
+  assert.equal(
+    MIN_AGENT_CANCEL_GRACE_MS,
+    CONTAINER_TERMINATION_WORST_CASE_MS + KILL_GRACE_MS + CANCELLATION_SAFETY_MARGIN_MS,
+    "MIN_AGENT_CANCEL_GRACE_MS must be built from the escalation's actual worst case (all three attempts), not a single attempt's timeout"
+  );
+  assert.ok(
+    DEFAULT_CANCEL_GRACE_MS >= MIN_AGENT_CANCEL_GRACE_MS,
+    `DEFAULT_CANCEL_GRACE_MS (${DEFAULT_CANCEL_GRACE_MS}) must be at least MIN_AGENT_CANCEL_GRACE_MS ` +
+      `(${MIN_AGENT_CANCEL_GRACE_MS}), or the default itself would violate the floor this module enforces on an ` +
+      "explicit cancelGraceMs override - the supported agent path is not designed to overrun the outer session's " +
+      "grace budget merely because its own internal termination escalation is too large"
+  );
+});
+
+test("runAgentInPostgresResearchEnvironment rejects a cancelGraceMs below the supported minimum before any trial side effect (#188, third round, Blocking 1)", async () => {
+  const unsafe = MIN_AGENT_CANCEL_GRACE_MS - 1;
+  await assert.rejects(
+    runAgentInPostgresResearchEnvironment(
+      { root: "/dev/null/never-created", source: { repoPath: "/dev/null/never-created", ref: "HEAD" } },
+      { command: "/bin/true" },
+      { cancelGraceMs: unsafe }
+    ),
+    (error: Error) =>
+      error instanceof PostgresResearchError &&
+      error.message.includes(`cancelGraceMs=${unsafe}ms`) &&
+      error.message.includes(`minimum is ${MIN_AGENT_CANCEL_GRACE_MS}ms`)
+  );
+});
+
+test("an explicit cancelGraceMs at or above the supported minimum is accepted (#188, third round, Blocking 1)", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  const fixture = await withFixture(t);
+  const agentPath = await writeAgent(fixture, "agent-quick.sh", ["exit 0", ""].join("\n"));
+  const spec = specFor(fixture, "cancel-grace-safe");
+
+  // Exactly the minimum, not comfortably above it - proving the boundary
+  // itself is accepted (>=), not just values well clear of it.
+  const session = await runAgentInPostgresResearchEnvironment(spec, { command: agentPath, timeoutMs: 60_000 }, {
+    ...DEV_MODE,
+    cancelGraceMs: MIN_AGENT_CANCEL_GRACE_MS
+  });
+  assert.equal(session.agent.ok, true);
+});
+
+// #188, third round, Blocking 2: terminateResearchContainer() must only
+// report success once container absence is *confirmed* - never merely
+// requested. These are deterministic and need no real docker daemon: a fake
+// runCommand stands in for the daemon's responses at each of the up to three
+// steps (kill, the `rm -f` fallback, an independent `inspect` confirmation).
+
+test("terminateResearchContainer confirms success on the first docker kill", async () => {
+  const calls: string[][] = [];
+  const runCommand: RunCommand = async (command, args = []) => {
+    calls.push([command, ...args]);
+    return { ok: true, stdout: "", stderr: "", code: 0 };
+  };
+  const result = await terminateResearchContainer("trial-container", runCommand);
+  assert.deepEqual(result, { ok: true, alreadyGone: false });
+  assert.deepEqual(calls, [["docker", "kill", "trial-container"]], "a successful kill must need no escalation");
+});
+
+test("terminateResearchContainer treats \"No such container\" as confirmed success at any step, not a failure", async () => {
+  const alreadyGoneAtKill: RunCommand = async (_command, args = []) => {
+    if (args[0] === "kill") return { ok: false, stdout: "", stderr: "Error response from daemon: No such container: trial-container", code: 1 };
+    throw new Error(`unexpected escalation: ${args.join(" ")}`);
+  };
+  assert.deepEqual(await terminateResearchContainer("trial-container", alreadyGoneAtKill), { ok: true, alreadyGone: true });
+
+  const alreadyGoneAtRm: RunCommand = async (_command, args = []) => {
+    if (args[0] === "kill") return { ok: false, stdout: "", stderr: "Error: some transient kill failure", code: 1 };
+    if (args[0] === "rm") return { ok: false, stdout: "", stderr: "Error: No such container: trial-container", code: 1 };
+    throw new Error(`unexpected escalation: ${args.join(" ")}`);
+  };
+  assert.deepEqual(await terminateResearchContainer("trial-container", alreadyGoneAtRm), { ok: true, alreadyGone: true });
+});
+
+test("terminateResearchContainer escalates to `docker rm -f` when kill fails, and confirms that success (#188 Blocking 2, case A)", async () => {
+  const calls: string[][] = [];
+  const runCommand: RunCommand = async (command, args = []) => {
+    calls.push([command, ...args]);
+    if (args[0] === "kill") return { ok: false, stdout: "", stderr: "Error: signal delivery failed", code: 1 };
+    if (args[0] === "rm") return { ok: true, stdout: "", stderr: "", code: 0 };
+    throw new Error(`unexpected command: ${args.join(" ")}`);
+  };
+  const result = await terminateResearchContainer("trial-container", runCommand);
+  assert.deepEqual(result, { ok: true, alreadyGone: false });
+  assert.deepEqual(calls, [
+    ["docker", "kill", "trial-container"],
+    ["docker", "rm", "-f", "trial-container"]
+  ]);
+});
+
+test("terminateResearchContainer confirms success via an independent docker inspect when both kill and rm -f error (#188 Blocking 2, case A)", async () => {
+  const calls: string[][] = [];
+  const runCommand: RunCommand = async (command, args = []) => {
+    calls.push([command, ...args]);
+    if (args[0] === "kill") return { ok: false, stdout: "", stderr: "context deadline exceeded", code: 1 };
+    if (args[0] === "rm") return { ok: false, stdout: "", stderr: "context deadline exceeded", code: 1 };
+    if (args[0] === "inspect") return { ok: true, stdout: "false\n", stderr: "", code: 0 }; // present, not running
+    throw new Error(`unexpected command: ${args.join(" ")}`);
+  };
+  const result = await terminateResearchContainer("trial-container", runCommand);
+  assert.deepEqual(result, { ok: true, alreadyGone: true });
+  assert.equal(calls.length, 3, "confirmation must only be consulted once both direct attempts have failed");
+});
+
+test("terminateResearchContainer reports an unconfirmed failure only once kill, rm -f AND an independent inspect have all failed (#188 Blocking 2, case B)", async () => {
+  const calls: string[][] = [];
+  const runCommand: RunCommand = async (command, args = []) => {
+    calls.push([command, ...args]);
+    if (args[0] === "kill") return { ok: false, stdout: "", stderr: "Error: daemon unavailable", code: 1 };
+    if (args[0] === "rm") return { ok: false, stdout: "", stderr: "Error: daemon unavailable", code: 1 };
+    if (args[0] === "inspect") return { ok: true, stdout: "true\n", stderr: "", code: 0 }; // still running
+    throw new Error(`unexpected command: ${args.join(" ")}`);
+  };
+  const result = await terminateResearchContainer("trial-container", runCommand);
+  assert.equal(result.ok, false);
+  assert.match((result as { ok: false; error: string }).error, /could not be confirmed/);
+  assert.equal(calls.length, 3, "every escalation step must actually have been attempted before giving up");
+});
 
 test("an agent process receives the dynamic coordinates and queries the live cluster before cleanup", async (t) => {
   if (await skipWithoutToolchain(t)) return;
@@ -170,6 +538,46 @@ test("an agent that hangs is killed at its timeout and the environment is torn d
   assert.equal(session.runtime.cleanup!.stopped, true);
   assert.equal(await exists(join(spec.root, "pgdata")), false);
   assert.equal(await exists(session.connection.socketDir), false);
+});
+
+test("the outer session timeout kills a hanging agent ahead of an unset agent.timeoutMs, and cleanup waits for it (#188)", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  const fixture = await withFixture(t);
+  const agentPath = await writeAgent(fixture, "agent-hang-session.sh", ['echo "hanging"', "sleep 600", ""].join("\n"));
+
+  const spec = specFor(fixture, "session-timeout");
+  const started = Date.now();
+  // agent.timeoutMs is deliberately unset: only the session backstop
+  // (options.timeoutMs) should be what kills this agent.
+  let caught: unknown;
+  try {
+    await runAgentInPostgresResearchEnvironment(spec, { command: agentPath }, { ...DEV_MODE, timeoutMs: 5000 });
+    assert.fail("expected the session timeout to reject the call");
+  } catch (error) {
+    caught = error;
+  }
+
+  assert.ok(caught instanceof PostgresResearchTimeoutError, `expected PostgresResearchTimeoutError, got ${caught}`);
+  assert.ok(Date.now() - started < 30_000, "the session must finish near its deadline, not wait out the agent's 600s sleep");
+  // A session timeout must not be an evidence-free rejection: the
+  // environment's own runtime manifest is attached to the thrown error.
+  const manifest = (caught as PostgresResearchTimeoutError).runtimeManifest as { cleanup?: Record<string, unknown> } | undefined;
+  assert.ok(manifest, "the thrown timeout must carry the environment's runtime manifest");
+  assert.equal(manifest!.cleanup?.stopped, true);
+  assert.equal(manifest!.cleanup?.sessionTimedOut, true);
+  assert.equal(manifest!.cleanup?.cancelGraceExceeded, false, "a conforming agent kill settles well inside the grace bound");
+  // The agent's own cancellation outcome survives the timeout race too
+  // (#188, second round, Blocking 3) - unisolated mode has no stop() to
+  // fail, so terminationError is absent, but timeoutSource must still be
+  // there, proving the wiring from inside the discarded body to the thrown
+  // error works even without docker involved.
+  const agentTermination = (caught as PostgresResearchTimeoutError).agentTermination;
+  assert.ok(agentTermination, "the thrown timeout must carry the agent's own cancellation diagnostics");
+  assert.equal(agentTermination!.timeoutSource, "session");
+  assert.equal(agentTermination!.terminationError, undefined);
+  // Teardown only happened after the agent was actually killed, the same
+  // ordering guarantee agent.timeoutMs already gives.
+  assert.equal(await exists(join(spec.root, "pgdata")), false);
 });
 
 test("an unrunnable agent command fails loudly and still cleans up", async (t) => {
