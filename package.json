@@ -40,6 +40,8 @@
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test \"test/*.test.ts\"",
     "test:e2e": "playwright test",
+    "test:historical-pg-184": "node --import tsx --test test/historical-postgres-integration.test.ts",
+    "historical-pg-184": "tsx scripts/historical-postgres-184.ts",
     "mcp": "tsx server/mcp.ts"
   },
   "dependencies": {

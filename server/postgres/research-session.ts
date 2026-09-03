@@ -325,6 +325,12 @@ export function unscoredReasons(input: {
 
 export type PostgresResearchSessionResult = {
   agent: PostgresResearchAgentResult;
+  /**
+   * Grader-side path of the agent's writable research workspace. In isolated
+   * mode this is the host side of the scratch bind mount; never pass it back
+   * into the agent as a host path.
+   */
+  workspaceDir: string;
   /** Exactly what was exported into the agent process. */
   agentEnvironment: Record<string, string>;
   isolation: PostgresResearchIsolationRecord;
@@ -705,7 +711,9 @@ export async function runAgentInPostgresResearchEnvironment(
 
         if (launchConfig.mode === "unisolated-development") {
           await env.start();
-          const injected = env.agentEnvironment(agent.envPrefix);
+          const scratchDir = await createAgentScratchDir(env.root);
+          const prefix = agent.envPrefix ?? "HR_PG";
+          const injected = { ...env.agentEnvironment(prefix), [`${prefix}_WORK_DIR`]: scratchDir };
           const result = await runAgentProcess(unisolatedLaunch(env, agent, injected), agent, signal);
           // Unisolated mode has no separate container to confirm - the
           // process closing *is* the confirmation - so confirmedStopped is
@@ -720,6 +728,7 @@ export async function runAgentInPostgresResearchEnvironment(
           }
           return {
             agent: result,
+            workspaceDir: scratchDir,
             agentEnvironment: injected,
             isolation: {
               mode: "unisolated-development" as const,
@@ -819,6 +828,7 @@ export async function runAgentInPostgresResearchEnvironment(
         });
         return {
           agent: result,
+          workspaceDir: scratchDir,
           agentEnvironment: injected,
           isolation: {
             mode: "container" as const,
