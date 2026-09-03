@@ -136,6 +136,8 @@ export type HistoricalPostgresTruthManifest = {
   historicalRevision: string;
   referenceRevision: string;
   gradingProtocol: "submitted-reproducer-exit-status-v1";
+  /** Grader-private relative path to the retained canonical verification reproducer; never used as an agent grading fallback. */
+  canonicalReproducer: string | null;
   /** SHA-256 of the canonical verification reproducer, when one was supplied; never the agent's. */
   canonicalReproducerSha256: string | null;
   /** SHA-256 over the sorted relative-path+content of reference/expected-behavior and reference/verification. */
@@ -330,9 +332,22 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
       "exists for this case) is used only to prove the task itself is well-posed before an agent ever sees it.\n"
   );
 
-  const canonicalReproducerSha256 = input.truth.knownReproducerPath
-    ? sha256(await readFile(input.truth.knownReproducerPath))
-    : null;
+  // The canonical reproducer, when supplied, is physically retained here
+  // (never the original host path) so a later ground-truth revalidation
+  // does not depend on the host-side fixture still existing. It must be
+  // copied - and its hash computed - before expectedBehaviorSha256 hashes
+  // reference/verification, and long before truth.json (which embeds
+  // bundleHash) is written, or the bundle hash would be non-deterministic
+  // or self-referential.
+  const canonicalReproducerRelativePath = "verification/canonical-reproducer.sql";
+  let canonicalReproducer: string | null = null;
+  let canonicalReproducerSha256: string | null = null;
+  if (input.truth.knownReproducerPath) {
+    const canonicalReproducerContents = await readFile(input.truth.knownReproducerPath);
+    await writeFile(join(verificationDir, "canonical-reproducer.sql"), canonicalReproducerContents);
+    canonicalReproducer = canonicalReproducerRelativePath;
+    canonicalReproducerSha256 = sha256(canonicalReproducerContents);
+  }
   const expectedBehaviorSha256 = await hashDirectoryContents(referenceDir);
 
   const taskDefinition = {
@@ -356,6 +371,7 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
     historicalRevision: input.source.historicalRevision,
     referenceRevision: input.source.referenceRevision,
     gradingProtocol: "submitted-reproducer-exit-status-v1" as const,
+    canonicalReproducer,
     canonicalReproducerSha256,
     expectedBehaviorSha256,
     taskDefinitionHash

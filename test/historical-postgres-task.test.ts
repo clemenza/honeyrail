@@ -111,9 +111,11 @@ test("historical task materialization keeps the scored tree and grader-private t
   assert.equal(truthManifest.historicalRevision, spec.source.historicalRevision);
   assert.equal(truthManifest.upstreamBug, spec.truth.upstreamBug);
   assert.equal(truthManifest.commitFest, spec.truth.commitFest);
+  assert.equal(truthManifest.canonicalReproducer, null);
   assert.equal(truthManifest.canonicalReproducerSha256, null);
   assert.ok(truthManifest.bundleHash);
   assert.ok(truthManifest.expectedBehaviorSha256);
+  await assert.rejects(readFile(join(task.referenceDir, "verification", "canonical-reproducer.sql"), "utf8"));
 
   await assert.rejects(readFile(join(task.workspaceDir, "reference-manifest.json"), "utf8"));
   await assert.rejects(readFile(join(task.workspaceDir, "truth.json"), "utf8"));
@@ -143,9 +145,11 @@ test("historical task truth bundle hash covers the bug identity and both revisio
     join(root, "revision-changed")
   );
   const reproPath = join(root, "known-repro.sql");
-  await writeFile(reproPath, "SELECT 1;\n");
+  const reproAContents = "SELECT 1;\n";
+  await writeFile(reproPath, reproAContents);
   const anotherReproPath = join(root, "another-repro.sql");
-  await writeFile(anotherReproPath, "SELECT 2;\n");
+  const reproBContents = "SELECT 2;\n";
+  await writeFile(anotherReproPath, reproBContents);
   const reproA = await materializeHistoricalPostgresTask({ ...spec, truth: { ...spec.truth, knownReproducerPath: reproPath } }, join(root, "repro-a"));
   const reproB = await materializeHistoricalPostgresTask({ ...spec, truth: { ...spec.truth, knownReproducerPath: anotherReproPath } }, join(root, "repro-b"));
 
@@ -157,17 +161,31 @@ test("historical task truth bundle hash covers the bug identity and both revisio
   assert.notEqual(revisionChanged.truthManifest.bundleHash, baseline.truthManifest.bundleHash);
   assert.notEqual(reproA.truthManifest.bundleHash, reproB.truthManifest.bundleHash);
   assert.notEqual(reproA.truthManifest.bundleHash, baseline.truthManifest.bundleHash);
+
+  // The retained file and manifest path must reflect which canonical
+  // reproducer produced each bundle, not just its hash.
+  assert.equal(reproA.truthManifest.canonicalReproducer, "verification/canonical-reproducer.sql");
+  assert.equal(reproB.truthManifest.canonicalReproducer, "verification/canonical-reproducer.sql");
+  assert.notEqual(reproA.truthManifest.canonicalReproducerSha256, reproB.truthManifest.canonicalReproducerSha256);
+  assert.equal(await readFile(join(reproA.referenceDir, "verification", "canonical-reproducer.sql"), "utf8"), reproAContents);
+  assert.equal(await readFile(join(reproB.referenceDir, "verification", "canonical-reproducer.sql"), "utf8"), reproBContents);
 });
 
-test("historical task materialization records a canonical reproducer hash without leaking it to the agent", async () => {
+test("historical task materialization retains the canonical reproducer file, grader-private, without leaking it to the agent", async () => {
   const { root, spec } = await fixture();
   const reproPath = join(root, "known-repro.sql");
-  await writeFile(reproPath, "SELECT 1;\n");
+  const reproContents = "SELECT 1;\n";
+  await writeFile(reproPath, reproContents);
   const task = await materializeHistoricalPostgresTask(
     { ...spec, truth: { ...spec.truth, knownReproducerPath: reproPath } },
     join(root, "case-with-known-repro")
   );
+  assert.equal(task.truthManifest.canonicalReproducer, "verification/canonical-reproducer.sql");
   assert.ok(task.truthManifest.canonicalReproducerSha256);
+
+  const retained = await readFile(join(task.referenceDir, "verification", "canonical-reproducer.sql"), "utf8");
+  assert.equal(retained, reproContents);
+
   const publicManifestText = JSON.stringify(task.taskManifest);
   assert.ok(!publicManifestText.includes(task.truthManifest.canonicalReproducerSha256!));
 });
@@ -264,7 +282,8 @@ test("historical submission validation rejects an oversized reproducer before th
 test("no file anywhere under task/ leaks either revision, the bug identity, or a grader-private path", async () => {
   const { root, spec } = await fixture();
   const reproPath = join(root, "known-repro.sql");
-  await writeFile(reproPath, "SELECT 1;\n");
+  const reproContents = "SELECT 1;\n";
+  await writeFile(reproPath, reproContents);
   const task = await materializeHistoricalPostgresTask(
     { ...spec, truth: { ...spec.truth, knownReproducerPath: reproPath } },
     join(root, "case")
@@ -278,6 +297,10 @@ test("no file anywhere under task/ leaks either revision, the bug identity, or a
   assert.ok(coveredNames.includes("source-manifest.json"));
   assert.ok(coveredNames.includes("prompt.md"));
   assert.ok(coveredNames.some((name) => name.startsWith("workspace/README")));
+  // The canonical verification reproducer must never itself appear under
+  // task/, by name or by any relative path pointing at it.
+  assert.ok(!coveredNames.includes("canonical-reproducer.sql"));
+  assert.ok(!coveredNames.some((name) => name.includes("canonical-reproducer")));
 
   const secrets: Record<string, string> = {
     "historical revision": spec.source.historicalRevision,
@@ -285,7 +308,10 @@ test("no file anywhere under task/ leaks either revision, the bug identity, or a
     "upstream bug id": "99999",
     "CommitFest id": "1234",
     "grader-private mirror path": spec.source.repoPath,
-    "canonical reproducer hash": task.truthManifest.canonicalReproducerSha256!
+    "canonical reproducer hash": task.truthManifest.canonicalReproducerSha256!,
+    "canonical reproducer relative path": task.truthManifest.canonicalReproducer!,
+    "canonical reproducer contents": reproContents,
+    "canonical reproducer host path": reproPath
   };
   for (const file of files) {
     for (const [label, secret] of Object.entries(secrets)) {
@@ -293,6 +319,12 @@ test("no file anywhere under task/ leaks either revision, the bug identity, or a
     }
   }
   await assert.rejects(readFile(join(task.sourceDir, ".git", "HEAD"), "utf8"));
+
+  // The retained canonical reproducer must exist only under reference/.
+  const referenceFiles = await readTreeAsText(task.referenceDir);
+  const canonicalReproducerFile = referenceFiles.find((file) => file.relativePath === "verification/canonical-reproducer.sql");
+  assert.ok(canonicalReproducerFile);
+  assert.equal(canonicalReproducerFile!.text, reproContents);
 });
 
 test("public source-manifest.json is sanitized; full provenance stays grader-side", async () => {
