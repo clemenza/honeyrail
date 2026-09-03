@@ -39,4 +39,5 @@ test("#184 known local PostgreSQL verification distinguishes the pinned historic
   assert.equal(layout.truthManifest.commitFest, 7059);
   assert.equal(layout.truthManifest.referenceRevision, task.source.referenceRevision);
   assert.ok(layout.truthManifest.canonicalReproducerSha256);
+  assert.equal(layout.truthManifest.canonicalReproducer, "verification/canonical-reproducer.sql");
 });
