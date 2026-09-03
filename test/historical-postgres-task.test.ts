@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, readdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,7 +12,7 @@ import {
   type HistoricalPostgresTaskSpec
 } from "../server/postgres/historical-task.js";
 import type { PostgresResearchSessionResult } from "../server/postgres/research-session.js";
-import { createSyntheticPostgresSourceRepo } from "./helpers/postgres-source-fixture.js";
+import { createAdditionalSyntheticCommit, createSyntheticPostgresSourceRepo } from "./helpers/postgres-source-fixture.js";
 
 /** Every file under `root`, as `{ relativePath, text }`, for scanning agent-visible bundles for leaked secrets. */
 async function readTreeAsText(root: string): Promise<{ relativePath: string; text: string }[]> {
@@ -84,7 +83,7 @@ async function fixture() {
     build: { mode: "host" },
     prompt: "Test the supplied PostgreSQL source for correctness regressions."
   };
-  return { root, spec };
+  return { root, repo, spec };
 }
 
 test("historical task materialization keeps the scored tree and grader-private truth separate", async () => {
@@ -124,21 +123,23 @@ test("historical task materialization keeps the scored tree and grader-private t
 });
 
 test("historical task truth bundle hash covers the bug identity and both revisions, not just shape", async () => {
-  const { root, spec } = await fixture();
-  // A second synthetic repo built from byte-identical fixture content, so
-  // its commit hashes could otherwise coincide with the first repo's (git
-  // commit hashes have only second-resolution timestamps, and this helper's
-  // author/committer/message are fixed) - a real flake seen on a fast CI
-  // runner. A unique marker file staged before the helper's own commit rules
-  // that out unconditionally, regardless of timing.
-  const repo2Root = await mkdtemp(join(tmpdir(), "honeyrail-historical-task-repo2-"));
-  await writeFile(join(repo2Root, "UNIQUE_MARKER.txt"), `${randomUUID()}\n`);
-  const repo2 = await createSyntheticPostgresSourceRepo(repo2Root);
+  const { root, repo, spec } = await fixture();
   const baseline = await materializeHistoricalPostgresTask(spec, join(root, "baseline"));
 
   const bugChanged = await materializeHistoricalPostgresTask({ ...spec, truth: { ...spec.truth, upstreamBug: "a completely different bug" } }, join(root, "bug-changed"));
+
+  // A revision guaranteed distinct from spec.source.referenceRevision: a
+  // child commit's hash is chained through its parent's, so - unlike two
+  // independently created repos, whose initial commits share no parent and
+  // can coincide when content, author/committer and even the timestamp's
+  // second all happen to match (a real flake seen on a fast CI runner) -
+  // this cannot collide regardless of timing. Asserted explicitly so a
+  // future fixture regression fails loudly here rather than showing up only
+  // as an unrelated, hard-to-diagnose bundleHash mismatch below.
+  const differentReferenceRevision = await createAdditionalSyntheticCommit(repo.repoPath, "truth-hash-reference-change");
+  assert.notEqual(differentReferenceRevision, spec.source.referenceRevision);
   const revisionChanged = await materializeHistoricalPostgresTask(
-    { ...spec, source: { repoPath: repo2.repoPath, historicalRevision: repo2.ref, referenceRevision: repo2.laterRef } },
+    { ...spec, source: { ...spec.source, referenceRevision: differentReferenceRevision } },
     join(root, "revision-changed")
   );
   const reproPath = join(root, "known-repro.sql");

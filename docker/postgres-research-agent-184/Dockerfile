@@ -12,4 +12,4 @@
 #   docker build -t honeyrail-postgres-research-184-agent:latest docker/postgres-research-agent-184
 FROM honeyrail-postgres-research:latest
 
-COPY --chown=pgresearch:pgresearch mini-agent.mjs finding-validation.mjs /opt/agent/
+COPY --chown=pgresearch:pgresearch mini-agent.mjs finding-validation.mjs tool-loop.mjs /opt/agent/

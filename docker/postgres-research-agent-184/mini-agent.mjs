@@ -24,6 +24,7 @@ import { spawnSync } from "node:child_process";
 import { appendFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { validateSubmitFindingArgs } from "./finding-validation.mjs";
+import { processToolCalls } from "./tool-loop.mjs";
 
 const EXIT_OK = 0;
 const EXIT_CONFIG_ERROR = 1;
@@ -186,31 +187,24 @@ async function main() {
       messages.push({ role: "user", content: "Please call run_shell to continue investigating, or submit_finding to finish." });
       continue;
     }
-    for (const call of message.tool_calls) {
-      let args = {};
-      let argsParseError = null;
-      try {
-        args = JSON.parse(call.function.arguments || "{}");
-      } catch (error) {
-        // Malformed JSON from the model: still routed through the real
-        // handler below (submitFinding/runShell), which will report a
-        // proper tool error rather than the driver silently proceeding as
-        // if empty arguments were intentional.
-        argsParseError = String(error && error.message ? error.message : error);
+    // "First valid submission is final": once submit_finding returns ok:true,
+    // no further call in this same batch runs - not a second submit_finding,
+    // and not a trailing run_shell that could mutate the workspace after the
+    // grading-relevant files were already written. See tool-loop.mjs.
+    const { entries } = processToolCalls(message.tool_calls, { runShell, trySubmitFinding: submitFinding });
+    for (const entry of entries) {
+      if (!entry.executed) {
+        logTranscript({ turn, role: "driver", event: "trailing-tool-call-skipped", tool: entry.call.function.name, reason: entry.skippedReason });
+        // Every tool_call_id the API sent needs a matching "tool" message in
+        // the next request, even one this driver deliberately did not run.
+        messages.push({ role: "tool", tool_call_id: entry.call.id, content: JSON.stringify({ ok: false, skipped: true, reason: entry.skippedReason }) });
+        continue;
       }
-      const result =
-        call.function.name === "run_shell"
-          ? runShell(String(args.command || ""))
-          : call.function.name === "submit_finding"
-            ? argsParseError
-              ? { ok: false, error: `arguments were not valid JSON: ${argsParseError}` }
-              : submitFinding(args)
-            : { error: `unknown tool ${call.function.name}` };
       // The raw attempted call (including malformed/rejected submit_finding
       // attempts) is always recorded, exactly as the model produced it -
       // never silently repaired into a valid submission.
-      logTranscript({ turn, role: "tool", tool: call.function.name, args, argsParseError, result });
-      messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+      logTranscript({ turn, role: "tool", tool: entry.call.function.name, args: entry.args, argsParseError: entry.argsParseError, result: entry.result });
+      messages.push({ role: "tool", tool_call_id: entry.call.id, content: JSON.stringify(entry.result) });
     }
   }
 

@@ -6,6 +6,19 @@
 // Deliberately strict: an invalid attempt is reported as `{ ok: false, error }`
 // and never coerced into a valid finding - no defaulting `status` to
 // "not-reproduced", no placeholder summary, no synthesized reproducer.
+import { basename } from "node:path";
+
+/**
+ * The historical grader's own contract (validateHistoricalPostgresSubmission
+ * in server/postgres/historical-task.ts) requires `reproducer` to name a
+ * file directly inside the workspace - no path separators, no `.`/`..`. The
+ * adapter enforces the identical rule here so a value it accepts can never
+ * be one the grader would reject as an integrity violation.
+ */
+function isBareWorkspaceFilename(value) {
+  return value !== "" && value !== "." && value !== ".." && basename(value) === value;
+}
+
 export function validateSubmitFindingArgs(args) {
   const status = args && args.status;
   if (status !== "reproduced" && status !== "not-reproduced") {
@@ -21,6 +34,9 @@ export function validateSubmitFindingArgs(args) {
   const filename = typeof args.reproducer_filename === "string" ? args.reproducer_filename.trim() : "";
   const sql = typeof args.reproducer_sql === "string" ? args.reproducer_sql.trim() : "";
   if (!filename) return { ok: false, error: 'reproducer_filename must be a non-empty string when status is "reproduced"' };
+  if (!isBareWorkspaceFilename(filename)) {
+    return { ok: false, error: "reproducer_filename must name a file directly inside the workspace (no path separators, not \".\" or \"..\")" };
+  }
   if (!sql) return { ok: false, error: 'reproducer_sql must be a non-empty string when status is "reproduced"' };
   return { ok: true, finding: { status, summary, reproducer: filename }, reproducerFile: { filename, sql } };
 }

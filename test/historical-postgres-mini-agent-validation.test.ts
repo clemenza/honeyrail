@@ -72,3 +72,24 @@ test("undefined arguments (malformed tool call) are rejected rather than throwin
   const result = validateSubmitFindingArgs(undefined);
   assert.equal(result.ok, false);
 });
+
+/**
+ * The historical grader (validateHistoricalPostgresSubmission) requires
+ * `reproducer` to name a file directly inside the workspace - the adapter
+ * must reject the identical set of shapes, or it could accept a submission
+ * the grader would only later reject as an integrity violation.
+ */
+for (const filename of ["../repro.sql", "sub/repro.sql", "/repro.sql", ".", ".."]) {
+  test(`reproducer_filename "${filename}" is rejected`, () => {
+    const result = validateSubmitFindingArgs({ status: "reproduced", summary: "observed", reproducer_filename: filename, reproducer_sql: "SELECT 1;" });
+    assert.equal(result.ok, false);
+  });
+}
+
+for (const filename of ["repro.sql", "case.sql", "join_bug.sql"]) {
+  test(`reproducer_filename "${filename}" is accepted`, () => {
+    const result = validateSubmitFindingArgs({ status: "reproduced", summary: "observed", reproducer_filename: filename, reproducer_sql: "SELECT 1;" });
+    assert.equal(result.ok, true);
+    if (result.ok && result.finding.status === "reproduced") assert.equal(result.finding.reproducer, filename);
+  });
+}
