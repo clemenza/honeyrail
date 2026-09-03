@@ -27,10 +27,25 @@ const result = await runHistoricalPostgresTrial({
   session: network || image ? { isolation: { ...(network ? { network: network as "none" | "bridge" } : {}), ...(image ? { image } : {}) } } : undefined
 });
 process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-if (
-  result.status !== "completed" ||
-  !result.grade ||
-  (result.grade.status !== "rediscovered" && result.grade.status !== "miss")
-) {
+
+// Deliberately three separate facts, printed together so a reader (or a CI
+// log) cannot mistake an unscored integration smoke run for an official
+// scored result: "completed" alone does not mean scored, and a diagnostic
+// grade computed on an unscored run is never the same thing as a score.
+const officialScoredResult =
+  result.status === "completed" && result.scoredEligible && result.grade ? result.grade.status : "N/A";
+process.stdout.write(
+  "\nReal-agent trial summary:\n" +
+    `  integration status:      ${result.status}\n` +
+    `  scoredEligible:           ${result.scoredEligible}\n` +
+    `  diagnostic grader result: ${result.grade ? result.grade.status : "N/A"}\n` +
+    `  official scored result:   ${officialScoredResult}\n`
+);
+
+// "unscored" is a legitimate, successful integration run (real agent, real
+// environment, isolation just wasn't the scored configuration) - it must not
+// fail the CLI. Only a genuine setup/agent/grader failure should.
+const integrationFailed = result.status === "blocked" || result.status === "infrastructure_error" || result.status === "integrity_error";
+if (integrationFailed) {
   process.exitCode = 1;
 }

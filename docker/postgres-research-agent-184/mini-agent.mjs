@@ -12,9 +12,23 @@
 // Runs entirely inside the isolated agent container: everything it can see
 // is either baked into the derived image or one of the six paths
 // server/postgres/agent-container.ts bind-mounts.
+//
+// Exit-code contract (research-session.ts reads only exitCode === 0 as
+// agent.ok): 0 is reserved for "a valid finding.json was produced". Every
+// other outcome - missing credential, an LLM API/driver exception, or
+// exhausting the turn budget without a valid submit_finding call - exits
+// non-zero, so HistoricalPostgresTrial classifies it as "blocked" rather
+// than silently reporting agent.ok = true for a run that never actually
+// produced a gradable submission.
 import { spawnSync } from "node:child_process";
 import { appendFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { validateSubmitFindingArgs } from "./finding-validation.mjs";
+
+const EXIT_OK = 0;
+const EXIT_CONFIG_ERROR = 1;
+const EXIT_DRIVER_ERROR = 2;
+const EXIT_BUDGET_EXHAUSTED = 3;
 
 const apiKey = String(process.env.HONEYRAIL_AGENT_LLM_API_KEY || "").trim();
 const baseUrl = String(process.env.HONEYRAIL_AGENT_LLM_BASE_URL || "https://api.deepseek.com").trim();
@@ -25,12 +39,12 @@ const maxTurns = Number(process.env.HONEYRAIL_AGENT_MAX_TURNS || 14);
 const shellTimeoutMs = Number(process.env.HONEYRAIL_AGENT_SHELL_TIMEOUT_MS || 45_000);
 
 if (!apiKey) {
-  console.error("HONEYRAIL_AGENT_LLM_API_KEY is required inside the agent container.");
-  process.exit(0); // A missing driver credential is a blocked/incomplete agent run, not infrastructure.
+  console.error("HONEYRAIL_AGENT_LLM_API_KEY is required inside the agent container; this is a driver configuration failure.");
+  process.exit(EXIT_CONFIG_ERROR);
 }
 if (!prompt) {
-  console.error("HONEYRAIL_TASK_PROMPT was not injected; nothing to investigate.");
-  process.exit(0);
+  console.error("HONEYRAIL_TASK_PROMPT was not injected; this is a driver/session configuration failure, not an agent decision.");
+  process.exit(EXIT_CONFIG_ERROR);
 }
 
 const tools = [
@@ -50,14 +64,14 @@ const tools = [
     type: "function",
     function: {
       name: "submit_finding",
-      description: "Submit your final finding.json. Calling this ends the trial.",
+      description: "Submit your final finding.json. Calling this with a valid payload ends the trial.",
       parameters: {
         type: "object",
         properties: {
           status: { type: "string", enum: ["reproduced", "not-reproduced"] },
           summary: { type: "string" },
           reproducer_filename: { type: "string", description: 'Required when status is "reproduced"; the workspace filename you also wrote the SQL to.' },
-          reproducer_sql: { type: "string", description: "The full contents of the SQL reproducer; written to reproducer_filename in your workspace." }
+          reproducer_sql: { type: "string", description: 'Required when status is "reproduced"; written to reproducer_filename in your workspace.' }
         },
         required: ["status", "summary"]
       }
@@ -89,16 +103,22 @@ function logTranscript(entry) {
 
 let submitted = false;
 
+/**
+ * Strictly validates the attempted submission (via the pure, unit-tested
+ * `validateSubmitFindingArgs`) and returns a tool error on anything invalid -
+ * it never silently normalizes a malformed call into a valid finding.json
+ * (no defaulting `status` to "not-reproduced", no placeholder summary). An
+ * invalid attempt is recorded in the transcript by the caller exactly as the
+ * model produced it; this function's only side effect on success is writing
+ * finding.json (and the reproducer file, when applicable).
+ */
 function submitFinding(args) {
-  const status = args.status === "reproduced" ? "reproduced" : "not-reproduced";
-  const summary = String(args.summary || "").trim() || "(no summary provided)";
-  const finding = { status, summary };
-  if (status === "reproduced") {
-    const filename = String(args.reproducer_filename || "repro.sql").trim() || "repro.sql";
-    finding.reproducer = filename;
-    writeFileSync(join(workDir, filename), String(args.reproducer_sql || "").trim() + "\n");
+  const validated = validateSubmitFindingArgs(args);
+  if (!validated.ok) return validated;
+  if (validated.reproducerFile) {
+    writeFileSync(join(workDir, validated.reproducerFile.filename), `${validated.reproducerFile.sql}\n`);
   }
-  writeFileSync(join(workDir, "finding.json"), `${JSON.stringify(finding, null, 2)}\n`);
+  writeFileSync(join(workDir, "finding.json"), `${JSON.stringify(validated.finding, null, 2)}\n`);
   submitted = true;
   return { ok: true };
 }
@@ -113,10 +133,17 @@ async function callModel(messages, forceSubmit) {
     body: JSON.stringify(requestBody)
   });
   if (!response.ok) {
+    // Deliberately not caught here: an API 401/429/500 must propagate out of
+    // main() so the driver exits non-zero (EXIT_DRIVER_ERROR), not report a
+    // successful agent run that happened to produce no finding.
     throw new Error(`LLM API error ${response.status}: ${(await response.text()).slice(0, 2000)}`);
   }
   const responseBody = await response.json();
-  return responseBody.choices[0].message;
+  const choice = responseBody && responseBody.choices && responseBody.choices[0];
+  if (!choice || !choice.message) {
+    throw new Error(`LLM API returned an unexpected response shape: ${JSON.stringify(responseBody).slice(0, 2000)}`);
+  }
+  return choice.message;
 }
 
 async function main() {
@@ -131,10 +158,11 @@ async function main() {
         "tool-call turns, so read only as much source as you need to form one or two concrete hypotheses, then " +
         "actually run candidate SQL against the live instance early and iterate empirically rather than only reading " +
         "source. When you are done investigating (or your turn budget is about to run out), call submit_finding " +
-        "exactly once - a timely \"not-reproduced\" with your best partial findings beats never submitting. If status " +
-        "is \"reproduced\", the SQL you give as reproducer_sql must encode its own assertion via psql's " +
-        "ON_ERROR_STOP: exit 0 only when the suspect behavior is actually observed (e.g. raise an exception when the " +
-        "*correct* result is seen, so a correct run exits non-zero and a buggy run exits 0)."
+        "exactly once with a valid payload - a timely \"not-reproduced\" with your best partial findings beats never " +
+        "submitting, but an unsubmitted trial is graded as incomplete, not as a miss. If status is \"reproduced\", " +
+        "both reproducer_filename and reproducer_sql are required, and the SQL must encode its own assertion via " +
+        "psql's ON_ERROR_STOP: exit 0 only when the suspect behavior is actually observed (e.g. raise an exception " +
+        "when the *correct* result is seen, so a correct run exits non-zero and a buggy run exits 0)."
     },
     { role: "user", content: prompt }
   ];
@@ -145,10 +173,10 @@ async function main() {
     if (remaining <= 5 && !forceSubmit) {
       messages.push({
         role: "user",
-        content: `You have ${remaining} tool-call turns left before this trial ends. Call submit_finding now with your best current conclusion if you have not already.`
+        content: `You have ${remaining} tool-call turns left before this trial ends. Call submit_finding now with a valid payload if you have not already.`
       });
     } else if (forceSubmit) {
-      messages.push({ role: "user", content: "This is your last turn. You must call submit_finding now with your best current conclusion." });
+      messages.push({ role: "user", content: "This is your last turn. You must call submit_finding now with a valid payload." });
     }
     const message = await callModel(messages, forceSubmit);
     messages.push({ role: "assistant", content: message.content ?? null, tool_calls: message.tool_calls });
@@ -160,40 +188,57 @@ async function main() {
     }
     for (const call of message.tool_calls) {
       let args = {};
+      let argsParseError = null;
       try {
         args = JSON.parse(call.function.arguments || "{}");
-      } catch {
-        // Malformed arguments from the model; treat as empty rather than crash the driver.
+      } catch (error) {
+        // Malformed JSON from the model: still routed through the real
+        // handler below (submitFinding/runShell), which will report a
+        // proper tool error rather than the driver silently proceeding as
+        // if empty arguments were intentional.
+        argsParseError = String(error && error.message ? error.message : error);
       }
-      const result = call.function.name === "run_shell" ? runShell(String(args.command || "")) : call.function.name === "submit_finding" ? submitFinding(args) : { error: `unknown tool ${call.function.name}` };
-      logTranscript({ turn, role: "tool", tool: call.function.name, args, result });
+      const result =
+        call.function.name === "run_shell"
+          ? runShell(String(args.command || ""))
+          : call.function.name === "submit_finding"
+            ? argsParseError
+              ? { ok: false, error: `arguments were not valid JSON: ${argsParseError}` }
+              : submitFinding(args)
+            : { error: `unknown tool ${call.function.name}` };
+      // The raw attempted call (including malformed/rejected submit_finding
+      // attempts) is always recorded, exactly as the model produced it -
+      // never silently repaired into a valid submission.
+      logTranscript({ turn, role: "tool", tool: call.function.name, args, argsParseError, result });
       messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
     }
   }
 
   if (!submitted) {
-    // The model exhausted its turn budget (including a final forced-tool-choice
-    // attempt) without calling submit_finding. Recording this as a driver-issued
-    // not-reproduced - clearly labeled as such in the summary and the transcript,
-    // never as a model assertion - is what keeps a genuine budget-exhaustion miss
-    // from being misclassified as a malformed/invalid submission.
-    console.error(`Agent stopped after ${maxTurns} turns without calling submit_finding; recording a driver-issued not-reproduced.`);
-    logTranscript({ role: "driver", event: "stopped-without-submission-fallback-not-reproduced", maxTurns });
-    submitFinding({
-      status: "not-reproduced",
-      summary: `Driver-issued fallback: the agent did not call submit_finding within its ${maxTurns}-turn budget (including a final forced attempt), so no conclusive finding was reached.`
-    });
+    // Exhausting the turn budget without a valid submit_finding call is a
+    // protocol/budget failure, not an agent conclusion - it must not produce
+    // finding.json at all. HistoricalPostgresTrial then sees agent.ok=false
+    // (from the non-zero exit below) and reports "blocked", never a graded
+    // miss.
+    console.error(`Agent did not produce a valid submit_finding call within its ${maxTurns}-turn budget.`);
+    logTranscript({ role: "driver", event: "budget-exhausted-no-valid-submission", maxTurns });
+    process.exitCode = EXIT_BUDGET_EXHAUSTED;
   }
 }
 
 main()
   .catch((error) => {
     console.error(`mini-agent driver failed: ${error && error.stack ? error.stack : error}`);
+    try {
+      logTranscript({ role: "driver", event: "driver-exception", error: String(error && error.message ? error.message : error) });
+    } catch {
+      // Best-effort: if the transcript itself is unwritable, the exit code below still reports failure.
+    }
+    process.exitCode = EXIT_DRIVER_ERROR;
   })
   .finally(() => {
-    // The driver's own completion (with or without a submission) is what
-    // "agent finished" means to the session; grading below decides the
-    // score. A driver crash still exits 0 so a legitimate miss/invalid
-    // submission is never misreported as an infrastructure failure.
-    process.exit(0);
+    // process.exitCode defaults to 0 (EXIT_OK) and is only ever raised above -
+    // never lowered back to 0 - so a config/driver/budget failure always
+    // surfaces as a non-zero exit to research-session's agent.ok check.
+    process.exit(process.exitCode ?? EXIT_OK);
   });

@@ -14,7 +14,8 @@ import {
 import {
   runAgentInPostgresResearchEnvironment,
   type PostgresResearchAgentSpec,
-  type PostgresResearchSessionOptions
+  type PostgresResearchSessionOptions,
+  type PostgresResearchSessionResult
 } from "./research-session.js";
 
 /**
@@ -73,6 +74,20 @@ export type HistoricalPostgresTaskLayout = {
   taskManifest: HistoricalPostgresTaskManifest;
   referenceManifest: HistoricalPostgresReferenceManifest;
   truthManifest: HistoricalPostgresTruthManifest;
+};
+
+/**
+ * Agent-visible replacement for the full `PostgresSourceManifest` that
+ * `materializePostgresSource()` returns. The full manifest carries
+ * `repoPath`, `ref`, `resolvedCommit` and `sourceDir` - the historical
+ * revision itself and a local grader-only filesystem path - so it is never
+ * written into `task/`. This sanitized shape is: only what an agent could
+ * legitimately want to confirm about the tree it was actually given.
+ */
+export type HistoricalPostgresPublicSourceManifest = {
+  schemaVersion: 1;
+  sourceHash: string;
+  gitDirPresent: boolean;
 };
 
 /**
@@ -159,11 +174,30 @@ export type HistoricalPostgresGrade = {
   gradedAt: string;
 };
 
+/**
+ * `"unscored"` is the outcome for an otherwise-normal run whose isolation was
+ * not scored-eligible (e.g. `network: "bridge"` for a real agent that needs
+ * model-API access): the grader may still run as a diagnostic, but the trial
+ * itself must never be reported as `"completed"` with a scored `miss` or
+ * `rediscovered` - see `scoredEligible` below, which is what a consumer must
+ * check before treating `grade` as an official score rather than a
+ * diagnostic.
+ */
+export type HistoricalPostgresTrialStatus = "completed" | "unscored" | "blocked" | "infrastructure_error" | "integrity_error";
+
 export type HistoricalPostgresTrial = {
   taskId: string;
-  status: "completed" | "blocked" | "infrastructure_error" | "integrity_error";
+  status: HistoricalPostgresTrialStatus;
+  /**
+   * Mirrors `session.isolation.scoredEligible`. `false` means the run's
+   * isolation (most commonly a non-`"none"` agent network) was not the
+   * scored configuration; any `grade` present is diagnostic only, and
+   * `status` will never be `"completed"` in that case - see `"unscored"`.
+   */
+  scoredEligible: boolean;
   workspaceDir?: string;
   agent: Record<string, unknown>;
+  /** Official score only when `scoredEligible` is true and `status` is `"completed"`; diagnostic otherwise. */
   grade?: HistoricalPostgresGrade;
   artifacts: string[];
   diagnostics: string[];
@@ -351,7 +385,16 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
   const taskManifestPath = join(taskDir, "task-manifest.json");
   const referenceManifestPath = join(referenceDir, "reference-manifest.json");
   const truthManifestPath = join(referenceDir, "truth.json");
-  await writeJson(join(taskDir, "source-manifest.json"), source);
+  // The full PostgresSourceManifest (repoPath, ref, resolvedCommit, sourceDir)
+  // is grader-private provenance - it names the historical revision and a
+  // local mirror path outright. Only a sanitized shape reaches task/.
+  const publicSourceManifest: HistoricalPostgresPublicSourceManifest = {
+    schemaVersion: 1,
+    sourceHash: source.sourceHash,
+    gitDirPresent: source.gitDirPresent
+  };
+  await writeJson(join(taskDir, "source-manifest.json"), publicSourceManifest);
+  await writeJson(join(referenceDir, "source-manifest.json"), source);
   await writeJson(taskManifestPath, taskManifest);
   await writeJson(referenceManifestPath, referenceManifest);
   await writeJson(truthManifestPath, truthManifest);
@@ -545,14 +588,17 @@ export async function runHistoricalPostgresTrial(input: {
   agent: PostgresResearchAgentSpec;
   artifactDir: string;
   session?: PostgresResearchSessionOptions;
+  /** Injectable for tests (e.g. a fixture with `isolation.scoredEligible: false`); defaults to the real session runner. */
+  runSession?: typeof runAgentInPostgresResearchEnvironment;
 }): Promise<HistoricalPostgresTrial> {
   const task = checkedTaskSpec(input.task);
   const artifacts: string[] = [];
+  const runSession = input.runSession ?? runAgentInPostgresResearchEnvironment;
   try {
     await mkdir(input.artifactDir, { recursive: true });
     const taskLayout = await materializeHistoricalPostgresTask(task, join(input.artifactDir, "task-bundle"));
     artifacts.push(taskLayout.taskDir, taskLayout.referenceDir);
-    const session = await runAgentInPostgresResearchEnvironment(
+    const session: PostgresResearchSessionResult = await runSession(
       {
         root: await createAgentEnvRoot("historical-agent-"),
         privateDir: join(input.artifactDir, "agent-private"),
@@ -571,16 +617,27 @@ export async function runHistoricalPostgresTrial(input: {
       },
       input.session
     );
+    const scoredEligible = session.isolation.scoredEligible;
     const returnedWorkspace = join(input.artifactDir, "agent-workspace");
     await assertWorkspaceWithinLimits(session.workspaceDir);
     await cp(session.workspaceDir, returnedWorkspace, { recursive: true, dereference: false });
     artifacts.push(returnedWorkspace);
     await writeJson(join(input.artifactDir, "agent-result.json"), session);
+    await writeFile(join(input.artifactDir, "agent-stdout.txt"), session.agent.stdout ?? "");
+    await writeFile(join(input.artifactDir, "agent-stderr.txt"), session.agent.stderr ?? "");
+    const evidenceWarnings: string[] = [];
     // The PostgreSQL server log from the agent's own live investigation
     // session - distinct from (and in addition to) any per-revision grading
     // log the two-revision grader below writes under grader/{historical,reference}.
+    // A copy failure must be visible, not swallowed: this is required #184 evidence.
     if (session.runtime?.logPath) {
-      await cp(session.runtime.logPath, join(input.artifactDir, "agent-postgres.log")).catch(() => undefined);
+      try {
+        await cp(session.runtime.logPath, join(input.artifactDir, "agent-postgres.log"));
+      } catch (error) {
+        evidenceWarnings.push(`evidence_warning: could not retain the agent's own PostgreSQL log: ${(error as Error).message}`);
+      }
+    } else {
+      evidenceWarnings.push("evidence_warning: session reported no runtime.logPath for the agent's own PostgreSQL log.");
     }
     // Grader-private convenience copies at the artifact root; the agent never
     // saw this artifactDir, only its bind-mounted workspace above.
@@ -591,27 +648,47 @@ export async function runHistoricalPostgresTrial(input: {
       return {
         taskId: task.taskId,
         status: "blocked",
+        scoredEligible,
         workspaceDir: returnedWorkspace,
         agent: session.agent,
         artifacts,
-        diagnostics: [session.agent.timedOut ? "Agent timed out before submission." : "Agent exited without a successful completed run."]
+        diagnostics: [
+          session.agent.timedOut ? "Agent timed out before submission." : "Agent exited without a successful completed run.",
+          ...evidenceWarnings
+        ]
       };
     }
+    // A diagnostic grade is still useful evidence even when the run is not
+    // scored-eligible, but it must never be reported as a completed score:
+    // see HistoricalPostgresTrialStatus - "unscored" exists precisely so a
+    // consumer cannot mistake a bridge-network smoke run for a scored miss
+    // or rediscovery.
     const grade = await gradeHistoricalPostgresSubmission({ task, workspaceDir: returnedWorkspace, artifactDir: join(input.artifactDir, "grader") });
     artifacts.push(join(input.artifactDir, "grader"));
+    const status: HistoricalPostgresTrialStatus =
+      grade.status === "integrity_error"
+        ? "integrity_error"
+        : grade.status === "infrastructure_error"
+          ? "infrastructure_error"
+          : scoredEligible
+            ? "completed"
+            : "unscored";
+    const unscoredNotice = !scoredEligible && status === "unscored" ? [`Not a scored trial: ${session.isolation.warning ?? "isolation was not scored-eligible."}`] : [];
     return {
       taskId: task.taskId,
-      status: grade.status === "integrity_error" ? "integrity_error" : grade.status === "infrastructure_error" ? "infrastructure_error" : "completed",
+      status,
+      scoredEligible,
       workspaceDir: returnedWorkspace,
       agent: session.agent,
       grade,
       artifacts,
-      diagnostics: grade.diagnostics
+      diagnostics: [...unscoredNotice, ...grade.diagnostics, ...evidenceWarnings]
     };
   } catch (error) {
     return {
       taskId: task.taskId,
       status: error instanceof HistoricalPostgresIntegrityError ? "integrity_error" : "infrastructure_error",
+      scoredEligible: false,
       agent: {},
       artifacts,
       diagnostics: [
