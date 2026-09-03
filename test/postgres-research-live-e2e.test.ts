@@ -625,6 +625,36 @@ test(
     await (await import("node:fs/promises")).mkdir(scratch, { recursive: true });
     await writeAgentScript(scratch, "sleep.sh", "sleep 600\n");
 
+    // Ordering proof, not just a final-leak-absence proof (#188 review): poll
+    // `docker ps -a` for the agent (`honeyrail-pg-research-*`) and runtime
+    // (`honeyrail-pg-runtime-*`) container names as they appear, and record
+    // the moment each is first observed *gone*. Both run `--rm`, so "gone"
+    // means docker has actually removed it, not merely stopped it - a real
+    // termination event, not an inference. If cleanup ever began stopping the
+    // runtime container before the agent container was confirmed terminated,
+    // the runtime container's disappearance would be observed at or before
+    // the agent container's, which the assertion below would catch.
+    let agentContainerGoneAt: number | undefined;
+    let runtimeContainerGoneAt: number | undefined;
+    let sawAgentContainer = false;
+    let sawRuntimeContainer = false;
+    let polling = true;
+    const pollLoop = (async () => {
+      while (polling) {
+        const listing = await runCommandSafe("docker", ["ps", "-a", "--filter", "name=honeyrail-pg-", "--format", "{{.Names}}"], {
+          timeout: 10_000
+        }).catch(() => ({ ok: false, stdout: "", stderr: "", code: 1 }));
+        const present = new Set(listing.stdout.split("\n").filter(Boolean));
+        const agentNowPresent = [...present].some((name) => name.startsWith("honeyrail-pg-research-"));
+        const runtimeNowPresent = [...present].some((name) => name.startsWith("honeyrail-pg-runtime-"));
+        if (agentNowPresent) sawAgentContainer = true;
+        else if (sawAgentContainer && agentContainerGoneAt === undefined) agentContainerGoneAt = Date.now();
+        if (runtimeNowPresent) sawRuntimeContainer = true;
+        else if (sawRuntimeContainer && runtimeContainerGoneAt === undefined) runtimeContainerGoneAt = Date.now();
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      }
+    })();
+
     const started = Date.now();
     let caught: unknown;
     try {
@@ -636,6 +666,9 @@ test(
       assert.fail("expected the session timeout to reject the call");
     } catch (error) {
       caught = error;
+    } finally {
+      polling = false;
+      await pollLoop;
     }
 
     assert.ok(caught instanceof PostgresResearchTimeoutError, `expected PostgresResearchTimeoutError, got ${caught}`);
@@ -653,9 +686,24 @@ test(
     assert.equal(manifest!.cleanup?.sessionTimedOut, true, "evidence must identify this as a session timeout, not an agent timeout");
     assert.equal(manifest!.cleanup?.cancelGraceExceeded, false, "the agent container was killed and awaited well inside the grace bound");
 
-    // The proof that actually matters: no leaked runtime or agent container,
-    // and no leaked per-trial filesystem state - the same assertions the
-    // agent-timeout test above makes, now for the session backstop.
+    // The ordering invariant itself: the agent container must have been
+    // confirmed gone no later than the runtime container - i.e. agent
+    // termination was awaited before (or, at worst, alongside) runtime/
+    // filesystem cleanup, never after it.
+    assert.ok(sawAgentContainer, "the poll must have observed the agent container while it existed");
+    assert.ok(sawRuntimeContainer, "the poll must have observed the runtime container while it existed");
+    assert.ok(agentContainerGoneAt !== undefined, "the agent container must have been confirmed gone");
+    assert.ok(runtimeContainerGoneAt !== undefined, "the runtime container must have been confirmed gone");
+    assert.ok(
+      agentContainerGoneAt! <= runtimeContainerGoneAt!,
+      "the agent container must be confirmed terminated before final PostgreSQL/runtime cleanup is complete - " +
+        `agent gone at ${agentContainerGoneAt}, runtime gone at ${runtimeContainerGoneAt}`
+    );
+
+    // The proof that final state also matters: no leaked runtime or agent
+    // container, and no leaked per-trial filesystem state - the same
+    // assertions the agent-timeout test above makes, now for the session
+    // backstop.
     const leaked = await runCommandSafe("docker", ["ps", "-a", "--filter", "name=honeyrail-pg-", "--format", "{{.Names}}"], {
       timeout: 30_000
     });

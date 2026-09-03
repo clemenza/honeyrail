@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { runCommandSafe } from "../utils.js";
@@ -234,14 +233,35 @@ export async function dockerAvailable(runCommand = runCommandSafe): Promise<bool
   return result.ok && Boolean(result.stdout.trim());
 }
 
-/** Best-effort stop of a named container; used when an agent exceeds its timeout. */
-export function killResearchContainer(containerName: string): void {
-  try {
-    spawn("docker", ["kill", containerName], { stdio: "ignore" }).on("error", () => {});
-  } catch {
-    // The daemon is gone or the container already exited; the client process
-    // is killed separately, so there is nothing further to do here.
-  }
+export type ContainerTerminationResult =
+  | { ok: true; alreadyGone: boolean }
+  | { ok: false; error: string };
+
+/**
+ * Terminates a named research container and does not resolve until docker
+ * has confirmed the outcome - never fire-and-forget (#188 review). Awaiting
+ * this, not merely awaiting the *local* `docker run` client's own exit, is
+ * what makes "the agent container has actually stopped" an observed fact
+ * rather than an inference: the two are different processes with different
+ * exit timing, and a client that closes for an unrelated reason must not be
+ * mistaken for a container that was actually killed.
+ *
+ * "No such container" is treated as success, not a failure: every research
+ * container runs `--rm`, so a container that already exited on its own has
+ * already been removed by docker, and the agent is gone either way - which
+ * is the actual goal, not the specific command that got there. Any other
+ * non-zero result is returned as a diagnostic rather than swallowed, so a
+ * caller cannot report an ordered termination that did not really happen.
+ */
+export async function terminateResearchContainer(
+  containerName: string,
+  runCommand: RunCommand = runCommandSafe
+): Promise<ContainerTerminationResult> {
+  const result = await runCommand("docker", ["kill", containerName], { timeout: 30_000 });
+  if (result.ok) return { ok: true, alreadyGone: false };
+  const message = (result.stderr || result.stdout || `docker kill exited with code ${result.code}`).trim();
+  if (/no such container/i.test(message)) return { ok: true, alreadyGone: true };
+  return { ok: false, error: message };
 }
 
 /**

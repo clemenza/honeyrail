@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { appendFile } from "node:fs/promises";
-import { nowIso } from "../utils.js";
+import { nowIso, runCommandSafe } from "../utils.js";
 import {
   PostgresResearchError,
   PostgresResearchTimeoutError,
@@ -18,7 +18,7 @@ import {
   containerAgentEnvironment,
   createAgentScratchDir,
   dockerAvailable,
-  killResearchContainer,
+  terminateResearchContainer,
   DEFAULT_RESEARCH_IMAGE,
   DEFAULT_RESEARCH_NETWORK,
   resolveResearchAgentImageIdentity,
@@ -136,6 +136,17 @@ export type PostgresResearchAgentResult = {
    * Absent when `timedOut` is false.
    */
   timeoutSource?: "agent" | "session";
+  /**
+   * Set when `timedOut` is true in isolated mode and the explicit
+   * `docker kill` request (see `AgentLaunch.stop`, `terminateResearchContainer()`)
+   * did not succeed - a daemon/client failure, or an unexpected non-zero
+   * result other than "already gone" (#188 review). This is recorded rather
+   * than swallowed: cancellation still escalates to the local client process
+   * regardless (see `runAgentProcess`), but a failed termination request
+   * must not be indistinguishable from a successful one just because the
+   * local client eventually exited too.
+   */
+  terminationError?: string;
   stdout: string;
   stderr: string;
   startedAt: string;
@@ -381,8 +392,16 @@ type AgentLaunch = {
   /** Reported to the caller: the agent's own view of what it ran and where. */
   reported: { command: string; args: string[]; cwd: string };
   spawn: { command: string; args: string[]; cwd?: string; env: NodeJS.ProcessEnv; detached: boolean };
-  /** Called on timeout, before the SIGTERM/SIGKILL escalation on the client process. */
-  stop?: () => void;
+  /**
+   * Called on timeout and *awaited* before the SIGTERM/SIGKILL escalation on
+   * the client process (#188 review). In isolated mode this is
+   * `terminateResearchContainer()`: awaiting it, rather than firing it and
+   * moving on, is what makes "the agent container has stopped" an observed
+   * fact by the time cancellation proceeds, rather than an assumption resting
+   * on the local `docker run` client happening to exit soon after. A
+   * rejection is caught by the caller and recorded, not swallowed.
+   */
+  stop?: () => Promise<void> | void;
 };
 
 type AgentIsolationLaunchConfig =
@@ -432,31 +451,55 @@ export async function runAgentProcess(
 
   let timedOut = false;
   let timeoutSource: "agent" | "session" | undefined;
+  let terminationError: string | undefined;
   let killTimer: NodeJS.Timeout | undefined;
   let graceTimer: NodeJS.Timeout | undefined;
 
-  function cancel(source: "agent" | "session") {
-    if (timedOut) return; // idempotent: whichever cause fires first wins, harmlessly.
+  /**
+   * The single place either timeout cause routes through, so the two can
+   * never double-kill. `timedOut` is set *synchronously*, before the first
+   * `await`, so a second call - the other cause firing moments later, or at
+   * the same tick - sees it already true and returns immediately: harmless,
+   * not a second kill.
+   *
+   * The ordering below is the fix for #188's review: `launch.stop()` is
+   * awaited to completion before the SIGTERM/SIGKILL escalation on the local
+   * client process runs. In isolated mode that means `docker kill` has
+   * already been requested *and confirmed* (or confirmed failed - see
+   * below) before this function does anything that could make the local
+   * `docker run` client exit on its own; the client closing early because it
+   * independently noticed its container die is a stronger, not weaker,
+   * version of the same guarantee. Either way, `runAgentProcess` cannot
+   * resolve - and therefore `withPostgresResearchEnvironment`'s cleanup
+   * cannot begin - until this has run to completion.
+   */
+  async function cancel(source: "agent" | "session") {
+    if (timedOut) return;
     timedOut = true;
     timeoutSource = source;
     try {
-      // In isolated mode this is `docker kill`: signalling the client alone
-      // would leave the container - and therefore the agent - running. A
-      // throwing stop must not prevent the SIGTERM/SIGKILL escalation below.
-      launch.stop?.();
-    } catch {
-      // Best-effort; the process-level kill sequence is the fallback.
+      await launch.stop?.();
+    } catch (error) {
+      // Recorded, not swallowed (#188 review): a failed termination request
+      // must not be indistinguishable from a successful one just because the
+      // local client eventually exits too, from the escalation below.
+      terminationError = (error as Error).message;
     }
     killTree(child, "SIGTERM");
     graceTimer = setTimeout(() => killTree(child, "SIGKILL"), KILL_GRACE_MS);
     graceTimer.unref?.();
   }
 
+  // Neither call site awaits cancel() itself - agent.timeoutMs's timer and
+  // the abort listener are both synchronous callbacks - but that is fine:
+  // the process only actually resolves once the "close" listener below
+  // fires, and that cannot happen from *our* action until cancel()'s await
+  // on launch.stop() has completed.
   if (agent.timeoutMs) {
-    killTimer = setTimeout(() => cancel("agent"), agent.timeoutMs);
+    killTimer = setTimeout(() => void cancel("agent"), agent.timeoutMs);
     killTimer.unref?.();
   }
-  const onAbort = () => cancel("session");
+  const onAbort = () => void cancel("session");
   if (signal) {
     if (signal.aborted) onAbort();
     else signal.addEventListener("abort", onAbort, { once: true });
@@ -485,6 +528,7 @@ export async function runAgentProcess(
     signal: exit.signal,
     timedOut,
     ...(timedOut ? { timeoutSource } : {}),
+    ...(terminationError ? { terminationError } : {}),
     stdout: stdout.text(),
     stderr: stderr.text(),
     startedAt,
@@ -634,7 +678,12 @@ export async function runAgentInPostgresResearchEnvironment(
               cwd: agent.cwd ?? RESEARCH_CONTAINER_PATHS.scratch
             },
             spawn: { command: "docker", args: containerArgs, env: process.env, detached: false },
-            stop: () => killResearchContainer(containerName)
+            stop: async () => {
+              const termination = await terminateResearchContainer(containerName, runCommand ?? runCommandSafe);
+              if (!termination.ok) {
+                throw new PostgresResearchError(`docker kill ${containerName} failed: ${termination.error}`);
+              }
+            }
           },
           agent,
           signal

@@ -531,6 +531,61 @@ test("a body that never observes the session AbortSignal cannot block cleanup pa
   );
 });
 
+test("a cleanup failure during a session timeout does not mask the timeout as the primary cause (#188)", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  const fixture = await withFixture(t);
+
+  // Throws rather than returning { ok: false }: cleanup()'s stop() call is
+  // itself unguarded (stop() returning false is an ordinary escalation from
+  // fast to immediate, not a cleanup *failure*), so this exercises the
+  // catch block that actually populates cleanupResult.errors - a real
+  // cleanup failure, not merely a slow one - while the session timeout is
+  // what is driving this call.
+  const brokenStop: typeof runCommandSafe = async (command, args, options) => {
+    if (command.endsWith("pg_ctl") && (args ?? []).includes("stop")) {
+      throw new Error("pg_ctl stop: connection to the postmaster's control socket was refused");
+    }
+    return runCommandSafe(command, args, options);
+  };
+
+  let env: PostgresResearchEnvironment | undefined;
+  let caught: unknown;
+  try {
+    await withPostgresResearchEnvironment(
+      specFor(fixture, "cleanup-fails-under-timeout", { runCommand: brokenStop }),
+      async (e, signal) => {
+        env = e;
+        await e.start();
+        await new Promise<void>((_resolve, reject) => {
+          const onAbort = () => reject(signal.reason);
+          if (signal.aborted) return onAbort();
+          signal.addEventListener("abort", onAbort, { once: true });
+        });
+      },
+      { timeoutMs: 250 }
+    );
+    assert.fail("expected the session timeout to reject the call");
+  } catch (error) {
+    caught = error;
+  }
+
+  // The primary cause must survive intact: a cleanup-step failure must not
+  // replace it, wrap it, or otherwise obscure that this was a timeout.
+  assert.ok(caught instanceof PostgresResearchTimeoutError, `expected PostgresResearchTimeoutError, got ${caught}`);
+  assert.match((caught as Error).message, /timed out/);
+
+  // ...while the cleanup failure itself remains visible as a diagnostic,
+  // alongside the correct session-timeout classification - neither hides
+  // the other.
+  const cleanup = env!.runtimeManifest().cleanup;
+  assert.equal(cleanup?.sessionTimedOut, true);
+  assert.equal(cleanup?.stopped, false, "the injected failure must actually have failed cleanup's stop step");
+  assert.ok(
+    cleanup?.errors.some((message) => /control socket was refused/.test(message)),
+    `expected a stop failure in cleanup.errors, got ${JSON.stringify(cleanup?.errors)}`
+  );
+});
+
 test("the postgres-research executor records source, build and runtime manifests as artifacts and evidence", async (t) => {
   if (await skipWithoutToolchain(t)) return;
   const fixture = await withFixture(t);

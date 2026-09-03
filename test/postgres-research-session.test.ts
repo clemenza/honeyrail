@@ -72,15 +72,20 @@ async function skipWithoutToolchain(t: TestContext) {
 // session's outer AbortSignal fund the same kill sequence. These tests are
 // deterministic and need neither a research environment nor a docker daemon
 // - they spawn a plain shell process directly, the same way unisolatedLaunch()
-// does - so they exercise the cancellation semantics in isolation from
-// materialize/build/start and from any container boundary.
+// does (detached: true, so killTree()'s process-group signal reaches a
+// grandchild like `sleep` directly rather than only the wrapper shell - a
+// non-interactive shell blocked on a foreground command can defer acting on
+// its own SIGTERM until that command exits on its own, so `detached: false`
+// here would make these tests flaky-slow rather than deterministic) - so they
+// exercise the cancellation semantics in isolation from materialize/build/start
+// and from any container boundary.
 async function withShellScript(t: TestContext, body: string) {
   const dir = await mkdtemp(join(tmpdir(), "honeyrail-pg-agent-process-"));
   t.after(async () => rm(dir, { recursive: true, force: true }));
   const path = join(dir, "script.sh");
   await writeFile(path, `#!/bin/sh\n${body}`);
   await chmod(path, 0o755);
-  return { command: path, args: [] as string[], cwd: dir, env: process.env, detached: false };
+  return { command: path, args: [] as string[], cwd: dir, env: process.env, detached: true };
 }
 
 test("the session AbortSignal kills the agent and records timeoutSource \"session\", even without agent.timeoutMs", async (t) => {
@@ -143,13 +148,13 @@ test("a signal already aborted before the agent is launched kills it immediately
   assert.ok(Date.now() - started < 3000, `a pre-aborted signal must kill immediately, not wait out the 5s sleep (${result.durationMs}ms)`);
 });
 
-test("a throwing stop() callback does not prevent the kill sequence or crash the caller", async (t) => {
+test("a throwing/rejecting stop() is recorded as terminationError, not swallowed, and still does not prevent the kill sequence (#188)", async (t) => {
   const launch = await withShellScript(t, "sleep 5\n");
   const controller = new AbortController();
   setTimeout(() => controller.abort(), 100);
 
   const result = await runAgentProcess(
-    { reported: launch, spawn: launch, stop: () => { throw new Error("stop() blew up"); } },
+    { reported: launch, spawn: launch, stop: async () => { throw new Error("docker kill failed: no such container"); } },
     { command: launch.command },
     controller.signal
   );
@@ -157,6 +162,64 @@ test("a throwing stop() callback does not prevent the kill sequence or crash the
   assert.equal(result.timedOut, true);
   assert.equal(result.timeoutSource, "session");
   assert.equal(result.ok, false);
+  assert.match(
+    result.terminationError ?? "",
+    /docker kill failed/,
+    "a failed termination request must be recorded, not indistinguishable from a successful one"
+  );
+});
+
+test("runAgentProcess does not resolve while an async termination operation is still pending, and resolves once it settles (#188)", async (t) => {
+  const launch = await withShellScript(t, "sleep 30\n");
+  const controller = new AbortController();
+
+  let stopCalled = false;
+  let resolveTermination!: () => void;
+  const terminationGate = new Promise<void>((resolve) => {
+    resolveTermination = resolve;
+  });
+
+  const resultPromise = runAgentProcess(
+    {
+      reported: launch,
+      spawn: launch,
+      stop: async () => {
+        stopCalled = true;
+        // Deliberately left unresolved until the test resolves it below -
+        // simulating a still-in-flight `docker kill` (or an async
+        // terminate() the reviewer's minimal-design alternatives suggest).
+        await terminationGate;
+      }
+    },
+    { command: launch.command },
+    controller.signal
+  );
+
+  controller.abort();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(stopCalled, true, "cancellation must call stop() promptly once the signal aborts");
+
+  // The core assertion: with termination still pending, the local child has
+  // not been signalled yet (cancel() awaits stop() before escalating), so
+  // runAgentProcess must not have resolved either. An implementation that
+  // merely waits for the local docker-run client - without gating on the
+  // termination operation itself - would fail this by resolving early.
+  const settledWhilePending = await Promise.race([
+    resultPromise.then(() => "settled" as const),
+    new Promise<"still-pending">((resolve) => setTimeout(() => resolve("still-pending"), 500))
+  ]);
+  assert.equal(
+    settledWhilePending,
+    "still-pending",
+    "runAgentProcess must not resolve while agent-container termination is still pending"
+  );
+
+  resolveTermination();
+  const result = await resultPromise;
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.timeoutSource, "session");
+  assert.equal(result.terminationError, undefined, "a termination that eventually succeeds must not be recorded as an error");
 });
 
 test("an agent process receives the dynamic coordinates and queries the live cluster before cleanup", async (t) => {
