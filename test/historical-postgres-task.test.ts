@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -13,25 +13,7 @@ import {
 } from "../server/postgres/historical-task.js";
 import type { PostgresResearchSessionResult } from "../server/postgres/research-session.js";
 import { createAdditionalSyntheticCommit, createSyntheticPostgresSourceRepo } from "./helpers/postgres-source-fixture.js";
-
-/** Every file under `root`, as `{ relativePath, text }`, for scanning agent-visible bundles for leaked secrets. */
-async function readTreeAsText(root: string): Promise<{ relativePath: string; text: string }[]> {
-  const out: { relativePath: string; text: string }[] = [];
-  async function visit(dir: string, prefix: string) {
-    const entries = await readdir(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      const full = join(dir, entry.name);
-      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
-      if (entry.isDirectory()) {
-        await visit(full, rel);
-        continue;
-      }
-      out.push({ relativePath: rel, text: await readFile(full, "utf8").catch(() => "") });
-    }
-  }
-  await visit(root, "");
-  return out;
-}
+import { readTreeAsText } from "./helpers/read-tree-as-text.js";
 
 /**
  * A minimal fixture standing in for `runAgentInPostgresResearchEnvironment()`,
@@ -152,6 +134,8 @@ test("historical task truth bundle hash covers the bug identity and both revisio
   await writeFile(anotherReproPath, reproBContents);
   const reproA = await materializeHistoricalPostgresTask({ ...spec, truth: { ...spec.truth, knownReproducerPath: reproPath } }, join(root, "repro-a"));
   const reproB = await materializeHistoricalPostgresTask({ ...spec, truth: { ...spec.truth, knownReproducerPath: anotherReproPath } }, join(root, "repro-b"));
+  const oraclePattern = { historical: [{ label: "x", matches: "^x$" }], reference: [{ label: "x", matches: "^y$" }] };
+  const oracleDeclared = await materializeHistoricalPostgresTask({ ...spec, truth: { ...spec.truth, behavioralOracle: oraclePattern } }, join(root, "oracle-declared"));
 
   // Each of these actually re-materializes and re-hashes the bundle (not a
   // fabricated tampered copy), so a bundleHash implementation that ignored
@@ -161,6 +145,11 @@ test("historical task truth bundle hash covers the bug identity and both revisio
   assert.notEqual(revisionChanged.truthManifest.bundleHash, baseline.truthManifest.bundleHash);
   assert.notEqual(reproA.truthManifest.bundleHash, reproB.truthManifest.bundleHash);
   assert.notEqual(reproA.truthManifest.bundleHash, baseline.truthManifest.bundleHash);
+  // A declared behavioral oracle is truth material too: it moves the hash,
+  // and its absence is recorded as null rather than dropped from the shape.
+  assert.notEqual(oracleDeclared.truthManifest.bundleHash, baseline.truthManifest.bundleHash);
+  assert.deepEqual(oracleDeclared.truthManifest.behavioralOracle, oraclePattern);
+  assert.equal(baseline.truthManifest.behavioralOracle, null);
 
   // The retained file and manifest path must reflect which canonical
   // reproducer produced each bundle, not just its hash.

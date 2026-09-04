@@ -1,19 +1,25 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  gradeHistoricalPostgresSubmission,
   historicalPostgres002TaskPrompt,
   historicalPostgres002TaskSpec,
   materializeHistoricalPostgresTask,
+  resolveOracleReproduction,
   type HistoricalPostgresTaskSpec
 } from "../server/postgres/historical-task.js";
 import { createSyntheticPostgresSourceRepo } from "./helpers/postgres-source-fixture.js";
+import { readTreeAsText } from "./helpers/read-tree-as-text.js";
 
-test("historicalPostgres002TaskSpec carries the frozen #185 Bug 2 identity and no CommitFest", () => {
+test("historicalPostgres002TaskSpec carries the frozen #185 Bug 2 identity behind an opaque task id, and no CommitFest", () => {
   const spec = historicalPostgres002TaskSpec("/unused/repo/path");
-  assert.equal(spec.taskId, "pg-hist-plpgsql-call-stale-plan-002");
+  // Opaque, matching postgres-historical-001's convention - never the
+  // descriptive corpus slot id, which names PL/pgSQL/CALL/"stale plan"
+  // outright and would leak the failure mechanism through HONEYRAIL_TASK_ID.
+  assert.equal(spec.taskId, "postgres-historical-002");
   assert.equal(spec.source.historicalRevision, "7696b2ea52416cc2f4046a359d3b6f760e4c013d");
   assert.equal(spec.source.referenceRevision, "7f875fb5bd603d8640cc7aca2c79c604aacd3890");
   assert.equal(spec.truth.upstreamBug, "PostgreSQL BUG #18574");
@@ -24,7 +30,27 @@ test("historicalPostgres002TaskSpec carries the frozen #185 Bug 2 identity and n
   assert.ok(!spec.prompt.includes("18574"));
   assert.ok(!spec.prompt.toLowerCase().includes("cache lookup"));
   assert.ok(!spec.prompt.toLowerCase().includes("commitfest"));
+  assert.ok(!spec.prompt.toLowerCase().includes("stale"));
   assert.equal(historicalPostgres002TaskPrompt(), spec.prompt);
+});
+
+test("historicalPostgres002TaskSpec declares a behavioral oracle matching #185's confirmed observations", () => {
+  const spec = historicalPostgres002TaskSpec("/unused/repo/path");
+  const oracle = spec.truth.behavioralOracle;
+  assert.ok(oracle);
+  assert.equal(oracle!.historical.length, 2);
+  assert.equal(oracle!.reference.length, 2);
+  const baseline = /^procedure parameter "r1" is an output parameter but corresponding argument is not writable$/;
+  assert.ok(baseline.test('procedure parameter "r1" is an output parameter but corresponding argument is not writable'));
+  assert.equal(new RegExp(oracle!.historical[0].matches).source, baseline.source);
+  assert.equal(new RegExp(oracle!.reference[0].matches).source, baseline.source);
+  assert.equal(new RegExp(oracle!.reference[1].matches).source, baseline.source);
+  // The stale-plan observation is matched by a targeted, anchored `\d+` for
+  // the dynamic OID - never a broad "strip every digit" transform.
+  const staleCache = new RegExp(oracle!.historical[1].matches);
+  assert.ok(staleCache.test("cache lookup failed for function 16386"));
+  assert.ok(staleCache.test("cache lookup failed for function 987654"));
+  assert.ok(!staleCache.test('procedure parameter "r1" is an output parameter but corresponding argument is not writable'));
 });
 
 test("historicalPostgres002TaskSpec passes a known-reproducer path through to truth for provenance hashing", () => {
@@ -87,4 +113,233 @@ test("truth.commitFest must be a positive integer when present, but may be omitt
     materializeHistoricalPostgresTask(baseSpec, join(root, "case")),
     /truth.commitFest must be a positive integer/
   );
+});
+
+test("postgres-historical-001 still materializes and hashes under the widened truth schema", async () => {
+  // Regression coverage for the commitFest/behavioralOracle schema widening:
+  // a spec that (like case 001) sets neither field must still produce a
+  // valid, leak-free bundle whose null-shaped optional fields don't collide
+  // with a spec that omits them differently.
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-historical-001-regression-"));
+  const repo = await createSyntheticPostgresSourceRepo(root);
+  const spec: HistoricalPostgresTaskSpec = {
+    taskId: "postgres-historical-001",
+    source: { repoPath: repo.repoPath, historicalRevision: repo.ref, referenceRevision: repo.laterRef },
+    truth: { upstreamBug: "PostgreSQL #19560", commitFest: 7059 },
+    build: { mode: "host" },
+    prompt: "Test the supplied PostgreSQL source for a join-planning correctness regression."
+  };
+  const task = await materializeHistoricalPostgresTask(spec, join(root, "case"));
+  assert.equal(task.truthManifest.commitFest, 7059);
+  assert.equal(task.truthManifest.behavioralOracle, null);
+  const publicManifestText = JSON.stringify(task.taskManifest);
+  assert.ok(!publicManifestText.includes("7059"));
+  assert.ok(!publicManifestText.includes("19560"));
+});
+
+/** Given a revision string and the two-observation sequence it should have produced, builds the execution shape `resolveOracleReproduction` reads. */
+function executionWithObservations(observations: string[]): { ok: boolean; stdout: string; stderr: string; exitCode: number; durationMs: number } {
+  const stderr = observations.map((message) => `ERROR:  ${message}`).join("\n");
+  return { ok: observations.length > 0, stdout: "", stderr, exitCode: observations.length > 0 ? 0 : 1, durationMs: 1 };
+}
+
+test("resolveOracleReproduction: the historical ref is reproduced only when captured observations match the declared stale-plan sequence", () => {
+  const spec = historicalPostgres002TaskSpec("/unused/repo/path");
+  const baseline = 'procedure parameter "r1" is an output parameter but corresponding argument is not writable';
+
+  const correct = resolveOracleReproduction({
+    execution: executionWithObservations([baseline, "cache lookup failed for function 16386"]),
+    revision: spec.source.historicalRevision,
+    spec
+  });
+  assert.equal(correct.reproduced, true);
+  assert.equal(correct.oracle?.satisfied, true);
+
+  // An unrelated error sequence must not earn rediscovery credit just
+  // because the script happened to exit non-specifically on this revision.
+  const unrelated = resolveOracleReproduction({
+    execution: executionWithObservations([baseline, "relation \"missing_table\" does not exist"]),
+    revision: spec.source.historicalRevision,
+    spec
+  });
+  assert.equal(unrelated.reproduced, false);
+  assert.equal(unrelated.oracle?.satisfied, false);
+
+  // Wrong *first* observation also fails, even if the second happens to match.
+  const wrongFirst = resolveOracleReproduction({
+    execution: executionWithObservations(["some other error", "cache lookup failed for function 16386"]),
+    revision: spec.source.historicalRevision,
+    spec
+  });
+  assert.equal(wrongFirst.reproduced, false);
+});
+
+test("resolveOracleReproduction: `reproduced` always tests against the declared historical signature, so the reference ref is correctly NOT reproduced when it holds the baseline", () => {
+  const spec = historicalPostgres002TaskSpec("/unused/repo/path");
+  const baseline = 'procedure parameter "r1" is an output parameter but corresponding argument is not writable';
+
+  // The reference ref correctly holding the baseline twice does not match
+  // the historical (stale-cache) signature, so reproduced is false here -
+  // exactly the polarity gradeHistoricalPostgresSubmission()'s existing
+  // formula expects on the reference side (see the e2e test below).
+  const correctReference = resolveOracleReproduction({
+    execution: executionWithObservations([baseline, baseline]),
+    revision: spec.source.referenceRevision,
+    spec
+  });
+  assert.equal(correctReference.reproduced, false);
+  assert.equal(correctReference.oracle?.satisfied, false);
+  assert.ok(correctReference.oracle?.diagnostics.some((line) => line.includes("correctly matched the declared expected (fixed) baseline")));
+
+  // A reference-ref run whose captured output happens to look like the
+  // buggy stale-cache failure (e.g. a misconfigured/mismatched build, or a
+  // real regression on the "fixed" ref) DOES match the historical signature,
+  // so reproduced is true - which the classification formula reads as
+  // disqualifying (invalid_submission), never as a spurious rediscovered.
+  const staleShapedOnReference = resolveOracleReproduction({
+    execution: executionWithObservations([baseline, "cache lookup failed for function 55555"]),
+    revision: spec.source.referenceRevision,
+    spec
+  });
+  assert.equal(staleShapedOnReference.reproduced, true);
+  assert.equal(staleShapedOnReference.oracle?.satisfied, true);
+
+  // A reference-ref run that fails for some unrelated, unattributed reason
+  // (neither the historical signature nor the declared baseline) is also
+  // correctly not-reproduced, but the evidence flags that it isn't
+  // attributable to the declared oracle either way.
+  const unattributed = resolveOracleReproduction({
+    execution: executionWithObservations(["connection refused"]),
+    revision: spec.source.referenceRevision,
+    spec
+  });
+  assert.equal(unattributed.reproduced, false);
+  assert.ok(unattributed.oracle?.diagnostics.some((line) => line.includes("not fully attributable to the declared oracle")));
+});
+
+test("end-to-end: an oracle-declared task correctly classifies rediscovered vs. a non-specific differential vs. a stale-shaped reference run", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-historical-002-e2e-"));
+  const spec = historicalPostgres002TaskSpec("/unused/repo/path");
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  await writeFile(join(workspace, "repro.sql"), "-- irrelevant to grading here; gradeRevision is injected below\n");
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "reproduced", summary: "observed", reproducer: "repro.sql" }));
+  const baseline = 'procedure parameter "r1" is an output parameter but corresponding argument is not writable';
+
+  // A real rediscovery: historical matches the stale-plan sequence,
+  // reference matches the baseline-twice sequence.
+  const rediscovered = await gradeHistoricalPostgresSubmission({
+    task: spec,
+    workspaceDir: workspace,
+    artifactDir: join(root, "rediscovered"),
+    gradeRevision: async ({ revision }) =>
+      resolveOracleReproduction({
+        execution:
+          revision === spec.source.historicalRevision
+            ? executionWithObservations([baseline, "cache lookup failed for function 16386"])
+            : executionWithObservations([baseline, baseline]),
+        revision,
+        spec
+      })
+  });
+  assert.equal(rediscovered.status, "rediscovered", JSON.stringify(rediscovered, null, 2));
+  // Both are evaluated against the same declared historical signature: the
+  // historical run matches it (true), the reference run correctly does not
+  // (false) - see resolveOracleReproduction's symmetric-polarity design.
+  assert.equal(rediscovered.historical.oracle?.satisfied, true);
+  assert.equal(rediscovered.reference.oracle?.satisfied, false);
+  assert.ok(rediscovered.reference.oracle?.diagnostics.some((line) => line.includes("correctly matched the declared expected (fixed) baseline")));
+
+  // A script that exits 0 on the historical ref and non-zero on the
+  // reference ref for an unrelated reason (not the declared oracle) must not
+  // be credited: the historical side's oracle is unsatisfied, so this is a
+  // miss even though a naive exit-status differential would have called it
+  // rediscovered.
+  const nonSpecific = await gradeHistoricalPostgresSubmission({
+    task: spec,
+    workspaceDir: workspace,
+    artifactDir: join(root, "non-specific"),
+    gradeRevision: async ({ revision }) =>
+      resolveOracleReproduction({
+        execution:
+          revision === spec.source.historicalRevision
+            ? executionWithObservations(["totally unrelated failure"])
+            : { ok: true, stdout: "", stderr: "", exitCode: 0, durationMs: 1 },
+        revision,
+        spec
+      })
+  });
+  assert.equal(nonSpecific.status, "miss", JSON.stringify(nonSpecific, null, 2));
+
+  // The exact scenario the review flagged: a reference run whose captured
+  // output reproduces the stale-cache (historical) failure must NOT be
+  // accepted as a rediscovery. It matches the historical signature, so
+  // reference.reproduced is true, which the existing formula reads as
+  // disqualifying - invalid_submission, never rediscovered.
+  const staleShapedReference = await gradeHistoricalPostgresSubmission({
+    task: spec,
+    workspaceDir: workspace,
+    artifactDir: join(root, "stale-shaped-reference"),
+    gradeRevision: async ({ revision }) =>
+      resolveOracleReproduction({
+        execution:
+          revision === spec.source.historicalRevision
+            ? executionWithObservations([baseline, "cache lookup failed for function 16386"])
+            : executionWithObservations([baseline, "cache lookup failed for function 55555"]),
+        revision,
+        spec
+      })
+  });
+  assert.equal(staleShapedReference.reference.oracle?.satisfied, true);
+  assert.equal(staleShapedReference.reference.reproduced, true);
+  assert.equal(staleShapedReference.status, "invalid_submission", JSON.stringify(staleShapedReference, null, 2));
+});
+
+test("no file anywhere under the materialized task/ tree leaks the bug identity, the failure-mechanism vocabulary, either revision, or the canonical reproducer", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-historical-002-leak-"));
+  // Real Bug 2 identity/oracle/prompt from historicalPostgres002TaskSpec(),
+  // but pointed at a synthetic local repo (via its own refs) so this test
+  // doesn't need the real PostgreSQL history the frozen #185 SHAs live in.
+  // The repo must be created (and its fixture ref committed) BEFORE the
+  // known-repro.sql fixture file is written anywhere under `root`: this
+  // helper commits everything already present in its repoPath, so writing
+  // the repro file first would leak it straight into the archived snapshot
+  // and produce a false-positive "leak" that isn't the historical-task
+  // materializer's fault at all.
+  const repo = await createSyntheticPostgresSourceRepo(root);
+  const reproPath = join(root, "known-repro.sql");
+  const reproContents = "\\set ON_ERROR_STOP off\n-- canonical Bug 2 reproducer content (never committed)\n";
+  await writeFile(reproPath, reproContents);
+  const base = historicalPostgres002TaskSpec(repo.repoPath, reproPath);
+  const spec: HistoricalPostgresTaskSpec = { ...base, source: { ...base.source, historicalRevision: repo.ref, referenceRevision: repo.laterRef } };
+  const task = await materializeHistoricalPostgresTask(spec, join(root, "case"));
+
+  const taskFiles = await readTreeAsText(task.taskDir);
+  const secrets: Record<string, string> = {
+    "upstream bug number": "18574",
+    "upstream bug id": "BUG #18574",
+    "failure mechanism (hyphenated)": "stale-plan",
+    "failure mechanism (spaced)": "stale plan",
+    "failure mechanism (cache lookup)": "cache lookup",
+    "historical revision": spec.source.historicalRevision,
+    "reference revision": spec.source.referenceRevision,
+    "grader-private mirror path": spec.source.repoPath,
+    "canonical reproducer host path": reproPath,
+    "canonical reproducer contents": reproContents,
+    "canonical reproducer hash": task.truthManifest.canonicalReproducerSha256!
+  };
+  for (const file of taskFiles) {
+    for (const [label, secret] of Object.entries(secrets)) {
+      assert.ok(!file.text.includes(secret), `task/${file.relativePath} leaked ${label}`);
+    }
+  }
+  // The canonical reproducer's grader-private relative path must not appear
+  // under task/ - but it legitimately exists under reference/, so that
+  // absence is scoped to task/ specifically, not asserted globally.
+  assert.ok(!taskFiles.some((file) => file.text.includes("canonical-reproducer.sql")));
+
+  const referenceFiles = await readTreeAsText(task.referenceDir);
+  const retained = referenceFiles.find((file) => file.relativePath === "verification/canonical-reproducer.sql");
+  assert.ok(retained);
+  assert.equal(retained!.text, reproContents);
 });

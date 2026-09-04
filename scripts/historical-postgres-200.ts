@@ -14,6 +14,11 @@ if (!Array.isArray(args) || args.some((value) => typeof value !== "string")) {
   throw new Error("HONEYRAIL_PG_200_AGENT_ARGS must be a JSON array of strings when set.");
 }
 const knownReproducer = String(process.env.HONEYRAIL_PG_200_REPRODUCER || "").trim();
+if (!knownReproducer) {
+  throw new Error(
+    "HONEYRAIL_PG_200_REPRODUCER is required to run this task's real trial with canonical truth provenance; unlike case 001, case 002 must not run without it."
+  );
+}
 const network = String(process.env.HONEYRAIL_PG_200_AGENT_NETWORK || "").trim();
 const image = String(process.env.HONEYRAIL_PG_200_AGENT_IMAGE || "").trim();
 const artifactDir = resolve(process.env.HONEYRAIL_PG_200_ARTIFACT_DIR || "output/historical-pg-200");

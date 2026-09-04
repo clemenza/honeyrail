@@ -28,16 +28,31 @@ test("#200 known local PostgreSQL verification distinguishes the pinned historic
   assert.equal(grade.historical.reproduced, true);
   assert.equal(grade.reference.reproduced, false);
 
+  // Both `reproduced` booleans above are oracle-driven (see
+  // resolveOracleReproduction), not the script's own exit status: the
+  // historical run's captured stderr must actually match the declared
+  // stale-plan signature, in order, and the reference run must NOT.
+  assert.equal(grade.historical.oracle?.satisfied, true);
+  assert.equal(grade.historical.oracle?.observations.length, 2);
+  assert.equal(grade.reference.oracle?.satisfied, false);
+  assert.ok(
+    grade.reference.oracle?.diagnostics.some((line) => line.includes("correctly matched the declared expected (fixed) baseline")),
+    "the reference run's own captured output must positively confirm the declared fixed-ref baseline, not merely fail to match the historical pattern for some unrelated reason"
+  );
+
   // The materialized task tree must not leak the bug identity or fixed ref
   // that the assertion above depends on grader-side.
   const layout = await materializeHistoricalPostgresTask(task, join(root, "task-bundle"));
   const publicManifest = JSON.stringify(layout.taskManifest);
   assert.ok(!publicManifest.includes("18574"));
   assert.ok(!publicManifest.includes("BUG #18574"));
+  assert.ok(!publicManifest.includes("cache lookup"));
   assert.ok(!("referenceRevision" in layout.taskManifest));
+  assert.equal(layout.taskManifest.taskId, "postgres-historical-002");
   assert.equal(layout.truthManifest.upstreamBug, "PostgreSQL BUG #18574");
   assert.equal(layout.truthManifest.commitFest, null);
   assert.equal(layout.truthManifest.referenceRevision, task.source.referenceRevision);
   assert.ok(layout.truthManifest.canonicalReproducerSha256);
   assert.equal(layout.truthManifest.canonicalReproducer, "verification/canonical-reproducer.sql");
+  assert.ok(layout.truthManifest.behavioralOracle);
 });
