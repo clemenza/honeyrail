@@ -88,6 +88,14 @@ The base `docker/postgres-research` image deliberately ships no agent CLI ("whic
 
 A real LLM agent needs outbound network access to its model API, which the scored default (`network: "none"`) does not provide. `research-session.ts` already anticipates this: `isolation.network: "bridge"` is a supported, explicit opt-in that is honestly recorded as `scoredEligible: false` with a stated reason (see `unscoredReasons()`), rather than a silent downgrade. The two-revision **grading** of both pinned revisions is unaffected and stays fully isolated (`network: "none"`) regardless of the agent's own network mode, since grading never runs an agent - only `psqlFile()` against each revision's own runtime container. See "Scored vs. unscored" above: a bridge-network run is always `status: "unscored"`, never a scored `miss`/`rediscovered`.
 
+### Restricted model egress (#197)
+
+`isolation.restrictedEgress` is the configuration in which a real model-backed agent *can* be scored. It creates a per-trial `--internal` docker network, puts a one-upstream relay sidecar on it (`server/postgres/egress-gateway.ts`, `docker/postgres-egress-gateway/`), joins the agent to that network only, and injects `DEEPSEEK_BASE_URL=http://egress-gateway:<port>` (or a caller-chosen `envVar`, e.g. `mini-agent.mjs`'s `HONEYRAIL_AGENT_LLM_BASE_URL`) so the agent's model client talks to the sidecar. Only the sidecar is additionally attached to `bridge`, so it is the only member of that network with a route out.
+
+The distinction from `network: "bridge"` is that this one is *verified*: `docker network inspect --format '{{.Internal}}'` must answer exactly `true` before any container starts, or the session throws rather than downgrading. That check is what `isolation.restrictedEgressVerified` records, and it is the only thing that lets a non-`"none"` `networkMode` still be `scoredEligible: true`. `isolation.egressGateway` carries the container name, the exact network name (`networkMode` is that same name, never a summary label) and the upstream *hostname* - never the full URL and never a credential; the API key travels as a request header and is not logged, recorded or relayed into any artifact.
+
+Evidence: `test/postgres-egress-gateway-live-e2e.test.ts` proves, against a real daemon and from a container in the agent's own position, that `http://egress-gateway:<port>/...` reaches the configured upstream while `https://www.postgresql.org/` and `https://github.com/postgres/postgres` do not. `isolation.network` and `isolation.restrictedEgress` are mutually exclusive - under restricted egress the network is derived, not chosen.
+
 ```sh
 docker build -t honeyrail-postgres-research-184-agent:latest docker/postgres-research-agent-184
 
