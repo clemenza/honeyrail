@@ -40,11 +40,31 @@ behavioralOracle?: {
 }
 ```
 
-When a task declares one, `resolveOracleReproduction()` extracts the ordered sequence of psql `ERROR` message bodies from the submitted reproducer's own captured stderr (`extractPsqlErrorObservations()` - this also strips any leading `psql:<file>:<line>:` label, so source path/line never enters an observation and never needs separate normalization) and matches it, in order, against `behavioralOracle.historical` (`evaluateBehavioralOracle()`). **The same `historical` pattern set is tested on both revisions** - symmetric by design: this is what makes `HistoricalPostgresRevisionObservation.reproduced` mean the same thing regardless of which side produced it ("does this build's captured output match the known regression's own signature?"), so the existing `historical.reproduced`/`reference.reproduced` classification formula in `gradeHistoricalPostgresSubmission()` needs no change at all - a reference-ref run that reproduces the buggy signature (e.g. a stale-cache failure appearing on the "fixed" build) is `reproduced: true` there too, which the formula already reads as disqualifying (`invalid_submission`), never a spurious `rediscovered`. `behavioralOracle.reference` is not dead data even though it doesn't drive `reproduced`: whenever a reference-ref run does *not* match the historical signature, its evidence additionally records whether it positively confirmed the declared expected (fixed) baseline pattern, or failed for some other, unattributed reason - visible in `oracle.diagnostics`.
+When a task declares one, `resolveOracleReproduction()` extracts the ordered sequence of psql `ERROR` message bodies from the submitted reproducer's own captured stderr (`extractPsqlErrorObservations()` - this also strips any leading `psql:<file>:<line>:` label, so source path/line never enters an observation and never needs separate normalization) and calls `evaluateOracleAttribution()`, which matches those observations against **both** halves of the declared oracle and returns a structural `HistoricalPostgresOracleAttribution`:
+
+```ts
+type HistoricalPostgresOracleAttribution = {
+  gradeable: boolean;                       // did execution produce anything to evaluate at all?
+  historicalMatch: HistoricalPostgresOracleResult;  // matched against behavioralOracle.historical
+  referenceMatch: HistoricalPostgresOracleResult;   // matched against behavioralOracle.reference
+  attributedTo: "historical" | "reference" | "unattributed";
+};
+```
+
+`gradeable`, "matches the known regression", "matches the declared expected/fixed behavior", and the overall attribution are four separate, structurally-represented facts - not one boolean and a diagnostic string. `attributedTo` is `"historical"` when only `historicalMatch` is satisfied, `"reference"` when only `referenceMatch` is satisfied, and `"unattributed"` whenever *neither* is satisfied (or, pathologically, both are - a task-authoring bug in the declared patterns, which must also fail closed rather than pick a side arbitrarily). `"unattributed"` is the fix for a real gap: a reference-ref run that fails for some unrelated, unattributed reason used to read as plain "not reproduced" - indistinguishable from a reference run that correctly confirmed the fix - which let an unattributed reference-side outcome flow through the classifier as if the fix had been positively confirmed. It no longer can: `gradeHistoricalPostgresSubmission()` requires `reference.attribution.attributedTo === "reference"` (not merely `!== "historical"`) for `rediscovered`, so `"unattributed"` on either side lands in `invalid_submission` alongside "reference still shows the historical signature" - both correctly blocked from `rediscovered`. `reproduced` (`attributedTo === "historical"`) is retained only as an informational summary field; the classifier consumes `attribution` directly.
 
 A dynamic value like the stale-plan failure's OID is matched structurally (`matches: "^cache lookup failed for function \\d+$"`), never stripped out of the observation with a broad transform - a targeted, anchored pattern in the declared expectation is what keeps a meaningful difference elsewhere in a message from ever being silently erased.
 
-Absent a declared oracle (case 001, and any synthetic/unit-test spec), `reproduced` is exactly the legacy `execution.ok` exit-status differential - zero behavior change.
+Absent a declared oracle (case 001, and any synthetic/unit-test spec), `reproduced` is exactly the legacy `execution.ok` exit-status differential and the classifier takes its original, untouched branch - zero behavior change.
+
+### Grading protocol identifiers
+
+`reference/truth.json` and `reference-manifest.json` both carry `gradingProtocol`, now one of two honestly distinct values rather than one string covering two different grading semantics:
+
+- `"submitted-reproducer-exit-status-v1"` - case 001, and any spec that declares no `truth.behavioralOracle`. Grading is purely the reproducer's own exit-status differential, unchanged since #184.
+- `"submitted-reproducer-behavioral-oracle-v1"` - case 002, and any future spec that declares a `behavioralOracle`. Grading additionally requires the structural attribution above.
+
+`materializeHistoricalPostgresTask()` derives this from whether `truth.behavioralOracle` is present - no separate configuration to keep in sync - and it flows into the existing generic `bundleHash`/`taskDefinitionHash` hashing with no extra plumbing, since it's just another field in the objects already being hashed. Which protocol graded a task instance is therefore itself provenance-covered.
 
 ## Submission and deterministic grade
 
@@ -71,6 +91,8 @@ Before copying returned agent output the grader caps the workspace at 16 MiB and
 | malformed/missing `finding.json`, or `reproduced` without a valid `reproducer` | n/a | `invalid_submission` |
 | build/start/grader failure | n/a | `infrastructure_error` |
 | workspace escape/tamper | n/a | `integrity_error` |
+
+This table is the `"submitted-reproducer-exit-status-v1"` protocol (case 001): "Historical"/"Corrected" above are the reproducer's own `execution.ok` exit-status differential. Under `"submitted-reproducer-behavioral-oracle-v1"` (case 002+), the same four grade outcomes still apply, but "Historical"/"Corrected" mean the captured-output `attributedTo` result instead: `miss` requires `historical.attribution.attributedTo !== "historical"`; `rediscovered` requires `historical.attribution.attributedTo === "historical"` **and** `reference.attribution.attributedTo === "reference"` (a positive match, not merely "not historical"); anything else creditable-shaped (reference still shows the historical signature, or is `"unattributed"`) is `invalid_submission` - never a silent `rediscovered`.
 
 Each revision's artifact directory retains source/build/runtime manifests, server log, grader output, and final `grade.json`. No infrastructure failure is converted into a miss.
 

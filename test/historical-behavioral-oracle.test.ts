@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { evaluateBehavioralOracle, extractPsqlErrorObservations } from "../server/postgres/historical-behavioral-oracle.js";
+import {
+  evaluateBehavioralOracle,
+  evaluateOracleAttribution,
+  extractPsqlErrorObservations,
+  type HistoricalPostgresBehavioralOracle
+} from "../server/postgres/historical-behavioral-oracle.js";
 
 test("extractPsqlErrorObservations: single ERROR line", () => {
   const stderr = 'psql:<stdin>:3: ERROR:  procedure parameter "r1" is an output parameter but corresponding argument is not writable\n';
@@ -106,4 +111,57 @@ test("evaluateBehavioralOracle: a buggy-ref-shaped observation does not satisfy 
 
 test("evaluateBehavioralOracle: a malformed pattern throws rather than silently failing", () => {
   assert.throws(() => evaluateBehavioralOracle(["anything"], [{ label: "broken", matches: "(unterminated" }]), /not a valid regular expression/);
+});
+
+const ORACLE: HistoricalPostgresBehavioralOracle = {
+  historical: [
+    { label: "first", matches: "^baseline error$" },
+    { label: "second", matches: "^stale-cache error \\d+$" }
+  ],
+  reference: [
+    { label: "first", matches: "^baseline error$" },
+    { label: "second", matches: "^baseline error$" }
+  ]
+};
+
+test("evaluateOracleAttribution: attributes \"historical\" when only the historical pattern set matches", () => {
+  const result = evaluateOracleAttribution(["baseline error", "stale-cache error 42"], ORACLE);
+  assert.equal(result.attributedTo, "historical");
+  assert.equal(result.historicalMatch.satisfied, true);
+  assert.equal(result.referenceMatch.satisfied, false);
+  assert.equal(result.gradeable, true);
+});
+
+test("evaluateOracleAttribution: attributes \"reference\" when only the reference pattern set matches", () => {
+  const result = evaluateOracleAttribution(["baseline error", "baseline error"], ORACLE);
+  assert.equal(result.attributedTo, "reference");
+  assert.equal(result.historicalMatch.satisfied, false);
+  assert.equal(result.referenceMatch.satisfied, true);
+  assert.equal(result.gradeable, true);
+});
+
+test("evaluateOracleAttribution: attributes \"unattributed\" when neither pattern set matches", () => {
+  const result = evaluateOracleAttribution(["baseline error", "connection refused"], ORACLE);
+  assert.equal(result.attributedTo, "unattributed");
+  assert.equal(result.historicalMatch.satisfied, false);
+  assert.equal(result.referenceMatch.satisfied, false);
+  assert.equal(result.gradeable, true);
+});
+
+test("evaluateOracleAttribution: attributes \"unattributed\" (fails closed) when, pathologically, both pattern sets match", () => {
+  const overlapping: HistoricalPostgresBehavioralOracle = {
+    historical: [{ label: "only", matches: "^ambiguous error$" }],
+    reference: [{ label: "only", matches: "^ambiguous error$" }]
+  };
+  const result = evaluateOracleAttribution(["ambiguous error"], overlapping);
+  assert.equal(result.attributedTo, "unattributed");
+  assert.equal(result.historicalMatch.satisfied, true);
+  assert.equal(result.referenceMatch.satisfied, true);
+});
+
+test("evaluateOracleAttribution: gradeable is false only when no observations were captured at all, independent of match outcome", () => {
+  assert.equal(evaluateOracleAttribution([], ORACLE).gradeable, false);
+  assert.equal(evaluateOracleAttribution([], ORACLE).attributedTo, "unattributed");
+  assert.equal(evaluateOracleAttribution(["totally unrelated"], ORACLE).gradeable, true);
+  assert.equal(evaluateOracleAttribution(["totally unrelated"], ORACLE).attributedTo, "unattributed");
 });

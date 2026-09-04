@@ -103,3 +103,47 @@ export function evaluateBehavioralOracle(observations: string[], expected: Histo
   }
   return { observations, expected, satisfied, diagnostics };
 }
+
+export type HistoricalPostgresOracleAttribution = {
+  /**
+   * True iff extraction captured at least one observation at all - i.e. the
+   * run produced something to evaluate, as opposed to a totally empty
+   * capture (e.g. psql never reached a CALL, or stderr was empty). This is
+   * "did we get gradeable output", independent of whether what was captured
+   * matches either declared pattern set - see #200's second review round,
+   * which asked for execution validity to be represented separately from
+   * behavioral attribution rather than folded into a single boolean.
+   */
+  gradeable: boolean;
+  /** Observations matched against the oracle's `historical` pattern set. */
+  historicalMatch: HistoricalPostgresOracleResult;
+  /** Observations matched against the oracle's `reference` pattern set. */
+  referenceMatch: HistoricalPostgresOracleResult;
+  /**
+   * Structural attribution - not just diagnostic prose. `"unattributed"`
+   * covers both "matched neither declared pattern set" (the primary
+   * correctness fix this type exists for: an unrelated/unexpected
+   * reference-side failure must never silently pass as "the bug is absent")
+   * and the pathological case where both matched (a task-authoring bug in
+   * the declared oracle itself - historical and reference patterns should be
+   * mutually exclusive by construction, so this fails closed rather than
+   * picking one arbitrarily).
+   */
+  attributedTo: "historical" | "reference" | "unattributed";
+};
+
+/**
+ * Evaluates one revision run's captured observations against *both* halves
+ * of a declared oracle and produces a structural attribution. Pure, no I/O.
+ */
+export function evaluateOracleAttribution(observations: string[], oracle: HistoricalPostgresBehavioralOracle): HistoricalPostgresOracleAttribution {
+  const historicalMatch = evaluateBehavioralOracle(observations, oracle.historical);
+  const referenceMatch = evaluateBehavioralOracle(observations, oracle.reference);
+  const attributedTo: HistoricalPostgresOracleAttribution["attributedTo"] =
+    historicalMatch.satisfied && !referenceMatch.satisfied
+      ? "historical"
+      : referenceMatch.satisfied && !historicalMatch.satisfied
+        ? "reference"
+        : "unattributed";
+  return { gradeable: observations.length > 0, historicalMatch, referenceMatch, attributedTo };
+}

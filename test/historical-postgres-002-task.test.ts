@@ -34,6 +34,16 @@ test("historicalPostgres002TaskSpec carries the frozen #185 Bug 2 identity behin
   assert.equal(historicalPostgres002TaskPrompt(), spec.prompt);
 });
 
+test("historicalPostgres002TaskSpec materializes under the behavioral-oracle grading protocol, distinct from case 001's exit-status protocol", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-historical-002-protocol-"));
+  const repo = await createSyntheticPostgresSourceRepo(root);
+  const base = historicalPostgres002TaskSpec(repo.repoPath);
+  const spec: HistoricalPostgresTaskSpec = { ...base, source: { ...base.source, historicalRevision: repo.ref, referenceRevision: repo.laterRef } };
+  const task = await materializeHistoricalPostgresTask(spec, join(root, "case"));
+  assert.equal(task.truthManifest.gradingProtocol, "submitted-reproducer-behavioral-oracle-v1");
+  assert.equal(task.referenceManifest.gradingProtocol, "submitted-reproducer-behavioral-oracle-v1");
+});
+
 test("historicalPostgres002TaskSpec declares a behavioral oracle matching #185's confirmed observations", () => {
   const spec = historicalPostgres002TaskSpec("/unused/repo/path");
   const oracle = spec.truth.behavioralOracle;
@@ -132,6 +142,12 @@ test("postgres-historical-001 still materializes and hashes under the widened tr
   const task = await materializeHistoricalPostgresTask(spec, join(root, "case"));
   assert.equal(task.truthManifest.commitFest, 7059);
   assert.equal(task.truthManifest.behavioralOracle, null);
+  // Backward compatibility for the grading-protocol identifier change: a
+  // spec that declares no behavioralOracle (case 001) must still get the
+  // exact original protocol string, byte-for-byte - never the new
+  // behavioral-oracle one.
+  assert.equal(task.truthManifest.gradingProtocol, "submitted-reproducer-exit-status-v1");
+  assert.equal(task.referenceManifest.gradingProtocol, "submitted-reproducer-exit-status-v1");
   const publicManifestText = JSON.stringify(task.taskManifest);
   assert.ok(!publicManifestText.includes("7059"));
   assert.ok(!publicManifestText.includes("19560"));
@@ -153,7 +169,10 @@ test("resolveOracleReproduction: the historical ref is reproduced only when capt
     spec
   });
   assert.equal(correct.reproduced, true);
-  assert.equal(correct.oracle?.satisfied, true);
+  assert.equal(correct.attribution?.attributedTo, "historical");
+  assert.equal(correct.attribution?.historicalMatch.satisfied, true);
+  assert.equal(correct.attribution?.referenceMatch.satisfied, false);
+  assert.equal(correct.attribution?.gradeable, true);
 
   // An unrelated error sequence must not earn rediscovery credit just
   // because the script happened to exit non-specifically on this revision.
@@ -163,7 +182,8 @@ test("resolveOracleReproduction: the historical ref is reproduced only when capt
     spec
   });
   assert.equal(unrelated.reproduced, false);
-  assert.equal(unrelated.oracle?.satisfied, false);
+  assert.equal(unrelated.attribution?.attributedTo, "unattributed");
+  assert.equal(unrelated.attribution?.gradeable, true);
 
   // Wrong *first* observation also fails, even if the second happens to match.
   const wrongFirst = resolveOracleReproduction({
@@ -172,49 +192,61 @@ test("resolveOracleReproduction: the historical ref is reproduced only when capt
     spec
   });
   assert.equal(wrongFirst.reproduced, false);
+  assert.equal(wrongFirst.attribution?.attributedTo, "unattributed");
+
+  // No observations at all (e.g. the script never reached a CALL) is
+  // explicitly "not gradeable", distinct from "gradeable but unmatched".
+  const empty = resolveOracleReproduction({
+    execution: executionWithObservations([]),
+    revision: spec.source.historicalRevision,
+    spec
+  });
+  assert.equal(empty.attribution?.gradeable, false);
+  assert.equal(empty.attribution?.attributedTo, "unattributed");
 });
 
-test("resolveOracleReproduction: `reproduced` always tests against the declared historical signature, so the reference ref is correctly NOT reproduced when it holds the baseline", () => {
+test("resolveOracleReproduction: attribution is symmetric - the reference ref is correctly attributed to \"reference\" when it holds the baseline", () => {
   const spec = historicalPostgres002TaskSpec("/unused/repo/path");
   const baseline = 'procedure parameter "r1" is an output parameter but corresponding argument is not writable';
 
-  // The reference ref correctly holding the baseline twice does not match
-  // the historical (stale-cache) signature, so reproduced is false here -
-  // exactly the polarity gradeHistoricalPostgresSubmission()'s existing
-  // formula expects on the reference side (see the e2e test below).
+  // The reference ref correctly holding the baseline twice is positively
+  // attributed to "reference" - not merely "not historical" - which is what
+  // the classifier now requires for rediscovered (see the e2e test below).
   const correctReference = resolveOracleReproduction({
     execution: executionWithObservations([baseline, baseline]),
     revision: spec.source.referenceRevision,
     spec
   });
   assert.equal(correctReference.reproduced, false);
-  assert.equal(correctReference.oracle?.satisfied, false);
-  assert.ok(correctReference.oracle?.diagnostics.some((line) => line.includes("correctly matched the declared expected (fixed) baseline")));
+  assert.equal(correctReference.attribution?.attributedTo, "reference");
+  assert.equal(correctReference.attribution?.referenceMatch.satisfied, true);
+  assert.equal(correctReference.attribution?.historicalMatch.satisfied, false);
 
   // A reference-ref run whose captured output happens to look like the
   // buggy stale-cache failure (e.g. a misconfigured/mismatched build, or a
-  // real regression on the "fixed" ref) DOES match the historical signature,
-  // so reproduced is true - which the classification formula reads as
-  // disqualifying (invalid_submission), never as a spurious rediscovered.
+  // real regression on the "fixed" ref) is attributed to "historical", which
+  // the classification formula reads as disqualifying (invalid_submission),
+  // never as a spurious rediscovered.
   const staleShapedOnReference = resolveOracleReproduction({
     execution: executionWithObservations([baseline, "cache lookup failed for function 55555"]),
     revision: spec.source.referenceRevision,
     spec
   });
   assert.equal(staleShapedOnReference.reproduced, true);
-  assert.equal(staleShapedOnReference.oracle?.satisfied, true);
+  assert.equal(staleShapedOnReference.attribution?.attributedTo, "historical");
 
-  // A reference-ref run that fails for some unrelated, unattributed reason
-  // (neither the historical signature nor the declared baseline) is also
-  // correctly not-reproduced, but the evidence flags that it isn't
-  // attributable to the declared oracle either way.
+  // A reference-ref run that fails for some unrelated reason (neither the
+  // historical signature nor the declared baseline) is "unattributed" - the
+  // primary correctness fix this attribution model exists for: this must
+  // never be treated as equivalent to "correctly matches the fixed baseline".
   const unattributed = resolveOracleReproduction({
     execution: executionWithObservations(["connection refused"]),
     revision: spec.source.referenceRevision,
     spec
   });
   assert.equal(unattributed.reproduced, false);
-  assert.ok(unattributed.oracle?.diagnostics.some((line) => line.includes("not fully attributable to the declared oracle")));
+  assert.equal(unattributed.attribution?.attributedTo, "unattributed");
+  assert.equal(unattributed.attribution?.referenceMatch.satisfied, false);
 });
 
 test("end-to-end: an oracle-declared task correctly classifies rediscovered vs. a non-specific differential vs. a stale-shaped reference run", async () => {
@@ -243,12 +275,12 @@ test("end-to-end: an oracle-declared task correctly classifies rediscovered vs. 
       })
   });
   assert.equal(rediscovered.status, "rediscovered", JSON.stringify(rediscovered, null, 2));
-  // Both are evaluated against the same declared historical signature: the
-  // historical run matches it (true), the reference run correctly does not
-  // (false) - see resolveOracleReproduction's symmetric-polarity design.
-  assert.equal(rediscovered.historical.oracle?.satisfied, true);
-  assert.equal(rediscovered.reference.oracle?.satisfied, false);
-  assert.ok(rediscovered.reference.oracle?.diagnostics.some((line) => line.includes("correctly matched the declared expected (fixed) baseline")));
+  // Historical is positively attributed to "historical"; reference is
+  // positively attributed to "reference" (the expected/fixed baseline was
+  // actually, structurally observed - not merely "didn't match historical").
+  assert.equal(rediscovered.historical.attribution?.attributedTo, "historical");
+  assert.equal(rediscovered.reference.attribution?.attributedTo, "reference");
+  assert.equal(rediscovered.reference.attribution?.referenceMatch.satisfied, true);
 
   // A script that exits 0 on the historical ref and non-zero on the
   // reference ref for an unrelated reason (not the declared oracle) must not
@@ -290,9 +322,52 @@ test("end-to-end: an oracle-declared task correctly classifies rediscovered vs. 
         spec
       })
   });
-  assert.equal(staleShapedReference.reference.oracle?.satisfied, true);
+  assert.equal(staleShapedReference.reference.attribution?.attributedTo, "historical");
   assert.equal(staleShapedReference.reference.reproduced, true);
   assert.equal(staleShapedReference.status, "invalid_submission", JSON.stringify(staleShapedReference, null, 2));
+
+  // The specific scenario the second review round required: historical
+  // correctly matches, but the reference run fails for some unrelated
+  // reason that matches *neither* declared pattern set. This must never be
+  // reported as rediscovered just because "not matching the historical
+  // signature" used to be treated as good enough - it is unattributed, and
+  // unattributed is invalid_submission, not rediscovered.
+  const unattributedReference = await gradeHistoricalPostgresSubmission({
+    task: spec,
+    workspaceDir: workspace,
+    artifactDir: join(root, "unattributed-reference"),
+    gradeRevision: async ({ revision }) =>
+      resolveOracleReproduction({
+        execution:
+          revision === spec.source.historicalRevision
+            ? executionWithObservations([baseline, "cache lookup failed for function 16386"])
+            : executionWithObservations(["connection refused by the runtime container"]),
+        revision,
+        spec
+      })
+  });
+  assert.equal(unattributedReference.historical.attribution?.attributedTo, "historical");
+  assert.equal(unattributedReference.reference.attribution?.attributedTo, "unattributed");
+  assert.notEqual(unattributedReference.status, "rediscovered", JSON.stringify(unattributedReference, null, 2));
+  assert.equal(unattributedReference.status, "invalid_submission", JSON.stringify(unattributedReference, null, 2));
+  assert.ok(unattributedReference.diagnostics.some((line) => line.includes("not attributable to the declared oracle")));
+
+  // Historical-side miss, regardless of what the reference side shows.
+  const historicalMiss = await gradeHistoricalPostgresSubmission({
+    task: spec,
+    workspaceDir: workspace,
+    artifactDir: join(root, "historical-miss"),
+    gradeRevision: async ({ revision }) =>
+      resolveOracleReproduction({
+        execution:
+          revision === spec.source.historicalRevision
+            ? executionWithObservations(["unrelated failure"])
+            : executionWithObservations([baseline, baseline]),
+        revision,
+        spec
+      })
+  });
+  assert.equal(historicalMiss.status, "miss", JSON.stringify(historicalMiss, null, 2));
 });
 
 test("no file anywhere under the materialized task/ tree leaks the bug identity, the failure-mechanism vocabulary, either revision, or the canonical reproducer", async () => {

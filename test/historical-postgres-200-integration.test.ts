@@ -31,14 +31,14 @@ test("#200 known local PostgreSQL verification distinguishes the pinned historic
   // Both `reproduced` booleans above are oracle-driven (see
   // resolveOracleReproduction), not the script's own exit status: the
   // historical run's captured stderr must actually match the declared
-  // stale-plan signature, in order, and the reference run must NOT.
-  assert.equal(grade.historical.oracle?.satisfied, true);
-  assert.equal(grade.historical.oracle?.observations.length, 2);
-  assert.equal(grade.reference.oracle?.satisfied, false);
-  assert.ok(
-    grade.reference.oracle?.diagnostics.some((line) => line.includes("correctly matched the declared expected (fixed) baseline")),
-    "the reference run's own captured output must positively confirm the declared fixed-ref baseline, not merely fail to match the historical pattern for some unrelated reason"
-  );
+  // stale-plan signature, in order, and the reference run must be
+  // *positively* attributed to the declared expected (fixed) baseline - not
+  // merely fail to match the historical pattern for some unrelated reason.
+  assert.equal(grade.historical.attribution?.attributedTo, "historical");
+  assert.equal(grade.historical.attribution?.historicalMatch.satisfied, true);
+  assert.equal(grade.historical.attribution?.historicalMatch.observations.length, 2);
+  assert.equal(grade.reference.attribution?.attributedTo, "reference");
+  assert.equal(grade.reference.attribution?.referenceMatch.satisfied, true);
 
   // The materialized task tree must not leak the bug identity or fixed ref
   // that the assertion above depends on grader-side.
@@ -55,4 +55,6 @@ test("#200 known local PostgreSQL verification distinguishes the pinned historic
   assert.ok(layout.truthManifest.canonicalReproducerSha256);
   assert.equal(layout.truthManifest.canonicalReproducer, "verification/canonical-reproducer.sql");
   assert.ok(layout.truthManifest.behavioralOracle);
+  assert.equal(layout.truthManifest.gradingProtocol, "submitted-reproducer-behavioral-oracle-v1");
+  assert.equal(layout.referenceManifest.gradingProtocol, "submitted-reproducer-behavioral-oracle-v1");
 });
