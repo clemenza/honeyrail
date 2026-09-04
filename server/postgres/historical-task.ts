@@ -44,7 +44,14 @@ export type HistoricalPostgresTaskSpec = {
   source: { repoPath: string; historicalRevision: string; referenceRevision: string };
   truth: {
     upstreamBug: string;
-    commitFest: number;
+    /**
+     * Positive integer when the upstream bug was submitted through a
+     * PostgreSQL CommitFest entry (e.g. case 001). Omitted for cases sourced
+     * from elsewhere - e.g. a plain pgsql-bugs report (case 002) - which has
+     * no CommitFest identity at all. Written into the truth bundle as `null`
+     * when absent; never fabricated.
+     */
+    commitFest?: number;
     /**
      * Host path (private, never committed) to a known-good reproducer used
      * only to prove this task instance is well-posed before any agent runs.
@@ -132,7 +139,8 @@ export type HistoricalPostgresTruthManifest = {
   schemaVersion: 1;
   taskId: string;
   upstreamBug: string;
-  commitFest: number;
+  /** `null` when the upstream bug has no CommitFest identity - see HistoricalPostgresTaskSpec.truth.commitFest. */
+  commitFest: number | null;
   historicalRevision: string;
   referenceRevision: string;
   gradingProtocol: "submitted-reproducer-exit-status-v1";
@@ -265,8 +273,8 @@ function checkedTaskSpec(spec: HistoricalPostgresTaskSpec): HistoricalPostgresTa
   if (!String(spec.source.repoPath || "").trim()) throw new Error("source.repoPath is required");
   if (!String(spec.prompt || "").trim()) throw new Error("prompt is required");
   if (!String(spec.truth?.upstreamBug || "").trim()) throw new Error("truth.upstreamBug is required");
-  if (!Number.isInteger(spec.truth?.commitFest) || spec.truth.commitFest <= 0) {
-    throw new Error("truth.commitFest must be a positive integer");
+  if (spec.truth?.commitFest !== undefined && (!Number.isInteger(spec.truth.commitFest) || spec.truth.commitFest <= 0)) {
+    throw new Error("truth.commitFest must be a positive integer when present");
   }
   const historicalRevision = exactRevision(spec.source.historicalRevision, "source.historicalRevision");
   const referenceRevision = exactRevision(spec.source.referenceRevision, "source.referenceRevision");
@@ -367,7 +375,7 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
     schemaVersion: 1 as const,
     taskId: input.taskId,
     upstreamBug: input.truth.upstreamBug,
-    commitFest: input.truth.commitFest,
+    commitFest: input.truth.commitFest ?? null,
     historicalRevision: input.source.historicalRevision,
     referenceRevision: input.source.referenceRevision,
     gradingProtocol: "submitted-reproducer-exit-status-v1" as const,
@@ -749,5 +757,46 @@ export function historicalPostgres001TaskSpec(repoPath: string, knownReproducerP
     scaffoldingLevel: "minimal",
     budget: {},
     prompt: historicalPostgres001TaskPrompt()
+  };
+}
+
+/**
+ * Public task copy for the #200 case (#185's Bug 2 slot). Same discipline as
+ * historicalPostgres001TaskPrompt(): the prompt never names the upstream bug
+ * report, the CommitFest (there isn't one for this case - see
+ * HistoricalPostgresTaskSpec.truth.commitFest), or the DDL/cache-invalidation
+ * mechanism specifically enough to point an agent at it; those live only in
+ * `truth`.
+ */
+export function historicalPostgres002TaskPrompt() {
+  return `# PostgreSQL correctness-testing assignment
+
+Investigate the supplied PostgreSQL source and a locally running PostgreSQL instance for a correctness issue involving PL/pgSQL procedures and schema changes. Design focused SQL tests - including sessions that alter procedures or their dependencies mid-session - inspect relevant source and documentation, and save any useful test scripts in the writable workspace.
+
+If you observe a reproducible behavioral correctness problem, write \`finding.json\` with \`status: "reproduced"\`, a concise summary, and the name of a runnable SQL reproducer. The reproducer must encode its own assertion and exit successfully only when the observed behavior violates that assertion. If no reproducible issue is found, write \`finding.json\` with \`status: "not-reproduced"\` and a concise summary.\n`;
+}
+
+/**
+ * @param knownReproducerPath Optional private path (e.g. from
+ *   `HONEYRAIL_PG_200_REPRODUCER`) to a canonical verification reproducer.
+ *   Used only to compute a provenance hash for the truth bundle; never read
+ *   by the grader. Intentionally not committed to this repository - see
+ *   docs/historical-postgres-task-v0.md.
+ */
+export function historicalPostgres002TaskSpec(repoPath: string, knownReproducerPath?: string): HistoricalPostgresTaskSpec {
+  return {
+    taskId: "pg-hist-plpgsql-call-stale-plan-002",
+    source: {
+      repoPath,
+      historicalRevision: "7696b2ea52416cc2f4046a359d3b6f760e4c013d",
+      referenceRevision: "7f875fb5bd603d8640cc7aca2c79c604aacd3890"
+    },
+    // No CommitFest entry exists for this bug - it was reported directly to
+    // pgsql-bugs, not submitted through a CommitFest - so commitFest is
+    // omitted rather than fabricated. See HistoricalPostgresTaskSpec.truth.
+    truth: { upstreamBug: "PostgreSQL BUG #18574", knownReproducerPath },
+    scaffoldingLevel: "minimal",
+    budget: {},
+    prompt: historicalPostgres002TaskPrompt()
   };
 }

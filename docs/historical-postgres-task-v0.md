@@ -27,7 +27,7 @@ The agent receives the historical source, prompt, live local instance, and writa
 
 A dedicated test (`"no file anywhere under task/ leaks..."`) walks the entire `task/` tree recursively and asserts no file's text contains either revision, the upstream bug id, the CommitFest id, the local mirror path, the canonical reproducer's contents, relative path, or hash, or the canonical reproducer's original host path - so a future field added to any file under `task/` is covered automatically, not just `task-manifest.json`.
 
-The selected local case has the opaque id `postgres-historical-001` (`historicalPostgres001TaskSpec()`); its truth bundle records the real upstream bug and both pinned revisions, but neither this document nor any agent-visible artifact does.
+Two local cases exist so far. The first has the opaque id `postgres-historical-001` (`historicalPostgres001TaskSpec()`, #184); its truth bundle records the real upstream bug and both pinned revisions, but neither this document nor any agent-visible artifact does. The second has the opaque id `pg-hist-plpgsql-call-stale-plan-002` (`historicalPostgres002TaskSpec()`, #200 - Bug 2 of the corpus tracked in #185); it follows the identical boundary and grading contract. Its upstream bug was reported directly to pgsql-bugs rather than submitted through a CommitFest, so it has no CommitFest identity at all: `HistoricalPostgresTaskSpec.truth.commitFest` is optional, and `reference/truth.json` records `commitFest: null` rather than a fabricated number whenever a case has none. Every other truth field (`upstreamBug`, both revisions, the canonical-reproducer provenance) is still recorded and still covered by `bundleHash` exactly as before; `commitFest`'s presence or absence is just one more fact the hash covers, not a hole in it.
 
 ## Submission and deterministic grade
 
@@ -67,7 +67,7 @@ Each revision's artifact directory retains source/build/runtime manifests, serve
 
 ## Local use
 
-The programmatic entry points are `historicalPostgres001TaskSpec()`, `materializeHistoricalPostgresTask()`, `runHistoricalPostgresTrial()`, and `gradeHistoricalPostgresSubmission()` from `server/postgres/historical-task.ts`. `runHistoricalPostgresTrial()` is the real-agent vertical slice: it passes the public task prompt as `HONEYRAIL_TASK_PROMPT` and the opaque id as `HONEYRAIL_TASK_ID`, gives the isolated agent its normal `$HR_PG_WORK_DIR`, copies returned files grader-side, and grades the same submitted file on both revisions.
+The programmatic entry points are `historicalPostgres001TaskSpec()` / `historicalPostgres002TaskSpec()`, `materializeHistoricalPostgresTask()`, `runHistoricalPostgresTrial()`, and `gradeHistoricalPostgresSubmission()` from `server/postgres/historical-task.ts`. `runHistoricalPostgresTrial()` is the real-agent vertical slice: it passes the public task prompt as `HONEYRAIL_TASK_PROMPT` and the opaque id as `HONEYRAIL_TASK_ID`, gives the isolated agent its normal `$HR_PG_WORK_DIR`, copies returned files grader-side, and grades the same submitted file on both revisions.
 
 The real two-revision check is opt-in because it needs the prebuilt local Docker images, PostgreSQL mirror, and the local known repro (the repro is intentionally not committed). It must report the historical/reference execution records, source/build hashes, `grade.json`, and artifact paths; a missing image, build, or startup is `infrastructure_error`, not an agent miss.
 
@@ -81,6 +81,29 @@ npm run test:historical-pg-184
 export HONEYRAIL_PG_184_AGENT_COMMAND=/path/in/agent-image/to/agent
 npm run historical-pg-184
 ```
+
+Case 002 (#200) follows the identical shape, on `HONEYRAIL_PG_200_*` instead of `HONEYRAIL_PG_184_*`:
+
+```sh
+export HONEYRAIL_PG_200_MIRROR=/path/to/local/postgres-mirror
+export HONEYRAIL_PG_200_REPRODUCER=/private/path/to/known-repro.sql
+npm run test:historical-pg-200
+
+export HONEYRAIL_PG_200_AGENT_COMMAND=/path/in/agent-image/to/agent
+npm run historical-pg-200
+```
+
+### Case 002's canonical reproducer (private, not committed)
+
+Like case 001's, case 002's canonical verification reproducer is deliberately **not** committed to this repository: this is a public repo, and checking in the answer key would let it leak into a future agent's training data, which would defeat the eval it is meant to validate. `HONEYRAIL_PG_200_REPRODUCER` points at a private local file; `historicalPostgres002TaskSpec()`'s `knownReproducerPath` parameter only hashes it into `reference/truth.json` for provenance (`canonicalReproducerSha256`) and, when the test above is run, retains a copy under the case's own `reference/verification/canonical-reproducer.sql` - grader-private, never mounted into an agent. The grader never executes this file as part of grading a submission; it exists only to prove a task instance is well-posed before any agent runs.
+
+Building that file locally, encode the five-step sequence recorded in #185 (create wrapper procedure `p1`, create called procedure `p2`, invoke `p1` once to record the baseline error, drop and recreate `p2`, invoke `p1` again) as a single `psql -X` script that self-asserts via its own exit status, matching the exit-code convention above:
+
+1. `\set ON_ERROR_STOP off` before any DDL/CALL runs - the first invocation of `p1` is *expected* to error (that is the recorded baseline, not a script failure), and the script must keep running past it to reach the drop/recreate and the second invocation. `psqlFile()` in `runtime-container.ts` invokes psql with `-v ON_ERROR_STOP=1` as an initial variable, but a `\set` meta-command inside the script file overrides it before the first statement runs, so no change to the shared research-environment code is needed for this.
+2. Capture each invocation's resulting error text server-side rather than trusting psql's own exit code - e.g. a `DO $$ ... EXCEPTION WHEN OTHERS THEN ... $$` block that records `SQLERRM`/`SQLSTATE` into a temporary table, or psql's `:LAST_ERROR_MESSAGE` / `:LAST_ERROR_SQLSTATE` special variables (available since PG10). This is what "do not rely only on the `psql` exit status" (#200) means in practice: the exit status the script ultimately produces is *derived from* the captured message text, not just from whether some statement errored.
+3. Before comparing the second invocation's captured message against the expected patterns, normalize the dynamic object id out of it (e.g. `regexp_replace(message, '[0-9]+', '<OID>', 'g')`) - the buggy ref's failure names a real, non-reproducible OID, and the grader must never compare a literal OID.
+4. Compare, in order: the first invocation's message against the baseline OUT-parameter error, and the normalized second invocation's message against the same baseline error. Finish with `\set ON_ERROR_STOP on` and either exit 0 (the second message did *not* normalize to the baseline - i.e. it matches the buggy ref's stale cache-lookup failure, so the regression is observed) or force a non-zero exit (the second message matches the baseline again - the regression is absent, as on the fixed ref).
+5. Use a fresh cluster (or an equivalently reset schema) per invocation of the script, and run it with `psql -X` to ignore any local `.psqlrc` - both per #200's grader requirements.
 
 ### Real-agent vertical slice
 
