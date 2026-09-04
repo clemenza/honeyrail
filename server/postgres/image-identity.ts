@@ -67,14 +67,51 @@ export class PostgresImageError extends Error {
   }
 }
 
-async function inspect(image: string, format: string, runCommand: RunCommand, buildHint: string): Promise<string> {
-  const result = await runCommand("docker", ["image", "inspect", "--format", format, image], { timeout: 30_000 });
+/**
+ * One `docker image inspect <image>` (JSON, no `--format`), rather than five
+ * separate `--format '{{.Field}}'` calls.
+ *
+ * The per-field Go-template form broke on real GitHub Actions runners for any
+ * image with no variant (ordinary amd64/arm64 images, not just arm/v7):
+ * `{{if .Variant}}{{.Variant}}{{end}}` raised `template parsing error:
+ * ... map has no entry for key "Variant"` rather than evaluating the `if` as
+ * false. That daemon's `docker image inspect --format` evidently renders
+ * against a decoded `map[string]interface{}` for at least some fields, and
+ * Go's `text/template` treats a *missing* map key as an execution error on
+ * direct field access - unlike a present-but-empty field, and unlike `index`,
+ * which returns the zero value for an absent key without erroring. Confirmed
+ * against this repository's own `pg-research-integration.yml` run (#197
+ * round 2 review): `test/postgres-research-live-e2e.test.ts` failed with
+ * this exact error, yet the workflow still reported success (the other,
+ * separate defect that review fixed).
+ *
+ * A single plain JSON inspect sidesteps the whole class of template-shape
+ * assumptions at once - Id/RepoDigests/Os/Architecture/Variant are read as
+ * ordinary (possibly-`undefined`) JSON properties in TypeScript, where an
+ * absent key is just `undefined`, not a template execution error.
+ */
+async function inspectJson(image: string, runCommand: RunCommand, buildHint: string): Promise<Record<string, unknown>> {
+  const result = await runCommand("docker", ["image", "inspect", image], { timeout: 30_000 });
   if (!result.ok) {
     throw new PostgresImageError(
       `Image "${image}" is not available to the docker daemon. ${buildHint} ${(result.stderr || result.stdout).trim()}`
     );
   }
-  return result.stdout.trim();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result.stdout);
+  } catch (error) {
+    throw new PostgresImageError(`Image "${image}": docker image inspect returned output that could not be parsed as JSON: ${(error as Error).message}`);
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0 || typeof parsed[0] !== "object" || parsed[0] === null) {
+    throw new PostgresImageError(`Image "${image}": docker image inspect returned no entry`);
+  }
+  return parsed[0] as Record<string, unknown>;
+}
+
+function stringField(source: Record<string, unknown>, key: string): string {
+  const value = source[key];
+  return typeof value === "string" ? value : "";
 }
 
 export function normalizeContainerOs(value: string): string {
@@ -133,12 +170,17 @@ export async function resolveImageIdentity(
   options: { runCommand?: RunCommand; buildHint: string }
 ): Promise<ContainerImageIdentity> {
   const runCommand = options.runCommand ?? runCommandSafe;
-  const id = await inspect(image, "{{.Id}}", runCommand, options.buildHint);
-  const digest = await inspect(image, "{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}", runCommand, options.buildHint);
-  const os = await inspect(image, "{{.Os}}", runCommand, options.buildHint);
-  const architecture = await inspect(image, "{{.Architecture}}", runCommand, options.buildHint);
-  const variant = await inspect(image, "{{if .Variant}}{{.Variant}}{{end}}", runCommand, options.buildHint);
+  const inspected = await inspectJson(image, runCommand, options.buildHint);
+  const id = stringField(inspected, "Id");
   if (!id) throw new PostgresImageError(`Image "${image}" reported no image id`);
+  const repoDigests = Array.isArray(inspected.RepoDigests) ? inspected.RepoDigests : [];
+  const digest = typeof repoDigests[0] === "string" ? repoDigests[0] : "";
+  const os = stringField(inspected, "Os");
+  const architecture = stringField(inspected, "Architecture");
+  // A genuinely absent `Variant` key (the common case for amd64/arm64 images,
+  // and the exact case that broke the old per-field template form) reads as
+  // plain `undefined` here, not a template execution error.
+  const variant = typeof inspected.Variant === "string" ? inspected.Variant : "";
   const platform = normalizedContainerPlatform({ os, architecture, variant });
   return {
     reference: image,

@@ -114,14 +114,33 @@ jobs:
       - name: Runtime sidecar unit tests
         run: node --import tsx --test test/postgres-research-runtime.test.ts
 
+      # Every step below pipes `node --test` into `tee` so the log survives
+      # for the skip-check and the uploaded artifact - and every one of them
+      # needs `set -o pipefail` to mean anything as a gate. Without it, a
+      # GitHub Actions `run:` step's exit status is `tee`'s (always 0, since
+      # `tee` itself never fails just because the data it copied represents a
+      # failing test), not the left-hand `node --test` process's - so a
+      # *step* piping a failing suite into `tee` reports success regardless
+      # of what is inside the log (#197 round 2 review, found via a real CI
+      # run: `test/postgres-research-live-e2e.test.ts` reported `fail 1` and
+      # the step - and the whole workflow - still concluded `success`).
+      # GitHub's default `bash` invocation for a `run:` step does NOT set
+      # `-o pipefail` on its own; it has to be requested explicitly, on every
+      # step that pipes, not just the ones that already happened to write
+      # `set -euo pipefail` for an unrelated reason (loop/variable safety).
       - name: Real containerized build and cache-identity scan
-        run: node --import tsx --test test/postgres-research-real-build.test.ts 2>&1 | tee real-build.log
+        run: |
+          set -euo pipefail
+          node --import tsx --test test/postgres-research-real-build.test.ts 2>&1 | tee real-build.log
 
       - name: Real live cluster, isolated agent, restart and cleanup
-        run: node --import tsx --test test/postgres-research-live-e2e.test.ts 2>&1 | tee live-e2e.log
+        run: |
+          set -euo pipefail
+          node --import tsx --test test/postgres-research-live-e2e.test.ts 2>&1 | tee live-e2e.log
 
       - name: Isolation and network boundary tests
         run: |
+          set -euo pipefail
           node --import tsx --test test/postgres-research-isolation.test.ts 2>&1 | tee isolation.log
           node --import tsx --test test/postgres-research-network.test.ts 2>&1 | tee network.log
 
@@ -133,29 +152,16 @@ jobs:
         # sources that would hand a Historical PG agent its own answer key.
         # A skip here is not a pass; it is #197's required negative evidence
         # simply not having run.
-        run: node --import tsx --test test/postgres-egress-gateway-live-e2e.test.ts 2>&1 | tee egress-gateway.log
-
-      - name: Fail if any required test skipped
-        # The point of this job. `node --test`'s TAP-ish summary reports a
-        # skipped count; anything above zero here means the gate did not
-        # actually run, which is a failure and not a pass.
         run: |
           set -euo pipefail
-          status=0
-          for log in real-build.log live-e2e.log isolation.log network.log egress-gateway.log; do
-            # `node --test`'s summary line is "<glyph> skipped <n>"; take the
-            # last field of the last such line so the glyph's encoding is
-            # irrelevant. An unparseable summary counts as a failure, not as a
-            # zero.
-            skipped=$(grep -E 'skipped [0-9]+$' "$log" | tail -1 | awk '{print $NF}')
-            echo "$log: skipped=${skipped:-unparseable}"
-            if [ "${skipped:-1}" != "0" ]; then
-              echo "::error file=$log::a required PostgreSQL research test skipped; a skip is not a pass"
-              grep -nE '^.\s' "$log" | grep -i 'skip' || true
-              status=1
-            fi
-          done
-          exit $status
+          node --import tsx --test test/postgres-egress-gateway-live-e2e.test.ts 2>&1 | tee egress-gateway.log
+
+      - name: Fail if any required test skipped
+        # The point of this job. See scripts/pg-research-gate-check.sh - the
+        # exact script test/pg-research-integration-gate.test.ts also
+        # exercises, so this step and its regression coverage cannot drift
+        # apart (#197 round 2 review).
+        run: bash scripts/pg-research-gate-check.sh real-build.log live-e2e.log isolation.log network.log egress-gateway.log
 
       - name: No leaked containers, networks or build views
         if: always()

@@ -606,17 +606,19 @@ test("an unrunnable agent command fails loudly and still cleans up", async (t) =
 });
 
 test("the research agent image resolver records immutable identity fields for a mutable tag", async () => {
-  const answers: Record<string, string> = {
-    "{{.Id}}": `sha256:${"c".repeat(64)}`,
-    "{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}":
-      `example.test/honeyrail/postgres-research@sha256:${"d".repeat(64)}`,
-    "{{.Os}}": "linux",
-    "{{.Architecture}}": "arm64",
-    "{{if .Variant}}{{.Variant}}{{end}}": ""
+  // A single `docker image inspect` JSON payload, no `Variant` key - the real
+  // shape for an ordinary arm64 image, and the shape that broke the old
+  // five-call per-field `--format` template form on a real daemon (#197
+  // round 2 review).
+  const inspected = {
+    Id: `sha256:${"c".repeat(64)}`,
+    RepoDigests: [`example.test/honeyrail/postgres-research@sha256:${"d".repeat(64)}`],
+    Os: "linux",
+    Architecture: "arm64"
   };
-  const runCommand: RunCommand = async (_command, args = []) => ({
+  const runCommand: RunCommand = async () => ({
     ok: true,
-    stdout: `${answers[args[3]] ?? ""}\n`,
+    stdout: `${JSON.stringify([inspected])}\n`,
     stderr: "",
     code: 0
   });
@@ -671,14 +673,7 @@ test("a missing research agent image fails before source materialization and nev
 
   assert.deepEqual(calls, [
     ["docker", "version", "--format", "{{.Server.Version}}"],
-    [
-      "docker",
-      "image",
-      "inspect",
-      "--format",
-      "{{.Id}}",
-      "honeyrail-postgres-research:definitely-not-present"
-    ]
+    ["docker", "image", "inspect", "honeyrail-postgres-research:definitely-not-present"]
   ]);
   assert.equal(await exists(spec.root), false, "a missing agent image must fail before materializing source");
 });
@@ -812,13 +807,11 @@ async function skipWithoutDockerClient(t: TestContext) {
  */
 function scriptedDocker(script: (args: string[]) => Awaited<ReturnType<RunCommand>> | undefined = () => undefined) {
   const calls: string[][] = [];
-  const imageAnswers: Record<string, string> = {
-    "{{.Id}}": `sha256:${"e".repeat(64)}`,
-    "{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}": "",
-    "{{.Os}}": "linux",
-    "{{.Architecture}}": "arm64",
-    "{{if .Variant}}{{.Variant}}{{end}}": ""
-  };
+  // A single `docker image inspect <image>` JSON payload, no `Variant` key at
+  // all - the real shape for an ordinary arm64 image, and the shape that
+  // broke the old five-call per-field `--format` template form on a real
+  // GitHub Actions daemon (#197 round 2 review).
+  const imageInspectJson = { Id: `sha256:${"e".repeat(64)}`, RepoDigests: [], Os: "linux", Architecture: "arm64" };
   const runCommand: RunCommand = async (command, args = [], options = {}) => {
     if (command !== "docker") return runCommandSafe(command, args, options);
     calls.push([command, ...args]);
@@ -826,7 +819,7 @@ function scriptedDocker(script: (args: string[]) => Awaited<ReturnType<RunComman
     if (scripted) return scripted;
     const ok = { ok: true as const, stdout: "", stderr: "", code: 0 };
     if (args[0] === "version") return { ...ok, stdout: "27.0.0\n" };
-    if (args[0] === "image" && args[1] === "inspect") return { ...ok, stdout: `${imageAnswers[args[3]] ?? ""}\n` };
+    if (args[0] === "image" && args[1] === "inspect") return { ...ok, stdout: `${JSON.stringify([imageInspectJson])}\n` };
     if (args[0] === "network" && args[1] === "inspect") return { ...ok, stdout: "true\n" };
     if (args[0] === "run") return { ...ok, stdout: `${"f".repeat(64)}\n` };
     return ok;

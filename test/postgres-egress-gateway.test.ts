@@ -41,14 +41,14 @@ import type { RunCommand } from "../server/postgres/runtime.js";
 
 const OK = { ok: true as const, stdout: "", stderr: "", code: 0 };
 
-/** What `resolveEgressGatewayImageIdentity()`'s five sequential `docker image inspect --format <x>` calls answer with, by default. */
-const IMAGE_ANSWERS: Record<string, string> = {
-  "{{.Id}}": `sha256:${"c".repeat(64)}`,
-  "{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}": "",
-  "{{.Os}}": "linux",
-  "{{.Architecture}}": "arm64",
-  "{{if .Variant}}{{.Variant}}{{end}}": ""
-};
+/**
+ * What `resolveEgressGatewayImageIdentity()`'s single `docker image inspect
+ * <image>` (JSON) call answers with, by default. Deliberately carries no
+ * `Variant` key at all - the real shape for an ordinary amd64/arm64 image,
+ * and the shape that broke the old per-field `--format` template form on a
+ * real GitHub Actions daemon (#197 round 2 review).
+ */
+const IMAGE_INSPECT_JSON = { Id: `sha256:${"c".repeat(64)}`, RepoDigests: [], Os: "linux", Architecture: "arm64" };
 
 /** A scripted daemon: every step succeeds, and every invocation is recorded. */
 function fakeDaemon(overrides: (args: string[]) => Awaited<ReturnType<RunCommand>> | undefined = () => undefined) {
@@ -57,7 +57,7 @@ function fakeDaemon(overrides: (args: string[]) => Awaited<ReturnType<RunCommand
     calls.push([command, ...args]);
     const override = overrides(args);
     if (override) return override;
-    if (args[0] === "image" && args[1] === "inspect") return { ...OK, stdout: `${IMAGE_ANSWERS[args[3]] ?? ""}\n` };
+    if (args[0] === "image" && args[1] === "inspect") return { ...OK, stdout: `${JSON.stringify([IMAGE_INSPECT_JSON])}\n` };
     if (args[0] === "network" && args[1] === "inspect") return { ...OK, stdout: "true\n" };
     if (args[0] === "run") return { ...OK, stdout: `${"a".repeat(64)}\n` };
     return OK;
@@ -191,15 +191,17 @@ test("startEgressGateway creates an internal network, verifies it, starts the ga
   assert.ok(handle.internalNetworkName.startsWith("honeyrail-pg-egress-net-"));
   // #197 round 2: the handle carries the resolved, immutable identity of the
   // image that actually ran - not just the mutable tag it was asked for.
-  assert.equal(handle.imageIdentity.id, IMAGE_ANSWERS["{{.Id}}"]);
+  assert.equal(handle.imageIdentity.id, IMAGE_INSPECT_JSON.Id);
+  assert.equal(handle.imageIdentity.variant, null, "no Variant key in the daemon's JSON must normalize to null, not throw");
   assert.equal(handle.imageIdentity.platform, "linux/arm64");
   assert.equal(handle.imageIdentitySchemaVersion, 1);
 
   assert.deepEqual(shapes(calls), ["image inspect", "network create", "network inspect", "run", "network connect", "exec"]);
   // Resolved before anything else exists: a missing image must have zero side
-  // effects, not even a network.
-  const [imageIdentityCalls, rest] = [calls.slice(0, 5), calls.slice(5)];
-  for (const call of imageIdentityCalls) assert.deepEqual(call.slice(0, 3), ["docker", "image", "inspect"]);
+  // effects, not even a network. A single JSON inspect now, not five
+  // per-field template calls.
+  const [imageIdentityCall, ...rest] = [calls[0], ...calls.slice(1)];
+  assert.deepEqual(imageIdentityCall, ["docker", "image", "inspect", DEFAULT_EGRESS_GATEWAY_IMAGE]);
   assert.deepEqual(rest[0], ["docker", "network", "create", "--internal", handle.internalNetworkName]);
   assert.deepEqual(rest[1], ["docker", "network", "inspect", "--format", "{{.Internal}}", handle.internalNetworkName]);
   // The outbound leg is added after the container is already running on the
