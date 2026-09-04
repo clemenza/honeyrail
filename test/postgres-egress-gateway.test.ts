@@ -41,6 +41,15 @@ import type { RunCommand } from "../server/postgres/runtime.js";
 
 const OK = { ok: true as const, stdout: "", stderr: "", code: 0 };
 
+/** What `resolveEgressGatewayImageIdentity()`'s five sequential `docker image inspect --format <x>` calls answer with, by default. */
+const IMAGE_ANSWERS: Record<string, string> = {
+  "{{.Id}}": `sha256:${"c".repeat(64)}`,
+  "{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}": "",
+  "{{.Os}}": "linux",
+  "{{.Architecture}}": "arm64",
+  "{{if .Variant}}{{.Variant}}{{end}}": ""
+};
+
 /** A scripted daemon: every step succeeds, and every invocation is recorded. */
 function fakeDaemon(overrides: (args: string[]) => Awaited<ReturnType<RunCommand>> | undefined = () => undefined) {
   const calls: string[][] = [];
@@ -48,6 +57,7 @@ function fakeDaemon(overrides: (args: string[]) => Awaited<ReturnType<RunCommand
     calls.push([command, ...args]);
     const override = overrides(args);
     if (override) return override;
+    if (args[0] === "image" && args[1] === "inspect") return { ...OK, stdout: `${IMAGE_ANSWERS[args[3]] ?? ""}\n` };
     if (args[0] === "network" && args[1] === "inspect") return { ...OK, stdout: "true\n" };
     if (args[0] === "run") return { ...OK, stdout: `${"a".repeat(64)}\n` };
     return OK;
@@ -55,14 +65,22 @@ function fakeDaemon(overrides: (args: string[]) => Awaited<ReturnType<RunCommand
   return { calls, runCommand };
 }
 
-/** The docker subcommand shape of each recorded call, for order assertions. */
+/**
+ * The docker subcommand shape of each recorded call, for order assertions.
+ * `resolveEgressGatewayImageIdentity()`'s five sequential `image inspect`
+ * calls (id/digest/os/arch/variant) collapse into one `"image inspect"` step,
+ * matching what these sequence assertions actually describe - the lifecycle,
+ * not each individual field lookup.
+ */
 function shapes(calls: string[][]): string[] {
-  return calls.map((call) => {
+  const raw = calls.map((call) => {
     const args = call.slice(1);
     if (args[0] === "network") return `network ${args[1]}`;
     if (args[0] === "exec") return "exec";
+    if (args[0] === "image") return "image inspect";
     return String(args[0]);
   });
+  return raw.filter((shape, index) => shape !== "image inspect" || raw[index - 1] !== "image inspect");
 }
 
 // --- the argv, asserted exactly -------------------------------------------
@@ -171,19 +189,47 @@ test("startEgressGateway creates an internal network, verifies it, starts the ga
   assert.equal(handle.internalVerified, true);
   assert.ok(handle.containerName.startsWith("honeyrail-pg-egress-gateway-"));
   assert.ok(handle.internalNetworkName.startsWith("honeyrail-pg-egress-net-"));
+  // #197 round 2: the handle carries the resolved, immutable identity of the
+  // image that actually ran - not just the mutable tag it was asked for.
+  assert.equal(handle.imageIdentity.id, IMAGE_ANSWERS["{{.Id}}"]);
+  assert.equal(handle.imageIdentity.platform, "linux/arm64");
+  assert.equal(handle.imageIdentitySchemaVersion, 1);
 
-  assert.deepEqual(shapes(calls), ["network create", "network inspect", "run", "network connect", "exec"]);
-  assert.deepEqual(calls[0], ["docker", "network", "create", "--internal", handle.internalNetworkName]);
-  assert.deepEqual(calls[1], ["docker", "network", "inspect", "--format", "{{.Internal}}", handle.internalNetworkName]);
+  assert.deepEqual(shapes(calls), ["image inspect", "network create", "network inspect", "run", "network connect", "exec"]);
+  // Resolved before anything else exists: a missing image must have zero side
+  // effects, not even a network.
+  const [imageIdentityCalls, rest] = [calls.slice(0, 5), calls.slice(5)];
+  for (const call of imageIdentityCalls) assert.deepEqual(call.slice(0, 3), ["docker", "image", "inspect"]);
+  assert.deepEqual(rest[0], ["docker", "network", "create", "--internal", handle.internalNetworkName]);
+  assert.deepEqual(rest[1], ["docker", "network", "inspect", "--format", "{{.Internal}}", handle.internalNetworkName]);
   // The outbound leg is added after the container is already running on the
   // internal network, so there is no window in which the agent-facing network
   // could have inherited a route.
-  assert.deepEqual(calls[3], ["docker", "network", "connect", EGRESS_GATEWAY_OUTBOUND_NETWORK, handle.containerName]);
-  assert.equal(calls[2][calls[2].indexOf("--network") + 1], handle.internalNetworkName);
+  assert.deepEqual(rest[3], ["docker", "network", "connect", EGRESS_GATEWAY_OUTBOUND_NETWORK, handle.containerName]);
+  assert.equal(rest[2][rest[2].indexOf("--network") + 1], handle.internalNetworkName);
+  // Launched by the resolved content-addressed id, never by the mutable
+  // `:latest` reference - that binding is the whole point of round 2.
+  assert.equal(rest[2][rest[2].length - 1], handle.imageIdentity.id);
+  assert.notEqual(rest[2][rest[2].length - 1], DEFAULT_EGRESS_GATEWAY_IMAGE);
   // Readiness is proved from inside the container's own namespace - a host
   // fetch could not reach an --internal network at all.
-  assert.equal(calls[4][2], handle.containerName);
-  assert.equal(calls[4][3], "node");
+  assert.equal(rest[4][2], handle.containerName);
+  assert.equal(rest[4][3], "node");
+});
+
+test("startEgressGateway resolves the gateway image before creating any network, and fails closed on a missing one", async () => {
+  const { calls, runCommand } = fakeDaemon((args) =>
+    args[0] === "image" && args[1] === "inspect" ? { ok: false as const, stdout: "", stderr: "Error: No such image", code: 1 } : undefined
+  );
+
+  await assert.rejects(
+    startEgressGateway({ upstreamUrl: "https://api.deepseek.com", runCommand }),
+    (error: Error) =>
+      error instanceof PostgresEgressGatewayError &&
+      /not available to the docker daemon/.test(error.message) &&
+      /docker build -t honeyrail-postgres-egress-gateway:latest docker\/postgres-egress-gateway/.test(error.message)
+  );
+  assert.deepEqual(shapes(calls), ["image inspect"], "no network, and no container, may be created for an image that cannot be resolved");
 });
 
 test("startEgressGateway fails closed when docker does not report the network as internal, and starts no container", async () => {
@@ -201,7 +247,7 @@ test("startEgressGateway fails closed when docker does not report the network as
 
   // The whole point: no gateway, no agent, and no leaked network.
   assert.equal(shapes(calls).includes("run"), false, "no container may start on a network that was not proven internal");
-  assert.deepEqual(shapes(calls), ["network create", "network inspect", "network rm"]);
+  assert.deepEqual(shapes(calls), ["image inspect", "network create", "network inspect", "network rm"]);
 });
 
 test("startEgressGateway also fails closed when the inspect itself fails, rather than assuming the flag took", async () => {
@@ -240,7 +286,7 @@ test("startEgressGateway cleans up the network when the container cannot start, 
       /Could not start the egress gateway/.test(error.message) &&
       /docker build -t honeyrail-postgres-egress-gateway:latest docker\/postgres-egress-gateway/.test(error.message)
   );
-  assert.deepEqual(shapes(calls), ["network create", "network inspect", "run", "network rm"]);
+  assert.deepEqual(shapes(calls), ["image inspect", "network create", "network inspect", "run", "network rm"]);
 });
 
 test("startEgressGateway removes the container and the network when the outbound leg cannot be attached", async () => {
@@ -254,7 +300,7 @@ test("startEgressGateway removes the container and the network when the outbound
     startEgressGateway({ upstreamUrl: "https://api.deepseek.com", runCommand }),
     (error: Error) => error instanceof PostgresEgressGatewayError && /outbound leg/.test(error.message)
   );
-  assert.deepEqual(shapes(calls), ["network create", "network inspect", "run", "network connect", "rm", "network rm"]);
+  assert.deepEqual(shapes(calls), ["image inspect", "network create", "network inspect", "run", "network connect", "rm", "network rm"]);
 });
 
 test("startEgressGateway reports the gateway's own logs when it never becomes healthy, and cleans up", async () => {

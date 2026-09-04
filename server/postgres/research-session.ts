@@ -31,8 +31,10 @@ import { containerPlatformsCompatible, normalizedContainerPlatform } from "./ima
 import {
   egressGatewayUpstreamHost,
   startEgressGateway,
+  DEFAULT_EGRESS_GATEWAY_IMAGE,
   type EgressGatewayHandle
 } from "./egress-gateway.js";
+import type { ContainerImageIdentity } from "./image-identity.js";
 import type { PostgresRuntimeRecord } from "./runtime-container.js";
 
 /**
@@ -292,12 +294,21 @@ export type PostgresResearchContainerIsolationRecord = {
    * `upstreamHost` is the hostname only - no path, no query, no credential.
    * The agent's model API key travels as a request header and is never logged,
    * recorded or passed through this path.
+   *
+   * `image`/`imageIdentity` bind this evidence to the exact gateway that
+   * relayed the agent's traffic, the same way the top-level `image`/
+   * `imageIdentity` pair binds it to the exact agent image (#197 round 2): a
+   * mutable `:latest` tag proves nothing about which bytes actually ran the
+   * relay on the day this trial executed.
    */
   egressGateway?: {
     containerName: string;
     internalNetworkName: string;
     upstreamHost: string;
     internalVerified: boolean;
+    image: string;
+    imageIdentity: ContainerImageIdentity;
+    imageIdentitySchemaVersion: 1;
   };
   /** Mirrors PostgresBuildManifest.scoredEligible, so this record stands alone. */
   buildScoredEligible: boolean;
@@ -1023,7 +1034,10 @@ export async function runAgentInPostgresResearchEnvironment(
                     // Hostname only, never the full URL - see the field's own
                     // doc comment on PostgresResearchContainerIsolationRecord.
                     upstreamHost: egressGatewayUpstreamHost(isolation.restrictedEgress!.upstreamUrl),
-                    internalVerified: gateway.internalVerified
+                    internalVerified: gateway.internalVerified,
+                    image: isolation.restrictedEgress!.image ?? DEFAULT_EGRESS_GATEWAY_IMAGE,
+                    imageIdentity: gateway.imageIdentity,
+                    imageIdentitySchemaVersion: 1 as const
                   }
                 }
               : {}),

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { runCommandSafe } from "../utils.js";
 import { containerHardeningArgs } from "../containers/hardening.js";
+import { resolveImageIdentity, type ContainerImageIdentity } from "./image-identity.js";
 import { PostgresResearchError } from "./research-environment.js";
 import type { RunCommand } from "./runtime.js";
 
@@ -83,6 +84,30 @@ export class PostgresEgressGatewayError extends PostgresResearchError {
   }
 }
 
+/**
+ * Resolves the gateway image's identity, failing loudly (no implicit pull) if
+ * the daemon does not already have it - the same rule
+ * `resolveResearchAgentImageIdentity()` follows for the agent image, and for
+ * the same reason: a scored trial's evidence must name the exact image that
+ * ran the relay, not a mutable `:latest` tag that could point at different
+ * bytes on two different days. `startEgressGateway()` calls this before it
+ * creates the `--internal` network, so a missing gateway image is a setup
+ * error with zero trial side effects, same as a missing agent image.
+ */
+export async function resolveEgressGatewayImageIdentity(
+  image: string = DEFAULT_EGRESS_GATEWAY_IMAGE,
+  runCommand: RunCommand = runCommandSafe
+): Promise<ContainerImageIdentity> {
+  try {
+    return await resolveImageIdentity(image, {
+      runCommand,
+      buildHint: `Build it first: docker build -t ${image} docker/postgres-egress-gateway.`
+    });
+  } catch (error) {
+    throw new PostgresEgressGatewayError((error as Error).message, { cause: error });
+  }
+}
+
 export type EgressGatewayOptions = {
   /**
    * The one destination this gateway relays to, e.g. `https://api.deepseek.com`.
@@ -116,6 +141,15 @@ export type EgressGatewayHandle = {
    * a `--internal` flag was passed.
    */
   internalVerified: boolean;
+  /**
+   * The immutable identity docker resolved before launch (#197 round 2). The
+   * gateway container is started by this id, not by the mutable `image`
+   * reference, so scored evidence is bound to the exact bytes that ran the
+   * relay - the same discipline `ResearchAgentImageIdentity` gives the agent
+   * image.
+   */
+  imageIdentity: ContainerImageIdentity;
+  imageIdentitySchemaVersion: 1;
   /** Removes the container and then the network. Idempotent, and never throws. */
   stop(): Promise<void>;
 };
@@ -247,6 +281,13 @@ export async function startEgressGateway(options: EgressGatewayOptions): Promise
   const port = options.port ?? DEFAULT_EGRESS_GATEWAY_PORT;
   const image = options.image ?? DEFAULT_EGRESS_GATEWAY_IMAGE;
 
+  // Resolved before anything else is created (#197 round 2): a missing
+  // gateway image is a setup error, and must produce zero side effects - not
+  // even a network. Launched below by `imageIdentity.id`, never by the
+  // mutable `image` reference, so the container that actually ran cannot
+  // silently differ from the one this identity names.
+  const imageIdentity = await resolveEgressGatewayImageIdentity(image, runCommand);
+
   const created = await runCommand("docker", ["network", "create", "--internal", internalNetworkName], {
     timeout: EGRESS_GATEWAY_COMMAND_TIMEOUT_MS
   });
@@ -278,13 +319,18 @@ export async function startEgressGateway(options: EgressGatewayOptions): Promise
       );
     }
 
-    const started = await runCommand("docker", buildEgressGatewayDockerArgs(options, containerName, internalNetworkName), {
-      timeout: EGRESS_GATEWAY_COMMAND_TIMEOUT_MS
-    });
+    const started = await runCommand(
+      "docker",
+      // `image: imageIdentity.id`, never the mutable reference: the resolved
+      // content-addressed id is what actually launches, so a tag that moved
+      // between resolution and launch cannot change which bytes ran.
+      buildEgressGatewayDockerArgs({ ...options, image: imageIdentity.id }, containerName, internalNetworkName),
+      { timeout: EGRESS_GATEWAY_COMMAND_TIMEOUT_MS }
+    );
     if (!started.ok) {
       throw new PostgresEgressGatewayError(
-        `Could not start the egress gateway from "${image}": ${(started.stderr || started.stdout).trim()}. ` +
-          `Build it first: docker build -t ${image} docker/postgres-egress-gateway.`
+        `Could not start the egress gateway from "${image}" (resolved id ${imageIdentity.id}): ` +
+          `${(started.stderr || started.stdout).trim()}. Build it first: docker build -t ${image} docker/postgres-egress-gateway.`
       );
     }
     containerStarted = true;
@@ -322,6 +368,8 @@ export async function startEgressGateway(options: EgressGatewayOptions): Promise
       hostname: EGRESS_GATEWAY_NETWORK_ALIAS,
       port,
       internalVerified: true,
+      imageIdentity,
+      imageIdentitySchemaVersion: 1,
       async stop() {
         if (stopped) return;
         stopped = true;

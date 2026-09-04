@@ -864,6 +864,11 @@ test("restrictedEgress runs the agent on the verified --internal network and inj
   assert.equal(session.isolation.restrictedEgressVerified, true);
   assert.equal(session.isolation.egressGateway!.internalNetworkName, session.isolation.networkMode);
   assert.equal(session.isolation.egressGateway!.internalVerified, true);
+  // #197 round 2: scored evidence is bound to the gateway's own resolved,
+  // immutable image identity - not just the mutable tag it was launched from.
+  assert.equal(session.isolation.egressGateway!.image, "honeyrail-postgres-egress-gateway:latest");
+  assert.equal(session.isolation.egressGateway!.imageIdentity.id, `sha256:${"e".repeat(64)}`);
+  assert.equal(session.isolation.egressGateway!.imageIdentitySchemaVersion, 1);
   // Hostname only: no scheme, no path, and above all no credential.
   assert.equal(session.isolation.egressGateway!.upstreamHost, "api.example-model.test");
   assert.equal(
