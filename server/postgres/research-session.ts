@@ -28,6 +28,13 @@ import {
   RESEARCH_CONTAINER_PATHS
 } from "./agent-container.js";
 import { containerPlatformsCompatible, normalizedContainerPlatform } from "./image-identity.js";
+import {
+  egressGatewayUpstreamHost,
+  startEgressGateway,
+  DEFAULT_EGRESS_GATEWAY_IMAGE,
+  type EgressGatewayHandle
+} from "./egress-gateway.js";
+import type { ContainerImageIdentity } from "./image-identity.js";
 import type { PostgresRuntimeRecord } from "./runtime-container.js";
 
 /**
@@ -250,8 +257,14 @@ export type PostgresResearchContainerIsolationRecord = {
   /**
    * The docker network the agent container ran on. `"none"` is the scored
    * default; anything else is recorded verbatim and makes `scoredEligible`
-   * false. Absent for an unisolated development run, which had the host's
-   * whole network.
+   * false unless `restrictedEgressVerified` says otherwise. Absent for an
+   * unisolated development run, which had the host's whole network.
+   *
+   * Under `isolation.restrictedEgress` this is the *actual* per-trial
+   * `--internal` network name (`honeyrail-pg-egress-net-<uuid>`), never a
+   * summary label like `"restricted-egress"`: a reviewer must be able to see
+   * the exact docker network that ran, the same way `mounts` shows the exact
+   * bind specs.
    */
   networkMode: string;
   /**
@@ -261,6 +274,42 @@ export type PostgresResearchContainerIsolationRecord = {
    * carries this record carries the verdict with it.
    */
   scoredEligible: boolean;
+  /**
+   * Set only for a restricted-egress run (#197), and only ever `true`: docker
+   * itself confirmed `Internal=true` on the network the agent joined, so the
+   * agent had no default gateway and no route to any public destination -
+   * including the PostgreSQL mailing lists and GitHub mirrors that hold the
+   * answer to a Historical PG task. `startEgressGateway()` throws rather than
+   * returning an unverified handle, so an unprovable restriction never reaches
+   * this record at all.
+   *
+   * This is the one thing that lets a non-`"none"` `networkMode` still be
+   * scored-eligible; see `unscoredReasons()`.
+   */
+  restrictedEgressVerified?: boolean;
+  /**
+   * The sidecar that carried the agent's model traffic, for the same reason
+   * `runtime` is here: the record has to stand alone as evidence.
+   *
+   * `upstreamHost` is the hostname only - no path, no query, no credential.
+   * The agent's model API key travels as a request header and is never logged,
+   * recorded or passed through this path.
+   *
+   * `image`/`imageIdentity` bind this evidence to the exact gateway that
+   * relayed the agent's traffic, the same way the top-level `image`/
+   * `imageIdentity` pair binds it to the exact agent image (#197 round 2): a
+   * mutable `:latest` tag proves nothing about which bytes actually ran the
+   * relay on the day this trial executed.
+   */
+  egressGateway?: {
+    containerName: string;
+    internalNetworkName: string;
+    upstreamHost: string;
+    internalVerified: boolean;
+    image: string;
+    imageIdentity: ContainerImageIdentity;
+    imageIdentitySchemaVersion: 1;
+  };
   /** Mirrors PostgresBuildManifest.scoredEligible, so this record stands alone. */
   buildScoredEligible: boolean;
   /** Mirrors PostgresRuntimeRecord.scoredEligible - did the server run in a container? */
@@ -283,6 +332,8 @@ export type PostgresResearchUnisolatedIsolationRecord = {
   imageIdentity?: never;
   imageIdentitySchemaVersion?: never;
   networkMode?: never;
+  restrictedEgressVerified?: never;
+  egressGateway?: never;
   scoredEligible: false;
   buildScoredEligible: boolean;
   runtimeScoredEligible: boolean;
@@ -299,9 +350,19 @@ export function unscoredReasons(input: {
   networkMode: string;
   buildScoredEligible: boolean;
   runtimeScoredEligible?: boolean;
+  /**
+   * #197: docker confirmed the agent's network was `--internal`, so it had no
+   * default gateway at all and its only reachable peer was the egress-gateway
+   * sidecar. That is a stronger statement than `"none"` about *public*
+   * destinations and an equally strong one about the host, so a network mode
+   * that carries this proof is scored-eligible even though it is not `"none"`.
+   * Absent/false keeps the pre-#197 rule exactly as it was, which is what makes
+   * a plain `network: "bridge"` run still unscored (#194/#196).
+   */
+  restrictedEgressVerified?: boolean;
 }): string[] {
   const reasons: string[] = [];
-  if (input.networkMode !== "none") {
+  if (input.networkMode !== "none" && !input.restrictedEgressVerified) {
     reasons.push(
       `The agent container ran on docker network "${input.networkMode}" rather than "none", so it had a route to ` +
         "the host and to private networks (on Docker Desktop, host.docker.internal; on Linux, the bridge gateway). " +
@@ -352,13 +413,42 @@ export type PostgresResearchIsolationOptions = {
    *
    * "bridge" (or any other docker network) is allowed - a real research agent
    * usually needs outbound model-API access - but it is an explicit opt-in
-   * and the resulting session records `scoredEligible: false`. There is
-   * deliberately no restricted-egress mode here: a real one needs NET_ADMIN
-   * inside a `--cap-drop=ALL` container plus IPv4+IPv6 policy, which is a
-   * larger change than this round, and a half-built one would be worse than
-   * an honest label.
+   * and the resulting session records `scoredEligible: false`.
+   *
+   * Mutually exclusive with `restrictedEgress`, which *derives* the network
+   * rather than accepting one.
    */
   network?: "none" | "bridge" | (string & {});
+  /**
+   * The scored path for a real model-backed agent (#197).
+   *
+   * When set, this session creates a per-trial `--internal` docker network,
+   * puts a one-upstream relay sidecar on it (see ./egress-gateway.ts), joins
+   * the agent to that network *only*, and injects
+   * `<envVar>=http://egress-gateway:<port>` so the agent's model client talks
+   * to the sidecar instead of the internet. The sidecar is the sole member with
+   * an outbound path, so the agent can reach its model API and its own
+   * PostgreSQL runtime and nothing else - notably not the public PostgreSQL
+   * mailing lists or GitHub mirrors that hold the answer to a Historical PG
+   * task.
+   *
+   * Unlike a plain `network` opt-in this remains scored-eligible, because the
+   * `--internal` property is *verified against the daemon* before the agent
+   * runs and recorded as `isolation.restrictedEgressVerified`. A restriction
+   * that cannot be proven aborts the session rather than downgrading it.
+   *
+   * Container mode only: there is no boundary at all to restrict egress
+   * *from* under `allowUnisolatedForDevelopment`, so combining the two is
+   * rejected rather than quietly ignored.
+   */
+  restrictedEgress?: {
+    /** The one destination the agent may reach, e.g. `"https://api.deepseek.com"`. Base URL only; never a credential. */
+    upstreamUrl: string;
+    /** Variable the gateway's URL is injected as. Defaults to DSH's own `DEEPSEEK_BASE_URL`. */
+    envVar?: string;
+    image?: string;
+    port?: number;
+  };
   memory?: string;
   pidsLimit?: number;
   /** Where per-trial build views are created; defaults next to the build cache. */
@@ -379,6 +469,17 @@ export type PostgresResearchIsolationOptions = {
 export type PostgresResearchSessionOptions = WithPostgresResearchEnvironmentOptions & {
   isolation?: PostgresResearchIsolationOptions;
 };
+
+/**
+ * DSH's own base-URL variable: `@deepseek-ai/dsh-llm-deepseek` resolves its
+ * connection as `config.baseURL ?? environment?.get("DEEPSEEK_BASE_URL")?.value
+ * ?? "https://api.deepseek.com"`, so setting this is all it takes to route a
+ * real DSH agent through the gateway - no `--patch`, no TLS interception and
+ * no DNS trickery. `restrictedEgress.envVar` overrides it for a different
+ * agent CLI (docker/postgres-research-agent-184/mini-agent.mjs, for instance,
+ * reads `HONEYRAIL_AGENT_LLM_BASE_URL`).
+ */
+export const DEFAULT_RESTRICTED_EGRESS_ENV_VAR = "DEEPSEEK_BASE_URL";
 
 export const UNISOLATED_WARNING =
   "This agent ran as an unconfined host process (isolation.allowUnisolatedForDevelopment). " +
@@ -671,6 +772,30 @@ export async function runAgentInPostgresResearchEnvironment(
     );
   }
   const isolation = options.isolation ?? {};
+  // Both rejected here, before any side effect, for the same reason
+  // cancelGraceMs is: an incoherent isolation request is a configuration error,
+  // not a trial outcome (#197).
+  //
+  // `network` and `restrictedEgress` are mutually exclusive rather than
+  // "restrictedEgress wins", because under restricted egress the network is
+  // *derived* - it is the per-trial `--internal` network the gateway created,
+  // whose name does not exist until then - and silently discarding a
+  // caller-chosen network would mean a caller who asked for "none" got a
+  // routable one without being told.
+  if (isolation.restrictedEgress && isolation.network !== undefined) {
+    throw new PostgresResearchError(
+      "isolation.network and isolation.restrictedEgress are mutually exclusive: a restricted-egress session runs the " +
+        "agent on the per-trial --internal network its own gateway creates, so there is no caller-chosen network to " +
+        `honour (got network: ${JSON.stringify(isolation.network)}). Drop isolation.network.`
+    );
+  }
+  if (isolation.restrictedEgress && isolation.allowUnisolatedForDevelopment) {
+    throw new PostgresResearchError(
+      "isolation.restrictedEgress is meaningless with isolation.allowUnisolatedForDevelopment: an unconfined host " +
+        "process has the host's whole network, so there is no container boundary to restrict egress from. Drop one " +
+        "of the two."
+    );
+  }
   const runCommand = spec.runCommand;
   if (!isolation.allowUnisolatedForDevelopment && !(await dockerAvailable(runCommand))) {
     throw new PostgresResearchError(
@@ -757,6 +882,30 @@ export async function runAgentInPostgresResearchEnvironment(
 
         const injected = containerAgentEnvironment(env.connectionInfo(), agent.envPrefix);
         const containerName = `honeyrail-pg-research-${randomUUID()}`;
+
+        // Started before the agent container exists, and deliberately with no
+        // agent-side side effects behind it: if the gateway cannot be brought
+        // up - or, more importantly, if its `--internal` network cannot be
+        // *proven* internal - this throws and no agent ever runs, exactly the
+        // way a missing agent image does. A trial that could not prove its
+        // egress restriction must not exist, not merely be marked unscored.
+        const gateway: EgressGatewayHandle | undefined = isolation.restrictedEgress
+          ? await startEgressGateway({
+              upstreamUrl: isolation.restrictedEgress.upstreamUrl,
+              image: isolation.restrictedEgress.image,
+              port: isolation.restrictedEgress.port,
+              runCommand
+            })
+          : undefined;
+        // Last, after the caller's own env and the injected PostgreSQL
+        // coordinates, for the same reason those coordinates come last: the
+        // model route is decided by the isolation configuration, not by the
+        // agent spec, and an agent that could override it back to the real API
+        // would walk straight out of the restriction.
+        const egressEnv = gateway
+          ? { [isolation.restrictedEgress!.envVar ?? DEFAULT_RESTRICTED_EGRESS_ENV_VAR]: `http://${gateway.hostname}:${gateway.port}` }
+          : {};
+
         const containerArgs = buildResearchContainerArgs(
           {
             mounts: {
@@ -771,11 +920,14 @@ export async function runAgentInPostgresResearchEnvironment(
             },
             command: [agent.command, ...(agent.args ?? [])],
             image: agentImage.id,
-            network: isolation.network,
+            // Derived, not caller-chosen, under restricted egress - the two are
+            // rejected together at the top of this function, so this is never
+            // silently discarding an isolation.network the caller asked for.
+            network: gateway?.internalNetworkName ?? isolation.network,
             memory: isolation.memory,
             pidsLimit: isolation.pidsLimit,
             interactive: true,
-            env: { ...(agent.env ?? {}), ...injected }
+            env: { ...(agent.env ?? {}), ...injected, ...egressEnv }
           },
           containerName
         );
@@ -801,7 +953,15 @@ export async function runAgentInPostgresResearchEnvironment(
           },
           agent,
           signal
-        );
+        ).catch(async (error: unknown) => {
+          // runAgentProcess only rejects once the agent's own launch has
+          // settled (it throws from the child's `error` event, and any
+          // cancellation it started has already been awaited), so the gateway
+          // is safe to remove here - and must be, or a failed launch would leak
+          // a container and a network per attempt.
+          await gateway?.stop();
+          throw error;
+        });
         if (result.timedOut) {
           agentTermination = {
             timeoutSource: result.timeoutSource!,
@@ -818,18 +978,45 @@ export async function runAgentInPostgresResearchEnvironment(
           if (result.confirmedStopped === false) env.markAgentTerminationUnconfirmed();
         }
 
-        const networkMode = isolation.network ?? DEFAULT_RESEARCH_NETWORK;
+        // Strictly after the agent container has settled - runAgentProcess()
+        // resolves only once the child has closed *and* any termination
+        // request it made has been awaited - and strictly before
+        // withPostgresResearchEnvironment's finally runs env.cleanup(). The
+        // ordering is the same discipline the rest of this file follows and is
+        // not cosmetic: removing the gateway (and, with it, the network the
+        // agent container is attached to) while the agent might still be using
+        // it would produce garbage evidence rather than a failed trial.
+        //
+        // The unconfirmed-termination case fails closed for exactly the reason
+        // env.cleanup() does: the agent container's absence could not be
+        // established, so its network must not be pulled out from under it.
+        // A retained per-trial network is an operator problem; a network
+        // removed under a live agent is a corrupted trial.
+        if (gateway) {
+          if (result.confirmedStopped === false) {
+            console.error(
+              `egress-gateway: retaining ${gateway.containerName} and network ${gateway.internalNetworkName} - the agent ` +
+                `container ${containerName}'s termination could not be confirmed, so its network must not be removed ` +
+                "under it. Remove both by hand once the container is gone."
+            );
+          } else {
+            await gateway.stop();
+          }
+        }
+
+        const networkMode = gateway?.internalNetworkName ?? isolation.network ?? DEFAULT_RESEARCH_NETWORK;
         const buildScoredEligible = env.buildManifest.scoredEligible;
         const runtimeRecord = env.runtimeIsolation();
         const reasons = unscoredReasons({
           networkMode,
           buildScoredEligible,
-          runtimeScoredEligible: runtimeRecord.scoredEligible
+          runtimeScoredEligible: runtimeRecord.scoredEligible,
+          restrictedEgressVerified: gateway?.internalVerified
         });
         return {
           agent: result,
           workspaceDir: scratchDir,
-          agentEnvironment: injected,
+          agentEnvironment: { ...injected, ...egressEnv },
           isolation: {
             mode: "container" as const,
             isolated: true as const,
@@ -838,6 +1025,22 @@ export async function runAgentInPostgresResearchEnvironment(
             imageIdentitySchemaVersion: 1 as const,
             networkMode,
             scoredEligible: reasons.length === 0,
+            ...(gateway
+              ? {
+                  restrictedEgressVerified: gateway.internalVerified,
+                  egressGateway: {
+                    containerName: gateway.containerName,
+                    internalNetworkName: gateway.internalNetworkName,
+                    // Hostname only, never the full URL - see the field's own
+                    // doc comment on PostgresResearchContainerIsolationRecord.
+                    upstreamHost: egressGatewayUpstreamHost(isolation.restrictedEgress!.upstreamUrl),
+                    internalVerified: gateway.internalVerified,
+                    image: isolation.restrictedEgress!.image ?? DEFAULT_EGRESS_GATEWAY_IMAGE,
+                    imageIdentity: gateway.imageIdentity,
+                    imageIdentitySchemaVersion: 1 as const
+                  }
+                }
+              : {}),
             buildScoredEligible,
             runtimeScoredEligible: runtimeRecord.scoredEligible,
             runtime: runtimeRecord,

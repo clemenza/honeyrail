@@ -8,9 +8,16 @@ name: PostgreSQL Research Integration
 # source mirror are absent. That is the right behaviour for a contributor's
 # laptop and exactly the wrong behaviour for a merge gate: a skip is not a
 # pass, and the #182 fourth review says so in as many words. This workflow
-# therefore builds the three images, prepares a pinned PostgreSQL ref, runs the
-# real build / runtime / agent end-to-end tests, and **fails if any required
-# test reports itself skipped**.
+# therefore builds the four images (adding docker/postgres-egress-gateway for
+# #197), prepares a pinned PostgreSQL ref, runs the real build / runtime /
+# agent / restricted-egress end-to-end tests, and **fails if any required test
+# reports itself skipped**.
+#
+# The restricted-egress gateway (#197) is a merge-gate requirement, not an
+# optional extra: it is the only configuration in which a real model-backed
+# agent trial can be scoredEligible at all, so a change that silently breaks
+# its `--internal`-network boundary must fail this gate the same way a change
+# that broke the runtime sidecar already does.
 #
 # It is a separate workflow rather than a job in ci.yml because it is
 # minutes-not-seconds and needs its own concurrency and caching story.
@@ -29,7 +36,9 @@ on:
       - "docker/postgres-research/**"
       - "docker/postgres-research-builder/**"
       - "docker/postgres-research-runtime/**"
+      - "docker/postgres-egress-gateway/**"
       - "test/postgres-research-*.ts"
+      - "test/postgres-egress-gateway*.ts"
       - ".github/workflows/pg-research-integration.yml"
   workflow_dispatch:
 
@@ -64,15 +73,20 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build the three research images
+      - name: Build the four research images
         # Uniquely tagged as well as :latest so the run's evidence names an
         # exact image, and so a stale :latest cannot be what actually ran.
+        # postgres-egress-gateway (#197) is built here too: it is what proves
+        # a real model-backed agent trial's restricted-egress boundary, and a
+        # build failure here must fail the gate the same way any other image
+        # in this list already does.
         run: |
           set -euo pipefail
           for pair in \
             "honeyrail-postgres-builder docker/postgres-research-builder" \
             "honeyrail-postgres-runtime docker/postgres-research-runtime" \
-            "honeyrail-postgres-research docker/postgres-research"; do
+            "honeyrail-postgres-research docker/postgres-research" \
+            "honeyrail-postgres-egress-gateway docker/postgres-egress-gateway"; do
             set -- $pair
             docker build -t "$1:latest" -t "$1:${GITHUB_SHA}" "$2"
           done
@@ -80,7 +94,7 @@ jobs:
       - name: Record image identities
         run: |
           set -euo pipefail
-          for image in honeyrail-postgres-builder honeyrail-postgres-runtime honeyrail-postgres-research; do
+          for image in honeyrail-postgres-builder honeyrail-postgres-runtime honeyrail-postgres-research honeyrail-postgres-egress-gateway; do
             docker image inspect --format \
               '{{.RepoTags}} id={{.Id}} os={{.Os}} arch={{.Architecture}}' "$image:${GITHUB_SHA}"
           done
@@ -100,46 +114,69 @@ jobs:
       - name: Runtime sidecar unit tests
         run: node --import tsx --test test/postgres-research-runtime.test.ts
 
+      # Every step below pipes `node --test` into `tee` so the log survives
+      # for the skip-check and the uploaded artifact - and every one of them
+      # needs `set -o pipefail` to mean anything as a gate. Without it, a
+      # GitHub Actions `run:` step's exit status is `tee`'s (always 0, since
+      # `tee` itself never fails just because the data it copied represents a
+      # failing test), not the left-hand `node --test` process's - so a
+      # *step* piping a failing suite into `tee` reports success regardless
+      # of what is inside the log (#197 round 2 review, found via a real CI
+      # run: `test/postgres-research-live-e2e.test.ts` reported `fail 1` and
+      # the step - and the whole workflow - still concluded `success`).
+      # GitHub's default `bash` invocation for a `run:` step does NOT set
+      # `-o pipefail` on its own; it has to be requested explicitly, on every
+      # step that pipes, not just the ones that already happened to write
+      # `set -euo pipefail` for an unrelated reason (loop/variable safety).
       - name: Real containerized build and cache-identity scan
-        run: node --import tsx --test test/postgres-research-real-build.test.ts 2>&1 | tee real-build.log
+        run: |
+          set -euo pipefail
+          node --import tsx --test test/postgres-research-real-build.test.ts 2>&1 | tee real-build.log
 
       - name: Real live cluster, isolated agent, restart and cleanup
-        run: node --import tsx --test test/postgres-research-live-e2e.test.ts 2>&1 | tee live-e2e.log
+        run: |
+          set -euo pipefail
+          node --import tsx --test test/postgres-research-live-e2e.test.ts 2>&1 | tee live-e2e.log
 
       - name: Isolation and network boundary tests
         run: |
+          set -euo pipefail
           node --import tsx --test test/postgres-research-isolation.test.ts 2>&1 | tee isolation.log
           node --import tsx --test test/postgres-research-network.test.ts 2>&1 | tee network.log
 
-      - name: Fail if any required test skipped
-        # The point of this job. `node --test`'s TAP-ish summary reports a
-        # skipped count; anything above zero here means the gate did not
-        # actually run, which is a failure and not a pass.
+      - name: Restricted-egress gateway boundary, positive and negative evidence (#197)
+        # The composed proof the daemon-free suite cannot give: from a
+        # container in the agent's own network position, the gateway relay
+        # reaches its configured upstream while https://www.postgresql.org/
+        # and https://github.com/postgres/postgres do not - the two public
+        # sources that would hand a Historical PG agent its own answer key.
+        # A skip here is not a pass; it is #197's required negative evidence
+        # simply not having run.
         run: |
           set -euo pipefail
-          status=0
-          for log in real-build.log live-e2e.log isolation.log network.log; do
-            # `node --test`'s summary line is "<glyph> skipped <n>"; take the
-            # last field of the last such line so the glyph's encoding is
-            # irrelevant. An unparseable summary counts as a failure, not as a
-            # zero.
-            skipped=$(grep -E 'skipped [0-9]+$' "$log" | tail -1 | awk '{print $NF}')
-            echo "$log: skipped=${skipped:-unparseable}"
-            if [ "${skipped:-1}" != "0" ]; then
-              echo "::error file=$log::a required PostgreSQL research test skipped; a skip is not a pass"
-              grep -nE '^.\s' "$log" | grep -i 'skip' || true
-              status=1
-            fi
-          done
-          exit $status
+          node --import tsx --test test/postgres-egress-gateway-live-e2e.test.ts 2>&1 | tee egress-gateway.log
 
-      - name: No leaked containers or build views
+      - name: Fail if any required test skipped
+        # The point of this job. See scripts/pg-research-gate-check.sh - the
+        # exact script test/pg-research-integration-gate.test.ts also
+        # exercises, so this step and its regression coverage cannot drift
+        # apart (#197 round 2 review).
+        run: bash scripts/pg-research-gate-check.sh real-build.log live-e2e.log isolation.log network.log egress-gateway.log
+
+      - name: No leaked containers, networks or build views
         if: always()
         run: |
           set -euo pipefail
           leaked=$(docker ps -a --filter name=honeyrail-pg- --format '{{.Names}}\t{{.Status}}')
           echo "leaked containers: ${leaked:-(none)}"
           test -z "$leaked"
+          # The restricted-egress gateway (#197) additionally creates a
+          # per-trial --internal docker network; a leaked one is exactly as
+          # much an operator problem as a leaked container, and just as
+          # invisible to the container check above.
+          leaked_networks=$(docker network ls --filter name=honeyrail-pg-egress-net- --format '{{.Name}}')
+          echo "leaked egress-gateway networks: ${leaked_networks:-(none)}"
+          test -z "$leaked_networks"
 
       - name: Upload logs
         if: always()
@@ -151,4 +188,5 @@ jobs:
             live-e2e.log
             isolation.log
             network.log
+            egress-gateway.log
           if-no-files-found: warn

@@ -178,16 +178,14 @@ test("a missing runtime image fails loudly with the command that would create it
 });
 
 test("the runtime records the image identity the daemon resolved, not the tag it was asked for", async () => {
-  const answers: Record<string, string> = {
-    "{{.Id}}": `sha256:${"b".repeat(64)}`,
-    "{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}": "",
-    "{{.Os}}": "linux",
-    "{{.Architecture}}": "arm64",
-    "{{if .Variant}}{{.Variant}}{{end}}": ""
-  };
-  const runCommand: RunCommand = async (_command, args = []) => ({
+  // A single `docker image inspect <image>` JSON payload, deliberately with
+  // no `Variant` key at all - the exact shape a real daemon returns for an
+  // ordinary amd64/arm64 image, and the shape that broke the old five-call
+  // per-field template form (#197 round 2 review).
+  const inspected = { Id: `sha256:${"b".repeat(64)}`, RepoDigests: [], Os: "linux", Architecture: "arm64" };
+  const runCommand: RunCommand = async () => ({
     ok: true,
-    stdout: `${answers[args[3]] ?? ""}\n`,
+    stdout: `${JSON.stringify([inspected])}\n`,
     stderr: "",
     code: 0
   });

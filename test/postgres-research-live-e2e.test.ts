@@ -24,6 +24,7 @@ import {
 import { DEFAULT_BUILDER_IMAGE } from "../server/postgres/build-container.js";
 import { DEFAULT_RUNTIME_IMAGE, PostgresRuntimeContainerError } from "../server/postgres/runtime-container.js";
 import { runAgentInPostgresResearchEnvironment } from "../server/postgres/research-session.js";
+import { normalizeContainerVariant } from "../server/postgres/image-identity.js";
 import type { RunCommand } from "../server/postgres/runtime.js";
 
 /**
@@ -480,21 +481,24 @@ test(
       assert.equal(session.isolation.imageIdentity.architecture, session.build.arch);
       assert.equal(session.isolation.runtime!.mode, "container");
       assert.match(session.isolation.runtime!.image!.id, /^sha256:[0-9a-f]{64}$/);
-      const inspectedAgentImage = await runCommandSafe(
-        "docker",
-        [
-          "image",
-          "inspect",
-          "--format",
-          "{{.Id}}|{{.Os}}|{{.Architecture}}|{{if .Variant}}{{.Variant}}{{end}}",
-          DEFAULT_RESEARCH_IMAGE
-        ],
-        { timeout: 30_000 }
-      );
+      // Plain JSON, not a `--format` template: on a real daemon whose image
+      // inspect JSON simply has no `Variant` key (the ordinary case for an
+      // amd64/arm64 image, not just `arm/v7`), a per-field
+      // `{{if .Variant}}{{.Variant}}{{end}}` template raises "map has no
+      // entry for key Variant" rather than evaluating false - confirmed on
+      // this repository's own GitHub Actions run (#197 round 2 review). The
+      // production resolver (resolveImageIdentity()) was fixed the same way;
+      // this independent cross-check must not reintroduce the same fragile
+      // template shape it exists to catch regressions in.
+      const inspectedAgentImage = await runCommandSafe("docker", ["image", "inspect", DEFAULT_RESEARCH_IMAGE], { timeout: 30_000 });
       assert.equal(inspectedAgentImage.ok, true, inspectedAgentImage.stderr || inspectedAgentImage.stdout);
+      const [rawInspected] = JSON.parse(inspectedAgentImage.stdout) as Array<Record<string, unknown>>;
+      assert.equal(rawInspected.Id, session.isolation.imageIdentity.id, "the recorded agent image id must match the daemon's");
+      assert.equal(rawInspected.Os, session.isolation.imageIdentity.os);
+      assert.equal(rawInspected.Architecture, session.isolation.imageIdentity.architecture);
       assert.equal(
-        inspectedAgentImage.stdout.trim(),
-        `${session.isolation.imageIdentity.id}|${session.isolation.imageIdentity.os}|${session.isolation.imageIdentity.architecture}|${session.isolation.imageIdentity.variant ?? ""}`,
+        normalizeContainerVariant(typeof rawInspected.Variant === "string" ? rawInspected.Variant : null),
+        session.isolation.imageIdentity.variant,
         "the recorded agent image identity must match the image inspected from the daemon"
       );
       // Ordered teardown, recorded.

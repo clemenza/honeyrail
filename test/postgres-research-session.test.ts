@@ -21,11 +21,19 @@ import {
   assertResearchAgentImageCompatible,
   runAgentInPostgresResearchEnvironment,
   runAgentProcess,
+  unscoredReasons,
   CANCELLATION_SAFETY_MARGIN_MS,
+  DEFAULT_RESTRICTED_EGRESS_ENV_VAR,
   KILL_GRACE_MS,
   MIN_AGENT_CANCEL_GRACE_MS,
   type PostgresResearchSessionOptions
 } from "../server/postgres/research-session.js";
+import {
+  DEFAULT_EGRESS_GATEWAY_PORT,
+  EGRESS_GATEWAY_NETWORK_ALIAS,
+  PostgresEgressGatewayError
+} from "../server/postgres/egress-gateway.js";
+import { runCommandSafe } from "../server/utils.js";
 import type { PostgresBuildManifest } from "../server/postgres/research-environment.js";
 import type { RunCommand } from "../server/postgres/runtime.js";
 import { createSyntheticPostgresSourceRepo, hasFixtureToolchain, type SyntheticPostgresSourceRepo } from "./helpers/postgres-source-fixture.js";
@@ -598,17 +606,19 @@ test("an unrunnable agent command fails loudly and still cleans up", async (t) =
 });
 
 test("the research agent image resolver records immutable identity fields for a mutable tag", async () => {
-  const answers: Record<string, string> = {
-    "{{.Id}}": `sha256:${"c".repeat(64)}`,
-    "{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}":
-      `example.test/honeyrail/postgres-research@sha256:${"d".repeat(64)}`,
-    "{{.Os}}": "linux",
-    "{{.Architecture}}": "arm64",
-    "{{if .Variant}}{{.Variant}}{{end}}": ""
+  // A single `docker image inspect` JSON payload, no `Variant` key - the real
+  // shape for an ordinary arm64 image, and the shape that broke the old
+  // five-call per-field `--format` template form on a real daemon (#197
+  // round 2 review).
+  const inspected = {
+    Id: `sha256:${"c".repeat(64)}`,
+    RepoDigests: [`example.test/honeyrail/postgres-research@sha256:${"d".repeat(64)}`],
+    Os: "linux",
+    Architecture: "arm64"
   };
-  const runCommand: RunCommand = async (_command, args = []) => ({
+  const runCommand: RunCommand = async () => ({
     ok: true,
-    stdout: `${answers[args[3]] ?? ""}\n`,
+    stdout: `${JSON.stringify([inspected])}\n`,
     stderr: "",
     code: 0
   });
@@ -663,14 +673,7 @@ test("a missing research agent image fails before source materialization and nev
 
   assert.deepEqual(calls, [
     ["docker", "version", "--format", "{{.Server.Version}}"],
-    [
-      "docker",
-      "image",
-      "inspect",
-      "--format",
-      "{{.Id}}",
-      "honeyrail-postgres-research:definitely-not-present"
-    ]
+    ["docker", "image", "inspect", "honeyrail-postgres-research:definitely-not-present"]
   ]);
   assert.equal(await exists(spec.root), false, "a missing agent image must fail before materializing source");
 });
@@ -763,4 +766,275 @@ test("a scored build rejects an agent image for the wrong platform", () => {
       }),
     (error: Error) => error instanceof PostgresResearchError && /must run on Linux/.test(error.message)
   );
+});
+
+// ---------------------------------------------------------------------------
+// #197: restricted model egress.
+//
+// The wiring under test is `isolation.restrictedEgress` -> a verified
+// `--internal` per-trial network -> the agent container's `--network` and its
+// injected model base URL -> the isolation record. The gateway lifecycle
+// itself, including every fail-closed path, is proved separately and entirely
+// daemon-free in test/postgres-egress-gateway.test.ts; the real
+// positive/negative network evidence (a probe container reaching the gateway
+// but not https://www.postgresql.org) is in
+// test/postgres-egress-gateway-live-e2e.test.ts.
+//
+// These tests script the *daemon side* only: every `docker` invocation the
+// session makes through `spec.runCommand` is answered by a fake, and everything
+// else (git, make, the synthetic fixture's build) runs for real. The one thing
+// that cannot be faked is the agent container itself, which
+// `runAgentProcess()` launches with a direct `spawn("docker", ...)` rather than
+// through `RunCommand` - so it really is executed, really fails against the
+// scripted image id, and is recorded as the failed-agent observation it is.
+// What is under test here is the isolation record, not the agent's exit code.
+// ---------------------------------------------------------------------------
+
+const RESTRICTED_UPSTREAM = "https://api.example-model.test";
+
+/** `docker` the client, not a reachable daemon - the fake answers for the daemon. */
+async function skipWithoutDockerClient(t: TestContext) {
+  const version = await runCommandSafe("docker", ["--version"], { timeout: 20_000 });
+  if (version.ok) return false;
+  t.skip("the docker client binary is unavailable, so the agent container cannot even be attempted");
+  return true;
+}
+
+/**
+ * Answers every `docker` command the session issues through `spec.runCommand`
+ * and passes everything else (git, sh, make) through to the real thing, so the
+ * synthetic fixture still builds and starts a live stub cluster.
+ */
+function scriptedDocker(script: (args: string[]) => Awaited<ReturnType<RunCommand>> | undefined = () => undefined) {
+  const calls: string[][] = [];
+  // A single `docker image inspect <image>` JSON payload, no `Variant` key at
+  // all - the real shape for an ordinary arm64 image, and the shape that
+  // broke the old five-call per-field `--format` template form on a real
+  // GitHub Actions daemon (#197 round 2 review).
+  const imageInspectJson = { Id: `sha256:${"e".repeat(64)}`, RepoDigests: [], Os: "linux", Architecture: "arm64" };
+  const runCommand: RunCommand = async (command, args = [], options = {}) => {
+    if (command !== "docker") return runCommandSafe(command, args, options);
+    calls.push([command, ...args]);
+    const scripted = script(args);
+    if (scripted) return scripted;
+    const ok = { ok: true as const, stdout: "", stderr: "", code: 0 };
+    if (args[0] === "version") return { ...ok, stdout: "27.0.0\n" };
+    if (args[0] === "image" && args[1] === "inspect") return { ...ok, stdout: `${JSON.stringify([imageInspectJson])}\n` };
+    if (args[0] === "network" && args[1] === "inspect") return { ...ok, stdout: "true\n" };
+    if (args[0] === "run") return { ...ok, stdout: `${"f".repeat(64)}\n` };
+    return ok;
+  };
+  return { calls, runCommand };
+}
+
+/** The docker subcommand shape of each recorded call, for order assertions. */
+function dockerShapes(calls: string[][]): string[] {
+  return calls.map((call) => {
+    const args = call.slice(1);
+    if (args[0] === "network") return `network ${args[1]}`;
+    if (args[0] === "image") return "image inspect";
+    return String(args[0]);
+  });
+}
+
+test("restrictedEgress runs the agent on the verified --internal network and injects the model route (#197)", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  if (await skipWithoutDockerClient(t)) return;
+  const fixture = await withFixture(t);
+  const { calls, runCommand } = scriptedDocker();
+  const spec = { ...specFor(fixture, "restricted-egress"), runCommand };
+
+  const session = await runAgentInPostgresResearchEnvironment(
+    spec,
+    { command: "/bin/true", timeoutMs: 120_000 },
+    { isolation: { restrictedEgress: { upstreamUrl: RESTRICTED_UPSTREAM } } }
+  );
+
+  assert.equal(session.isolation.mode, "container");
+  // The record names the *actual* docker network that ran, not a summary
+  // label - a reviewer has to be able to look it up.
+  assert.match(session.isolation.networkMode!, /^honeyrail-pg-egress-net-/);
+  assert.equal(session.isolation.restrictedEgressVerified, true);
+  assert.equal(session.isolation.egressGateway!.internalNetworkName, session.isolation.networkMode);
+  assert.equal(session.isolation.egressGateway!.internalVerified, true);
+  // #197 round 2: scored evidence is bound to the gateway's own resolved,
+  // immutable image identity - not just the mutable tag it was launched from.
+  assert.equal(session.isolation.egressGateway!.image, "honeyrail-postgres-egress-gateway:latest");
+  assert.equal(session.isolation.egressGateway!.imageIdentity.id, `sha256:${"e".repeat(64)}`);
+  assert.equal(session.isolation.egressGateway!.imageIdentitySchemaVersion, 1);
+  // Hostname only: no scheme, no path, and above all no credential.
+  assert.equal(session.isolation.egressGateway!.upstreamHost, "api.example-model.test");
+  assert.equal(
+    JSON.stringify(session.isolation).includes(RESTRICTED_UPSTREAM),
+    false,
+    "the record must carry the upstream host, never the full upstream URL"
+  );
+
+  // The agent's model client is pointed at the sidecar, by DSH's own variable.
+  assert.equal(
+    session.agentEnvironment[DEFAULT_RESTRICTED_EGRESS_ENV_VAR],
+    `http://${EGRESS_GATEWAY_NETWORK_ALIAS}:${DEFAULT_EGRESS_GATEWAY_PORT}`
+  );
+
+  // The network axis is no longer a reason. The synthetic fixture is a host
+  // build, so this session is still unscored - but for the build, and the
+  // warning has to say so rather than blaming a network it proved restricted.
+  assert.equal(session.isolation.buildScoredEligible, false);
+  assert.match(session.isolation.warning ?? "", /was not built by the pinned Linux build container/);
+  assert.equal(
+    /docker network/i.test(session.isolation.warning ?? ""),
+    false,
+    "a verified restricted-egress network must not be blamed in the unscored reasons"
+  );
+
+  // The daemon-side sequence, in order, ending with the gateway torn down
+  // after the agent container has settled.
+  const shapes = dockerShapes(calls);
+  assert.deepEqual(shapes.slice(0, 2), ["version", "image inspect"]);
+  const gatewayStart = shapes.indexOf("network create");
+  assert.deepEqual(
+    shapes.slice(gatewayStart),
+    ["network create", "network inspect", "run", "network connect", "exec", "rm", "network rm"],
+    `unexpected docker sequence: ${shapes.join(", ")}`
+  );
+  assert.deepEqual(calls[gatewayStart].slice(1, 4), ["network", "create", "--internal"]);
+  assert.equal(calls[gatewayStart + 3][3], "bridge", "only the gateway gets an outbound leg");
+});
+
+test("restrictedEgress.envVar redirects a non-DSH agent's own base-URL variable instead (#197)", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  if (await skipWithoutDockerClient(t)) return;
+  const fixture = await withFixture(t);
+  const { runCommand } = scriptedDocker();
+  const spec = { ...specFor(fixture, "restricted-egress-envvar"), runCommand };
+
+  const session = await runAgentInPostgresResearchEnvironment(
+    spec,
+    { command: "/bin/true", timeoutMs: 120_000 },
+    {
+      isolation: {
+        restrictedEgress: {
+          upstreamUrl: RESTRICTED_UPSTREAM,
+          // docker/postgres-research-agent-184/mini-agent.mjs's own variable.
+          envVar: "HONEYRAIL_AGENT_LLM_BASE_URL",
+          port: 9931
+        }
+      }
+    }
+  );
+
+  assert.equal(session.agentEnvironment.HONEYRAIL_AGENT_LLM_BASE_URL, `http://${EGRESS_GATEWAY_NETWORK_ALIAS}:9931`);
+  assert.equal(session.agentEnvironment[DEFAULT_RESTRICTED_EGRESS_ENV_VAR], undefined);
+  assert.equal(session.isolation.restrictedEgressVerified, true);
+});
+
+test("a network docker will not confirm as internal fails the whole session closed, before any agent runs (#197)", async (t) => {
+  if (await skipWithoutToolchain(t)) return;
+  if (await skipWithoutDockerClient(t)) return;
+  const fixture = await withFixture(t);
+  // A daemon that accepts `--internal` and then reports the network as not
+  // internal: the exact shape of a flag that silently did not take.
+  const { calls, runCommand } = scriptedDocker((args) =>
+    args[0] === "network" && args[1] === "inspect" ? { ok: true as const, stdout: "false\n", stderr: "", code: 0 } : undefined
+  );
+  const spec = { ...specFor(fixture, "restricted-egress-unverified"), runCommand };
+
+  await assert.rejects(
+    runAgentInPostgresResearchEnvironment(
+      spec,
+      { command: "/bin/true", timeoutMs: 120_000 },
+      { isolation: { restrictedEgress: { upstreamUrl: RESTRICTED_UPSTREAM } } }
+    ),
+    (error: Error) =>
+      error instanceof PostgresResearchError &&
+      error instanceof PostgresEgressGatewayError &&
+      /Refusing to run a restricted-egress trial/.test(error.message)
+  );
+
+  // Fail closed, not "unscored": an unprovable restriction must produce no
+  // trial at all, so no gateway starts, no agent container is launched, and
+  // the network is not left behind.
+  const shapes = dockerShapes(calls);
+  assert.equal(shapes.includes("run"), false, "nothing may start on a network that was not proven internal");
+  assert.deepEqual(shapes.slice(shapes.indexOf("network create")), ["network create", "network inspect", "network rm"]);
+  assert.equal(await exists(join(spec.root, "pgdata")), false, "the environment is still torn down on this path");
+});
+
+test("isolation.network and isolation.restrictedEgress are mutually exclusive, and rejected before any side effect (#197)", async () => {
+  await assert.rejects(
+    runAgentInPostgresResearchEnvironment(
+      { root: "/dev/null/never-created", source: { repoPath: "/dev/null/never-created", ref: "HEAD" } },
+      { command: "/bin/true" },
+      { isolation: { network: "bridge", restrictedEgress: { upstreamUrl: RESTRICTED_UPSTREAM } } }
+    ),
+    (error: Error) =>
+      error instanceof PostgresResearchError &&
+      /mutually exclusive/.test(error.message) &&
+      /got network: "bridge"/.test(error.message)
+  );
+
+  // Including "none": the network is *derived* under restricted egress, so
+  // even a caller asking for the scored default is asking for something this
+  // mode cannot honour, and must be told rather than silently overridden.
+  await assert.rejects(
+    runAgentInPostgresResearchEnvironment(
+      { root: "/dev/null/never-created", source: { repoPath: "/dev/null/never-created", ref: "HEAD" } },
+      { command: "/bin/true" },
+      { isolation: { network: "none", restrictedEgress: { upstreamUrl: RESTRICTED_UPSTREAM } } }
+    ),
+    (error: Error) => error instanceof PostgresResearchError && /mutually exclusive/.test(error.message)
+  );
+});
+
+test("restrictedEgress is rejected outright in unisolated development mode (#197)", async () => {
+  await assert.rejects(
+    runAgentInPostgresResearchEnvironment(
+      { root: "/dev/null/never-created", source: { repoPath: "/dev/null/never-created", ref: "HEAD" } },
+      { command: "/bin/true" },
+      { isolation: { allowUnisolatedForDevelopment: true, restrictedEgress: { upstreamUrl: RESTRICTED_UPSTREAM } } }
+    ),
+    (error: Error) =>
+      error instanceof PostgresResearchError && /no container boundary to restrict egress from/.test(error.message)
+  );
+});
+
+test("only a *verified* restricted-egress network escapes the network reason; plain bridge still does not (#194/#196 regression guard)", () => {
+  // The #197 addition: a non-"none" network is scored-eligible only when the
+  // restriction was proven.
+  assert.deepEqual(
+    unscoredReasons({
+      networkMode: "honeyrail-pg-egress-net-1234",
+      buildScoredEligible: true,
+      runtimeScoredEligible: true,
+      restrictedEgressVerified: true
+    }),
+    [],
+    "a container build, a container runtime and a proven-internal network is a scored trial"
+  );
+
+  // ...and the same network without the proof is not, with the reason text
+  // unchanged from #194/#196 - it is still substantively true.
+  const unverified = unscoredReasons({
+    networkMode: "honeyrail-pg-egress-net-1234",
+    buildScoredEligible: true,
+    runtimeScoredEligible: true
+  });
+  assert.equal(unverified.length, 1);
+  assert.match(unverified[0], /rather than "none"/);
+  assert.match(unverified[0], /host\.docker\.internal/);
+
+  // The exact #194/#196 behaviour this issue must not regress: a plain bridge
+  // run is unscored whether or not restrictedEgress exists as a feature, and
+  // an explicit `restrictedEgressVerified: false` cannot launder it.
+  for (const input of [
+    { networkMode: "bridge", buildScoredEligible: true, runtimeScoredEligible: true },
+    { networkMode: "bridge", buildScoredEligible: true, runtimeScoredEligible: true, restrictedEgressVerified: false }
+  ]) {
+    const reasons = unscoredReasons(input);
+    assert.equal(reasons.length, 1, `bridge must stay unscored: ${JSON.stringify(input)}`);
+    assert.match(reasons[0], /docker network "bridge" rather than "none"/);
+  }
+
+  // "none" is unaffected either way - the scored default did not move.
+  assert.deepEqual(unscoredReasons({ networkMode: "none", buildScoredEligible: true, runtimeScoredEligible: true }), []);
 });
