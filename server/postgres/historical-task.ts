@@ -393,8 +393,14 @@ class HistoricalPostgresIntegrityError extends Error {
   }
 }
 
-const sha256 = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
-function canonicalize(value: unknown): unknown {
+/**
+ * Exported (not just locally used) so `historical-corpus.ts` computes the
+ * corpus-level manifest hash with the exact same canonicalize+sha256
+ * algorithm as every per-task truth/task-definition hash in this file,
+ * rather than a second copy that could silently drift from this one.
+ */
+export const sha256 = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
+export function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (value && typeof value === "object") {
     return Object.fromEntries(
@@ -406,7 +412,7 @@ function canonicalize(value: unknown): unknown {
   return value;
 }
 
-const stableJson = (value: unknown) => JSON.stringify(canonicalize(value), null, 2);
+export const stableJson = (value: unknown) => JSON.stringify(canonicalize(value), null, 2);
 
 /** Deterministic content hash of a directory: sorted relative-path:sha256 pairs, joined and re-hashed. */
 async function hashDirectoryContents(root: string): Promise<string> {

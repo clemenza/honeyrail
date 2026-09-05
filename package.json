@@ -46,6 +46,7 @@
     "historical-pg-200": "tsx scripts/historical-postgres-200.ts",
     "test:historical-pg-199": "node --import tsx --test test/historical-postgres-199-integration.test.ts",
     "historical-pg-199": "tsx scripts/historical-postgres-199.ts",
+    "historical-pg-201-freeze": "tsx scripts/historical-postgres-201-freeze.ts",
     "mcp": "tsx server/mcp.ts"
   },
   "dependencies": {

@@ -2,6 +2,8 @@
 
 Issue #184 adds one local task contract for a historical PostgreSQL correctness regression. It uses the existing PostgreSQL research environment; it does not introduce another executor or orchestration layer.
 
+See `docs/historical-postgres-corpus-v0.md` (issue #201) for how the three tasks below are frozen into one versioned, hashed Corpus v0 manifest, including the corrected TRAIN/FRONTIER/FRONTIER (no pristine HOLDOUT) partition.
+
 ## Layout and boundary
 
 ```text

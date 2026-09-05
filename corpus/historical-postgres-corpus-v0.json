@@ -1,0 +1,142 @@
+{
+  "schemaVersion": 1,
+  "corpusId": "historical-postgres-corpus-v0",
+  "freezeDate": "2026-09-05T16:29:51.541Z",
+  "gradingEntryPoint": [
+    "materializeHistoricalPostgresTask",
+    "gradeHistoricalPostgresSubmission",
+    "runHistoricalPostgresTrial"
+  ],
+  "outcomeVocabulary": [
+    "blocked",
+    "infrastructure_error",
+    "integrity_error",
+    "invalid_submission",
+    "miss",
+    "rediscovered"
+  ],
+  "holdoutNote": "Corpus v0 is an engineering rediscovery corpus for Historical PostgreSQL MVP validation. It does not currently provide a pristine HOLDOUT generalization claim.",
+  "tasks": [
+    {
+      "taskId": "postgres-historical-001",
+      "partition": "TRAIN",
+      "sourceSnapshotHash": "345953caead8e74c1b6645d6be1fceac2a7388f2",
+      "promptHash": "43d211a8be89a569fff0a07d88678508001c3ac87b583af069fe2434fba6e37f",
+      "taskDefinitionHash": "9ad24085b7406645f6ed682f0c6cd912de8cedd15d2a55eb7074ff4c4f623321",
+      "truthBundleHash": "934c7923465cade82768093e486b2910d47241572e19b4e5941eba4bf116b1c9",
+      "gradingProtocol": "submitted-reproducer-exit-status-v1",
+      "scaffoldingLevel": "minimal",
+      "budget": {},
+      "buildProfile": "container",
+      "artifactContract": {
+        "agentVisible": [
+          "task/prompt.md",
+          "task/task-manifest.json",
+          "task/source-manifest.json",
+          "task/workspace/"
+        ],
+        "agentSubmitted": [
+          "finding.json",
+          "<reproducer file>? (required only when finding.json status is \"reproduced\")"
+        ],
+        "graderRetained": [
+          "reference/truth.json",
+          "reference/reference-manifest.json",
+          "agent-result.json",
+          "agent-stdout.txt",
+          "agent-stderr.txt",
+          "grader/historical/*",
+          "grader/reference/*",
+          "grader/grade.json"
+        ]
+      },
+      "provenanceReferences": [
+        "#178",
+        "#184",
+        "#185",
+        "#201"
+      ]
+    },
+    {
+      "taskId": "postgres-historical-002",
+      "partition": "FRONTIER",
+      "sourceSnapshotHash": "0a70fe6725e2f5263fcf4806f99bada7c278f571",
+      "promptHash": "3e687239da6ecd809e205fbb3ac205eb6c79365fd10f1d3885ee604c43cfc072",
+      "taskDefinitionHash": "73c3c101adf1c4270226398f9c240e4762d72c4afd18345ca58c0c06f4c1b23b",
+      "truthBundleHash": "106aee7eb0313ddcdf42846cb1433f62c3ba6b181a3bc8b7a68ac0f4fca5f296",
+      "gradingProtocol": "submitted-reproducer-behavioral-oracle-v1",
+      "scaffoldingLevel": "minimal",
+      "budget": {},
+      "buildProfile": "container",
+      "artifactContract": {
+        "agentVisible": [
+          "task/prompt.md",
+          "task/task-manifest.json",
+          "task/source-manifest.json",
+          "task/workspace/"
+        ],
+        "agentSubmitted": [
+          "finding.json",
+          "<reproducer file>? (required only when finding.json status is \"reproduced\")"
+        ],
+        "graderRetained": [
+          "reference/truth.json",
+          "reference/reference-manifest.json",
+          "agent-result.json",
+          "agent-stdout.txt",
+          "agent-stderr.txt",
+          "grader/historical/*",
+          "grader/reference/*",
+          "grader/grade.json"
+        ]
+      },
+      "provenanceReferences": [
+        "#178",
+        "#185",
+        "#200",
+        "#201"
+      ]
+    },
+    {
+      "taskId": "postgres-historical-003",
+      "partition": "FRONTIER",
+      "sourceSnapshotHash": "ab49034bfdf5935880666e2a503fe09bb5105838",
+      "promptHash": "91009f52f4014e72c8071781eca89b51dbfefec0fcdc8ee6b213a6305e06bb4e",
+      "taskDefinitionHash": "c132c2911adb14b17942c7bec3fb0bc38a37ce3ba236ab1fc4a2c37ed67b1eef",
+      "truthBundleHash": "c92b37915ecda8955c94de5db20c4168ef522621578cb7ed2568385cd9e211c2",
+      "gradingProtocol": "submitted-reproducer-structured-oracle-v1",
+      "scaffoldingLevel": "minimal",
+      "budget": {},
+      "buildProfile": "container",
+      "artifactContract": {
+        "agentVisible": [
+          "task/prompt.md",
+          "task/task-manifest.json",
+          "task/source-manifest.json",
+          "task/workspace/"
+        ],
+        "agentSubmitted": [
+          "finding.json",
+          "<reproducer file>? (required only when finding.json status is \"reproduced\")"
+        ],
+        "graderRetained": [
+          "reference/truth.json",
+          "reference/reference-manifest.json",
+          "agent-result.json",
+          "agent-stdout.txt",
+          "agent-stderr.txt",
+          "grader/historical/*",
+          "grader/reference/*",
+          "grader/grade.json"
+        ]
+      },
+      "provenanceReferences": [
+        "#178",
+        "#185",
+        "#199",
+        "#201"
+      ]
+    }
+  ],
+  "corpusHash": "f1b6369296114c0f459dea04729306f2b7f41400a5922ed8dd44a1ba7b94d1f5"
+}
