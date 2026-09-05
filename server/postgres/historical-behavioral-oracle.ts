@@ -204,24 +204,42 @@ export type HistoricalPostgresExecutionValidity = { valid: true } | { valid: fal
  *
  * - `0` - success (or, with `ON_ERROR_STOP` off, "no fatal client-level
  *   error"; the script may still contain tolerated SQL errors).
- * - `1` - a fatal **client-side** error (out of memory, could not open the
- *   script, bad invocation) - never caused by SQL content. `docker exec`
- *   itself failing to even launch psql (a dead container, an OCI runtime
- *   failure, etc.) also surfaces as this same nonzero exit from the `docker`
- *   process - either way, psql never reached interpretable SQL execution.
- * - `2` - a **connection failure** - psql's own documented meaning; also
- *   never caused by SQL content.
  * - `3` - a SQL/script-level error occurred **and** `ON_ERROR_STOP` was in
  *   effect at that point.
+ *
+ * `0` and `3` are the *only* two possible outcomes of actual SQL-content
+ * execution under psql's documented exit-status contract - so this is an
+ * **allow-list**, not a deny-list of known-bad codes: anything else is
+ * unconditionally invalid, whether or not it happens to be one of the
+ * failure codes already known and named below. This matters for a case an
+ * earlier deny-list version of this function got wrong (#200 fifth review
+ * round, Blocking 1): `docker exec` has its own reserved, undocumented-here
+ * exit codes for "the contained command could not be invoked"/"could not be
+ * found" (commonly `125`-`127`, distinct from psql's own `1`/`2`) when the
+ * container/exec transport fails *before* psql ever runs - a deny-list that
+ * only checked for `1`/`2`/`"ETIMEDOUT"` would silently fall through to
+ * `valid: true` for any of those, or for any other exotic/future exit code
+ * neither psql nor this comment anticipated. The allow-list has no such gap:
+ * only a real, positively-confirmed `0`/`3` SQL-content outcome is ever
+ * `valid`.
+ *
+ * The two *named* failure codes below are recorded for diagnostics, not
+ * because the allow-list depends on naming every bad case:
+ *
+ * - `1` - a fatal **client-side** error (out of memory, could not open the
+ *   script, bad invocation) - never caused by SQL content. `docker exec`
+ *   itself sometimes also surfaces a transport-level failure as this same
+ *   code (Docker's own reservation of `125`-`127` is not always what a given
+ *   Docker/OCI version actually returns) - either way, psql never reached
+ *   interpretable SQL execution, so the allow-list already rejects it
+ *   regardless of which of the two actually happened.
+ * - `2` - a **connection failure** - psql's own documented meaning; also
+ *   never caused by SQL content.
  * - `"ETIMEDOUT"` - `execWithInput()`'s own timeout path (runtime-container.ts);
  *   never a SQL-content outcome either.
  *
- * `0` and `3` are the *only* possible outcomes of SQL content execution, so
- * anything else (`1`, `2`, `"ETIMEDOUT"`) is unambiguously a client/
- * transport/runtime failure, decided from the real signal the layer that
- * actually ran the command produced - not inferred from free text. A real
- * `ERROR:` record from the server, even a completely unexpected one, is
- * still a *valid*, interpretable execution (exit `0` or `3`); whether it
+ * A real `ERROR:` record from the server, even a completely unexpected one,
+ * is still a *valid*, interpretable execution (exit `0` or `3`); whether it
  * matches anything declared is a separate question `evaluateOracleAttribution()`
  * answers, not this function. No stderr-text fallback is needed or used.
  */
@@ -232,6 +250,9 @@ export function classifyExecutionValidity(execution: {
   exitCode?: number | string;
   durationMs: number;
 }): HistoricalPostgresExecutionValidity {
+  if (execution.exitCode === 0 || execution.exitCode === 3) {
+    return { valid: true };
+  }
   if (execution.exitCode === "ETIMEDOUT") {
     return { valid: false, reason: "psql execution timed out before completing - not attributable to any declared behavior." };
   }
@@ -239,7 +260,7 @@ export function classifyExecutionValidity(execution: {
     return {
       valid: false,
       reason:
-        "psql/docker reported a fatal client-level failure (exit code 1) - psql's own documented exit status for a client-side error, never a SQL-content outcome. This also covers the container/exec transport never reaching psql at all (a dead container or OCI runtime failure surfaces as this same child-process exit code)."
+        "Exit code 1 - either psql's own documented fatal client-side error, or the container/exec transport never reaching psql at all (a dead container or OCI runtime failure can surface as this same child-process exit code). Either way, psql never reached interpretable SQL execution."
     };
   }
   if (execution.exitCode === 2) {
@@ -248,7 +269,10 @@ export function classifyExecutionValidity(execution: {
       reason: "psql reported a connection failure (exit code 2) - psql's own documented meaning; the session never reached interpretable SQL execution."
     };
   }
-  return { valid: true };
+  return {
+    valid: false,
+    reason: `Exit code ${JSON.stringify(execution.exitCode)} is not one of psql's two documented SQL-content outcomes (0 or 3) - treated as an unrecognized transport/runtime failure (e.g. a Docker/OCI exec failure such as 125-127) rather than assumed valid.`
+  };
 }
 
 export type HistoricalPostgresOracleAttribution = {

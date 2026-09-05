@@ -297,6 +297,19 @@ test("classifyExecutionValidity: a timeout is invalid", () => {
   assert.equal(result.valid, false);
 });
 
+test("classifyExecutionValidity: an exotic Docker/OCI exec exit code (not one of psql's own 0/3) is invalid, even though it isn't in the named failure list", () => {
+  // #200 fifth review round, Blocking 1: the function must be an allow-list
+  // (only 0/3 are ever valid) rather than a deny-list of specifically-named
+  // bad codes - otherwise a Docker/OCI transport failure using an exit code
+  // this module doesn't happen to name (commonly 125-127 for "container
+  // command could not be invoked/found") would silently fall through to
+  // `valid: true`. None of these are psql's own 1/2/"ETIMEDOUT" either.
+  for (const exitCode of [125, 126, 127, 137]) {
+    const result = classifyExecutionValidity(executionOf({ stderr: "", exitCode, ok: false }));
+    assert.equal(result.valid, false, `exit code ${exitCode} must not be treated as valid`);
+  }
+});
+
 test("classifyExecutionValidity: runtime/server death is invalid (exit code 2)", () => {
   const result = classifyExecutionValidity(
     executionOf({
