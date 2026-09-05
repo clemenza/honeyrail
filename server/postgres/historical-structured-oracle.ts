@@ -134,8 +134,11 @@ export function parseTuplesOnlyOutput(stdout: string, fieldSeparator = "|"): str
  * array of non-empty string arrays. Throws if not — a task-authoring bug must
  * be loud, not silently produce wrong results (same discipline as
  * `evaluateBehavioralOracle()`'s malformed-regex throw).
+ *
+ * Exported so `loadHistoricalPostgres003PrivateTruth()` in `historical-task.ts`
+ * can reuse this validation without duplicating it.
  */
-function assertValidExpectedRows(rows: unknown): asserts rows is string[][] {
+export function assertValidExpectedRows(rows: unknown): asserts rows is string[][] {
   if (!Array.isArray(rows)) {
     throw new Error(`Structured oracle expected rows must be an array; got ${typeof rows}`);
   }
@@ -165,8 +168,12 @@ function assertValidExpectedRows(rows: unknown): asserts rows is string[][] {
  * a task-authoring bug must be loud rather than silently producing wrong
  * results. Does not validate actual captured rows (agent-submitted output),
  * which may contain arbitrary bytes by design.
+ *
+ * Exported so `loadHistoricalPostgres003PrivateTruth()` in `historical-task.ts`
+ * can validate private truth at load time (before any agent/grader run) without
+ * duplicating this logic.
  */
-function assertNoDelimiterInExpectedRows(rows: string[][], fieldSeparator: string): void {
+export function assertNoDelimiterInExpectedRows(rows: string[][], fieldSeparator: string): void {
   for (let i = 0; i < rows.length; i += 1) {
     for (let j = 0; j < rows[i].length; j += 1) {
       const field = rows[i][j];

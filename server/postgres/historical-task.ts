@@ -26,6 +26,8 @@ import {
   type HistoricalPostgresOracleAttribution
 } from "./historical-behavioral-oracle.js";
 import {
+  assertNoDelimiterInExpectedRows,
+  assertValidExpectedRows,
   evaluateStructuredOracleAttribution,
   type HistoricalPostgresStructuredOracle,
   type HistoricalPostgresStructuredOracleAttribution,
@@ -1258,10 +1260,17 @@ export async function loadHistoricalPostgres003PrivateTruth(filePath: string): P
   const value = raw as Record<string, unknown>;
   const upstreamBug = typeof value.upstreamBug === "string" ? value.upstreamBug.trim() : "";
   if (!upstreamBug) throw new Error(`loadHistoricalPostgres003PrivateTruth: ${filePath} missing or empty "upstreamBug"`);
-  const historicalRevision = typeof value.historicalRevision === "string" ? value.historicalRevision.trim() : "";
-  if (!historicalRevision) throw new Error(`loadHistoricalPostgres003PrivateTruth: ${filePath} missing or empty "historicalRevision"`);
-  const referenceRevision = typeof value.referenceRevision === "string" ? value.referenceRevision.trim() : "";
-  if (!referenceRevision) throw new Error(`loadHistoricalPostgres003PrivateTruth: ${filePath} missing or empty "referenceRevision"`);
+  // Validate revision format: must be a pinned 40-character hex SHA. Reuses the
+  // private exactRevision() helper already used by checkedTaskSpec() — same
+  // module, no need to export it.
+  const historicalRevision = exactRevision(
+    typeof value.historicalRevision === "string" ? value.historicalRevision.trim() : "",
+    `loadHistoricalPostgres003PrivateTruth: ${filePath} "historicalRevision"`
+  );
+  const referenceRevision = exactRevision(
+    typeof value.referenceRevision === "string" ? value.referenceRevision.trim() : "",
+    `loadHistoricalPostgres003PrivateTruth: ${filePath} "referenceRevision"`
+  );
   const oracle = value.structuredOracle;
   if (!oracle || typeof oracle !== "object" || Array.isArray(oracle)) {
     throw new Error(`loadHistoricalPostgres003PrivateTruth: ${filePath} missing or invalid "structuredOracle"`);
@@ -1272,15 +1281,29 @@ export async function loadHistoricalPostgres003PrivateTruth(filePath: string): P
     if (!sideVal || typeof sideVal !== "object" || Array.isArray(sideVal)) {
       throw new Error(`loadHistoricalPostgres003PrivateTruth: ${filePath} structuredOracle.${side} must be an object`);
     }
-    const sideRows = (sideVal as Record<string, unknown>).rows;
-    if (!Array.isArray(sideRows) || sideRows.length === 0) {
-      throw new Error(`loadHistoricalPostgres003PrivateTruth: ${filePath} structuredOracle.${side}.rows must be a non-empty array`);
+    const sideValObj = sideVal as Record<string, unknown>;
+    // Validate `ordered` type when present — task-authoring bug must be loud.
+    if ("ordered" in sideValObj && typeof sideValObj.ordered !== "boolean") {
+      throw new Error(
+        `loadHistoricalPostgres003PrivateTruth: ${filePath} structuredOracle.${side}.ordered must be a boolean when present; got ${typeof sideValObj.ordered}`
+      );
     }
-    for (let i = 0; i < sideRows.length; i++) {
-      if (!Array.isArray(sideRows[i]) || (sideRows[i] as unknown[]).length === 0) {
-        throw new Error(`loadHistoricalPostgres003PrivateTruth: ${filePath} structuredOracle.${side}.rows[${i}] must be a non-empty array`);
-      }
-    }
+    // Reuse the exported oracle row validators from historical-structured-oracle.ts
+    // so this loader and evaluateStructuredOracle() enforce the same rules without
+    // duplication. Both throw loudly on malformed private truth — a task-authoring
+    // bug must fail at load time, not later when the grader happens to run.
+    assertValidExpectedRows(sideValObj.rows);
+    assertNoDelimiterInExpectedRows(sideValObj.rows, "|");
+  }
+  // An oracle that can't structurally distinguish the two revisions is a
+  // task-authoring bug and must fail loudly at load time rather than only
+  // surfacing later as "always unattributed."
+  const historicalSide = (oracleObj.historical as Record<string, unknown>);
+  const referenceSide = (oracleObj.reference as Record<string, unknown>);
+  if (JSON.stringify(historicalSide) === JSON.stringify(referenceSide)) {
+    throw new Error(
+      `loadHistoricalPostgres003PrivateTruth: ${filePath} structuredOracle.historical and .reference are identical — the oracle cannot distinguish the two revisions`
+    );
   }
   return { upstreamBug, historicalRevision, referenceRevision, structuredOracle: value.structuredOracle as HistoricalPostgresStructuredOracle };
 }

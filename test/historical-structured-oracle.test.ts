@@ -14,6 +14,7 @@ import {
   type HistoricalPostgresTaskSpec
 } from "../server/postgres/historical-task.js";
 import { createSyntheticPostgresSourceRepo } from "./helpers/postgres-source-fixture.js";
+import { SYNTHETIC_ORACLE } from "./helpers/synthetic-oracle-fixture.js";
 
 const VALID = { valid: true } as const;
 
@@ -22,7 +23,7 @@ const VALID = { valid: true } as const;
 // ---------------------------------------------------------------------------
 
 test("parseTuplesOnlyOutput: single row, three fields", () => {
-  assert.deepEqual(parseTuplesOnlyOutput("serializable|on|on\n"), [["serializable", "on", "on"]]);
+  assert.deepEqual(parseTuplesOnlyOutput("alpha|x|y\n"), [["alpha", "x", "y"]]);
 });
 
 test("parseTuplesOnlyOutput: two rows", () => {
@@ -64,8 +65,8 @@ test("parseTuplesOnlyOutput: throws on non-string input", () => {
 
 test("evaluateStructuredOracle: exact historical match satisfies (ordered)", () => {
   const result = evaluateStructuredOracle(
-    [["read committed", "off", "off"]],
-    { rows: [["read committed", "off", "off"]] }
+    [["alpha", "x", "y"]],
+    { rows: [["alpha", "x", "y"]] }
   );
   assert.equal(result.satisfied, true);
   assert.deepEqual(result.diagnostics, []);
@@ -73,8 +74,8 @@ test("evaluateStructuredOracle: exact historical match satisfies (ordered)", () 
 
 test("evaluateStructuredOracle: exact reference match satisfies", () => {
   const result = evaluateStructuredOracle(
-    [["serializable", "on", "on"]],
-    { rows: [["serializable", "on", "on"]] }
+    [["beta", "m", "n"]],
+    { rows: [["beta", "m", "n"]] }
   );
   assert.equal(result.satisfied, true);
   assert.deepEqual(result.diagnostics, []);
@@ -82,18 +83,18 @@ test("evaluateStructuredOracle: exact reference match satisfies", () => {
 
 test("evaluateStructuredOracle: wrong field value is unsatisfied with diagnostic", () => {
   const result = evaluateStructuredOracle(
-    [["read committed", "off", "off"]],
-    { rows: [["serializable", "on", "on"]] }
+    [["alpha", "x", "y"]],
+    { rows: [["beta", "m", "n"]] }
   );
   assert.equal(result.satisfied, false);
-  assert.ok(result.diagnostics.some((d) => d.includes('"serializable"') && d.includes('"read committed"')));
+  assert.ok(result.diagnostics.some((d) => d.includes('"beta"') && d.includes('"alpha"')));
 });
 
 test("evaluateStructuredOracle: missing field (fewer fields in a row) is unsatisfied", () => {
   // Only 2 fields, expected 3
   const result = evaluateStructuredOracle(
-    [["serializable", "on"]],
-    { rows: [["serializable", "on", "on"]] }
+    [["beta", "m"]],
+    { rows: [["beta", "m", "n"]] }
   );
   assert.equal(result.satisfied, false);
   assert.ok(result.diagnostics.some((d) => d.includes("field")));
@@ -102,23 +103,23 @@ test("evaluateStructuredOracle: missing field (fewer fields in a row) is unsatis
 test("evaluateStructuredOracle: extra field (more fields in a row) is unsatisfied", () => {
   // 4 fields, expected 3
   const result = evaluateStructuredOracle(
-    [["serializable", "on", "on", "extra"]],
-    { rows: [["serializable", "on", "on"]] }
+    [["beta", "m", "n", "extra"]],
+    { rows: [["beta", "m", "n"]] }
   );
   assert.equal(result.satisfied, false);
   assert.ok(result.diagnostics.some((d) => d.includes("field")));
 });
 
 test("evaluateStructuredOracle: missing row (fewer rows) is unsatisfied", () => {
-  const result = evaluateStructuredOracle([], { rows: [["serializable", "on", "on"]] });
+  const result = evaluateStructuredOracle([], { rows: [["beta", "m", "n"]] });
   assert.equal(result.satisfied, false);
   assert.ok(result.diagnostics.some((d) => d.includes("Expected exactly 1 row(s), got 0")));
 });
 
 test("evaluateStructuredOracle: extra row (more rows than expected) is unsatisfied", () => {
   const result = evaluateStructuredOracle(
-    [["serializable", "on", "on"], ["extra", "row", "here"]],
-    { rows: [["serializable", "on", "on"]] }
+    [["beta", "m", "n"], ["extra", "row", "here"]],
+    { rows: [["beta", "m", "n"]] }
   );
   assert.equal(result.satisfied, false);
   assert.ok(result.diagnostics.some((d) => d.includes("Expected exactly 1 row(s), got 2")));
@@ -159,13 +160,13 @@ test("evaluateStructuredOracle: malformed truth (empty rows array) throws", () =
 // evaluateStructuredOracleAttribution
 // ---------------------------------------------------------------------------
 
-const ORACLE: HistoricalPostgresStructuredOracle = {
-  historical: { rows: [["read committed", "off", "off"]] },
-  reference: { rows: [["serializable", "on", "on"]] }
-};
+// SYNTHETIC_ORACLE is imported from test/helpers/synthetic-oracle-fixture.ts.
+// It uses domain-neutral placeholder tokens:
+//   historical: [["alpha", "x", "y"]]
+//   reference:  [["beta",  "m", "n"]]
 
 test("evaluateStructuredOracleAttribution: attributes 'historical' when only the historical expectation matches", () => {
-  const result = evaluateStructuredOracleAttribution("read committed|off|off\n", ORACLE, VALID);
+  const result = evaluateStructuredOracleAttribution("alpha|x|y\n", SYNTHETIC_ORACLE, VALID);
   assert.equal(result.attributedTo, "historical");
   assert.equal(result.historicalMatch.satisfied, true);
   assert.equal(result.referenceMatch.satisfied, false);
@@ -173,14 +174,14 @@ test("evaluateStructuredOracleAttribution: attributes 'historical' when only the
 });
 
 test("evaluateStructuredOracleAttribution: attributes 'reference' when only the reference expectation matches", () => {
-  const result = evaluateStructuredOracleAttribution("serializable|on|on\n", ORACLE, VALID);
+  const result = evaluateStructuredOracleAttribution("beta|m|n\n", SYNTHETIC_ORACLE, VALID);
   assert.equal(result.attributedTo, "reference");
   assert.equal(result.historicalMatch.satisfied, false);
   assert.equal(result.referenceMatch.satisfied, true);
 });
 
 test("evaluateStructuredOracleAttribution: unrelated but valid output is unattributed", () => {
-  const result = evaluateStructuredOracleAttribution("repeatable read|on|off\n", ORACLE, VALID);
+  const result = evaluateStructuredOracleAttribution("gamma|p|q\n", SYNTHETIC_ORACLE, VALID);
   assert.equal(result.attributedTo, "unattributed");
   assert.equal(result.historicalMatch.satisfied, false);
   assert.equal(result.referenceMatch.satisfied, false);
@@ -190,7 +191,7 @@ test("evaluateStructuredOracleAttribution: infrastructure-invalid execution is a
   const invalid = { valid: false, reason: "test-injected transport failure" } as const;
   // Even output that would otherwise satisfy the historical expectation must
   // not be attributed when the execution itself was not valid/interpretable.
-  const result = evaluateStructuredOracleAttribution("read committed|off|off\n", ORACLE, invalid);
+  const result = evaluateStructuredOracleAttribution("alpha|x|y\n", SYNTHETIC_ORACLE, invalid);
   assert.equal(result.attributedTo, "unattributed");
   assert.equal(result.validity.valid, false);
   // Rows are not parsed when execution is invalid
@@ -199,7 +200,7 @@ test("evaluateStructuredOracleAttribution: infrastructure-invalid execution is a
 });
 
 test("evaluateStructuredOracleAttribution: empty stdout on a valid execution is unattributed", () => {
-  const result = evaluateStructuredOracleAttribution("", ORACLE, VALID);
+  const result = evaluateStructuredOracleAttribution("", SYNTHETIC_ORACLE, VALID);
   assert.equal(result.attributedTo, "unattributed");
   assert.equal(result.validity.valid, true);
 });
@@ -222,7 +223,7 @@ test("gradeHistoricalPostgresSubmission: structured oracle — correct captured 
     source: { repoPath: repo.repoPath, historicalRevision: repo.ref, referenceRevision: repo.laterRef },
     truth: {
       upstreamBug: "Synthetic upstream #99901",
-      structuredOracle: ORACLE
+      structuredOracle: SYNTHETIC_ORACLE
     },
     build: { mode: "host" },
     prompt: "Structured oracle self-assertion test."
@@ -241,12 +242,12 @@ test("gradeHistoricalPostgresSubmission: structured oracle — correct captured 
       reproduced: true,
       execution: {
         ok: true, // BOTH sides exit 0 — violates the self-assertion contract
-        stdout: "read committed|off|off\n",
+        stdout: "alpha|x|y\n",
         stderr: "",
         exitCode: 0,
         durationMs: 10
       },
-      attribution: evaluateStructuredOracleAttribution("read committed|off|off\n", ORACLE, VALID)
+      attribution: evaluateStructuredOracleAttribution("alpha|x|y\n", SYNTHETIC_ORACLE, VALID)
     })
   });
   assert.equal(grade.status, "invalid_submission", JSON.stringify(grade, null, 2));

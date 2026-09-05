@@ -8,6 +8,7 @@ import {
   gradeHistoricalPostgresSubmission,
   historicalPostgres003TaskPrompt,
   historicalPostgres003TaskSpec,
+  loadHistoricalPostgres003PrivateTruth,
   materializeHistoricalPostgresTask,
   resolveOracleReproduction,
   type HistoricalPostgresCase003PrivateTruth,
@@ -16,17 +17,19 @@ import {
 import { evaluateStructuredOracleAttribution } from "../server/postgres/historical-structured-oracle.js";
 import { createSyntheticPostgresSourceRepo } from "./helpers/postgres-source-fixture.js";
 import { readTreeAsText } from "./helpers/read-tree-as-text.js";
+import { SYNTHETIC_ORACLE } from "./helpers/synthetic-oracle-fixture.js";
 
 // Synthetic private truth used for unit tests. Never contains real upstream
 // revisions, bug ids, or expected tuples — those are operator-supplied at
 // runtime via loadHistoricalPostgres003PrivateTruth() / HONEYRAIL_PG_199_PRIVATE_TRUTH.
+// Uses domain-neutral placeholder tokens; no PostgreSQL transaction-isolation vocabulary.
 const SYNTHETIC_003_PRIVATE_TRUTH: HistoricalPostgresCase003PrivateTruth = {
   upstreamBug: "Synthetic BUG #00003",
   historicalRevision: "c".repeat(40),
   referenceRevision: "d".repeat(40),
   structuredOracle: {
-    historical: { rows: [["synthetic-historical", "off", "off"]] },
-    reference: { rows: [["synthetic-reference", "on", "on"]] }
+    historical: { rows: [["synthetic-historical", "x", "y"]] },
+    reference: { rows: [["synthetic-reference", "m", "n"]] }
   }
 };
 
@@ -48,7 +51,7 @@ test("historicalPostgres003TaskSpec carries operator-supplied private truth behi
   assert.ok(!spec.prompt.toLowerCase().includes("commitfest"));
   assert.ok(!spec.prompt.toLowerCase().includes("savepoint"));
   assert.ok(!spec.prompt.toLowerCase().includes("chain"));
-  assert.ok(!spec.prompt.toLowerCase().includes("synthetic-reference|on|on"));
+  assert.ok(!spec.prompt.toLowerCase().includes("synthetic-reference|m|n"));
   assert.equal(historicalPostgres003TaskPrompt(), spec.prompt);
 });
 
@@ -256,37 +259,31 @@ test("Policy A: case 002 truth bundle is byte-for-byte identical after structure
 // resolveOracleReproduction: structured oracle dispatch
 // ---------------------------------------------------------------------------
 
+// SYNTHETIC_ORACLE: historical [["alpha","x","y"]], reference [["beta","m","n"]]
+
 test("resolveOracleReproduction: structured oracle — historical stdout gives reproduced: true", () => {
-  const oracle = {
-    historical: { rows: [["read committed", "off", "off"]] },
-    reference: { rows: [["serializable", "on", "on"]] }
-  };
   const spec: HistoricalPostgresTaskSpec = {
     taskId: "synthetic-resolve-003",
     source: { repoPath: "/unused", historicalRevision: "a".repeat(40), referenceRevision: "b".repeat(40) },
-    truth: { upstreamBug: "Synthetic #99902", structuredOracle: oracle },
+    truth: { upstreamBug: "Synthetic #99902", structuredOracle: SYNTHETIC_ORACLE },
     build: { mode: "host" },
     prompt: "Test."
   };
-  const execution = { ok: true, stdout: "read committed|off|off\n", stderr: "", exitCode: 0 as const, durationMs: 5 };
+  const execution = { ok: true, stdout: "alpha|x|y\n", stderr: "", exitCode: 0 as const, durationMs: 5 };
   const { reproduced, attribution } = resolveOracleReproduction({ execution, revision: "a".repeat(40), spec });
   assert.equal(reproduced, true);
   assert.equal(attribution?.attributedTo, "historical");
 });
 
 test("resolveOracleReproduction: structured oracle — reference stdout gives reproduced: false", () => {
-  const oracle = {
-    historical: { rows: [["read committed", "off", "off"]] },
-    reference: { rows: [["serializable", "on", "on"]] }
-  };
   const spec: HistoricalPostgresTaskSpec = {
     taskId: "synthetic-resolve-003b",
     source: { repoPath: "/unused", historicalRevision: "a".repeat(40), referenceRevision: "b".repeat(40) },
-    truth: { upstreamBug: "Synthetic #99903", structuredOracle: oracle },
+    truth: { upstreamBug: "Synthetic #99903", structuredOracle: SYNTHETIC_ORACLE },
     build: { mode: "host" },
     prompt: "Test."
   };
-  const execution = { ok: false, stdout: "serializable|on|on\n", stderr: "", exitCode: 3 as const, durationMs: 5 };
+  const execution = { ok: false, stdout: "beta|m|n\n", stderr: "", exitCode: 3 as const, durationMs: 5 };
   const { reproduced, attribution } = resolveOracleReproduction({ execution, revision: "b".repeat(40), spec });
   assert.equal(reproduced, false);
   assert.equal(attribution?.attributedTo, "reference");
@@ -314,15 +311,11 @@ test("gradeHistoricalPostgresSubmission: structured oracle — full rediscovery 
   await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "reproduced", summary: "Bug 3 reproduced", reproducer: "repro.sql" }));
   await writeFile(join(workspace, "repro.sql"), "SELECT 1;\n");
 
-  const oracle = {
-    historical: { rows: [["read committed", "off", "off"]] },
-    reference: { rows: [["serializable", "on", "on"]] }
-  };
   const repo = await createSyntheticPostgresSourceRepo(root);
   const spec: HistoricalPostgresTaskSpec = {
     taskId: "synthetic-structured-grade",
     source: { repoPath: repo.repoPath, historicalRevision: repo.ref, referenceRevision: repo.laterRef },
-    truth: { upstreamBug: "Synthetic #99904", structuredOracle: oracle },
+    truth: { upstreamBug: "Synthetic #99904", structuredOracle: SYNTHETIC_ORACLE },
     build: { mode: "host" },
     prompt: "Test."
   };
@@ -332,8 +325,8 @@ test("gradeHistoricalPostgresSubmission: structured oracle — full rediscovery 
     artifactDir: join(root, "artifacts"),
     gradeRevision: gradeRevisionWith((revision) =>
       revision === repo.ref
-        ? { ok: true, stdout: "read committed|off|off\n", exitCode: 0 }
-        : { ok: false, stdout: "serializable|on|on\n", exitCode: 3 }
+        ? { ok: true, stdout: "alpha|x|y\n", exitCode: 0 }
+        : { ok: false, stdout: "beta|m|n\n", exitCode: 3 }
     )
   });
   assert.equal(grade.status, "rediscovered", JSON.stringify(grade, null, 2));
@@ -350,15 +343,11 @@ test("gradeHistoricalPostgresSubmission: structured oracle — wrong historical 
   await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "reproduced", summary: "miss test", reproducer: "repro.sql" }));
   await writeFile(join(workspace, "repro.sql"), "SELECT 1;\n");
 
-  const oracle = {
-    historical: { rows: [["read committed", "off", "off"]] },
-    reference: { rows: [["serializable", "on", "on"]] }
-  };
   const repo = await createSyntheticPostgresSourceRepo(root);
   const spec: HistoricalPostgresTaskSpec = {
     taskId: "synthetic-structured-miss",
     source: { repoPath: repo.repoPath, historicalRevision: repo.ref, referenceRevision: repo.laterRef },
-    truth: { upstreamBug: "Synthetic #99905", structuredOracle: oracle },
+    truth: { upstreamBug: "Synthetic #99905", structuredOracle: SYNTHETIC_ORACLE },
     build: { mode: "host" },
     prompt: "Test."
   };
@@ -367,7 +356,7 @@ test("gradeHistoricalPostgresSubmission: structured oracle — wrong historical 
     task: spec,
     workspaceDir: workspace,
     artifactDir: join(root, "artifacts"),
-    gradeRevision: gradeRevisionWith(() => ({ ok: true, stdout: "repeatable read|off|on\n", exitCode: 0 }))
+    gradeRevision: gradeRevisionWith(() => ({ ok: true, stdout: "gamma|p|q\n", exitCode: 0 }))
   });
   assert.equal(grade.status, "miss", JSON.stringify(grade, null, 2));
 });
@@ -379,15 +368,11 @@ test("gradeHistoricalPostgresSubmission: structured oracle — infrastructure-in
   await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "reproduced", summary: "infra test", reproducer: "repro.sql" }));
   await writeFile(join(workspace, "repro.sql"), "SELECT 1;\n");
 
-  const oracle = {
-    historical: { rows: [["read committed", "off", "off"]] },
-    reference: { rows: [["serializable", "on", "on"]] }
-  };
   const repo = await createSyntheticPostgresSourceRepo(root);
   const spec: HistoricalPostgresTaskSpec = {
     taskId: "synthetic-structured-infra",
     source: { repoPath: repo.repoPath, historicalRevision: repo.ref, referenceRevision: repo.laterRef },
-    truth: { upstreamBug: "Synthetic #99906", structuredOracle: oracle },
+    truth: { upstreamBug: "Synthetic #99906", structuredOracle: SYNTHETIC_ORACLE },
     build: { mode: "host" },
     prompt: "Test."
   };
@@ -418,9 +403,9 @@ test("no file anywhere under the materialized task/ tree leaks the bug identity,
   const reproPath = join(root, "known-repro.sql");
   const reproContents =
     "\\set ON_ERROR_STOP off\n" +
-    "SET default_transaction_isolation = 'read committed';\n" +
-    "SET default_transaction_read_only = off;\n" +
-    "SET default_transaction_deferrable = off;\n" +
+    "-- synthetic-canonical-reproducer for leak test (domain-neutral, never real)\n" +
+    "SELECT pg_typeof(1);\n" +
+    "SELECT pg_typeof(2);\n" +
     "-- canonical Bug 3 reproducer content (never committed)\n";
   await writeFile(reproPath, reproContents);
 
@@ -467,4 +452,150 @@ test("no file anywhere under the materialized task/ tree leaks the bug identity,
   const retained = referenceFiles.find((file) => file.relativePath === "verification/canonical-reproducer.sql");
   assert.ok(retained);
   assert.equal(retained!.text, reproContents);
+});
+
+// ---------------------------------------------------------------------------
+// loadHistoricalPostgres003PrivateTruth: strengthened validation tests (P1)
+// ---------------------------------------------------------------------------
+
+async function writePrivateTruth(dir: string, content: unknown): Promise<string> {
+  const path = join(dir, "private-truth.json");
+  await writeFile(path, JSON.stringify(content));
+  return path;
+}
+
+test("loadHistoricalPostgres003PrivateTruth: rejects non-40-hex historicalRevision", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeyrail-loader-val-"));
+  const path = await writePrivateTruth(dir, {
+    upstreamBug: "Synthetic BUG #00099",
+    historicalRevision: "not-a-sha",
+    referenceRevision: "d".repeat(40),
+    structuredOracle: {
+      historical: { rows: [["alpha", "x"]] },
+      reference: { rows: [["beta", "m"]] }
+    }
+  });
+  await assert.rejects(
+    () => loadHistoricalPostgres003PrivateTruth(path),
+    /40-character commit SHA/i
+  );
+});
+
+test("loadHistoricalPostgres003PrivateTruth: rejects non-40-hex referenceRevision", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeyrail-loader-val-"));
+  const path = await writePrivateTruth(dir, {
+    upstreamBug: "Synthetic BUG #00099",
+    historicalRevision: "c".repeat(40),
+    referenceRevision: "not-a-sha",
+    structuredOracle: {
+      historical: { rows: [["alpha", "x"]] },
+      reference: { rows: [["beta", "m"]] }
+    }
+  });
+  await assert.rejects(
+    () => loadHistoricalPostgres003PrivateTruth(path),
+    /40-character commit SHA/i
+  );
+});
+
+test("loadHistoricalPostgres003PrivateTruth: rejects a field that is not a string", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeyrail-loader-val-"));
+  const path = await writePrivateTruth(dir, {
+    upstreamBug: "Synthetic BUG #00099",
+    historicalRevision: "c".repeat(40),
+    referenceRevision: "d".repeat(40),
+    structuredOracle: {
+      historical: { rows: [[42, "x"]] }, // 42 is not a string
+      reference: { rows: [["beta", "m"]] }
+    }
+  });
+  await assert.rejects(
+    () => loadHistoricalPostgres003PrivateTruth(path),
+    /must be a string/i
+  );
+});
+
+test("loadHistoricalPostgres003PrivateTruth: rejects ordered present but not a boolean", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeyrail-loader-val-"));
+  const path = await writePrivateTruth(dir, {
+    upstreamBug: "Synthetic BUG #00099",
+    historicalRevision: "c".repeat(40),
+    referenceRevision: "d".repeat(40),
+    structuredOracle: {
+      historical: { rows: [["alpha", "x"]], ordered: "yes" }, // "yes" is not a boolean
+      reference: { rows: [["beta", "m"]] }
+    }
+  });
+  await assert.rejects(
+    () => loadHistoricalPostgres003PrivateTruth(path),
+    /ordered must be a boolean/i
+  );
+});
+
+test("loadHistoricalPostgres003PrivateTruth: rejects a field containing the separator", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeyrail-loader-val-"));
+  const path = await writePrivateTruth(dir, {
+    upstreamBug: "Synthetic BUG #00099",
+    historicalRevision: "c".repeat(40),
+    referenceRevision: "d".repeat(40),
+    structuredOracle: {
+      historical: { rows: [["alpha|x"]] }, // contains separator
+      reference: { rows: [["beta", "m"]] }
+    }
+  });
+  await assert.rejects(
+    () => loadHistoricalPostgres003PrivateTruth(path),
+    /field separator/i
+  );
+});
+
+test("loadHistoricalPostgres003PrivateTruth: rejects a field containing CR", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeyrail-loader-val-"));
+  const path = await writePrivateTruth(dir, {
+    upstreamBug: "Synthetic BUG #00099",
+    historicalRevision: "c".repeat(40),
+    referenceRevision: "d".repeat(40),
+    structuredOracle: {
+      historical: { rows: [["alpha\rx"]] }, // contains CR
+      reference: { rows: [["beta", "m"]] }
+    }
+  });
+  await assert.rejects(
+    () => loadHistoricalPostgres003PrivateTruth(path),
+    /CR character/i
+  );
+});
+
+test("loadHistoricalPostgres003PrivateTruth: rejects a field containing LF", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeyrail-loader-val-"));
+  const path = await writePrivateTruth(dir, {
+    upstreamBug: "Synthetic BUG #00099",
+    historicalRevision: "c".repeat(40),
+    referenceRevision: "d".repeat(40),
+    structuredOracle: {
+      historical: { rows: [["alpha\nx"]] }, // contains LF
+      reference: { rows: [["beta", "m"]] }
+    }
+  });
+  await assert.rejects(
+    () => loadHistoricalPostgres003PrivateTruth(path),
+    /LF character/i
+  );
+});
+
+test("loadHistoricalPostgres003PrivateTruth: rejects identical historical and reference sides", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeyrail-loader-val-"));
+  const path = await writePrivateTruth(dir, {
+    upstreamBug: "Synthetic BUG #00099",
+    historicalRevision: "c".repeat(40),
+    referenceRevision: "d".repeat(40),
+    structuredOracle: {
+      historical: { rows: [["alpha", "x"]] },
+      reference: { rows: [["alpha", "x"]] } // identical to historical
+    }
+  });
+  await assert.rejects(
+    () => loadHistoricalPostgres003PrivateTruth(path),
+    /identical/i
+  );
 });
