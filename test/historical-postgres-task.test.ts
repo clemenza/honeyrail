@@ -145,11 +145,17 @@ test("historical task truth bundle hash covers the bug identity and both revisio
   assert.notEqual(revisionChanged.truthManifest.bundleHash, baseline.truthManifest.bundleHash);
   assert.notEqual(reproA.truthManifest.bundleHash, reproB.truthManifest.bundleHash);
   assert.notEqual(reproA.truthManifest.bundleHash, baseline.truthManifest.bundleHash);
-  // A declared behavioral oracle is truth material too: it moves the hash,
-  // and its absence is recorded as null rather than dropped from the shape.
+  // A declared behavioral oracle is truth material too: it moves the hash.
+  // Its absence omits the key entirely (Policy A - see below), rather than
+  // recording it as null, so a legacy spec's serialized bundle stays exactly
+  // as it always was.
   assert.notEqual(oracleDeclared.truthManifest.bundleHash, baseline.truthManifest.bundleHash);
   assert.deepEqual(oracleDeclared.truthManifest.behavioralOracle, oraclePattern);
-  assert.equal(baseline.truthManifest.behavioralOracle, null);
+  // Key presence itself is conditional (Policy A / #200 third review round):
+  // a spec that declares no oracle must not gain a "behavioralOracle": null
+  // key at all, not just a null value - this file uses node:assert/strict,
+  // where `equal` is `strictEqual`, so `undefined` would not satisfy `null`.
+  assert.ok(!("behavioralOracle" in baseline.truthManifest));
 
   // The retained file and manifest path must reflect which canonical
   // reproducer produced each bundle, not just its hash.

@@ -44,25 +44,53 @@ export type HistoricalPostgresOracleResult = {
 };
 
 /**
+ * One psql/libpq message-record line: an optional non-semantic
+ * "psql:<file>:<line>:" label, then a recognized severity level, a colon,
+ * and the canonical two-space psql/libpq formatting (`errmsg`/`errdetail`'s
+ * own convention) before the message body. Anchored to the start of the
+ * line - not just "contains ERROR:" - so ordinary query output that merely
+ * *mentions* the substring "ERROR:" (e.g. a literal string a SELECT
+ * returns, or prose logged mid-line) is never mistaken for a real server
+ * error record. Every recognized severity is listed (not just ERROR) so
+ * `extractPsqlErrorObservations` can positively exclude
+ * WARNING/NOTICE/DETAIL/HINT/CONTEXT/STATEMENT/LOG/INFO/DEBUG* continuation
+ * lines rather than merely happening not to match them.
+ */
+const PSQL_MESSAGE_LINE = /^(?:psql:[^:]*:\d+:\s*)?(ERROR|WARNING|NOTICE|DETAIL|HINT|CONTEXT|STATEMENT|LOG|INFO|DEBUG\d?):  (.*)$/;
+
+export type HistoricalPostgresPsqlMessage = { severity: string; message: string };
+
+/** Every recognized psql/libpq message record in stderr, in order, with severity kept structurally. */
+export function extractPsqlMessages(stderr: string): HistoricalPostgresPsqlMessage[] {
+  const messages: HistoricalPostgresPsqlMessage[] = [];
+  for (const line of String(stderr ?? "").split(/\r?\n/)) {
+    const match = PSQL_MESSAGE_LINE.exec(line);
+    if (match) messages.push({ severity: match[1], message: match[2].trim() });
+  }
+  return messages;
+}
+
+/**
  * Extracts the ordered sequence of psql `ERROR` message bodies from raw
  * stderr captured with `ON_ERROR_STOP off` (so the script can run past an
  * expected error to reach later statements - see
  * docs/historical-postgres-task-v0.md).
  *
- * Deliberately keeps only the text after `ERROR:` on each matching line, so
- * any leading `psql:<file>:<line>:` label is stripped along with it - source
+ * Requires the canonical two-space `LEVEL:  message` formatting, anchored to
+ * the start of the line (with an optional leading `psql:<file>:<line>:`
+ * label, which is stripped along with the rest of the label - source
  * path/line therefore never enters the observation text in the common case,
- * and the oracle never has to normalize it separately. `DETAIL`/`CONTEXT`/
- * `HINT` continuation lines are not included; each observation is exactly
- * one `ERROR` line's message, trimmed.
+ * and the oracle never has to normalize it separately). `WARNING`/`NOTICE`/
+ * `DETAIL`/`HINT`/`CONTEXT`/`STATEMENT`/`LOG`/`INFO`/`DEBUG*` lines are
+ * recognized but deliberately excluded - only `ERROR`-severity records ever
+ * become observations. A bare substring `ERROR:` appearing mid-line in
+ * otherwise-ordinary output never matches, since it isn't anchored to the
+ * start of the line in the required record shape.
  */
 export function extractPsqlErrorObservations(stderr: string): string[] {
-  const observations: string[] = [];
-  for (const line of String(stderr ?? "").split(/\r?\n/)) {
-    const match = /ERROR:\s?(.*)$/.exec(line);
-    if (match) observations.push(match[1].trim());
-  }
-  return observations;
+  return extractPsqlMessages(stderr)
+    .filter((entry) => entry.severity === "ERROR")
+    .map((entry) => entry.message);
 }
 
 /**
@@ -104,30 +132,74 @@ export function evaluateBehavioralOracle(observations: string[], expected: Histo
   return { observations, expected, satisfied, diagnostics };
 }
 
+/**
+ * `{ valid: true }` when a captured psql execution is even interpretable;
+ * `{ valid: false, reason }` when it is a client/transport/runtime failure
+ * that must never be scored as a `miss` or `invalid_submission` just
+ * because it happened to produce zero (or garbage) observations - see
+ * `classifyExecutionValidity()`, which is what decides this, and #200's
+ * third review round, which is why this exists as its own structural
+ * concept rather than being inferred from observation count.
+ */
+export type HistoricalPostgresExecutionValidity = { valid: true } | { valid: false; reason: string };
+
+/**
+ * Decides whether a captured psql execution is even interpretable before any
+ * behavioral matching runs. Deliberately structural: inspects
+ * `execution.exitCode`/`execution.stderr` for known transport/runtime-level
+ * failure signatures, never SQL-level content - a real `ERROR:` record from
+ * the server, even a completely unexpected one, is a *valid*, interpretable
+ * execution; whether it matches anything declared is a separate question
+ * `evaluateOracleAttribution()` answers, not this function.
+ */
+export function classifyExecutionValidity(execution: {
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+  exitCode?: number | string;
+  durationMs: number;
+}): HistoricalPostgresExecutionValidity {
+  if (execution.exitCode === "ETIMEDOUT") {
+    return { valid: false, reason: "psql execution timed out before completing - not attributable to any declared behavior." };
+  }
+  const stderrText = String(execution.stderr ?? "");
+  const transportFailureSignatures: { pattern: RegExp; reason: string }[] = [
+    { pattern: /could not connect to server/i, reason: "psql could not connect to the server." },
+    { pattern: /server closed the connection unexpectedly/i, reason: "the server closed the connection unexpectedly (crash or restart)." },
+    { pattern: /the connection to the server was lost/i, reason: "the connection to the server was lost mid-session." },
+    { pattern: /No such container/i, reason: "the runtime container was not found (docker transport failure)." },
+    { pattern: /Error response from daemon/i, reason: "the Docker daemon reported a transport-level error." },
+    { pattern: /OCI runtime exec failed/i, reason: "the container runtime failed to exec the psql client." },
+    { pattern: /^could not read .+: /i, reason: "the grader could not read the reproducer file to execute it." }
+  ];
+  const matched = transportFailureSignatures.find(({ pattern }) => pattern.test(stderrText));
+  if (matched) return { valid: false, reason: matched.reason };
+  return { valid: true };
+}
+
 export type HistoricalPostgresOracleAttribution = {
   /**
-   * True iff extraction captured at least one observation at all - i.e. the
-   * run produced something to evaluate, as opposed to a totally empty
-   * capture (e.g. psql never reached a CALL, or stderr was empty). This is
-   * "did we get gradeable output", independent of whether what was captured
-   * matches either declared pattern set - see #200's second review round,
-   * which asked for execution validity to be represented separately from
-   * behavioral attribution rather than folded into a single boolean.
+   * Execution-validity decision, computed *before* any behavioral matching -
+   * see `classifyExecutionValidity()`. When `valid: false`, `attributedTo` is
+   * always `"unattributed"` regardless of what (if anything) was captured;
+   * a client/transport/runtime failure must never read as "the bug is
+   * absent" or "the bug wasn't reproduced" just because it produced no
+   * usable observations.
    */
-  gradeable: boolean;
+  validity: HistoricalPostgresExecutionValidity;
   /** Observations matched against the oracle's `historical` pattern set. */
   historicalMatch: HistoricalPostgresOracleResult;
   /** Observations matched against the oracle's `reference` pattern set. */
   referenceMatch: HistoricalPostgresOracleResult;
   /**
    * Structural attribution - not just diagnostic prose. `"unattributed"`
-   * covers both "matched neither declared pattern set" (the primary
-   * correctness fix this type exists for: an unrelated/unexpected
-   * reference-side failure must never silently pass as "the bug is absent")
-   * and the pathological case where both matched (a task-authoring bug in
-   * the declared oracle itself - historical and reference patterns should be
-   * mutually exclusive by construction, so this fails closed rather than
-   * picking one arbitrarily).
+   * covers: an invalid execution (see `validity` above); "matched neither
+   * declared pattern set" (an unrelated/unexpected reference-side failure
+   * must never silently pass as "the bug is absent"); and the pathological
+   * case where both matched (a task-authoring bug in the declared oracle
+   * itself - historical and reference patterns should be mutually exclusive
+   * by construction, so this fails closed rather than picking one
+   * arbitrarily).
    */
   attributedTo: "historical" | "reference" | "unattributed";
 };
@@ -135,15 +207,23 @@ export type HistoricalPostgresOracleAttribution = {
 /**
  * Evaluates one revision run's captured observations against *both* halves
  * of a declared oracle and produces a structural attribution. Pure, no I/O.
+ * `validity` must already reflect whether `observations` is trustworthy
+ * (callers should pass `[]` when `!validity.valid` - see
+ * `resolveOracleReproduction()` in historical-task.ts).
  */
-export function evaluateOracleAttribution(observations: string[], oracle: HistoricalPostgresBehavioralOracle): HistoricalPostgresOracleAttribution {
+export function evaluateOracleAttribution(
+  observations: string[],
+  oracle: HistoricalPostgresBehavioralOracle,
+  validity: HistoricalPostgresExecutionValidity
+): HistoricalPostgresOracleAttribution {
   const historicalMatch = evaluateBehavioralOracle(observations, oracle.historical);
   const referenceMatch = evaluateBehavioralOracle(observations, oracle.reference);
-  const attributedTo: HistoricalPostgresOracleAttribution["attributedTo"] =
-    historicalMatch.satisfied && !referenceMatch.satisfied
+  const attributedTo: HistoricalPostgresOracleAttribution["attributedTo"] = !validity.valid
+    ? "unattributed"
+    : historicalMatch.satisfied && !referenceMatch.satisfied
       ? "historical"
       : referenceMatch.satisfied && !historicalMatch.satisfied
         ? "reference"
         : "unattributed";
-  return { gradeable: observations.length > 0, historicalMatch, referenceMatch, attributedTo };
+  return { validity, historicalMatch, referenceMatch, attributedTo };
 }

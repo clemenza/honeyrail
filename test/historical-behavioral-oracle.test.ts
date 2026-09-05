@@ -1,11 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  classifyExecutionValidity,
   evaluateBehavioralOracle,
   evaluateOracleAttribution,
   extractPsqlErrorObservations,
   type HistoricalPostgresBehavioralOracle
 } from "../server/postgres/historical-behavioral-oracle.js";
+
+const VALID = { valid: true } as const;
+
+function executionOf(overrides: { stderr?: string; exitCode?: number | string; ok?: boolean }) {
+  return { ok: overrides.ok ?? true, stdout: "", stderr: overrides.stderr ?? "", exitCode: overrides.exitCode ?? 0, durationMs: 1 };
+}
 
 test("extractPsqlErrorObservations: single ERROR line", () => {
   const stderr = 'psql:<stdin>:3: ERROR:  procedure parameter "r1" is an output parameter but corresponding argument is not writable\n';
@@ -44,6 +51,31 @@ test("extractPsqlErrorObservations: no leading psql:<file>:<line>: label leaks i
 test("extractPsqlErrorObservations: empty stderr yields no observations", () => {
   assert.deepEqual(extractPsqlErrorObservations(""), []);
   assert.deepEqual(extractPsqlErrorObservations("NOTICE:  everything fine\n"), []);
+});
+
+test("extractPsqlErrorObservations: a NOTICE line is recognized but excluded", () => {
+  assert.deepEqual(extractPsqlErrorObservations("NOTICE:  identifier will be truncated\n"), []);
+});
+
+test("extractPsqlErrorObservations: a WARNING line is recognized but excluded", () => {
+  assert.deepEqual(extractPsqlErrorObservations("WARNING:  there is already a transaction in progress\n"), []);
+});
+
+test("extractPsqlErrorObservations: a DETAIL line is recognized but excluded", () => {
+  assert.deepEqual(extractPsqlErrorObservations('DETAIL:  Key (id)=(1) is not present in table "parent".\n'), []);
+});
+
+test("extractPsqlErrorObservations: a CONTEXT line is recognized but excluded", () => {
+  assert.deepEqual(extractPsqlErrorObservations('CONTEXT:  SQL statement "INSERT INTO child VALUES (1)"\n'), []);
+});
+
+test("extractPsqlErrorObservations: a HINT line is recognized but excluded", () => {
+  assert.deepEqual(extractPsqlErrorObservations("HINT:  You will need to rewrite or cast the expression.\n"), []);
+});
+
+test("extractPsqlErrorObservations: arbitrary stderr text merely containing the literal substring \"ERROR:\" mid-line is never treated as an observation", () => {
+  assert.deepEqual(extractPsqlErrorObservations("the query log noted an ERROR: condition earlier\n"), []);
+  assert.deepEqual(extractPsqlErrorObservations("this line mentions ERROR: but is not a real record and has no leading anchor\n"), []);
 });
 
 test("evaluateBehavioralOracle: ordered match succeeds", () => {
@@ -125,27 +157,26 @@ const ORACLE: HistoricalPostgresBehavioralOracle = {
 };
 
 test("evaluateOracleAttribution: attributes \"historical\" when only the historical pattern set matches", () => {
-  const result = evaluateOracleAttribution(["baseline error", "stale-cache error 42"], ORACLE);
+  const result = evaluateOracleAttribution(["baseline error", "stale-cache error 42"], ORACLE, VALID);
   assert.equal(result.attributedTo, "historical");
   assert.equal(result.historicalMatch.satisfied, true);
   assert.equal(result.referenceMatch.satisfied, false);
-  assert.equal(result.gradeable, true);
+  assert.equal(result.validity.valid, true);
 });
 
 test("evaluateOracleAttribution: attributes \"reference\" when only the reference pattern set matches", () => {
-  const result = evaluateOracleAttribution(["baseline error", "baseline error"], ORACLE);
+  const result = evaluateOracleAttribution(["baseline error", "baseline error"], ORACLE, VALID);
   assert.equal(result.attributedTo, "reference");
   assert.equal(result.historicalMatch.satisfied, false);
   assert.equal(result.referenceMatch.satisfied, true);
-  assert.equal(result.gradeable, true);
+  assert.equal(result.validity.valid, true);
 });
 
 test("evaluateOracleAttribution: attributes \"unattributed\" when neither pattern set matches", () => {
-  const result = evaluateOracleAttribution(["baseline error", "connection refused"], ORACLE);
+  const result = evaluateOracleAttribution(["baseline error", "connection refused"], ORACLE, VALID);
   assert.equal(result.attributedTo, "unattributed");
   assert.equal(result.historicalMatch.satisfied, false);
   assert.equal(result.referenceMatch.satisfied, false);
-  assert.equal(result.gradeable, true);
 });
 
 test("evaluateOracleAttribution: attributes \"unattributed\" (fails closed) when, pathologically, both pattern sets match", () => {
@@ -153,15 +184,68 @@ test("evaluateOracleAttribution: attributes \"unattributed\" (fails closed) when
     historical: [{ label: "only", matches: "^ambiguous error$" }],
     reference: [{ label: "only", matches: "^ambiguous error$" }]
   };
-  const result = evaluateOracleAttribution(["ambiguous error"], overlapping);
+  const result = evaluateOracleAttribution(["ambiguous error"], overlapping, VALID);
   assert.equal(result.attributedTo, "unattributed");
   assert.equal(result.historicalMatch.satisfied, true);
   assert.equal(result.referenceMatch.satisfied, true);
 });
 
-test("evaluateOracleAttribution: gradeable is false only when no observations were captured at all, independent of match outcome", () => {
-  assert.equal(evaluateOracleAttribution([], ORACLE).gradeable, false);
-  assert.equal(evaluateOracleAttribution([], ORACLE).attributedTo, "unattributed");
-  assert.equal(evaluateOracleAttribution(["totally unrelated"], ORACLE).gradeable, true);
-  assert.equal(evaluateOracleAttribution(["totally unrelated"], ORACLE).attributedTo, "unattributed");
+test("evaluateOracleAttribution: an invalid execution is always unattributed, regardless of what text happens to be present", () => {
+  const invalid = { valid: false, reason: "test-injected transport failure" } as const;
+  // Even text that would otherwise satisfy the historical pattern set must
+  // not be attributed when the execution itself wasn't valid/interpretable.
+  const result = evaluateOracleAttribution(["baseline error", "stale-cache error 42"], ORACLE, invalid);
+  assert.equal(result.attributedTo, "unattributed");
+  assert.equal(result.validity.valid, false);
+});
+
+test("evaluateOracleAttribution: zero observations on a valid execution is unattributed, not a special case", () => {
+  const result = evaluateOracleAttribution([], ORACLE, VALID);
+  assert.equal(result.attributedTo, "unattributed");
+  assert.equal(result.validity.valid, true);
+});
+
+test("classifyExecutionValidity: a client/spawn invocation failure is invalid", () => {
+  const result = classifyExecutionValidity(
+    executionOf({ stderr: "docker: Error response from daemon: No such container: honeyrail-pg-runtime-abc123.", exitCode: 1, ok: false })
+  );
+  assert.equal(result.valid, false);
+});
+
+test("classifyExecutionValidity: a connection failure is invalid", () => {
+  const result = classifyExecutionValidity(
+    executionOf({
+      stderr:
+        'psql: error: connection to server on socket "/tmp/.s.PGSQL.5432" failed: No such file or directory\n\tcould not connect to server',
+      exitCode: 2,
+      ok: false
+    })
+  );
+  assert.equal(result.valid, false);
+});
+
+test("classifyExecutionValidity: a timeout is invalid", () => {
+  const result = classifyExecutionValidity(executionOf({ stderr: "\ntimed out after 120000ms", exitCode: "ETIMEDOUT", ok: false }));
+  assert.equal(result.valid, false);
+});
+
+test("classifyExecutionValidity: runtime/server death is invalid", () => {
+  const result = classifyExecutionValidity(
+    executionOf({
+      stderr: "server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally",
+      exitCode: 2,
+      ok: false
+    })
+  );
+  assert.equal(result.valid, false);
+});
+
+test("classifyExecutionValidity: a normal execution containing a real (even unexpected) ERROR record is valid", () => {
+  // The crux: a genuine SQL-level error - however unexpected - is a valid,
+  // interpretable execution. Whether it matches anything declared is
+  // evaluateOracleAttribution's job, not this function's.
+  const result = classifyExecutionValidity(
+    executionOf({ stderr: 'ERROR:  relation "totally_unrelated_table" does not exist', exitCode: 1, ok: false })
+  );
+  assert.equal(result.valid, true);
 });
