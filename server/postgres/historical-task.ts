@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { cp, lstat, mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
-import { nowIso } from "../utils.js";
+import { nowIso, runCommandSafe } from "../utils.js";
 import {
   createAgentEnvRoot,
   materializePostgresSource,
@@ -20,7 +20,7 @@ import {
 import {
   classifyExecutionValidity,
   evaluateOracleAttribution,
-  extractPsqlErrorObservations,
+  extractPsqlErrorMessages,
   type HistoricalPostgresBehavioralOracle,
   type HistoricalPostgresObservationPattern,
   type HistoricalPostgresOracleAttribution
@@ -31,6 +31,7 @@ export type {
   HistoricalPostgresExecutionValidity,
   HistoricalPostgresObservationPattern,
   HistoricalPostgresOracleAttribution,
+  HistoricalPostgresOracleObservationInput,
   HistoricalPostgresOracleResult,
   HistoricalPostgresPsqlMessage
 } from "./historical-behavioral-oracle.js";
@@ -108,6 +109,14 @@ export type HistoricalPostgresTaskSpec = {
      * Copied byte-identical into reference/expected-behavior/fix-evidence
      * (fixed name, regardless of the source file's own name/extension) and
      * hashed into the truth bundle - never written anywhere under task/.
+     *
+     * Overrides auto-generation: when omitted and `behavioralOracle` (below)
+     * is declared, `materializeHistoricalPostgresTask()` generates real
+     * fix-evidence itself - a `git diff` between `historicalRevision` and
+     * `referenceRevision` in `repoPath`, which the local mirror this task
+     * type already requires makes available for free (#200 fourth review
+     * round, Blocking 4). Supply this only when narrative content a raw diff
+     * can't capture is worth adding.
      */
     knownFixEvidencePath?: string;
     /**
@@ -211,15 +220,23 @@ export type HistoricalPostgresTruthManifest = {
   /** SHA-256 of the canonical verification reproducer, when one was supplied; never the agent's. */
   canonicalReproducerSha256: string | null;
   /**
-   * Grader-private relative path to fix/reference evidence, when supplied -
-   * see HistoricalPostgresTaskSpec.truth.knownFixEvidencePath. `null` when
-   * none was supplied (this is a brand-new field with no pre-existing bytes
-   * to preserve, unlike `behavioralOracle` below, so unconditional `null` is
-   * fine here).
+   * Grader-private relative path to fix/reference evidence, present when
+   * either an operator explicitly supplied `truth.knownFixEvidencePath` or
+   * (for any task that declares `truth.behavioralOracle`) it was
+   * auto-generated as a real `git diff` between the two pinned revisions -
+   * see `materializeHistoricalPostgresTask()`'s Blocking-4 fix-evidence
+   * generation and HistoricalPostgresTaskSpec.truth.knownFixEvidencePath.
+   * The key itself - like `behavioralOracle` below - is omitted (not
+   * present-as-`null`) when neither applies, so a legacy exit-status task's
+   * (case 001's) serialized truth bundle - and therefore its hash - is
+   * byte-identical to what it was before this field existed (#200 fourth
+   * review round, "Blocking 3" - a corrected version of the third round's
+   * "unconditional null is fine here, it's brand new" reasoning, which was
+   * wrong: brand-new-to-this-PR does not mean safe-to-add-unconditionally).
    */
-  fixEvidence: string | null;
-  /** SHA-256 of the fix/reference evidence file, when supplied. */
-  fixEvidenceSha256: string | null;
+  fixEvidence?: string;
+  /** SHA-256 of the fix/reference evidence file. Present exactly when `fixEvidence` is. */
+  fixEvidenceSha256?: string;
   /**
    * Present only when the task declares `truth.behavioralOracle` - the key
    * itself is omitted (not present-as-`null`) when absent, so a legacy
@@ -473,18 +490,52 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
     canonicalReproducer = canonicalReproducerRelativePath;
     canonicalReproducerSha256 = sha256(canonicalReproducerContents);
   }
-  // Grader-private fix/reference evidence (#200 third review round, 5.B):
-  // same discipline as the canonical reproducer above - copied byte-identical
-  // under a fixed name (never the source file's own name), hashed, and
-  // covered by expectedBehaviorSha256/bundleHash. Purely optional provenance;
-  // never read by the grader during scoring and never written under task/.
-  const fixEvidenceRelativePath = "expected-behavior/fix-evidence";
-  let fixEvidence: string | null = null;
-  let fixEvidenceSha256: string | null = null;
+  // Grader-private fix/reference evidence (#200 third review round, 5.B;
+  // auto-generation added fourth review round, Blocking 4). Same discipline
+  // as the canonical reproducer above - copied/written under a fixed name
+  // (never a source file's own name), hashed, and covered by
+  // expectedBehaviorSha256/bundleHash. Purely optional provenance; never read
+  // by the grader during scoring and never written under task/.
+  //
+  // `knownFixEvidencePath`, when supplied, is an explicit operator override
+  // (narrative content a raw diff can't capture). Otherwise, for any task
+  // that declares `behavioralOracle`, real evidence is auto-generated from
+  // the local mirror this task type already requires - a `git diff` between
+  // the two pinned revisions - so a real historical task never has to rely
+  // on a manually maintained extra private file. A legacy exit-status task
+  // (no oracle declared, e.g. case 001) attempts neither path and keeps
+  // `fixEvidence`/`fixEvidenceSha256` absent from the truth bundle entirely
+  // (Policy A - see below).
+  //
+  // Generation failure is loud, not silent: an oracle-declaring task's
+  // `referenceRevision` must actually be diffable against `historicalRevision`
+  // in `repoPath`, or this throws - "missing evidence when the task requires
+  // it fails loudly, rather than silently satisfying acceptance" (#200
+  // fourth review round). An *empty* diff (two distinct commits with
+  // byte-identical trees - vanishingly unlikely for a real historical bug,
+  // but not itself a failure) is not an error; only `git diff` itself
+  // failing (e.g. an unresolvable ref) is.
+  let fixEvidence: string | undefined;
+  let fixEvidenceSha256: string | undefined;
   if (input.truth.knownFixEvidencePath) {
     const fixEvidenceContents = await readFile(input.truth.knownFixEvidencePath);
     await writeFile(join(expectedBehaviorDir, "fix-evidence"), fixEvidenceContents);
-    fixEvidence = fixEvidenceRelativePath;
+    fixEvidence = "expected-behavior/fix-evidence";
+    fixEvidenceSha256 = sha256(fixEvidenceContents);
+  } else if (input.truth.behavioralOracle) {
+    const diff = await runCommandSafe(
+      "git",
+      ["-C", input.source.repoPath, "diff", input.source.historicalRevision, input.source.referenceRevision],
+      { timeout: 60_000, maxBuffer: 1024 * 1024 * 8 }
+    );
+    if (!diff.ok) {
+      throw new Error(
+        `Could not generate grader-private fix/reference evidence: git diff ${input.source.historicalRevision} ${input.source.referenceRevision} in ${input.source.repoPath} failed: ${(diff.stderr || diff.stdout).trim()}`
+      );
+    }
+    const fixEvidenceContents = Buffer.from(diff.stdout, "utf8");
+    await writeFile(join(expectedBehaviorDir, "fix-evidence.diff"), fixEvidenceContents);
+    fixEvidence = "expected-behavior/fix-evidence.diff";
     fixEvidenceSha256 = sha256(fixEvidenceContents);
   }
   const expectedBehaviorSha256 = await hashDirectoryContents(referenceDir);
@@ -524,14 +575,17 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
     gradingProtocol,
     canonicalReproducer,
     canonicalReproducerSha256,
-    fixEvidence,
-    fixEvidenceSha256,
     // Key presence itself is conditional (not just its value) so a legacy
-    // spec that declares no oracle - case 001, and any synthetic/unit-test
-    // spec - serializes with exactly the same key set it always has, byte
-    // for byte, rather than gaining a new "behavioralOracle":null entry that
-    // would move bundleHash for zero behavioral reason (#200 third review
-    // round, "Important 4" / Policy A).
+    // spec that declares no oracle and no fix evidence - case 001, and any
+    // synthetic/unit-test spec that doesn't opt into either - serializes
+    // with exactly the same key set it always has, byte for byte, rather
+    // than gaining new "behavioralOracle":null / "fixEvidence":null entries
+    // that would move bundleHash for zero behavioral reason (#200 third
+    // review round, "Important 4" / Policy A - corrected in the fourth round
+    // to actually cover fixEvidence/fixEvidenceSha256 too, which an earlier
+    // round had added unconditionally on the mistaken reasoning that
+    // "brand new to this PR" meant "safe to add unconditionally").
+    ...(fixEvidence ? { fixEvidence, fixEvidenceSha256 } : {}),
     ...(input.truth.behavioralOracle ? { behavioralOracle: input.truth.behavioralOracle } : {}),
     expectedBehaviorSha256,
     taskDefinitionHash
@@ -675,7 +729,10 @@ export function resolveOracleReproduction(input: {
   // A client/transport/runtime failure never gets to claim it "matched"
   // anything - observations from an execution we can't even trust are
   // discarded before evaluation, not merely likely to fail to match.
-  const observations = validity.valid ? extractPsqlErrorObservations(input.execution.stderr) : [];
+  // Structured (not just message text) so a pattern that opts into
+  // `sqlstate` checking (#200 fourth review round, Blocking 2) can actually
+  // see it.
+  const observations = validity.valid ? extractPsqlErrorMessages(input.execution.stderr) : [];
   const attribution = evaluateOracleAttribution(observations, behavioralOracle, validity);
   return { reproduced: attribution.attributedTo === "historical", attribution };
 }

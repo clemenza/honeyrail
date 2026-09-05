@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,7 +12,7 @@ import {
   resolveOracleReproduction,
   type HistoricalPostgresTaskSpec
 } from "../server/postgres/historical-task.js";
-import { createSyntheticPostgresSourceRepo } from "./helpers/postgres-source-fixture.js";
+import { createAdditionalSyntheticCommit, createSyntheticPostgresSourceRepo } from "./helpers/postgres-source-fixture.js";
 import { readTreeAsText } from "./helpers/read-tree-as-text.js";
 
 test("historicalPostgres002TaskSpec carries the frozen #185 Bug 2 identity behind an opaque task id, and no CommitFest", () => {
@@ -155,6 +156,12 @@ test("postgres-historical-001 still materializes and hashes under the widened tr
   // pre-existing schema for zero behavioral reason.
   assert.ok(!("behavioralOracle" in task.truthManifest));
   assert.ok(!JSON.stringify(task.truthManifest).includes("behavioralOracle"));
+  // Same Policy-A treatment for fix-evidence (#200 fourth review round,
+  // Blocking 3): a legacy spec declares no oracle, so fix-evidence
+  // auto-generation never runs, and (having supplied no knownFixEvidencePath
+  // either) gets neither key at all - not present-as-null.
+  assert.ok(!("fixEvidence" in task.truthManifest));
+  assert.ok(!("fixEvidenceSha256" in task.truthManifest));
   // Backward compatibility for the grading-protocol identifier change: a
   // spec that declares no behavioralOracle (case 001) must still get the
   // exact original protocol string, byte-for-byte - never the new
@@ -211,9 +218,14 @@ test("knownFixEvidencePath is optional grader-private provenance: present when s
     build: { mode: "host" },
     prompt: "Test the supplied PostgreSQL source for a correctness regression."
   };
+  // baseSpec declares no behavioralOracle and no knownFixEvidencePath, so
+  // this is the legacy path: neither key is generated, and (#200 fourth
+  // review round, Blocking 3) neither key is even *present* - not
+  // present-as-null - matching behavioralOracle's own Policy-A treatment.
   const withoutEvidence = await materializeHistoricalPostgresTask(baseSpec, join(root, "without-evidence"));
-  assert.equal(withoutEvidence.truthManifest.fixEvidence, null);
-  assert.equal(withoutEvidence.truthManifest.fixEvidenceSha256, null);
+  assert.ok(!("fixEvidence" in withoutEvidence.truthManifest));
+  assert.ok(!("fixEvidenceSha256" in withoutEvidence.truthManifest));
+  assert.ok(!JSON.stringify(withoutEvidence.truthManifest).includes("fixEvidence"));
 
   const withEvidence = await materializeHistoricalPostgresTask(
     { ...baseSpec, truth: { ...baseSpec.truth, knownFixEvidencePath: fixEvidencePath } },
@@ -236,6 +248,114 @@ test("knownFixEvidencePath is optional grader-private provenance: present when s
   }
 });
 
+test("Policy A: a legacy truth bundle (no behavioralOracle, no fix evidence) is byte-for-byte identical to the pristine pre-#200 schema", async () => {
+  // #200 fourth review round, Blocking 3 - a real golden-compatibility
+  // proof, not just "one field happens to be absent": reconstructs the
+  // pristine pre-#200 (commit 7815901) truthShape literally, using this
+  // run's own resolved values, and proves the current legacy-path output
+  // has exactly that key set and those values, and therefore hashes
+  // identically under the same canonicalize+sha256 algorithm the code
+  // itself uses. This must fail if any new key is ever accidentally added
+  // to a legacy bundle in the future.
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-historical-golden-"));
+  const repo = await createSyntheticPostgresSourceRepo(root);
+  const spec: HistoricalPostgresTaskSpec = {
+    taskId: "postgres-historical-001",
+    source: { repoPath: repo.repoPath, historicalRevision: repo.ref, referenceRevision: repo.laterRef },
+    truth: { upstreamBug: "PostgreSQL #19560", commitFest: 7059 },
+    build: { mode: "host" },
+    prompt: "Test the supplied PostgreSQL source for a join-planning correctness regression."
+  };
+  const task = await materializeHistoricalPostgresTask(spec, join(root, "case"));
+
+  const { bundleHash: _currentBundleHash, ...currentWithoutBundleHash } = task.truthManifest;
+  const pristineShape = {
+    schemaVersion: 1 as const,
+    taskId: spec.taskId,
+    upstreamBug: spec.truth.upstreamBug,
+    commitFest: spec.truth.commitFest,
+    historicalRevision: task.truthManifest.historicalRevision,
+    referenceRevision: task.truthManifest.referenceRevision,
+    gradingProtocol: "submitted-reproducer-exit-status-v1" as const,
+    canonicalReproducer: task.truthManifest.canonicalReproducer,
+    canonicalReproducerSha256: task.truthManifest.canonicalReproducerSha256,
+    expectedBehaviorSha256: task.truthManifest.expectedBehaviorSha256,
+    taskDefinitionHash: task.truthManifest.taskDefinitionHash
+  };
+
+  // Exact key set: nothing added (behavioralOracle, fixEvidence,
+  // fixEvidenceSha256 all correctly absent), nothing missing.
+  assert.deepEqual(Object.keys(currentWithoutBundleHash).sort(), Object.keys(pristineShape).sort());
+  assert.deepEqual(currentWithoutBundleHash, pristineShape);
+
+  // And hashing the pristine shape with the exact same canonicalize+sha256
+  // algorithm the code itself uses reproduces the *actual* bundleHash the
+  // current code wrote - not merely "the shapes look equal".
+  function canonicalize(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(canonicalize);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([key, nested]) => [key, canonicalize(nested)])
+      );
+    }
+    return value;
+  }
+  const pristineHash = createHash("sha256").update(JSON.stringify(canonicalize(pristineShape), null, 2)).digest("hex");
+  assert.equal(pristineHash, task.truthManifest.bundleHash);
+
+  // Locked down explicitly, since Blocking 4 adds new logic near this area:
+  // taskDefinitionHash for this legacy input is unaffected by any of it.
+  assert.equal(task.taskManifest.hashes.taskDefinition, task.truthManifest.taskDefinitionHash);
+});
+
+test("Blocking 4: an oracle-declaring task auto-generates real grader-private fix evidence from the local mirror", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-historical-002-fixevidence-gen-"));
+  const repo = await createSyntheticPostgresSourceRepo(root);
+  const base = historicalPostgres002TaskSpec(repo.repoPath);
+  const spec: HistoricalPostgresTaskSpec = { ...base, source: { ...base.source, historicalRevision: repo.ref, referenceRevision: repo.laterRef } };
+  const task = await materializeHistoricalPostgresTask(spec, join(root, "case"));
+
+  assert.equal(task.truthManifest.fixEvidence, "expected-behavior/fix-evidence.diff");
+  assert.ok(task.truthManifest.fixEvidenceSha256);
+  const diffContents = await readFile(join(task.referenceDir, "expected-behavior", "fix-evidence.diff"), "utf8");
+  // createSyntheticPostgresSourceRepo's later commit adds FUTURE_FIX.txt -
+  // real diff content between the two pinned revisions, not a placeholder.
+  assert.ok(diffContents.includes("FUTURE_FIX.txt"));
+  assert.ok(diffContents.includes("history after the researched ref"));
+
+  // Moves provenance hashes relative to an equivalent spec whose two
+  // revisions produce a *different* diff.
+  const differentReferenceRevision = await createAdditionalSyntheticCommit(repo.repoPath, "fix-evidence-hash-movement");
+  const otherSpec: HistoricalPostgresTaskSpec = { ...spec, source: { ...spec.source, referenceRevision: differentReferenceRevision } };
+  const otherTask = await materializeHistoricalPostgresTask(otherSpec, join(root, "case-different-diff"));
+  assert.notEqual(otherTask.truthManifest.fixEvidenceSha256, task.truthManifest.fixEvidenceSha256);
+  assert.notEqual(otherTask.truthManifest.bundleHash, task.truthManifest.bundleHash);
+  assert.notEqual(otherTask.truthManifest.expectedBehaviorSha256, task.truthManifest.expectedBehaviorSha256);
+
+  // Never appears anywhere under task/ - the auto-generated diff content
+  // (which necessarily includes "future" repo content past the historical
+  // ref) must stay entirely grader-private.
+  const taskFiles = await readTreeAsText(task.taskDir);
+  for (const file of taskFiles) {
+    assert.ok(!file.text.includes("FUTURE_FIX.txt"), `task/${file.relativePath} leaked fix-evidence diff content`);
+    assert.ok(!file.text.includes("fix-evidence.diff"), `task/${file.relativePath} leaked the fix-evidence relative path`);
+  }
+});
+
+test("Blocking 4: an oracle-declaring task whose referenceRevision cannot be diffed fails materialization loudly, rather than silently omitting fix evidence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-historical-002-fixevidence-fail-"));
+  const repo = await createSyntheticPostgresSourceRepo(root);
+  const base = historicalPostgres002TaskSpec(repo.repoPath);
+  // A syntactically valid 40-hex SHA that does not exist as an object in
+  // this repo - `git diff` against it must fail, and materialization must
+  // fail loudly with it, not silently produce fixEvidence: undefined.
+  const unresolvableRevision = "000000000000000000000000000000000000dead";
+  const spec: HistoricalPostgresTaskSpec = { ...base, source: { ...base.source, historicalRevision: repo.ref, referenceRevision: unresolvableRevision } };
+  await assert.rejects(materializeHistoricalPostgresTask(spec, join(root, "case")), /Could not generate grader-private fix\/reference evidence/);
+});
+
 /**
  * Given the ordered observation sequence a revision's captured stderr should
  * contain, builds the execution shape `resolveOracleReproduction` reads.
@@ -247,6 +367,13 @@ test("knownFixEvidencePath is optional grader-private provenance: present when s
  * level: real self-assertion is "ok: true (exit 0) only on the historical
  * ref, ok: false (non-zero) only on the reference ref", independent of how
  * many observations were captured.
+ *
+ * The default (non-zero) `exitCode` when `ok` is false is `3` - psql's own
+ * documented "a SQL/script-level error occurred under ON_ERROR_STOP" status
+ * (#200 fourth review round, Blocking 1's exit-code-based validity contract:
+ * `1`/`2` are *client/connection*-level failures, never a legitimate
+ * self-assertion signal, and would now be misclassified as
+ * `infrastructure_error` - only `0`/`3` are SQL-content-driven outcomes).
  */
 function executionWithObservations(
   observations: string[],
@@ -254,7 +381,7 @@ function executionWithObservations(
 ): { ok: boolean; stdout: string; stderr: string; exitCode: number | string; durationMs: number } {
   const stderr = observations.map((message) => `ERROR:  ${message}`).join("\n");
   const ok = options.ok ?? observations.length > 0;
-  return { ok, stdout: "", stderr, exitCode: options.exitCode ?? (ok ? 0 : 1), durationMs: 1 };
+  return { ok, stdout: "", stderr, exitCode: options.exitCode ?? (ok ? 0 : 3), durationMs: 1 };
 }
 
 /** An execution shape representing a client/transport/runtime failure - never a SQL-level ERROR record. */

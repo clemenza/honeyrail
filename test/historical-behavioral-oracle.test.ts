@@ -145,6 +145,54 @@ test("evaluateBehavioralOracle: a malformed pattern throws rather than silently 
   assert.throws(() => evaluateBehavioralOracle(["anything"], [{ label: "broken", matches: "(unterminated" }]), /not a valid regular expression/);
 });
 
+// #200 fourth review round, Blocking 2 - reward-hacking regression test
+// (load-bearing for the benchmark trust boundary). A submitted reproducer
+// controls its own psql session and can emit arbitrary text to stderr - a
+// plain `RAISE EXCEPTION '<text>'` with no explicit `USING ERRCODE = ...`
+// produces a completely authentic-looking `ERROR:` line with attacker-chosen
+// text, at SQLSTATE `P0001`. A pattern that declares `sqlstate` requires an
+// exact match on that structural field too, which a bare RAISE EXCEPTION
+// cannot fake without deliberately setting a matching ERRCODE - meaningfully
+// raising the bar against naive text-only fabrication. This test uses a
+// synthetic oracle that opts into `sqlstate` (task 002's own real oracle
+// does not yet - see historical-task.ts's historicalPostgres002TaskSpec()
+// for why: the real SQLSTATE values haven't been verified against an actual
+// build in this sandbox), proving the mechanism works when a task uses it.
+test("evaluateBehavioralOracle: SQLSTATE requirement rejects a fabricated RAISE EXCEPTION that matches the message text but not the SQLSTATE", () => {
+  const hardenedPattern = [{ label: "internal error", matches: "^cache lookup failed for function \\d+$", sqlstate: "XX000" }];
+
+  // The genuine internal error: correct text, correct (internal-error-class) SQLSTATE.
+  const genuine = evaluateBehavioralOracle([{ severity: "ERROR", sqlstate: "XX000", message: "cache lookup failed for function 16386" }], hardenedPattern);
+  assert.equal(genuine.satisfied, true);
+
+  // A fabricated `RAISE EXCEPTION 'cache lookup failed for function 99999';`
+  // with no explicit ERRCODE: identical message text, but psql's default
+  // RAISE EXCEPTION SQLSTATE (P0001), not the declared XX000. Must fail.
+  const fabricated = evaluateBehavioralOracle(
+    [{ severity: "ERROR", sqlstate: "P0001", message: "cache lookup failed for function 99999" }],
+    hardenedPattern
+  );
+  assert.equal(fabricated.satisfied, false);
+  assert.ok(fabricated.diagnostics.some((line) => line.includes("SQLSTATE")));
+
+  // An observation with no SQLSTATE captured at all (e.g. VERBOSITY wasn't
+  // verbose) also fails a pattern that requires one - fails closed, not
+  // "SQLSTATE unknown so skip the check".
+  const noSqlstate = evaluateBehavioralOracle([{ severity: "ERROR", message: "cache lookup failed for function 16386" }], hardenedPattern);
+  assert.equal(noSqlstate.satisfied, false);
+
+  // Without a declared `sqlstate` (task 002's actual current oracle shape),
+  // the same fabricated observation *does* satisfy a message-only pattern -
+  // this is the honest, currently-unmitigated gap the sqlstate mechanism
+  // exists to close once a task's oracle opts into it.
+  const messageOnlyPattern = [{ label: "internal error", matches: "^cache lookup failed for function \\d+$" }];
+  const messageOnlyResult = evaluateBehavioralOracle(
+    [{ severity: "ERROR", sqlstate: "P0001", message: "cache lookup failed for function 99999" }],
+    messageOnlyPattern
+  );
+  assert.equal(messageOnlyResult.satisfied, true);
+});
+
 const ORACLE: HistoricalPostgresBehavioralOracle = {
   historical: [
     { label: "first", matches: "^baseline error$" },
@@ -205,14 +253,34 @@ test("evaluateOracleAttribution: zero observations on a valid execution is unatt
   assert.equal(result.validity.valid, true);
 });
 
-test("classifyExecutionValidity: a client/spawn invocation failure is invalid", () => {
+// #200 fourth review round, Blocking 1: validity is now decided
+// authoritatively from execution.exitCode alone, using psql's own
+// documented exit-status contract - not stderr text-matching, which the
+// review correctly flagged as fragile (real failures have many forms; SQL
+// content could coincidentally resemble a phrase). Fixtures below construct
+// exitCode directly; stderr text is kept only for realism/evidence, never
+// read by classifyExecutionValidity anymore.
+
+test("classifyExecutionValidity: a client/spawn invocation failure is invalid (exit code 1)", () => {
+  // Exit code 1 is psql's own documented "fatal client-side error" status,
+  // and also what a dead container/OCI runtime failure surfaces as when
+  // `docker exec` itself never reaches psql - either way, never a SQL-content
+  // outcome.
   const result = classifyExecutionValidity(
     executionOf({ stderr: "docker: Error response from daemon: No such container: honeyrail-pg-runtime-abc123.", exitCode: 1, ok: false })
   );
   assert.equal(result.valid, false);
 });
 
-test("classifyExecutionValidity: a connection failure is invalid", () => {
+test("classifyExecutionValidity: a Docker/runtime exec failure is invalid (exit code 1)", () => {
+  const result = classifyExecutionValidity(
+    executionOf({ stderr: "OCI runtime exec failed: exec failed: unable to start container process", exitCode: 1, ok: false })
+  );
+  assert.equal(result.valid, false);
+});
+
+test("classifyExecutionValidity: a connection/setup failure is invalid (exit code 2)", () => {
+  // Exit code 2 is psql's own documented "connection failure" status.
   const result = classifyExecutionValidity(
     executionOf({
       stderr:
@@ -229,7 +297,7 @@ test("classifyExecutionValidity: a timeout is invalid", () => {
   assert.equal(result.valid, false);
 });
 
-test("classifyExecutionValidity: runtime/server death is invalid", () => {
+test("classifyExecutionValidity: runtime/server death is invalid (exit code 2)", () => {
   const result = classifyExecutionValidity(
     executionOf({
       stderr: "server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally",
@@ -240,12 +308,27 @@ test("classifyExecutionValidity: runtime/server death is invalid", () => {
   assert.equal(result.valid, false);
 });
 
-test("classifyExecutionValidity: a normal execution containing a real (even unexpected) ERROR record is valid", () => {
+test("classifyExecutionValidity: a completed execution (exit code 0) containing a real, unrelated ERROR record is valid", () => {
   // The crux: a genuine SQL-level error - however unexpected - is a valid,
   // interpretable execution. Whether it matches anything declared is
   // evaluateOracleAttribution's job, not this function's.
   const result = classifyExecutionValidity(
-    executionOf({ stderr: 'ERROR:  relation "totally_unrelated_table" does not exist', exitCode: 1, ok: false })
+    executionOf({ stderr: 'ERROR:  relation "totally_unrelated_table" does not exist', exitCode: 0, ok: true })
   );
+  assert.equal(result.valid, true);
+});
+
+test("classifyExecutionValidity: a completed execution under ON_ERROR_STOP (exit code 3) is valid", () => {
+  // Exit code 3 is psql's own documented "a script error occurred and
+  // ON_ERROR_STOP was in effect" status - still a SQL-content outcome, not a
+  // client/transport failure.
+  const result = classifyExecutionValidity(
+    executionOf({ stderr: "ERROR:  syntax error at or near \"SELCT\"", exitCode: 3, ok: false })
+  );
+  assert.equal(result.valid, true);
+});
+
+test("classifyExecutionValidity: no oracle observations after a valid execution is still valid - a normal miss/unattributed result, not an infrastructure failure", () => {
+  const result = classifyExecutionValidity(executionOf({ stderr: "", exitCode: 0, ok: true }));
   assert.equal(result.valid, true);
 });
