@@ -44,6 +44,8 @@
     "historical-pg-184": "tsx scripts/historical-postgres-184.ts",
     "test:historical-pg-200": "node --import tsx --test test/historical-postgres-200-integration.test.ts",
     "historical-pg-200": "tsx scripts/historical-postgres-200.ts",
+    "test:historical-pg-199": "node --import tsx --test test/historical-postgres-199-integration.test.ts",
+    "historical-pg-199": "tsx scripts/historical-postgres-199.ts",
     "mcp": "tsx server/mcp.ts"
   },
   "dependencies": {
