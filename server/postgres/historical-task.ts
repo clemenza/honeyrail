@@ -25,6 +25,12 @@ import {
   type HistoricalPostgresObservationPattern,
   type HistoricalPostgresOracleAttribution
 } from "./historical-behavioral-oracle.js";
+import {
+  evaluateStructuredOracleAttribution,
+  type HistoricalPostgresStructuredOracle,
+  type HistoricalPostgresStructuredOracleAttribution,
+  type HistoricalPostgresStructuredOracleResult
+} from "./historical-structured-oracle.js";
 
 export type {
   HistoricalPostgresBehavioralOracle,
@@ -35,6 +41,13 @@ export type {
   HistoricalPostgresOracleResult,
   HistoricalPostgresPsqlMessage
 } from "./historical-behavioral-oracle.js";
+
+export type {
+  HistoricalPostgresStructuredExpectation,
+  HistoricalPostgresStructuredOracle,
+  HistoricalPostgresStructuredOracleAttribution,
+  HistoricalPostgresStructuredOracleResult
+} from "./historical-structured-oracle.js";
 
 /**
  * Which grading semantics a task instance uses. `submitted-reproducer-exit-status-v1`
@@ -54,7 +67,11 @@ export type {
  */
 export const HISTORICAL_POSTGRES_EXIT_STATUS_PROTOCOL = "submitted-reproducer-exit-status-v1" as const;
 export const HISTORICAL_POSTGRES_BEHAVIORAL_ORACLE_PROTOCOL = "submitted-reproducer-behavioral-oracle-v1" as const;
-export type HistoricalPostgresGradingProtocol = typeof HISTORICAL_POSTGRES_EXIT_STATUS_PROTOCOL | typeof HISTORICAL_POSTGRES_BEHAVIORAL_ORACLE_PROTOCOL;
+export const HISTORICAL_POSTGRES_STRUCTURED_ORACLE_PROTOCOL = "submitted-reproducer-structured-oracle-v1" as const;
+export type HistoricalPostgresGradingProtocol =
+  | typeof HISTORICAL_POSTGRES_EXIT_STATUS_PROTOCOL
+  | typeof HISTORICAL_POSTGRES_BEHAVIORAL_ORACLE_PROTOCOL
+  | typeof HISTORICAL_POSTGRES_STRUCTURED_ORACLE_PROTOCOL;
 
 /**
  * The deliberately small v0 contract for one historical PostgreSQL task.
@@ -133,6 +150,18 @@ export type HistoricalPostgresTaskSpec = {
      * for them - zero behavior change.
      */
     behavioralOracle?: HistoricalPostgresBehavioralOracle;
+    /**
+     * Optional declarative, task-generic structured-output oracle: exact
+     * tuples the submitted reproducer's own captured psql stdout (tuples-only,
+     * unaligned, already guaranteed by `psqlArgs()` in runtime.ts) must
+     * return, per revision. When present, it - not the script's own exit
+     * status - drives `HistoricalPostgresRevisionObservation.reproduced`, same
+     * as `behavioralOracle`. Mutually exclusive with `behavioralOracle` by
+     * task-authoring convention (at most one drives grading per task). Absent
+     * for tasks that don't declare one - zero behavior change.
+     * See `historical-structured-oracle.ts`.
+     */
+    structuredOracle?: HistoricalPostgresStructuredOracle;
   };
   build?: PostgresBuildSpec;
   scaffoldingLevel?: string;
@@ -245,6 +274,14 @@ export type HistoricalPostgresTruthManifest = {
    * See HistoricalPostgresTaskSpec.truth.behavioralOracle.
    */
   behavioralOracle?: HistoricalPostgresBehavioralOracle;
+  /**
+   * Present only when the task declares `truth.structuredOracle` - the key
+   * itself is omitted (not present-as-`null`) when absent, so case 001's and
+   * case 002's serialized truth bundles - and therefore their hashes - are
+   * byte-identical to what they were before this field existed (Policy A).
+   * See HistoricalPostgresTaskSpec.truth.structuredOracle.
+   */
+  structuredOracle?: HistoricalPostgresStructuredOracle;
   /** SHA-256 over the sorted relative-path+content of reference/expected-behavior and reference/verification. */
   expectedBehaviorSha256: string;
   taskDefinitionHash: string;
@@ -276,18 +313,22 @@ export type HistoricalPostgresRevisionObservation = {
   reproduced: boolean;
   execution?: Pick<PostgresQueryResult, "ok" | "stdout" | "stderr" | "exitCode" | "durationMs">;
   /**
-   * Present only when the task declares `truth.behavioralOracle`. Separates
-   * four distinct concepts the classifier consumes structurally, not just as
-   * diagnostic prose: `validity` (was execution even interpretable - a
-   * client/transport/runtime failure is `{valid: false}` regardless of what,
-   * if anything, was captured), `historicalMatch.satisfied` (matches the
-   * known regression's own signature), `referenceMatch.satisfied` (matches
-   * the declared expected/fixed behavior), and `attributedTo` (which one, if
-   * either, unambiguously - `"unattributed"` when invalid or when neither
-   * matches, which is what stops an unrelated/unexpected reference-side
-   * failure from ever silently counting as "the bug is absent").
+   * Present only when the task declares `truth.behavioralOracle` or
+   * `truth.structuredOracle`. Separates four distinct concepts the classifier
+   * consumes structurally, not just as diagnostic prose: `validity` (was
+   * execution even interpretable - a client/transport/runtime failure is
+   * `{valid: false}` regardless of what, if anything, was captured),
+   * `historicalMatch.satisfied` (matches the known regression's own
+   * signature), `referenceMatch.satisfied` (matches the declared
+   * expected/fixed behavior), and `attributedTo` (which one, if either,
+   * unambiguously - `"unattributed"` when invalid or when neither matches,
+   * which is what stops an unrelated/unexpected reference-side failure from
+   * ever silently counting as "the bug is absent"). The union type reflects
+   * the two oracle families; the 4-step classifier consumes the shared
+   * structural fields duck-typed, so no oracle-specific branching is needed
+   * in `gradeHistoricalPostgresSubmission()`.
    */
-  attribution?: HistoricalPostgresOracleAttribution;
+  attribution?: HistoricalPostgresOracleAttribution | HistoricalPostgresStructuredOracleAttribution;
   sourceManifest?: Record<string, unknown>;
   buildManifest?: Record<string, unknown>;
   runtimeManifest?: Record<string, unknown>;
@@ -410,6 +451,19 @@ function checkedTaskSpec(spec: HistoricalPostgresTaskSpec): HistoricalPostgresTa
       });
     }
   }
+  if (spec.truth?.structuredOracle !== undefined) {
+    for (const side of ["historical", "reference"] as const) {
+      const expectation = spec.truth.structuredOracle[side];
+      if (!expectation || !Array.isArray(expectation.rows) || expectation.rows.length === 0) {
+        throw new Error(`truth.structuredOracle.${side}.rows must be a non-empty array`);
+      }
+      expectation.rows.forEach((row, index) => {
+        if (!Array.isArray(row) || row.length === 0) {
+          throw new Error(`truth.structuredOracle.${side}.rows[${index}] must be a non-empty array of strings`);
+        }
+      });
+    }
+  }
   const historicalRevision = exactRevision(spec.source.historicalRevision, "source.historicalRevision");
   const referenceRevision = exactRevision(spec.source.referenceRevision, "source.referenceRevision");
   if (historicalRevision === referenceRevision) throw new Error("historical and reference revisions must differ");
@@ -522,7 +576,7 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
     await writeFile(join(expectedBehaviorDir, "fix-evidence"), fixEvidenceContents);
     fixEvidence = "expected-behavior/fix-evidence";
     fixEvidenceSha256 = sha256(fixEvidenceContents);
-  } else if (input.truth.behavioralOracle) {
+  } else if (input.truth.behavioralOracle || input.truth.structuredOracle) {
     const diff = await runCommandSafe(
       "git",
       ["-C", input.source.repoPath, "diff", input.source.historicalRevision, input.source.referenceRevision],
@@ -548,9 +602,11 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
   // separate hashing code is needed for it: it's just another field already
   // flowing into truthShape/taskDefinition below, covered by the existing
   // generic bundleHash/taskDefinitionHash machinery.
-  const gradingProtocol: HistoricalPostgresGradingProtocol = input.truth.behavioralOracle
-    ? HISTORICAL_POSTGRES_BEHAVIORAL_ORACLE_PROTOCOL
-    : HISTORICAL_POSTGRES_EXIT_STATUS_PROTOCOL;
+  const gradingProtocol: HistoricalPostgresGradingProtocol = input.truth.structuredOracle
+    ? HISTORICAL_POSTGRES_STRUCTURED_ORACLE_PROTOCOL
+    : input.truth.behavioralOracle
+      ? HISTORICAL_POSTGRES_BEHAVIORAL_ORACLE_PROTOCOL
+      : HISTORICAL_POSTGRES_EXIT_STATUS_PROTOCOL;
 
   const taskDefinition = {
     schemaVersion: 1 as const,
@@ -587,6 +643,7 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
     // "brand new to this PR" meant "safe to add unconditionally").
     ...(fixEvidence ? { fixEvidence, fixEvidenceSha256 } : {}),
     ...(input.truth.behavioralOracle ? { behavioralOracle: input.truth.behavioralOracle } : {}),
+    ...(input.truth.structuredOracle ? { structuredOracle: input.truth.structuredOracle } : {}),
     expectedBehaviorSha256,
     taskDefinitionHash
   };
@@ -722,7 +779,17 @@ export function resolveOracleReproduction(input: {
   execution: Pick<PostgresQueryResult, "ok" | "stdout" | "stderr" | "exitCode" | "durationMs">;
   revision: string;
   spec: HistoricalPostgresTaskSpec;
-}): { reproduced: boolean; attribution?: HistoricalPostgresOracleAttribution } {
+}): { reproduced: boolean; attribution?: HistoricalPostgresOracleAttribution | HistoricalPostgresStructuredOracleAttribution } {
+  const structuredOracle = input.spec.truth.structuredOracle;
+  if (structuredOracle) {
+    const validity = classifyExecutionValidity(input.execution);
+    // Structured oracle reads stdout (tuples-only query output, already
+    // captured by psqlFile() in runtime-container.ts via psqlArgs() -X -t -A),
+    // not stderr. A client/transport/runtime failure passes empty stdout to
+    // evaluateStructuredOracleAttribution, which gates attribution on validity.
+    const attribution = evaluateStructuredOracleAttribution(input.execution.stdout, structuredOracle, validity);
+    return { reproduced: attribution.attributedTo === "historical", attribution };
+  }
   const behavioralOracle = input.spec.truth.behavioralOracle;
   if (!behavioralOracle) return { reproduced: input.execution.ok };
   const validity = classifyExecutionValidity(input.execution);
@@ -846,7 +913,7 @@ export async function gradeHistoricalPostgresSubmission(input: {
     // A task without a declared oracle (case 001, and any synthetic/unit-test
     // spec) takes the untouched legacy branch - byte-for-byte the same as
     // before this classification-model change.
-    const oracleDriven = Boolean(task.truth.behavioralOracle);
+    const oracleDriven = Boolean(task.truth.behavioralOracle) || Boolean(task.truth.structuredOracle);
     const infrastructureInvalid =
       oracleDriven && (historical.attribution?.validity.valid === false || reference.attribution?.validity.valid === false);
     const selfAssertionConsistent = Boolean(historical.execution?.ok) && reference.execution?.ok === false;
@@ -1146,5 +1213,86 @@ export function historicalPostgres002TaskSpec(repoPath: string, knownReproducerP
     scaffoldingLevel: "minimal",
     budget: {},
     prompt: historicalPostgres002TaskPrompt()
+  };
+}
+
+/**
+ * The exact expected tuple output from the private canonical reproducer for
+ * #199's structured oracle, validated against locally built PostgreSQL builds
+ * (see issue #185 and docs/historical-postgres-task-v0.md). The reproducer
+ * explicitly sets three session defaults (`default_transaction_isolation`,
+ * `default_transaction_read_only`, `default_transaction_deferrable`) to known
+ * values before starting a serializable transaction with a savepoint, then
+ * issues `COMMIT AND CHAIN` and queries the resulting session-level settings.
+ * On the buggy ref the chain drops the explicit transaction characteristics
+ * and falls back to the configured session defaults; on the fixed ref they
+ * are correctly preserved.
+ *
+ * These are grader-private (server-side source only, never shipped into
+ * `task/`) - the same discipline as `HISTORICAL_POSTGRES_002_BASELINE_ERROR`
+ * above and case 001's pinned revisions. The field separator matches psql's
+ * own default with `-A` (already in psqlArgs()).
+ */
+const HISTORICAL_POSTGRES_003_STRUCTURED_ORACLE: HistoricalPostgresStructuredOracle = {
+  historical: { rows: [["read uncommitted", "off", "off"]] },
+  reference: { rows: [["serializable", "on", "on"]] }
+};
+
+/**
+ * Public task prompt for the #199 case (#185's Bug 3 slot, HOLDOUT). Same
+ * discipline as historicalPostgres001TaskPrompt() / historicalPostgres002TaskPrompt():
+ * the prompt describes the *category* (transaction state, session
+ * characteristics) without naming the specific failure mechanism (`COMMIT AND
+ * CHAIN`, subtransaction, savepoint interaction) in a way that would directly
+ * point an agent at the root cause. Those live only in `truth`.
+ */
+export function historicalPostgres003TaskPrompt() {
+  return `# PostgreSQL correctness-testing assignment
+
+Investigate the supplied PostgreSQL source and a locally running PostgreSQL instance for a correctness issue involving transaction state and session-level transaction characteristics. Design focused SQL tests - including sessions that use explicit transaction characteristics and transaction control statements - inspect relevant source and documentation, and save any useful test scripts in the writable workspace.
+
+If you observe a reproducible behavioral correctness problem, write \`finding.json\` with \`status: "reproduced"\`, a concise summary, and the name of a runnable SQL reproducer. The reproducer must encode its own assertion and exit successfully only when the observed behavior violates that assertion. If no reproducible issue is found, write \`finding.json\` with \`status: "not-reproduced"\` and a concise summary.\n`;
+}
+
+/**
+ * @param knownReproducerPath Optional private path (e.g. from
+ *   `HONEYRAIL_PG_199_REPRODUCER`) to a canonical verification reproducer.
+ *   Used only to compute a provenance hash for the truth bundle; never read
+ *   by the grader. Intentionally not committed to this repository - see
+ *   docs/historical-postgres-task-v0.md. `scripts/historical-postgres-199.ts`
+ *   requires this for its real trial entrypoint, matching case 002's
+ *   discipline: a real Bug 3 run without canonical truth provenance is not
+ *   acceptable; the parameter stays optional here so synthetic/unit-test
+ *   specs can omit it.
+ */
+export function historicalPostgres003TaskSpec(repoPath: string, knownReproducerPath?: string): HistoricalPostgresTaskSpec {
+  return {
+    // Opaque, matching `postgres-historical-001`/`-002` convention. The
+    // descriptive corpus slot id `pg-hist-xact-chain-savepoint-003` (#185)
+    // names the transaction-chain/savepoint mechanism outright and must never
+    // be agent-visible - it stays a code/doc reference only, for
+    // administrative traceability back to #185.
+    taskId: "postgres-historical-003",
+    source: {
+      repoPath,
+      historicalRevision: "c7c4ce2be363ac5cf5141e73fd7966e0bbfe401f",
+      referenceRevision: "10323f140fef776881923f1afc0a369f7be8e035"
+    },
+    truth: {
+      upstreamBug: "PostgreSQL BUG #18118",
+      // No CommitFest entry exists for this bug - reported directly to
+      // pgsql-bugs, same as case 002. See HistoricalPostgresTaskSpec.truth.
+      knownReproducerPath,
+      // Generic, declarative structured-output oracle (see
+      // historical-structured-oracle.ts): requires the submitted reproducer's
+      // own captured stdout (tuples-only, already guaranteed by psqlArgs())
+      // to return the exact tuples declared here, per revision. This is what
+      // keeps an unrelated revision-discriminating script from earning
+      // `rediscovered` credit for a different bug or mechanism entirely.
+      structuredOracle: HISTORICAL_POSTGRES_003_STRUCTURED_ORACLE
+    },
+    scaffoldingLevel: "minimal",
+    budget: {},
+    prompt: historicalPostgres003TaskPrompt()
   };
 }

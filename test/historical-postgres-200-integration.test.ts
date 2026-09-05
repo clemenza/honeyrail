@@ -3,7 +3,7 @@ import { cp, mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
-import { historicalPostgres002TaskSpec, gradeHistoricalPostgresSubmission, materializeHistoricalPostgresTask } from "../server/postgres/historical-task.js";
+import { historicalPostgres002TaskSpec, gradeHistoricalPostgresSubmission, materializeHistoricalPostgresTask, type HistoricalPostgresOracleAttribution } from "../server/postgres/historical-task.js";
 
 const mirror = String(process.env.HONEYRAIL_PG_200_MIRROR || "").trim();
 const knownReproducer = String(process.env.HONEYRAIL_PG_200_REPRODUCER || "").trim();
@@ -36,7 +36,8 @@ test("#200 known local PostgreSQL verification distinguishes the pinned historic
   // merely fail to match the historical pattern for some unrelated reason.
   assert.equal(grade.historical.attribution?.attributedTo, "historical");
   assert.equal(grade.historical.attribution?.historicalMatch.satisfied, true);
-  assert.equal(grade.historical.attribution?.historicalMatch.observations.length, 2);
+  const historicalMatch = (grade.historical.attribution as HistoricalPostgresOracleAttribution).historicalMatch;
+  assert.equal(historicalMatch.observations.length, 2);
   assert.equal(grade.reference.attribution?.attributedTo, "reference");
   assert.equal(grade.reference.attribution?.referenceMatch.satisfied, true);
 
