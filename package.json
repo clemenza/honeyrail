@@ -42,6 +42,8 @@
     "test:e2e": "playwright test",
     "test:historical-pg-184": "node --import tsx --test test/historical-postgres-integration.test.ts",
     "historical-pg-184": "tsx scripts/historical-postgres-184.ts",
+    "test:historical-pg-200": "node --import tsx --test test/historical-postgres-200-integration.test.ts",
+    "historical-pg-200": "tsx scripts/historical-postgres-200.ts",
     "mcp": "tsx server/mcp.ts"
   },
   "dependencies": {

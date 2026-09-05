@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { cp, lstat, mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
-import { nowIso } from "../utils.js";
+import { nowIso, runCommandSafe } from "../utils.js";
 import {
   createAgentEnvRoot,
   materializePostgresSource,
@@ -17,6 +17,44 @@ import {
   type PostgresResearchSessionOptions,
   type PostgresResearchSessionResult
 } from "./research-session.js";
+import {
+  classifyExecutionValidity,
+  evaluateOracleAttribution,
+  extractPsqlErrorMessages,
+  type HistoricalPostgresBehavioralOracle,
+  type HistoricalPostgresObservationPattern,
+  type HistoricalPostgresOracleAttribution
+} from "./historical-behavioral-oracle.js";
+
+export type {
+  HistoricalPostgresBehavioralOracle,
+  HistoricalPostgresExecutionValidity,
+  HistoricalPostgresObservationPattern,
+  HistoricalPostgresOracleAttribution,
+  HistoricalPostgresOracleObservationInput,
+  HistoricalPostgresOracleResult,
+  HistoricalPostgresPsqlMessage
+} from "./historical-behavioral-oracle.js";
+
+/**
+ * Which grading semantics a task instance uses. `submitted-reproducer-exit-status-v1`
+ * (case 001, and any spec that declares no `truth.behavioralOracle`) grades
+ * purely on the submitted reproducer's own exit-status differential across
+ * the two revisions. `submitted-reproducer-behavioral-oracle-v1` (case 002,
+ * and any future spec that declares a `behavioralOracle`) additionally
+ * requires the reproducer's own captured output to structurally match a
+ * declared, revision-specific observation sequence - see
+ * `historical-behavioral-oracle.ts` and `resolveOracleReproduction()` below.
+ * These are materially different grading semantics, so they get materially
+ * different protocol identifiers rather than sharing one string that would
+ * otherwise silently mean two different things depending on the task; the
+ * identifier is part of the hashed truth bundle (`truthShape.gradingProtocol`
+ * below), so which protocol graded a given task instance is itself
+ * provenance-covered.
+ */
+export const HISTORICAL_POSTGRES_EXIT_STATUS_PROTOCOL = "submitted-reproducer-exit-status-v1" as const;
+export const HISTORICAL_POSTGRES_BEHAVIORAL_ORACLE_PROTOCOL = "submitted-reproducer-behavioral-oracle-v1" as const;
+export type HistoricalPostgresGradingProtocol = typeof HISTORICAL_POSTGRES_EXIT_STATUS_PROTOCOL | typeof HISTORICAL_POSTGRES_BEHAVIORAL_ORACLE_PROTOCOL;
 
 /**
  * The deliberately small v0 contract for one historical PostgreSQL task.
@@ -44,7 +82,14 @@ export type HistoricalPostgresTaskSpec = {
   source: { repoPath: string; historicalRevision: string; referenceRevision: string };
   truth: {
     upstreamBug: string;
-    commitFest: number;
+    /**
+     * Positive integer when the upstream bug was submitted through a
+     * PostgreSQL CommitFest entry (e.g. case 001). Omitted for cases sourced
+     * from elsewhere - e.g. a plain pgsql-bugs report (case 002) - which has
+     * no CommitFest identity at all. Written into the truth bundle as `null`
+     * when absent; never fabricated.
+     */
+    commitFest?: number;
     /**
      * Host path (private, never committed) to a known-good reproducer used
      * only to prove this task instance is well-posed before any agent runs.
@@ -55,6 +100,39 @@ export type HistoricalPostgresTaskSpec = {
      * agent grading.
      */
     knownReproducerPath?: string;
+    /**
+     * Host path (private, never committed) to grader-private fix/reference
+     * evidence for this task instance - e.g. notes on the upstream fix, a
+     * diff, or release-note excerpts. Purely optional provenance: never read
+     * by the grader during scoring, exists only so a task instance's truth
+     * bundle can carry more than bare hashes when an operator supplies it.
+     * Copied byte-identical into reference/expected-behavior/fix-evidence
+     * (fixed name, regardless of the source file's own name/extension) and
+     * hashed into the truth bundle - never written anywhere under task/.
+     *
+     * Overrides auto-generation: when omitted and `behavioralOracle` (below)
+     * is declared, `materializeHistoricalPostgresTask()` generates real
+     * fix-evidence itself - a `git diff` between `historicalRevision` and
+     * `referenceRevision` in `repoPath`, which the local mirror this task
+     * type already requires makes available for free (#200 fourth review
+     * round, Blocking 4). Supply this only when narrative content a raw diff
+     * can't capture is worth adding.
+     */
+    knownFixEvidencePath?: string;
+    /**
+     * Optional declarative, task-generic behavioral oracle: ordered
+     * observation patterns the submitted reproducer's own captured psql
+     * stderr must match, per revision. When present, it - not the script's
+     * own exit status - drives `HistoricalPostgresRevisionObservation.reproduced`
+     * (see `defaultGradeRevision()`), so a submission can no longer earn
+     * `rediscovered` credit merely by encoding *some* revision-discriminating
+     * exit code; its captured output must actually match the declared
+     * upstream regression's observations, in order. Absent for tasks (e.g.
+     * case 001, and any synthetic/unit-test spec) that don't declare one,
+     * which keeps `reproduced` exactly the legacy `execution.ok` semantics
+     * for them - zero behavior change.
+     */
+    behavioralOracle?: HistoricalPostgresBehavioralOracle;
   };
   build?: PostgresBuildSpec;
   scaffoldingLevel?: string;
@@ -115,7 +193,7 @@ export type HistoricalPostgresTaskManifest = {
 export type HistoricalPostgresReferenceManifest = {
   schemaVersion: 1;
   taskId: string;
-  gradingProtocol: "submitted-reproducer-exit-status-v1";
+  gradingProtocol: HistoricalPostgresGradingProtocol;
   taskDefinitionHash: string;
   truthBundleHash: string;
 };
@@ -132,14 +210,41 @@ export type HistoricalPostgresTruthManifest = {
   schemaVersion: 1;
   taskId: string;
   upstreamBug: string;
-  commitFest: number;
+  /** `null` when the upstream bug has no CommitFest identity - see HistoricalPostgresTaskSpec.truth.commitFest. */
+  commitFest: number | null;
   historicalRevision: string;
   referenceRevision: string;
-  gradingProtocol: "submitted-reproducer-exit-status-v1";
+  gradingProtocol: HistoricalPostgresGradingProtocol;
   /** Grader-private relative path to the retained canonical verification reproducer; never used as an agent grading fallback. */
   canonicalReproducer: string | null;
   /** SHA-256 of the canonical verification reproducer, when one was supplied; never the agent's. */
   canonicalReproducerSha256: string | null;
+  /**
+   * Grader-private relative path to fix/reference evidence, present when
+   * either an operator explicitly supplied `truth.knownFixEvidencePath` or
+   * (for any task that declares `truth.behavioralOracle`) it was
+   * auto-generated as a real `git diff` between the two pinned revisions -
+   * see `materializeHistoricalPostgresTask()`'s Blocking-4 fix-evidence
+   * generation and HistoricalPostgresTaskSpec.truth.knownFixEvidencePath.
+   * The key itself - like `behavioralOracle` below - is omitted (not
+   * present-as-`null`) when neither applies, so a legacy exit-status task's
+   * (case 001's) serialized truth bundle - and therefore its hash - is
+   * byte-identical to what it was before this field existed (#200 fourth
+   * review round, "Blocking 3" - a corrected version of the third round's
+   * "unconditional null is fine here, it's brand new" reasoning, which was
+   * wrong: brand-new-to-this-PR does not mean safe-to-add-unconditionally).
+   */
+  fixEvidence?: string;
+  /** SHA-256 of the fix/reference evidence file. Present exactly when `fixEvidence` is. */
+  fixEvidenceSha256?: string;
+  /**
+   * Present only when the task declares `truth.behavioralOracle` - the key
+   * itself is omitted (not present-as-`null`) when absent, so a legacy
+   * exit-status task's (case 001's) serialized truth bundle - and therefore
+   * its hash - is byte-identical to what it was before this field existed.
+   * See HistoricalPostgresTaskSpec.truth.behavioralOracle.
+   */
+  behavioralOracle?: HistoricalPostgresBehavioralOracle;
   /** SHA-256 over the sorted relative-path+content of reference/expected-behavior and reference/verification. */
   expectedBehaviorSha256: string;
   taskDefinitionHash: string;
@@ -159,8 +264,30 @@ export type HistoricalPostgresGradeStatus =
   | "integrity_error";
 
 export type HistoricalPostgresRevisionObservation = {
+  /**
+   * When the task declares `truth.behavioralOracle`, this is
+   * `attribution.attributedTo === "historical"` - informational/back-compat
+   * only, since `gradeHistoricalPostgresSubmission()` no longer classifies
+   * from this boolean for oracle-declared tasks (it consumes `attribution`
+   * directly - see below). Falls back to `execution.ok` when no oracle is
+   * declared (legacy exit-status differential, e.g. case 001) - there
+   * `reproduced` is still what drives classification, unchanged.
+   */
   reproduced: boolean;
   execution?: Pick<PostgresQueryResult, "ok" | "stdout" | "stderr" | "exitCode" | "durationMs">;
+  /**
+   * Present only when the task declares `truth.behavioralOracle`. Separates
+   * four distinct concepts the classifier consumes structurally, not just as
+   * diagnostic prose: `validity` (was execution even interpretable - a
+   * client/transport/runtime failure is `{valid: false}` regardless of what,
+   * if anything, was captured), `historicalMatch.satisfied` (matches the
+   * known regression's own signature), `referenceMatch.satisfied` (matches
+   * the declared expected/fixed behavior), and `attributedTo` (which one, if
+   * either, unambiguously - `"unattributed"` when invalid or when neither
+   * matches, which is what stops an unrelated/unexpected reference-side
+   * failure from ever silently counting as "the bug is absent").
+   */
+  attribution?: HistoricalPostgresOracleAttribution;
   sourceManifest?: Record<string, unknown>;
   buildManifest?: Record<string, unknown>;
   runtimeManifest?: Record<string, unknown>;
@@ -265,8 +392,23 @@ function checkedTaskSpec(spec: HistoricalPostgresTaskSpec): HistoricalPostgresTa
   if (!String(spec.source.repoPath || "").trim()) throw new Error("source.repoPath is required");
   if (!String(spec.prompt || "").trim()) throw new Error("prompt is required");
   if (!String(spec.truth?.upstreamBug || "").trim()) throw new Error("truth.upstreamBug is required");
-  if (!Number.isInteger(spec.truth?.commitFest) || spec.truth.commitFest <= 0) {
-    throw new Error("truth.commitFest must be a positive integer");
+  if (spec.truth?.commitFest !== undefined && (!Number.isInteger(spec.truth.commitFest) || spec.truth.commitFest <= 0)) {
+    throw new Error("truth.commitFest must be a positive integer when present");
+  }
+  if (spec.truth?.behavioralOracle !== undefined) {
+    for (const side of ["historical", "reference"] as const) {
+      const patterns = spec.truth.behavioralOracle[side];
+      if (!Array.isArray(patterns) || patterns.length === 0) {
+        throw new Error(`truth.behavioralOracle.${side} must be a non-empty array of observation patterns`);
+      }
+      patterns.forEach((pattern, index) => {
+        try {
+          void new RegExp(pattern.matches);
+        } catch (error) {
+          throw new Error(`truth.behavioralOracle.${side}[${index}].matches is not a valid regular expression: ${(error as Error).message}`);
+        }
+      });
+    }
   }
   const historicalRevision = exactRevision(spec.source.historicalRevision, "source.historicalRevision");
   const referenceRevision = exactRevision(spec.source.referenceRevision, "source.referenceRevision");
@@ -348,7 +490,67 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
     canonicalReproducer = canonicalReproducerRelativePath;
     canonicalReproducerSha256 = sha256(canonicalReproducerContents);
   }
+  // Grader-private fix/reference evidence (#200 third review round, 5.B;
+  // auto-generation added fourth review round, Blocking 4). Same discipline
+  // as the canonical reproducer above - copied/written under a fixed name
+  // (never a source file's own name), hashed, and covered by
+  // expectedBehaviorSha256/bundleHash. Purely optional provenance; never read
+  // by the grader during scoring and never written under task/.
+  //
+  // `knownFixEvidencePath`, when supplied, is an explicit operator override
+  // (narrative content a raw diff can't capture). Otherwise, for any task
+  // that declares `behavioralOracle`, real evidence is auto-generated from
+  // the local mirror this task type already requires - a `git diff` between
+  // the two pinned revisions - so a real historical task never has to rely
+  // on a manually maintained extra private file. A legacy exit-status task
+  // (no oracle declared, e.g. case 001) attempts neither path and keeps
+  // `fixEvidence`/`fixEvidenceSha256` absent from the truth bundle entirely
+  // (Policy A - see below).
+  //
+  // Generation failure is loud, not silent: an oracle-declaring task's
+  // `referenceRevision` must actually be diffable against `historicalRevision`
+  // in `repoPath`, or this throws - "missing evidence when the task requires
+  // it fails loudly, rather than silently satisfying acceptance" (#200
+  // fourth review round). An *empty* diff (two distinct commits with
+  // byte-identical trees - vanishingly unlikely for a real historical bug,
+  // but not itself a failure) is not an error; only `git diff` itself
+  // failing (e.g. an unresolvable ref) is.
+  let fixEvidence: string | undefined;
+  let fixEvidenceSha256: string | undefined;
+  if (input.truth.knownFixEvidencePath) {
+    const fixEvidenceContents = await readFile(input.truth.knownFixEvidencePath);
+    await writeFile(join(expectedBehaviorDir, "fix-evidence"), fixEvidenceContents);
+    fixEvidence = "expected-behavior/fix-evidence";
+    fixEvidenceSha256 = sha256(fixEvidenceContents);
+  } else if (input.truth.behavioralOracle) {
+    const diff = await runCommandSafe(
+      "git",
+      ["-C", input.source.repoPath, "diff", input.source.historicalRevision, input.source.referenceRevision],
+      { timeout: 60_000, maxBuffer: 1024 * 1024 * 8 }
+    );
+    if (!diff.ok) {
+      throw new Error(
+        `Could not generate grader-private fix/reference evidence: git diff ${input.source.historicalRevision} ${input.source.referenceRevision} in ${input.source.repoPath} failed: ${(diff.stderr || diff.stdout).trim()}`
+      );
+    }
+    const fixEvidenceContents = Buffer.from(diff.stdout, "utf8");
+    await writeFile(join(expectedBehaviorDir, "fix-evidence.diff"), fixEvidenceContents);
+    fixEvidence = "expected-behavior/fix-evidence.diff";
+    fixEvidenceSha256 = sha256(fixEvidenceContents);
+  }
   const expectedBehaviorSha256 = await hashDirectoryContents(referenceDir);
+
+  // Which grading semantics this task instance uses - see
+  // HistoricalPostgresGradingProtocol. Derived from whether the task
+  // declares a behavioral oracle, so case 001 (no oracle) keeps its exact
+  // existing protocol string untouched while case 002 (and any future
+  // oracle-declaring task) gets an honestly distinct one. This is why no
+  // separate hashing code is needed for it: it's just another field already
+  // flowing into truthShape/taskDefinition below, covered by the existing
+  // generic bundleHash/taskDefinitionHash machinery.
+  const gradingProtocol: HistoricalPostgresGradingProtocol = input.truth.behavioralOracle
+    ? HISTORICAL_POSTGRES_BEHAVIORAL_ORACLE_PROTOCOL
+    : HISTORICAL_POSTGRES_EXIT_STATUS_PROTOCOL;
 
   const taskDefinition = {
     schemaVersion: 1 as const,
@@ -367,12 +569,24 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
     schemaVersion: 1 as const,
     taskId: input.taskId,
     upstreamBug: input.truth.upstreamBug,
-    commitFest: input.truth.commitFest,
+    commitFest: input.truth.commitFest ?? null,
     historicalRevision: input.source.historicalRevision,
     referenceRevision: input.source.referenceRevision,
-    gradingProtocol: "submitted-reproducer-exit-status-v1" as const,
+    gradingProtocol,
     canonicalReproducer,
     canonicalReproducerSha256,
+    // Key presence itself is conditional (not just its value) so a legacy
+    // spec that declares no oracle and no fix evidence - case 001, and any
+    // synthetic/unit-test spec that doesn't opt into either - serializes
+    // with exactly the same key set it always has, byte for byte, rather
+    // than gaining new "behavioralOracle":null / "fixEvidence":null entries
+    // that would move bundleHash for zero behavioral reason (#200 third
+    // review round, "Important 4" / Policy A - corrected in the fourth round
+    // to actually cover fixEvidence/fixEvidenceSha256 too, which an earlier
+    // round had added unconditionally on the mistaken reasoning that
+    // "brand new to this PR" meant "safe to add unconditionally").
+    ...(fixEvidence ? { fixEvidence, fixEvidenceSha256 } : {}),
+    ...(input.truth.behavioralOracle ? { behavioralOracle: input.truth.behavioralOracle } : {}),
     expectedBehaviorSha256,
     taskDefinitionHash
   };
@@ -381,7 +595,7 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
   const referenceManifest: HistoricalPostgresReferenceManifest = {
     schemaVersion: 1,
     taskId: input.taskId,
-    gradingProtocol: "submitted-reproducer-exit-status-v1",
+    gradingProtocol,
     taskDefinitionHash,
     truthBundleHash: truthManifest.bundleHash
   };
@@ -481,6 +695,48 @@ export async function validateHistoricalPostgresSubmission(workspaceDir: string)
   return { ok: true, status, submission: { status, summary, reproducer }, reproducerPath };
 }
 
+/**
+ * Given one revision's captured execution and the task's optional
+ * `truth.behavioralOracle`, decides `reproduced` and (when an oracle is
+ * declared) the structural `attribution` evidence behind it. Pure and
+ * side-effect free - no PostgreSQL/Docker/filesystem I/O - specifically so
+ * this decision is directly unit-testable without a real cluster; see
+ * `resolveOracleReproduction` tests in `test/historical-postgres-002-task.test.ts`
+ * and `evaluateOracleAttribution` tests in `test/historical-behavioral-oracle.test.ts`.
+ *
+ * Absent an oracle, `reproduced` is exactly the legacy `execution.ok`
+ * differential (case 001, and any synthetic/unit-test spec): zero behavior
+ * change, and `gradeHistoricalPostgresSubmission()` classifies from it
+ * unchanged. When an oracle is declared, this tests the captured
+ * observations against *both* halves of the oracle (via
+ * `evaluateOracleAttribution()`) - not just the historical half - which is
+ * what lets `attributedTo` distinguish "matches the known regression",
+ * "matches the declared expected/fixed behavior", and "matched neither"
+ * (`"unattributed"`): a run that fails for some unrelated reason on the
+ * reference revision no longer collapses into the same "not reproduced" bit
+ * as a run that correctly confirmed the fix. `reproduced` is retained only
+ * as an informational summary (`attributedTo === "historical"`); the
+ * classifier below consumes `attribution` directly.
+ */
+export function resolveOracleReproduction(input: {
+  execution: Pick<PostgresQueryResult, "ok" | "stdout" | "stderr" | "exitCode" | "durationMs">;
+  revision: string;
+  spec: HistoricalPostgresTaskSpec;
+}): { reproduced: boolean; attribution?: HistoricalPostgresOracleAttribution } {
+  const behavioralOracle = input.spec.truth.behavioralOracle;
+  if (!behavioralOracle) return { reproduced: input.execution.ok };
+  const validity = classifyExecutionValidity(input.execution);
+  // A client/transport/runtime failure never gets to claim it "matched"
+  // anything - observations from an execution we can't even trust are
+  // discarded before evaluation, not merely likely to fail to match.
+  // Structured (not just message text) so a pattern that opts into
+  // `sqlstate` checking (#200 fourth review round, Blocking 2) can actually
+  // see it.
+  const observations = validity.valid ? extractPsqlErrorMessages(input.execution.stderr) : [];
+  const attribution = evaluateOracleAttribution(observations, behavioralOracle, validity);
+  return { reproduced: attribution.attributedTo === "historical", attribution };
+}
+
 async function defaultGradeRevision(input: GradeRevisionInput): Promise<HistoricalPostgresRevisionObservation> {
   const root = await createAgentEnvRoot("historical-grade-");
   const envSpec: PostgresResearchSpec = {
@@ -502,7 +758,9 @@ async function defaultGradeRevision(input: GradeRevisionInput): Promise<Historic
     await writeJson(join(input.artifactDir, "runtime-manifest.live.json"), env.runtimeManifest());
     await writeJson(join(input.artifactDir, "grader-execution.json"), execution);
     await cp(env.logPath, join(input.artifactDir, "postgres.log"));
-    observation = { reproduced: execution.ok, execution, sourceManifest: env.sourceManifest, buildManifest: env.buildManifest, runtimeManifest: env.runtimeManifest() };
+    const { reproduced, attribution } = resolveOracleReproduction({ execution, revision: input.revision, spec: input.spec });
+    if (attribution) await writeJson(join(input.artifactDir, "attribution-result.json"), attribution);
+    observation = { reproduced, execution, attribution, sourceManifest: env.sourceManifest, buildManifest: env.buildManifest, runtimeManifest: env.runtimeManifest() };
   });
   const finalRuntimeManifest = environment!.runtimeManifest();
   await writeJson(join(input.artifactDir, "runtime-manifest.json"), finalRuntimeManifest);
@@ -565,15 +823,75 @@ export async function gradeHistoricalPostgresSubmission(input: {
       gradeRevision({ revision: task.source.referenceRevision, reproducerPath: validated.reproducerPath, artifactDir: referenceDir, spec: task })
     ]);
     artifacts.push(historicalDir, referenceDir);
-    const status: HistoricalPostgresGradeStatus = !historical.reproduced
-      ? "miss"
-      : reference.reproduced
-        ? "invalid_submission"
-        : "rediscovered";
-    const diagnostics =
-      status === "invalid_submission"
-        ? ["The submitted reproducer also succeeded on the corrected reference revision, so it is not target-specific."]
-        : [];
+    // Oracle-declared tasks (case 002+) classify from structural
+    // `attribution`, not the `reproduced` boolean, in four parts (#200
+    // third review round):
+    //   1. either side's execution being uninterpretable (client/transport/
+    //      runtime failure - see classifyExecutionValidity()) is always
+    //      `infrastructure_error`, checked first, before anything below ever
+    //      gets a chance to call it a miss/invalid submission;
+    //   2. `rediscovered` requires the reference run to *positively* match
+    //      the declared expected (fixed) baseline, not merely "not match the
+    //      historical signature" - an unattributed reference-side outcome
+    //      (`attributedTo === "unattributed"`) is `invalid_submission`, the
+    //      same bucket as "reference still shows the historical signature";
+    //   3. the public contract (see historicalPostgres002TaskPrompt()) still
+    //      requires the *submitted reproducer itself* to self-assert - exit
+    //      0 only on the historical ref, non-zero only on the reference ref,
+    //      exactly case 001's convention. The behavioral oracle is an
+    //      *additional* requirement on top of that contract, never a
+    //      replacement for it: a submission whose captured text matches the
+    //      declared signatures but whose own exit status doesn't follow the
+    //      public contract must not be credited either.
+    // A task without a declared oracle (case 001, and any synthetic/unit-test
+    // spec) takes the untouched legacy branch - byte-for-byte the same as
+    // before this classification-model change.
+    const oracleDriven = Boolean(task.truth.behavioralOracle);
+    const infrastructureInvalid =
+      oracleDriven && (historical.attribution?.validity.valid === false || reference.attribution?.validity.valid === false);
+    const selfAssertionConsistent = Boolean(historical.execution?.ok) && reference.execution?.ok === false;
+    const status: HistoricalPostgresGradeStatus = oracleDriven
+      ? infrastructureInvalid
+        ? "infrastructure_error"
+        : historical.attribution?.attributedTo !== "historical"
+          ? "miss"
+          : reference.attribution?.attributedTo !== "reference"
+            ? "invalid_submission"
+            : !selfAssertionConsistent
+              ? "invalid_submission"
+              : "rediscovered"
+      : !historical.reproduced
+        ? "miss"
+        : reference.reproduced
+          ? "invalid_submission"
+          : "rediscovered";
+    const diagnostics: string[] = [];
+    if (oracleDriven) {
+      if (status === "infrastructure_error") {
+        if (historical.attribution?.validity.valid === false) {
+          diagnostics.push(`Historical revision execution was not valid/interpretable: ${historical.attribution.validity.reason}`);
+        }
+        if (reference.attribution?.validity.valid === false) {
+          diagnostics.push(`Reference revision execution was not valid/interpretable: ${reference.attribution.validity.reason}`);
+        }
+      } else if (status === "miss") {
+        diagnostics.push(...(historical.attribution?.historicalMatch.diagnostics ?? []));
+      } else if (status === "invalid_submission") {
+        if (reference.attribution?.attributedTo !== "reference") {
+          diagnostics.push(
+            reference.attribution?.attributedTo === "historical"
+              ? "The submitted reproducer's captured behavior on the reference revision still matches the historical regression signature - not target-specific."
+              : "The reference revision's captured behavior matched neither the historical signature nor the declared expected reference behavior - this differential is not attributable to the declared oracle."
+          );
+        } else if (!selfAssertionConsistent) {
+          diagnostics.push(
+            "The submitted reproducer's own exit status does not follow the required self-asserting contract (must exit 0 only on the historical revision, non-zero only on the reference revision), even though its captured behavior matched the declared oracle."
+          );
+        }
+      }
+    } else if (status === "invalid_submission") {
+      diagnostics.push("The submitted reproducer also succeeded on the corrected reference revision, so it is not target-specific.");
+    }
     const result = { taskId: task.taskId, status, historical, reference, artifacts, diagnostics, gradedAt: nowIso() };
     await writeJson(join(input.artifactDir, "grade.json"), result);
     return result;
@@ -749,5 +1067,84 @@ export function historicalPostgres001TaskSpec(repoPath: string, knownReproducerP
     scaffoldingLevel: "minimal",
     budget: {},
     prompt: historicalPostgres001TaskPrompt()
+  };
+}
+
+/**
+ * Public task copy for the #200 case (#185's Bug 2 slot). Same discipline as
+ * historicalPostgres001TaskPrompt(): the prompt never names the upstream bug
+ * report, the CommitFest (there isn't one for this case - see
+ * HistoricalPostgresTaskSpec.truth.commitFest), or the DDL/cache-invalidation
+ * mechanism specifically enough to point an agent at it; those live only in
+ * `truth`.
+ */
+export function historicalPostgres002TaskPrompt() {
+  return `# PostgreSQL correctness-testing assignment
+
+Investigate the supplied PostgreSQL source and a locally running PostgreSQL instance for a correctness issue involving PL/pgSQL procedures and schema changes. Design focused SQL tests - including sessions that alter procedures or their dependencies mid-session - inspect relevant source and documentation, and save any useful test scripts in the writable workspace.
+
+If you observe a reproducible behavioral correctness problem, write \`finding.json\` with \`status: "reproduced"\`, a concise summary, and the name of a runnable SQL reproducer. The reproducer must encode its own assertion and exit successfully only when the observed behavior violates that assertion. If no reproducible issue is found, write \`finding.json\` with \`status: "not-reproduced"\` and a concise summary.\n`;
+}
+
+/**
+ * The exact confirmed observations from #185's manual validation against
+ * real PostgreSQL 14.13 (buggy) and 14.14 (fixed) builds. `\d+` for the
+ * stale-plan OID is a targeted, anchored pattern - never a broad
+ * "strip every digit" transform - so a meaningful numeric difference
+ * elsewhere in a message could never be silently erased.
+ */
+const HISTORICAL_POSTGRES_002_BASELINE_ERROR = '^procedure parameter "r1" is an output parameter but corresponding argument is not writable$';
+
+/**
+ * @param knownReproducerPath Optional private path (e.g. from
+ *   `HONEYRAIL_PG_200_REPRODUCER`) to a canonical verification reproducer.
+ *   Used only to compute a provenance hash for the truth bundle; never read
+ *   by the grader. Intentionally not committed to this repository - see
+ *   docs/historical-postgres-task-v0.md. `scripts/historical-postgres-200.ts`
+ *   - unlike case 001's script - requires this for its real trial entrypoint,
+ *   since a real Bug 2 run without canonical truth provenance is not
+ *   acceptable for this task; the parameter itself stays optional here so
+ *   synthetic/unit-test specs can omit it.
+ */
+export function historicalPostgres002TaskSpec(repoPath: string, knownReproducerPath?: string): HistoricalPostgresTaskSpec {
+  return {
+    // Opaque, matching `postgres-historical-001`'s convention. The
+    // descriptive corpus slot id `pg-hist-plpgsql-call-stale-plan-002`
+    // (#185) names PL/pgSQL, CALL and "stale plan" outright and must never
+    // be agent-visible (it would leak the failure mechanism through the
+    // task manifest / HONEYRAIL_TASK_ID) - it stays a code/doc reference
+    // only, for administrative traceability back to #185.
+    taskId: "postgres-historical-002",
+    source: {
+      repoPath,
+      historicalRevision: "7696b2ea52416cc2f4046a359d3b6f760e4c013d",
+      referenceRevision: "7f875fb5bd603d8640cc7aca2c79c604aacd3890"
+    },
+    truth: {
+      upstreamBug: "PostgreSQL BUG #18574",
+      // No CommitFest entry exists for this bug - it was reported directly
+      // to pgsql-bugs, not submitted through a CommitFest - so commitFest is
+      // omitted rather than fabricated. See HistoricalPostgresTaskSpec.truth.
+      knownReproducerPath,
+      // Generic, declarative oracle (see historical-behavioral-oracle.ts):
+      // requires the submitted reproducer's own captured stderr to contain
+      // these two ERROR observations, in order, before the historical ref
+      // counts as reproduced or the reference ref counts as the baseline.
+      // This is what keeps an unrelated revision-discriminating script from
+      // earning `rediscovered` credit for a different bug entirely.
+      behavioralOracle: {
+        historical: [
+          { label: "first CALL", matches: HISTORICAL_POSTGRES_002_BASELINE_ERROR },
+          { label: "second CALL", matches: "^cache lookup failed for function \\d+$" }
+        ],
+        reference: [
+          { label: "first CALL", matches: HISTORICAL_POSTGRES_002_BASELINE_ERROR },
+          { label: "second CALL", matches: HISTORICAL_POSTGRES_002_BASELINE_ERROR }
+        ]
+      }
+    },
+    scaffoldingLevel: "minimal",
+    budget: {},
+    prompt: historicalPostgres002TaskPrompt()
   };
 }
