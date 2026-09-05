@@ -108,6 +108,33 @@ test("checkedTaskSpec rejects a spec that declares both behavioralOracle and str
   );
 });
 
+test("checkedTaskSpec rejects a programmatically-constructed spec whose structuredOracle sides overlap (bypassing Case 003 loader)", async () => {
+  // Construct directly — not via historicalPostgres003TaskSpec()/loadHistoricalPostgres003PrivateTruth() —
+  // to prove checkedTaskSpec() enforces the invariant for any HistoricalPostgresTaskSpec,
+  // including ones that never go through the Case 003 JSON loader.
+  // historical omits `ordered` (defaults true), reference declares ordered: true explicitly —
+  // same semantics, same rows → overlap → must be rejected before grading can run.
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-historical-003-overlap-"));
+  const repo = await createSyntheticPostgresSourceRepo(root);
+  const overlapping: HistoricalPostgresTaskSpec = {
+    taskId: "synthetic-overlap-check",
+    source: { repoPath: repo.repoPath, historicalRevision: repo.ref, referenceRevision: repo.laterRef },
+    truth: {
+      upstreamBug: "Synthetic #overlap",
+      structuredOracle: {
+        historical: { rows: [["alpha"]] },
+        reference: { rows: [["alpha"]], ordered: true }
+      }
+    },
+    build: { mode: "host" },
+    prompt: "Test."
+  };
+  await assert.rejects(
+    () => materializeHistoricalPostgresTask(overlapping, join(root, "case")),
+    /overlap/i
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Grading protocol: structured oracle
 // ---------------------------------------------------------------------------
@@ -596,6 +623,6 @@ test("loadHistoricalPostgres003PrivateTruth: rejects identical historical and re
   });
   await assert.rejects(
     () => loadHistoricalPostgres003PrivateTruth(path),
-    /identical/i
+    /overlap/i
   );
 });

@@ -197,6 +197,74 @@ export function assertNoDelimiterInExpectedRows(rows: string[][], fieldSeparator
 }
 
 /**
+ * Builds a frequency map keyed by JSON.stringify(row). Used by both
+ * `evaluateStructuredOracle()` (ordered: false path) and
+ * `structuredExpectationsOverlap()` for deterministic multiset comparison.
+ * Module-level so neither function duplicates the implementation.
+ */
+function buildFrequencyMap(arr: string[][]): Map<string, number> {
+  const map = new Map<string, number>();
+  for (const row of arr) {
+    const key = JSON.stringify(row);
+    map.set(key, (map.get(key) ?? 0) + 1);
+  }
+  return map;
+}
+
+function frequencyMapsEqual(a: Map<string, number>, b: Map<string, number>): boolean {
+  if (a.size !== b.size) return false;
+  for (const [key, count] of a) {
+    if (b.get(key) !== count) return false;
+  }
+  return true;
+}
+
+/**
+ * Returns `true` if there exists some captured output that would satisfy
+ * *both* `a` and `b` under `evaluateStructuredOracle()`'s actual matching
+ * semantics — i.e., the two expectations are not mutually exclusive and the
+ * oracle cannot attribute a run to exactly one side.
+ *
+ * Semantics for all three cases (normalizing `ordered: undefined` → `true`):
+ * - **ordered + ordered**: overlap iff the row sequences are identical (same
+ *   rows, same order, same length) — only that one sequence satisfies both.
+ * - **unordered + unordered**: overlap iff the row multisets are identical
+ *   (same rows with same multiplicities, order irrelevant).
+ * - **ordered + unordered** (either side ordered, the other not): overlap iff
+ *   the ordered side's row sequence, treated as a multiset, equals the
+ *   unordered side's row multiset. The only output satisfying the ordered
+ *   oracle is exactly that sequence; it satisfies the unordered oracle iff
+ *   its multiset matches.
+ *
+ * Uses `buildFrequencyMap()` for all multiset comparisons — the same
+ * `JSON.stringify(row)`-keyed approach used by `evaluateStructuredOracle()`'s
+ * `ordered: false` path — so overlap semantics stay in lock-step with
+ * grading semantics.
+ *
+ * Exported so `checkedTaskSpec()` in `historical-task.ts` can enforce this
+ * invariant across all task specs, not just the Case 003 JSON loader.
+ */
+export function structuredExpectationsOverlap(
+  a: HistoricalPostgresStructuredExpectation,
+  b: HistoricalPostgresStructuredExpectation
+): boolean {
+  const aOrdered = a.ordered !== false; // normalise undefined → true
+  const bOrdered = b.ordered !== false; // normalise undefined → true
+
+  if (aOrdered && bOrdered) {
+    // ordered + ordered: overlap iff sequences are identical
+    if (a.rows.length !== b.rows.length) return false;
+    for (let i = 0; i < a.rows.length; i += 1) {
+      if (JSON.stringify(a.rows[i]) !== JSON.stringify(b.rows[i])) return false;
+    }
+    return true;
+  }
+
+  // unordered + unordered, or ordered + unordered: overlap iff multisets equal
+  return frequencyMapsEqual(buildFrequencyMap(a.rows), buildFrequencyMap(b.rows));
+}
+
+/**
  * Evaluates captured `rows` (from `parseTuplesOnlyOutput()`) against a
  * declared `expected` side of a structured oracle.
  *
@@ -230,14 +298,6 @@ export function evaluateStructuredOracle(
     // JSON.stringify(row). This avoids both locale-dependent ICU sort order
     // and the separator-ambiguity of joining fields with "" (["a","bc"] and
     // ["ab","c"] would both produce "abc" with join("")).
-    const buildFrequencyMap = (arr: string[][]): Map<string, number> => {
-      const map = new Map<string, number>();
-      for (const row of arr) {
-        const key = JSON.stringify(row);
-        map.set(key, (map.get(key) ?? 0) + 1);
-      }
-      return map;
-    };
     const actualFreq = buildFrequencyMap(rows);
     const expectedFreq = buildFrequencyMap(expectedRows);
     const allKeys = new Set([...actualFreq.keys(), ...expectedFreq.keys()]);

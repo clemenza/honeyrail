@@ -29,6 +29,8 @@ import {
   assertNoDelimiterInExpectedRows,
   assertValidExpectedRows,
   evaluateStructuredOracleAttribution,
+  structuredExpectationsOverlap,
+  type HistoricalPostgresStructuredExpectation,
   type HistoricalPostgresStructuredOracle,
   type HistoricalPostgresStructuredOracleAttribution,
   type HistoricalPostgresStructuredOracleResult
@@ -464,6 +466,11 @@ function checkedTaskSpec(spec: HistoricalPostgresTaskSpec): HistoricalPostgresTa
           throw new Error(`truth.structuredOracle.${side}.rows[${index}] must be a non-empty array of strings`);
         }
       });
+    }
+    if (structuredExpectationsOverlap(spec.truth.structuredOracle.historical, spec.truth.structuredOracle.reference)) {
+      throw new Error(
+        "truth.structuredOracle historical/reference expectations overlap and cannot be attributed unambiguously"
+      );
     }
   }
   if (spec.truth?.behavioralOracle !== undefined && spec.truth?.structuredOracle !== undefined) {
@@ -1297,12 +1304,12 @@ export async function loadHistoricalPostgres003PrivateTruth(filePath: string): P
   }
   // An oracle that can't structurally distinguish the two revisions is a
   // task-authoring bug and must fail loudly at load time rather than only
-  // surfacing later as "always unattributed."
-  const historicalSide = (oracleObj.historical as Record<string, unknown>);
-  const referenceSide = (oracleObj.reference as Record<string, unknown>);
-  if (JSON.stringify(historicalSide) === JSON.stringify(referenceSide)) {
+  // surfacing later as "always unattributed." Use the same semantic-overlap
+  // check that checkedTaskSpec() enforces generically — one definition of
+  // "overlap", not two subtly different implementations.
+  if (structuredExpectationsOverlap(oracleObj.historical as HistoricalPostgresStructuredExpectation, oracleObj.reference as HistoricalPostgresStructuredExpectation)) {
     throw new Error(
-      `loadHistoricalPostgres003PrivateTruth: ${filePath} structuredOracle.historical and .reference are identical — the oracle cannot distinguish the two revisions`
+      `loadHistoricalPostgres003PrivateTruth: ${filePath} structuredOracle.historical and .reference expectations overlap and cannot be attributed unambiguously — the oracle cannot distinguish the two revisions`
     );
   }
   return { upstreamBug, historicalRevision, referenceRevision, structuredOracle: value.structuredOracle as HistoricalPostgresStructuredOracle };

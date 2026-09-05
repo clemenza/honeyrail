@@ -7,6 +7,7 @@ import {
   evaluateStructuredOracle,
   evaluateStructuredOracleAttribution,
   parseTuplesOnlyOutput,
+  structuredExpectationsOverlap,
   type HistoricalPostgresStructuredOracle
 } from "../server/postgres/historical-structured-oracle.js";
 import {
@@ -318,4 +319,85 @@ test("evaluateStructuredOracle: ordered: false — fields that would collide wit
     { rows: [["ab", "c"]], ordered: false }
   );
   assert.equal(result.satisfied, false);
+});
+
+// ---------------------------------------------------------------------------
+// structuredExpectationsOverlap
+// ---------------------------------------------------------------------------
+
+test("structuredExpectationsOverlap: implicit ordered vs explicit ordered: true — detected as overlapping", () => {
+  // historical omits `ordered` (defaults to true), reference declares ordered: true explicitly.
+  // Both are semantically ordered with identical row sequences → overlap.
+  assert.equal(
+    structuredExpectationsOverlap(
+      { rows: [["alpha"]] },
+      { rows: [["alpha"]], ordered: true }
+    ),
+    true
+  );
+});
+
+test("structuredExpectationsOverlap: same content different JSON property insertion order — still detected as overlapping", () => {
+  // Proves the check is semantic, not a raw string/key-order comparison.
+  // Both sides ordered, same sequence — overlap regardless of object key order.
+  assert.equal(
+    structuredExpectationsOverlap(
+      { ordered: true, rows: [["alpha"]] },
+      { rows: [["alpha"]], ordered: true }
+    ),
+    true
+  );
+});
+
+test("structuredExpectationsOverlap: ordered vs unordered, same multiset — overlap true", () => {
+  assert.equal(
+    structuredExpectationsOverlap(
+      { rows: [["alpha"], ["beta"]], ordered: true },
+      { rows: [["beta"], ["alpha"]], ordered: false }
+    ),
+    true
+  );
+});
+
+test("structuredExpectationsOverlap: unordered duplicate multiplicity same multiset — overlap true", () => {
+  assert.equal(
+    structuredExpectationsOverlap(
+      { rows: [["alpha"], ["alpha"], ["beta"]], ordered: false },
+      { rows: [["beta"], ["alpha"], ["alpha"]], ordered: false }
+    ),
+    true
+  );
+});
+
+test("structuredExpectationsOverlap: genuinely disjoint expectations (different row content) — overlap false", () => {
+  assert.equal(
+    structuredExpectationsOverlap(
+      { rows: [["alpha"]] },
+      { rows: [["beta"]] }
+    ),
+    false
+  );
+});
+
+test("structuredExpectationsOverlap: same multiset size but different multiplicities — overlap false", () => {
+  // [alpha, alpha, beta] vs [alpha, beta, beta] — same size, different multiplicities
+  assert.equal(
+    structuredExpectationsOverlap(
+      { rows: [["alpha"], ["alpha"], ["beta"]], ordered: false },
+      { rows: [["alpha"], ["beta"], ["beta"]], ordered: false }
+    ),
+    false
+  );
+});
+
+test("structuredExpectationsOverlap: ordered sides with same multiset but different order — overlap false", () => {
+  // Both ordered: the only satisfying output for each is its exact sequence.
+  // alpha/beta vs beta/alpha — different sequences, no overlap.
+  assert.equal(
+    structuredExpectationsOverlap(
+      { rows: [["alpha"], ["beta"]] },
+      { rows: [["beta"], ["alpha"]] }
+    ),
+    false
+  );
 });
