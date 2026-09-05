@@ -1,6 +1,6 @@
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
-import { historicalPostgres003TaskSpec, runHistoricalPostgresTrial } from "../server/postgres/historical-task.js";
+import { historicalPostgres003TaskSpec, loadHistoricalPostgres003PrivateTruth, runHistoricalPostgresTrial } from "../server/postgres/historical-task.js";
 
 const mirror = String(process.env.HONEYRAIL_PG_199_MIRROR || "").trim();
 const command = String(process.env.HONEYRAIL_PG_199_AGENT_COMMAND || "").trim();
@@ -19,6 +19,13 @@ if (!knownReproducer) {
     "HONEYRAIL_PG_199_REPRODUCER is required to run this task's real trial with canonical truth provenance; unlike case 001, case 003 must not run without it."
   );
 }
+const privateTruthPath = String(process.env.HONEYRAIL_PG_199_PRIVATE_TRUTH || "").trim();
+if (!privateTruthPath) {
+  throw new Error(
+    "HONEYRAIL_PG_199_PRIVATE_TRUTH is required: set it to the path of the operator-supplied private-truth JSON file for case 003."
+  );
+}
+const privateTruth = await loadHistoricalPostgres003PrivateTruth(privateTruthPath);
 const network = String(process.env.HONEYRAIL_PG_199_AGENT_NETWORK || "").trim();
 const image = String(process.env.HONEYRAIL_PG_199_AGENT_IMAGE || "").trim();
 const artifactDir = resolve(process.env.HONEYRAIL_PG_199_ARTIFACT_DIR || "output/historical-pg-199");
@@ -26,7 +33,7 @@ const timeoutMs = Number(process.env.HONEYRAIL_PG_199_AGENT_TIMEOUT_MS || 30 * 6
 if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("HONEYRAIL_PG_199_AGENT_TIMEOUT_MS must be a positive number of milliseconds.");
 await mkdir(artifactDir, { recursive: true });
 const result = await runHistoricalPostgresTrial({
-  task: historicalPostgres003TaskSpec(resolve(mirror), knownReproducer ? resolve(knownReproducer) : undefined),
+  task: historicalPostgres003TaskSpec(resolve(mirror), privateTruth, knownReproducer ? resolve(knownReproducer) : undefined),
   agent: { command, args, timeoutMs, env: process.env.HONEYRAIL_PG_199_AGENT_ENV ? JSON.parse(process.env.HONEYRAIL_PG_199_AGENT_ENV) : undefined },
   artifactDir,
   session: network || image ? { isolation: { ...(network ? { network: network as "none" | "bridge" } : {}), ...(image ? { image } : {}) } } : undefined

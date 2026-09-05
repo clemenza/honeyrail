@@ -32,9 +32,26 @@ test("parseTuplesOnlyOutput: two rows", () => {
   ]);
 });
 
-test("parseTuplesOnlyOutput: empty stdout returns empty array", () => {
+test("parseTuplesOnlyOutput: truly empty stdout (no bytes) returns empty array", () => {
   assert.deepEqual(parseTuplesOnlyOutput(""), []);
-  assert.deepEqual(parseTuplesOnlyOutput("\n"), []);
+});
+
+test("parseTuplesOnlyOutput: bare \\n (psql trailing terminator only) returns one empty-field row, not empty array", () => {
+  // Problem A fix: only the single final trailing empty line is removed.
+  // "\n" splits to ["", ""], we pop "" -> [""], which is one line of empty
+  // string -> one row [""] (one field, value empty string).
+  // Zero-row psql output with -t -A emits nothing (""), not "\n".
+  assert.deepEqual(parseTuplesOnlyOutput("\n"), [[""]]);
+});
+
+test("parseTuplesOnlyOutput: one row with a single empty-string field is preserved", () => {
+  // A row whose only field is '' must not be lost to interior-line filtering.
+  assert.deepEqual(parseTuplesOnlyOutput("\n"), [[""]]);
+});
+
+test("parseTuplesOnlyOutput: multiple rows where one has an empty field in the middle", () => {
+  assert.deepEqual(parseTuplesOnlyOutput("a||b\n"), [["a", "", "b"]]);
+  assert.deepEqual(parseTuplesOnlyOutput("a||b\nx|y|z\n"), [["a", "", "b"], ["x", "y", "z"]]);
 });
 
 test("parseTuplesOnlyOutput: throws on non-string input", () => {
@@ -233,4 +250,71 @@ test("gradeHistoricalPostgresSubmission: structured oracle — correct captured 
     })
   });
   assert.equal(grade.status, "invalid_submission", JSON.stringify(grade, null, 2));
+});
+
+// ---------------------------------------------------------------------------
+// Problem B — delimiter ambiguity: expected fields containing separator/CR/LF
+// ---------------------------------------------------------------------------
+
+test("evaluateStructuredOracle: expected field containing field separator throws loudly", () => {
+  assert.throws(
+    () => evaluateStructuredOracle([["a"]], { rows: [["a|b"]] }),
+    /field separator/i
+  );
+});
+
+test("evaluateStructuredOracle: expected field containing CR throws loudly", () => {
+  assert.throws(
+    () => evaluateStructuredOracle([["a"]], { rows: [["a\rb"]] }),
+    /CR character/i
+  );
+});
+
+test("evaluateStructuredOracle: expected field containing LF throws loudly", () => {
+  assert.throws(
+    () => evaluateStructuredOracle([["a"]], { rows: [["a\nb"]] }),
+    /LF character/i
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Problem C — deterministic multiset comparison (ordered: false)
+// ---------------------------------------------------------------------------
+
+test("evaluateStructuredOracle: ordered: false — same rows in different order match", () => {
+  const result = evaluateStructuredOracle(
+    [["b", "2"], ["a", "1"]],
+    { rows: [["a", "1"], ["b", "2"]], ordered: false }
+  );
+  assert.equal(result.satisfied, true);
+  assert.deepEqual(result.diagnostics, []);
+});
+
+test("evaluateStructuredOracle: ordered: false — duplicate rows require matching multiplicity", () => {
+  // Two identical rows expected; one actual — mismatch
+  const result = evaluateStructuredOracle(
+    [["a", "1"]],
+    { rows: [["a", "1"], ["a", "1"]], ordered: false }
+  );
+  assert.equal(result.satisfied, false);
+  assert.ok(result.diagnostics.some((d) => d.includes("time(s)")));
+});
+
+test("evaluateStructuredOracle: ordered: false — different multiplicities mismatch", () => {
+  // Two of ["a"] expected, only one actual
+  const result = evaluateStructuredOracle(
+    [["a"], ["b"]],
+    { rows: [["a"], ["a"]], ordered: false }
+  );
+  assert.equal(result.satisfied, false);
+});
+
+test("evaluateStructuredOracle: ordered: false — fields that would collide with join('') are correctly distinguished", () => {
+  // ["a","bc"] and ["ab","c"] both join to "abc" — old code would treat them as equal.
+  // The frequency map uses JSON.stringify, so they remain distinct.
+  const result = evaluateStructuredOracle(
+    [["a", "bc"]],
+    { rows: [["ab", "c"]], ordered: false }
+  );
+  assert.equal(result.satisfied, false);
 });

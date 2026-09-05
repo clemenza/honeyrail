@@ -118,15 +118,15 @@ export function parseTuplesOnlyOutput(stdout: string, fieldSeparator = "|"): str
     throw new Error(`parseTuplesOnlyOutput: expected a string, got ${typeof stdout}`);
   }
   const lines = stdout.split(/\r?\n/);
-  // Drop one trailing empty line (psql always ends with \n)
+  // Drop exactly one trailing empty line (psql always ends with \n).
+  // Only the single final terminator is removed — interior empty lines are
+  // preserved so a real result row whose only field is an empty string
+  // (e.g. one row, one column, value '') is not silently discarded.
   if (lines.length > 0 && lines[lines.length - 1] === "") {
     lines.pop();
   }
-  // Skip any remaining empty lines (e.g. a bare "\n" input, or a result set
-  // with no rows, where psql outputs nothing beyond the trailing newline).
-  const nonEmpty = lines.filter((line) => line !== "");
-  if (nonEmpty.length === 0) return [];
-  return nonEmpty.map((line) => line.split(fieldSeparator));
+  if (lines.length === 0) return [];
+  return lines.map((line) => line.split(fieldSeparator));
 }
 
 /**
@@ -158,9 +158,35 @@ function assertValidExpectedRows(rows: unknown): asserts rows is string[][] {
   }
 }
 
-/** Canonical sort key for a row: fields joined with an ASCII unit-separator unlikely to appear in field values. */
-function rowSortKey(row: string[]): string {
-  return row.join("");
+/**
+ * Validates that no expected field value contains the field separator, a CR,
+ * or a LF — all of which would make row/field boundaries ambiguous. Applied
+ * only to grader-private truth (expected.rows), which task-authoring controls;
+ * a task-authoring bug must be loud rather than silently producing wrong
+ * results. Does not validate actual captured rows (agent-submitted output),
+ * which may contain arbitrary bytes by design.
+ */
+function assertNoDelimiterInExpectedRows(rows: string[][], fieldSeparator: string): void {
+  for (let i = 0; i < rows.length; i += 1) {
+    for (let j = 0; j < rows[i].length; j += 1) {
+      const field = rows[i][j];
+      if (field.includes(fieldSeparator)) {
+        throw new Error(
+          `Structured oracle expected rows[${i}][${j}] contains the field separator ${JSON.stringify(fieldSeparator)}, which makes field boundaries ambiguous`
+        );
+      }
+      if (field.includes("\r")) {
+        throw new Error(
+          `Structured oracle expected rows[${i}][${j}] contains a CR character (\\r), which would corrupt row boundaries`
+        );
+      }
+      if (field.includes("\n")) {
+        throw new Error(
+          `Structured oracle expected rows[${i}][${j}] contains a LF character (\\n), which would corrupt row boundaries`
+        );
+      }
+    }
+  }
 }
 
 /**
@@ -173,42 +199,62 @@ function rowSortKey(row: string[]): string {
  * - Each row's field count must exactly match the corresponding expected row.
  * - Each field value must be exactly equal (string equality, no trimming).
  * - When `expected.ordered !== false` (the default), positional order is
- *   enforced. When `ordered === false`, both sides are sorted by a canonical
- *   key before comparison (multiset semantics).
+ *   enforced. When `ordered === false`, comparison is a deterministic multiset:
+ *   frequency maps keyed by `JSON.stringify(row)` are compared, so duplicate
+ *   rows require matching multiplicity and row order is irrelevant.
  *
  * A malformed `expected.rows` (not an array of non-empty string arrays)
  * throws — task-authoring bugs must be loud, not silently produce wrong
- * results.
+ * results. A field value in `expected.rows` containing the field separator,
+ * CR, or LF also throws for the same reason.
  */
 export function evaluateStructuredOracle(
   rows: string[][],
-  expected: HistoricalPostgresStructuredExpectation
+  expected: HistoricalPostgresStructuredExpectation,
+  fieldSeparator = "|"
 ): HistoricalPostgresStructuredOracleResult {
   assertValidExpectedRows(expected.rows);
+  assertNoDelimiterInExpectedRows(expected.rows, fieldSeparator);
   const expectedRows = expected.rows;
   const diagnostics: string[] = [];
 
-  let actualRows: string[][];
-  let comparisonRows: string[][];
-
   if (expected.ordered === false) {
-    // Multiset comparison: sort both sides by the same canonical key.
-    actualRows = [...rows].sort((a, b) => rowSortKey(a).localeCompare(rowSortKey(b)));
-    comparisonRows = [...expectedRows].sort((a, b) => rowSortKey(a).localeCompare(rowSortKey(b)));
-  } else {
-    actualRows = rows;
-    comparisonRows = expectedRows;
+    // Deterministic multiset comparison: frequency maps keyed by
+    // JSON.stringify(row). This avoids both locale-dependent ICU sort order
+    // and the separator-ambiguity of joining fields with "" (["a","bc"] and
+    // ["ab","c"] would both produce "abc" with join("")).
+    const buildFrequencyMap = (arr: string[][]): Map<string, number> => {
+      const map = new Map<string, number>();
+      for (const row of arr) {
+        const key = JSON.stringify(row);
+        map.set(key, (map.get(key) ?? 0) + 1);
+      }
+      return map;
+    };
+    const actualFreq = buildFrequencyMap(rows);
+    const expectedFreq = buildFrequencyMap(expectedRows);
+    const allKeys = new Set([...actualFreq.keys(), ...expectedFreq.keys()]);
+    let satisfied = true;
+    for (const key of allKeys) {
+      const actualCount = actualFreq.get(key) ?? 0;
+      const expectedCount = expectedFreq.get(key) ?? 0;
+      if (actualCount !== expectedCount) {
+        satisfied = false;
+        diagnostics.push(`Multiset mismatch: row ${key} expected ${expectedCount} time(s), got ${actualCount} time(s).`);
+      }
+    }
+    return { rows, expected: expectedRows, satisfied, diagnostics };
   }
 
-  if (actualRows.length !== comparisonRows.length) {
-    diagnostics.push(`Expected exactly ${comparisonRows.length} row(s), got ${actualRows.length}.`);
+  if (rows.length !== expectedRows.length) {
+    diagnostics.push(`Expected exactly ${expectedRows.length} row(s), got ${rows.length}.`);
     return { rows, expected: expectedRows, satisfied: false, diagnostics };
   }
 
   let satisfied = true;
-  for (let i = 0; i < comparisonRows.length; i += 1) {
-    const expectedRow = comparisonRows[i];
-    const actualRow = actualRows[i];
+  for (let i = 0; i < expectedRows.length; i += 1) {
+    const expectedRow = expectedRows[i];
+    const actualRow = rows[i];
     if (actualRow.length !== expectedRow.length) {
       satisfied = false;
       diagnostics.push(

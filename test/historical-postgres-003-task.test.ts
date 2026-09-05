@@ -10,36 +10,50 @@ import {
   historicalPostgres003TaskSpec,
   materializeHistoricalPostgresTask,
   resolveOracleReproduction,
+  type HistoricalPostgresCase003PrivateTruth,
   type HistoricalPostgresTaskSpec
 } from "../server/postgres/historical-task.js";
 import { evaluateStructuredOracleAttribution } from "../server/postgres/historical-structured-oracle.js";
 import { createSyntheticPostgresSourceRepo } from "./helpers/postgres-source-fixture.js";
 import { readTreeAsText } from "./helpers/read-tree-as-text.js";
 
+// Synthetic private truth used for unit tests. Never contains real upstream
+// revisions, bug ids, or expected tuples — those are operator-supplied at
+// runtime via loadHistoricalPostgres003PrivateTruth() / HONEYRAIL_PG_199_PRIVATE_TRUTH.
+const SYNTHETIC_003_PRIVATE_TRUTH: HistoricalPostgresCase003PrivateTruth = {
+  upstreamBug: "Synthetic BUG #00003",
+  historicalRevision: "c".repeat(40),
+  referenceRevision: "d".repeat(40),
+  structuredOracle: {
+    historical: { rows: [["synthetic-historical", "off", "off"]] },
+    reference: { rows: [["synthetic-reference", "on", "on"]] }
+  }
+};
+
 // ---------------------------------------------------------------------------
 // Identity and structure
 // ---------------------------------------------------------------------------
 
-test("historicalPostgres003TaskSpec carries the frozen #185 Bug 3 identity behind an opaque task id, and no CommitFest", () => {
-  const spec = historicalPostgres003TaskSpec("/unused/repo/path");
+test("historicalPostgres003TaskSpec carries operator-supplied private truth behind an opaque task id, and no CommitFest", () => {
+  const spec = historicalPostgres003TaskSpec("/unused/repo/path", SYNTHETIC_003_PRIVATE_TRUTH);
   assert.equal(spec.taskId, "postgres-historical-003");
-  assert.equal(spec.source.historicalRevision, "c7c4ce2be363ac5cf5141e73fd7966e0bbfe401f");
-  assert.equal(spec.source.referenceRevision, "10323f140fef776881923f1afc0a369f7be8e035");
-  assert.equal(spec.truth.upstreamBug, "PostgreSQL BUG #18118");
+  assert.equal(spec.source.historicalRevision, SYNTHETIC_003_PRIVATE_TRUTH.historicalRevision);
+  assert.equal(spec.source.referenceRevision, SYNTHETIC_003_PRIVATE_TRUTH.referenceRevision);
+  assert.equal(spec.truth.upstreamBug, SYNTHETIC_003_PRIVATE_TRUTH.upstreamBug);
   assert.equal(spec.truth.commitFest, undefined);
   assert.ok(spec.prompt.trim().length > 0);
   // The prompt is agent-visible: it must never name the upstream bug, a
   // specific chain/savepoint/subtransaction mechanism, or the raw expected tuples.
-  assert.ok(!spec.prompt.includes("18118"));
+  assert.ok(!spec.prompt.includes("00003"));
   assert.ok(!spec.prompt.toLowerCase().includes("commitfest"));
   assert.ok(!spec.prompt.toLowerCase().includes("savepoint"));
   assert.ok(!spec.prompt.toLowerCase().includes("chain"));
-  assert.ok(!spec.prompt.toLowerCase().includes("serializable|on|on"));
+  assert.ok(!spec.prompt.toLowerCase().includes("synthetic-reference|on|on"));
   assert.equal(historicalPostgres003TaskPrompt(), spec.prompt);
 });
 
-test("historicalPostgres003TaskSpec declares a structured oracle with the expected tuple shape", () => {
-  const spec = historicalPostgres003TaskSpec("/unused/repo/path");
+test("historicalPostgres003TaskSpec declares a structured oracle from private truth", () => {
+  const spec = historicalPostgres003TaskSpec("/unused/repo/path", SYNTHETIC_003_PRIVATE_TRUTH);
   const oracle = spec.truth.structuredOracle;
   assert.ok(oracle, "structuredOracle must be present");
   assert.ok(Array.isArray(oracle!.historical.rows));
@@ -48,6 +62,8 @@ test("historicalPostgres003TaskSpec declares a structured oracle with the expect
   assert.equal(oracle!.reference.rows.length, 1);
   assert.equal(oracle!.historical.rows[0].length, 3);
   assert.equal(oracle!.reference.rows[0].length, 3);
+  assert.deepEqual(oracle!.historical, SYNTHETIC_003_PRIVATE_TRUTH.structuredOracle.historical);
+  assert.deepEqual(oracle!.reference, SYNTHETIC_003_PRIVATE_TRUTH.structuredOracle.reference);
   // Oracle sides must be mutually exclusive (historical != reference)
   assert.notDeepEqual(oracle!.historical.rows, oracle!.reference.rows);
   // No behavioralOracle on a structured-oracle task
@@ -55,8 +71,38 @@ test("historicalPostgres003TaskSpec declares a structured oracle with the expect
 });
 
 test("historicalPostgres003TaskSpec passes a known-reproducer path through to truth for provenance hashing", () => {
-  const spec = historicalPostgres003TaskSpec("/unused/repo/path", "/private/known-repro.sql");
+  const spec = historicalPostgres003TaskSpec("/unused/repo/path", SYNTHETIC_003_PRIVATE_TRUTH, "/private/known-repro.sql");
   assert.equal(spec.truth.knownReproducerPath, "/private/known-repro.sql");
+});
+
+// ---------------------------------------------------------------------------
+// Mutual exclusion: behavioralOracle and structuredOracle cannot coexist
+// ---------------------------------------------------------------------------
+
+test("checkedTaskSpec rejects a spec that declares both behavioralOracle and structuredOracle", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-historical-003-mutual-excl-"));
+  const repo = await createSyntheticPostgresSourceRepo(root);
+  const bothOracles: HistoricalPostgresTaskSpec = {
+    taskId: "synthetic-mutual-exclusion",
+    source: { repoPath: repo.repoPath, historicalRevision: repo.ref, referenceRevision: repo.laterRef },
+    truth: {
+      upstreamBug: "Synthetic #exclusive",
+      behavioralOracle: {
+        historical: [{ label: "hist", matches: "^historical error$" }],
+        reference: [{ label: "ref", matches: "^reference error$" }]
+      },
+      structuredOracle: {
+        historical: { rows: [["hist-val"]] },
+        reference: { rows: [["ref-val"]] }
+      }
+    },
+    build: { mode: "host" },
+    prompt: "Test."
+  };
+  await assert.rejects(
+    () => materializeHistoricalPostgresTask(bothOracles, join(root, "case")),
+    /mutually exclusive/i
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -66,8 +112,12 @@ test("historicalPostgres003TaskSpec passes a known-reproducer path through to tr
 test("historicalPostgres003TaskSpec materializes under the structured-oracle grading protocol, distinct from 001/002", async () => {
   const root = await mkdtemp(join(tmpdir(), "honeyrail-historical-003-protocol-"));
   const repo = await createSyntheticPostgresSourceRepo(root);
-  const base = historicalPostgres003TaskSpec(repo.repoPath);
-  const spec: HistoricalPostgresTaskSpec = { ...base, source: { ...base.source, historicalRevision: repo.ref, referenceRevision: repo.laterRef } };
+  const privateTruth: HistoricalPostgresCase003PrivateTruth = {
+    ...SYNTHETIC_003_PRIVATE_TRUTH,
+    historicalRevision: repo.ref,
+    referenceRevision: repo.laterRef
+  };
+  const spec = historicalPostgres003TaskSpec(repo.repoPath, privateTruth);
   const task = await materializeHistoricalPostgresTask(spec, join(root, "case"));
   assert.equal(task.truthManifest.gradingProtocol, "submitted-reproducer-structured-oracle-v1");
   assert.equal(task.referenceManifest.gradingProtocol, "submitted-reproducer-structured-oracle-v1");
@@ -356,7 +406,7 @@ test("gradeHistoricalPostgresSubmission: structured oracle — infrastructure-in
 });
 
 // ---------------------------------------------------------------------------
-// Recursive leak test — the most important correctness proof for HOLDOUT
+// Recursive leak test — confirms the task/ tree never carries private truth
 // ---------------------------------------------------------------------------
 
 test("no file anywhere under the materialized task/ tree leaks the bug identity, either revision, the canonical reproducer, or the expected oracle tuples", async () => {
@@ -374,19 +424,21 @@ test("no file anywhere under the materialized task/ tree leaks the bug identity,
     "-- canonical Bug 3 reproducer content (never committed)\n";
   await writeFile(reproPath, reproContents);
 
-  const base = historicalPostgres003TaskSpec(repo.repoPath, reproPath);
-  const spec: HistoricalPostgresTaskSpec = { ...base, source: { ...base.source, historicalRevision: repo.ref, referenceRevision: repo.laterRef } };
+  // Use synthetic private truth so no real bug identity appears in the repo.
+  // The leak test checks that whatever values ARE in the truth don't leak into task/.
+  const privateTruth: HistoricalPostgresCase003PrivateTruth = {
+    ...SYNTHETIC_003_PRIVATE_TRUTH,
+    historicalRevision: repo.ref,
+    referenceRevision: repo.laterRef
+  };
+  const spec = historicalPostgres003TaskSpec(repo.repoPath, privateTruth, reproPath);
   const task = await materializeHistoricalPostgresTask(spec, join(root, "case"));
 
   const taskFiles = await readTreeAsText(task.taskDir);
   const secrets: Record<string, string> = {
-    // Upstream bug identity
-    "upstream bug number": "18118",
-    "upstream bug id": "BUG #18118",
-    // Failure-mechanism vocabulary (never in the prompt, never in task/)
-    "failure mechanism (chain)": "COMMIT AND CHAIN",
-    "failure mechanism (savepoint)": "savepoint",
-    // Both pinned revisions
+    // Upstream bug identity (synthetic)
+    "upstream bug id": privateTruth.upstreamBug,
+    // Both pinned revisions (synthetic, taken from the repo fixture)
     "historical revision": spec.source.historicalRevision,
     "reference revision": spec.source.referenceRevision,
     // Grader-private filesystem paths
@@ -395,16 +447,9 @@ test("no file anywhere under the materialized task/ tree leaks the bug identity,
     // Reproducer content and provenance hash
     "canonical reproducer contents": reproContents,
     "canonical reproducer hash": task.truthManifest.canonicalReproducerSha256!,
-    // Expected oracle tuple strings — the HOLDOUT answer key. These must
-    // match the actual hardcoded HISTORICAL_POSTGRES_003_STRUCTURED_ORACLE
-    // values (confirmed against the real PostgreSQL mirror, not the private
-    // repro script's own inaccurate "read uncommitted" comment) — a leak test
-    // that checks for the wrong string would silently fail to catch a real
-    // leak of the true value.
-    "historical expected tuple (full)": "read committed|off|off",
-    "historical tuple field 0": "read committed",
-    "reference expected tuple (full)": "serializable|on|on",
-    "reference tuple field 0": "serializable"
+    // Expected oracle tuple strings from private truth
+    "historical expected tuple field 0": privateTruth.structuredOracle.historical.rows[0][0],
+    "reference expected tuple field 0": privateTruth.structuredOracle.reference.rows[0][0]
   };
 
   for (const file of taskFiles) {

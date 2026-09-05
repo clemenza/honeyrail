@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   historicalPostgres003TaskSpec,
+  loadHistoricalPostgres003PrivateTruth,
   gradeHistoricalPostgresSubmission,
   materializeHistoricalPostgresTask,
   type HistoricalPostgresStructuredOracleAttribution
@@ -12,9 +13,15 @@ import {
 
 const mirror = String(process.env.HONEYRAIL_PG_199_MIRROR || "").trim();
 const knownReproducer = String(process.env.HONEYRAIL_PG_199_REPRODUCER || "").trim();
+const privateTruthPath = String(process.env.HONEYRAIL_PG_199_PRIVATE_TRUTH || "").trim();
 
-test("#199 known local PostgreSQL verification distinguishes the pinned historical and corrected revisions", { skip: !mirror }, async () => {
+// Both mirror and private truth file are required for this integration test.
+// Skip when either is absent (same guard pattern as the existing MIRROR skip).
+const skipReason = !mirror ? "HONEYRAIL_PG_199_MIRROR not set" : !privateTruthPath ? "HONEYRAIL_PG_199_PRIVATE_TRUTH not set" : "";
+
+test("#199 known local PostgreSQL verification distinguishes the pinned historical and corrected revisions", { skip: !!skipReason }, async () => {
   assert.ok(knownReproducer, "HONEYRAIL_PG_199_REPRODUCER is required whenever HONEYRAIL_PG_199_MIRROR configures this integration test");
+  const privateTruth = await loadHistoricalPostgres003PrivateTruth(privateTruthPath);
   const root = await mkdtemp(join(tmpdir(), "honeyrail-pg199-integration-"));
   const workspace = join(root, "workspace");
   await mkdir(workspace);
@@ -23,7 +30,7 @@ test("#199 known local PostgreSQL verification distinguishes the pinned historic
     join(workspace, "finding.json"),
     JSON.stringify({ status: "reproduced", summary: "Known local historical-003 verification", reproducer: "repro.sql" })
   );
-  const task = historicalPostgres003TaskSpec(resolve(mirror), resolve(knownReproducer));
+  const task = historicalPostgres003TaskSpec(resolve(mirror), privateTruth, resolve(knownReproducer));
   const grade = await gradeHistoricalPostgresSubmission({
     task,
     workspaceDir: workspace,
@@ -52,12 +59,12 @@ test("#199 known local PostgreSQL verification distinguishes the pinned historic
   // that the assertion above depends on grader-side.
   const layout = await materializeHistoricalPostgresTask(task, join(root, "task-bundle"));
   const publicManifest = JSON.stringify(layout.taskManifest);
-  assert.ok(!publicManifest.includes("18118"));
-  assert.ok(!publicManifest.includes("BUG #18118"));
-  assert.ok(!publicManifest.includes("serializable"));
+  // Verify that the real private-truth values (from the loaded file) do NOT appear in task/
+  assert.ok(!publicManifest.includes(privateTruth.upstreamBug));
+  assert.ok(!publicManifest.includes(privateTruth.referenceRevision));
   assert.ok(!("referenceRevision" in layout.taskManifest));
   assert.equal(layout.taskManifest.taskId, "postgres-historical-003");
-  assert.equal(layout.truthManifest.upstreamBug, "PostgreSQL BUG #18118");
+  assert.equal(layout.truthManifest.upstreamBug, privateTruth.upstreamBug);
   assert.equal(layout.truthManifest.commitFest, null);
   assert.equal(layout.truthManifest.referenceRevision, task.source.referenceRevision);
   assert.ok(layout.truthManifest.canonicalReproducerSha256);

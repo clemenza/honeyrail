@@ -464,6 +464,9 @@ function checkedTaskSpec(spec: HistoricalPostgresTaskSpec): HistoricalPostgresTa
       });
     }
   }
+  if (spec.truth?.behavioralOracle !== undefined && spec.truth?.structuredOracle !== undefined) {
+    throw new Error("A task spec may declare at most one oracle: truth.behavioralOracle and truth.structuredOracle are mutually exclusive");
+  }
   const historicalRevision = exactRevision(spec.source.historicalRevision, "source.historicalRevision");
   const referenceRevision = exactRevision(spec.source.referenceRevision, "source.referenceRevision");
   if (historicalRevision === referenceRevision) throw new Error("historical and reference revisions must differ");
@@ -1217,29 +1220,74 @@ export function historicalPostgres002TaskSpec(repoPath: string, knownReproducerP
 }
 
 /**
- * The exact expected tuple output from the private canonical reproducer for
- * #199's structured oracle, validated against locally built PostgreSQL builds
- * (see issue #185 and docs/historical-postgres-task-v0.md). The reproducer
- * explicitly sets three session defaults (`default_transaction_isolation`,
- * `default_transaction_read_only`, `default_transaction_deferrable`) to known
- * values before starting a serializable transaction with a savepoint, then
- * issues `COMMIT AND CHAIN` and queries the resulting session-level settings.
- * On the buggy ref the chain drops the explicit transaction characteristics
- * and falls back to the configured session defaults; on the fixed ref they
- * are correctly preserved.
- *
- * These are grader-private (server-side source only, never shipped into
- * `task/`) - the same discipline as `HISTORICAL_POSTGRES_002_BASELINE_ERROR`
- * above and case 001's pinned revisions. The field separator matches psql's
- * own default with `-A` (already in psqlArgs()).
+ * Operator-supplied private truth for case 003 (issue #199). Passed at
+ * runtime via `loadHistoricalPostgres003PrivateTruth()` — never committed to
+ * this repository. The script `scripts/historical-postgres-199.ts` reads this
+ * from a local JSON file pointed to by `HONEYRAIL_PG_199_PRIVATE_TRUTH`.
+ * Synthetic values are used in unit tests.
  */
-const HISTORICAL_POSTGRES_003_STRUCTURED_ORACLE: HistoricalPostgresStructuredOracle = {
-  historical: { rows: [["read uncommitted", "off", "off"]] },
-  reference: { rows: [["serializable", "on", "on"]] }
+export type HistoricalPostgresCase003PrivateTruth = {
+  upstreamBug: string;
+  historicalRevision: string;
+  referenceRevision: string;
+  structuredOracle: HistoricalPostgresStructuredOracle;
 };
 
 /**
- * Public task prompt for the #199 case (#185's Bug 3 slot, HOLDOUT). Same
+ * Loads and validates operator-supplied private truth for case 003 from a
+ * local JSON file. Throws loudly (not falling back to any default) if the
+ * file is missing, unreadable, malformed, or missing required fields — same
+ * "task-authoring bug must be loud" discipline as `assertValidExpectedRows()`
+ * in `historical-structured-oracle.ts`.
+ *
+ * The file's contents flow only into the returned
+ * `HistoricalPostgresCase003PrivateTruth` object (and from there into
+ * `truth.*` in `historicalPostgres003TaskSpec()`). Nothing is ever written
+ * under `task/` from this data directly.
+ */
+export async function loadHistoricalPostgres003PrivateTruth(filePath: string): Promise<HistoricalPostgresCase003PrivateTruth> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(await readFile(filePath, "utf8"));
+  } catch (error) {
+    throw new Error(`loadHistoricalPostgres003PrivateTruth: could not read or parse ${filePath}: ${(error as Error).message}`);
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`loadHistoricalPostgres003PrivateTruth: ${filePath} must contain a JSON object`);
+  }
+  const value = raw as Record<string, unknown>;
+  const upstreamBug = typeof value.upstreamBug === "string" ? value.upstreamBug.trim() : "";
+  if (!upstreamBug) throw new Error(`loadHistoricalPostgres003PrivateTruth: ${filePath} missing or empty "upstreamBug"`);
+  const historicalRevision = typeof value.historicalRevision === "string" ? value.historicalRevision.trim() : "";
+  if (!historicalRevision) throw new Error(`loadHistoricalPostgres003PrivateTruth: ${filePath} missing or empty "historicalRevision"`);
+  const referenceRevision = typeof value.referenceRevision === "string" ? value.referenceRevision.trim() : "";
+  if (!referenceRevision) throw new Error(`loadHistoricalPostgres003PrivateTruth: ${filePath} missing or empty "referenceRevision"`);
+  const oracle = value.structuredOracle;
+  if (!oracle || typeof oracle !== "object" || Array.isArray(oracle)) {
+    throw new Error(`loadHistoricalPostgres003PrivateTruth: ${filePath} missing or invalid "structuredOracle"`);
+  }
+  const oracleObj = oracle as Record<string, unknown>;
+  for (const side of ["historical", "reference"] as const) {
+    const sideVal = oracleObj[side];
+    if (!sideVal || typeof sideVal !== "object" || Array.isArray(sideVal)) {
+      throw new Error(`loadHistoricalPostgres003PrivateTruth: ${filePath} structuredOracle.${side} must be an object`);
+    }
+    const sideRows = (sideVal as Record<string, unknown>).rows;
+    if (!Array.isArray(sideRows) || sideRows.length === 0) {
+      throw new Error(`loadHistoricalPostgres003PrivateTruth: ${filePath} structuredOracle.${side}.rows must be a non-empty array`);
+    }
+    for (let i = 0; i < sideRows.length; i++) {
+      if (!Array.isArray(sideRows[i]) || (sideRows[i] as unknown[]).length === 0) {
+        throw new Error(`loadHistoricalPostgres003PrivateTruth: ${filePath} structuredOracle.${side}.rows[${i}] must be a non-empty array`);
+      }
+    }
+  }
+  return { upstreamBug, historicalRevision, referenceRevision, structuredOracle: value.structuredOracle as HistoricalPostgresStructuredOracle };
+}
+
+
+/**
+ * Public task prompt for the #199 case (#185's Bug 3 slot). Same
  * discipline as historicalPostgres001TaskPrompt() / historicalPostgres002TaskPrompt():
  * the prompt describes the *category* (transaction state, session
  * characteristics) without naming the specific failure mechanism (`COMMIT AND
@@ -1255,17 +1303,23 @@ If you observe a reproducible behavioral correctness problem, write \`finding.js
 }
 
 /**
+ * @param privateTruth Operator-supplied private truth (upstream bug identity,
+ *   both pinned revisions, and the structured oracle). Never hardcoded in this
+ *   file — load it at runtime via `loadHistoricalPostgres003PrivateTruth()`.
+ *   Synthetic values are fine for unit tests.
  * @param knownReproducerPath Optional private path (e.g. from
  *   `HONEYRAIL_PG_199_REPRODUCER`) to a canonical verification reproducer.
  *   Used only to compute a provenance hash for the truth bundle; never read
- *   by the grader. Intentionally not committed to this repository - see
- *   docs/historical-postgres-task-v0.md. `scripts/historical-postgres-199.ts`
- *   requires this for its real trial entrypoint, matching case 002's
- *   discipline: a real Bug 3 run without canonical truth provenance is not
- *   acceptable; the parameter stays optional here so synthetic/unit-test
+ *   by the grader. Intentionally not committed to this repository.
+ *   `scripts/historical-postgres-199.ts` requires this for its real trial
+ *   entrypoint; the parameter stays optional here so synthetic/unit-test
  *   specs can omit it.
  */
-export function historicalPostgres003TaskSpec(repoPath: string, knownReproducerPath?: string): HistoricalPostgresTaskSpec {
+export function historicalPostgres003TaskSpec(
+  repoPath: string,
+  privateTruth: HistoricalPostgresCase003PrivateTruth,
+  knownReproducerPath?: string
+): HistoricalPostgresTaskSpec {
   return {
     // Opaque, matching `postgres-historical-001`/`-002` convention. The
     // descriptive corpus slot id `pg-hist-xact-chain-savepoint-003` (#185)
@@ -1275,11 +1329,11 @@ export function historicalPostgres003TaskSpec(repoPath: string, knownReproducerP
     taskId: "postgres-historical-003",
     source: {
       repoPath,
-      historicalRevision: "c7c4ce2be363ac5cf5141e73fd7966e0bbfe401f",
-      referenceRevision: "10323f140fef776881923f1afc0a369f7be8e035"
+      historicalRevision: privateTruth.historicalRevision,
+      referenceRevision: privateTruth.referenceRevision
     },
     truth: {
-      upstreamBug: "PostgreSQL BUG #18118",
+      upstreamBug: privateTruth.upstreamBug,
       // No CommitFest entry exists for this bug - reported directly to
       // pgsql-bugs, same as case 002. See HistoricalPostgresTaskSpec.truth.
       knownReproducerPath,
@@ -1289,7 +1343,7 @@ export function historicalPostgres003TaskSpec(repoPath: string, knownReproducerP
       // to return the exact tuples declared here, per revision. This is what
       // keeps an unrelated revision-discriminating script from earning
       // `rediscovered` credit for a different bug or mechanism entirely.
-      structuredOracle: HISTORICAL_POSTGRES_003_STRUCTURED_ORACLE
+      structuredOracle: privateTruth.structuredOracle
     },
     scaffoldingLevel: "minimal",
     budget: {},
