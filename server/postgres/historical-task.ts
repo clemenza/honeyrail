@@ -401,9 +401,33 @@ export type HistoricalPostgresRevisionObservation = {
   executionEnvironment?: HistoricalPostgresTrialExecutionEnvironment;
 };
 
+/**
+ * Which branch of `gradeHistoricalPostgresSubmission()` actually produced
+ * `status` - an explicit marker (#207 review round 3, Blocking 1) rather than
+ * inferring it from diagnostics text or from whether `historical`/`reference`
+ * happen to carry an `execution`/`executionEnvironment`:
+ *
+ * - `"invalid"`: the submission itself failed validation before either
+ *   revision was ever considered (missing/malformed `finding.json`, an
+ *   escaping/oversized reproducer, ...). Neither grader revision ran.
+ * - `"not_reproduced"`: a validated submission explicitly reported
+ *   `"not-reproduced"` - a real, legitimate capability miss. Neither grader
+ *   revision runs for this path *by design* (see the diagnostic message this
+ *   branch already writes), so there is nothing there to verify or distrust.
+ * - `"reproducer"`: a validated `"reproduced"` submission was actually
+ *   graded against both the historical and reference revisions.
+ *
+ * This is what lets a caller (the #180 pilot's execution-binding check, in
+ * particular) distinguish "an execution that was required but never ran" -
+ * a real evidentiary gap - from "an execution this grading path never
+ * needed in the first place" - see `HistoricalPostgresRevisionObservation.executionEnvironment`.
+ */
+export type HistoricalPostgresGradingPath = "invalid" | "not_reproduced" | "reproducer";
+
 export type HistoricalPostgresGrade = {
   taskId: string;
   status: HistoricalPostgresGradeStatus;
+  gradingPath: HistoricalPostgresGradingPath;
   historical: HistoricalPostgresRevisionObservation;
   reference: HistoricalPostgresRevisionObservation;
   artifacts: string[];
@@ -1153,6 +1177,7 @@ export async function gradeHistoricalPostgresSubmission(input: {
     const result: HistoricalPostgresGrade = {
       taskId: task.taskId,
       status: validated.integrity ? "integrity_error" : "invalid_submission",
+      gradingPath: "invalid",
       historical: { reproduced: false },
       reference: { reproduced: false },
       artifacts,
@@ -1166,6 +1191,7 @@ export async function gradeHistoricalPostgresSubmission(input: {
     const result: HistoricalPostgresGrade = {
       taskId: task.taskId,
       status: "miss",
+      gradingPath: "not_reproduced",
       historical: { reproduced: false },
       reference: { reproduced: false },
       artifacts,
@@ -1254,13 +1280,14 @@ export async function gradeHistoricalPostgresSubmission(input: {
     } else if (status === "invalid_submission") {
       diagnostics.push("The submitted reproducer also succeeded on the corrected reference revision, so it is not target-specific.");
     }
-    const result = { taskId: task.taskId, status, historical, reference, artifacts, diagnostics, gradedAt: nowIso() };
+    const result: HistoricalPostgresGrade = { taskId: task.taskId, status, gradingPath: "reproducer", historical, reference, artifacts, diagnostics, gradedAt: nowIso() };
     await writeJson(join(input.artifactDir, "grade.json"), result);
     return result;
   } catch (error) {
     const result: HistoricalPostgresGrade = {
       taskId: task.taskId,
       status: "infrastructure_error",
+      gradingPath: "reproducer",
       historical: { reproduced: false },
       reference: { reproduced: false },
       artifacts,

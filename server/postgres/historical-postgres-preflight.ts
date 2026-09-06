@@ -18,6 +18,7 @@ import {
   type GradeRevision,
   type HistoricalPostgresEnvironmentFingerprint,
   type HistoricalPostgresGradeStatus,
+  type HistoricalPostgresGradingPath,
   type HistoricalPostgresTaskSpec,
   type HistoricalPostgresTrial,
   type HistoricalPostgresTrialExecutionEnvironment
@@ -187,11 +188,20 @@ function diffExecutionEnvironment(frozen: HistoricalPostgresEnvironmentFingerpri
   return diffs;
 }
 
-/** One execution's binding status against the preflight-verified/frozen environment. */
+/**
+ * One execution's binding status against the preflight-verified/frozen
+ * environment. `"not_applicable"` is distinct from `"unverified"` (#207
+ * review round 3, Blocking 1): it means this execution was never *required*
+ * by the actual grading path that produced the result (e.g. neither grader
+ * revision runs for an explicit `"not-reproduced"` submission - see
+ * `HistoricalPostgresGradingPath`), never that evidence for a required
+ * execution is merely missing.
+ */
 export type HistoricalPostgresExecutionBindingComponent =
   | { status: "verified" }
   | { status: "mismatched"; diagnostics: string[] }
-  | { status: "unverified" };
+  | { status: "unverified" }
+  | { status: "not_applicable" };
 
 function executionBindingComponent(
   frozen: HistoricalPostgresEnvironmentFingerprint,
@@ -204,23 +214,27 @@ function executionBindingComponent(
 
 const UNVERIFIED_EXECUTION_BINDING: HistoricalPostgresExecutionBinding = {
   agent: { status: "unverified" },
-  historicalGrader: { status: "unverified" },
-  referenceGrader: { status: "unverified" },
+  historicalGrader: { status: "not_applicable" },
+  referenceGrader: { status: "not_applicable" },
   overall: { status: "unverified" }
 };
 
 /**
- * Whether every PostgreSQL execution that contributes to the final grade
- * matches the environment preflight verified (#207 review round 2, P0
- * Blocking 1). The final `rediscovered`/`miss`/`invalid_submission` result
- * comes from `gradeHistoricalPostgresSubmission()`'s own two independent
- * grader executions (`historicalGrader`, `referenceGrader`), not only the
- * agent's investigation session (`agent`) - a valid official score requires
- * all three bound. `overall` is fail-closed: `"verified"` only when every
- * component is; a proven mismatch on any one component always wins over an
- * `"unverified"` on another, and `"unverified"` never collapses into
- * `"verified"` - see `classifyPilotOutcome()`, which never treats "not
- * explicitly mismatched" as equivalent to verified.
+ * Whether every PostgreSQL execution *required by the actual grading path*
+ * matches the environment preflight verified (#180 P0 2 / #207 review rounds
+ * 2 and 3). The agent session is always required. The two grader revisions
+ * are required only when `gradingPath === "reproducer"` - a legitimate
+ * `"not-reproduced"` miss never runs either one, so treating that as
+ * "required but missing" would wrongly exclude a real, valid capability-miss
+ * sample from the #180 rediscovery-failure denominator (round 3's
+ * correction to round 2's stricter "all three always required" rule).
+ *
+ * `overall` is computed over only the required (non-`"not_applicable"`)
+ * components, and is fail-closed within that set: `"verified"` only when
+ * every required component is; a proven mismatch on any required component
+ * always wins over an `"unverified"` on another, and `"unverified"` never
+ * collapses into `"verified"` - see `classifyPilotOutcome()`, which never
+ * treats "not explicitly mismatched" as equivalent to verified.
  */
 export type HistoricalPostgresExecutionBinding = {
   agent: HistoricalPostgresExecutionBindingComponent;
@@ -232,19 +246,28 @@ export type HistoricalPostgresExecutionBinding = {
 function computeExecutionBinding(input: {
   frozen: HistoricalPostgresEnvironmentFingerprint;
   agent?: HistoricalPostgresTrialExecutionEnvironment;
+  /** Absent (e.g. the trial never reached a grade at all - "blocked") is treated the same as any non-`"reproducer"` path: graders are not_applicable. */
+  gradingPath?: HistoricalPostgresGradingPath;
   historicalGrader?: HistoricalPostgresTrialExecutionEnvironment;
   referenceGrader?: HistoricalPostgresTrialExecutionEnvironment;
 }): HistoricalPostgresExecutionBinding {
+  const graderExecutionRequired = input.gradingPath === "reproducer";
   const agent = executionBindingComponent(input.frozen, input.agent);
-  const historicalGrader = executionBindingComponent(input.frozen, input.historicalGrader);
-  const referenceGrader = executionBindingComponent(input.frozen, input.referenceGrader);
-  const components = [agent, historicalGrader, referenceGrader];
-  const overall: HistoricalPostgresExecutionBindingComponent = components.some((component) => component.status === "mismatched")
+  const historicalGrader: HistoricalPostgresExecutionBindingComponent = graderExecutionRequired
+    ? executionBindingComponent(input.frozen, input.historicalGrader)
+    : { status: "not_applicable" };
+  const referenceGrader: HistoricalPostgresExecutionBindingComponent = graderExecutionRequired
+    ? executionBindingComponent(input.frozen, input.referenceGrader)
+    : { status: "not_applicable" };
+  const required = [agent, historicalGrader, referenceGrader].filter(
+    (component): component is Exclude<HistoricalPostgresExecutionBindingComponent, { status: "not_applicable" }> => component.status !== "not_applicable"
+  );
+  const overall: HistoricalPostgresExecutionBindingComponent = required.some((component) => component.status === "mismatched")
     ? {
         status: "mismatched",
-        diagnostics: components.flatMap((component) => (component.status === "mismatched" ? component.diagnostics : []))
+        diagnostics: required.flatMap((component) => (component.status === "mismatched" ? component.diagnostics : []))
       }
-    : components.some((component) => component.status === "unverified")
+    : required.some((component) => component.status === "unverified")
       ? { status: "unverified" }
       : { status: "verified" };
   return { agent, historicalGrader, referenceGrader, overall };
@@ -422,7 +445,7 @@ export type HistoricalPostgresPilotEvidence = {
   datasetEligible: boolean;
   officialScoredResult: HistoricalPostgresGradeStatus | "N/A";
   scoredEligible?: boolean;
-  grade?: { status: HistoricalPostgresGradeStatus; diagnostics: string[]; gradedAt: string };
+  grade?: { status: HistoricalPostgresGradeStatus; gradingPath: HistoricalPostgresGradingPath; diagnostics: string[]; gradedAt: string };
   agent?: { ok: boolean; exitCode: number | null; timedOut: boolean; durationMs: number };
   workspaceDir?: string;
   artifacts: string[];
@@ -461,7 +484,12 @@ export function sanitizeHistoricalPostgresPilotEvidence(result: HistoricalPostgr
     officialScoredResult: result.officialScoredResult,
     scoredEligible: result.trial?.scoredEligible,
     grade: result.trial?.grade
-      ? { status: result.trial.grade.status, diagnostics: [...result.trial.grade.diagnostics], gradedAt: result.trial.grade.gradedAt }
+      ? {
+          status: result.trial.grade.status,
+          gradingPath: result.trial.grade.gradingPath,
+          diagnostics: [...result.trial.grade.diagnostics],
+          gradedAt: result.trial.grade.gradedAt
+        }
       : undefined,
     agent: sanitizeAgentSummary(result.trial?.agent),
     workspaceDir: result.trial?.workspaceDir,
@@ -474,17 +502,27 @@ export function sanitizeHistoricalPostgresPilotEvidence(result: HistoricalPostgr
 
 /**
  * The pilot-level outcome classifier (#180 P0 2 / P0 3 / P1 4, PR #207
- * review rounds 1 and 2): a completed, scored-eligible trial is only ever an
- * *official* scored result when EVERY execution that contributed to it -
- * the agent session AND both grader revisions - is individually bound to the
- * preflight-verified environment, AND it came from a real agent profile,
- * never a smoke stub. Fail-closed: `executionBinding.overall.status !==
- * "verified"` (which includes `"unverified"`, not only `"mismatched"`) is
- * never dataset-eligible - "not explicitly mismatched" is never treated as
- * equivalent to verified. A *proven* mismatch on any component additionally
- * forces `status: "integrity_error"`; a merely unverified component keeps
- * `status: "completed"` (the trial itself did complete) but still withholds
- * an official score.
+ * review rounds 1-3): a completed trial is only ever an *official* scored
+ * result when:
+ *
+ * - every execution *required by the actual grading path* is individually
+ *   bound to the preflight-verified environment (`executionBinding.overall
+ *   === "verified"` - already computed only over required components, see
+ *   `computeExecutionBinding()`);
+ * - it came from a real agent profile, never a smoke stub;
+ * - the grade itself is a genuine capability outcome - `"rediscovered"` or
+ *   `"miss"` - never `"invalid_submission"` (#207 review round 3, Blocking
+ *   2: #180 requires invalid outcomes reported separately and excluded from
+ *   the rediscovery-capability denominator, even when every execution that
+ *   did run is perfectly bound).
+ *
+ * Fail-closed throughout: `executionBinding.overall.status !== "verified"`
+ * (which includes `"unverified"`, not only `"mismatched"`) is never
+ * dataset-eligible - "not explicitly mismatched" is never treated as
+ * equivalent to verified. A *proven* mismatch on any required component
+ * additionally forces `status: "integrity_error"`; a merely unverified
+ * component, or a non-capability grade status, keeps `status: "completed"`
+ * (the trial itself did complete) but still withholds an official score.
  */
 function classifyPilotOutcome(input: {
   trial: HistoricalPostgresTrial;
@@ -499,10 +537,12 @@ function classifyPilotOutcome(input: {
   if (executionBinding.overall.status === "mismatched") {
     return { status: "integrity_error", datasetEligible: false, officialScoredResult: "N/A" };
   }
-  if (profileKind !== "agent" || executionBinding.overall.status !== "verified") {
-    return { status: "completed", datasetEligible: false, officialScoredResult: "N/A" };
+  const gradeStatus = trial.grade?.status;
+  const isCapabilityOutcome = gradeStatus === "rediscovered" || gradeStatus === "miss";
+  if (profileKind === "agent" && executionBinding.overall.status === "verified" && isCapabilityOutcome) {
+    return { status: "completed", datasetEligible: true, officialScoredResult: gradeStatus };
   }
-  return { status: "completed", datasetEligible: true, officialScoredResult: trial.grade!.status };
+  return { status: "completed", datasetEligible: false, officialScoredResult: "N/A" };
 }
 
 /**
@@ -630,16 +670,19 @@ export async function runHistoricalPostgresPilotTrial(input: {
   });
 
   const executionEnvironment = trial.executionEnvironment;
-  // All three executions that can contribute to the final grade - the agent
-  // session, and both grader revisions - are bound individually (#207
-  // review round 2, P0 Blocking 1). trial.grade is undefined whenever the
-  // submission was never actually graded (e.g. "blocked"), in which case the
-  // grader components are correctly "unverified" - though that never reaches
-  // classifyPilotOutcome's binding check anyway, since a non-"completed"
-  // trial.status short-circuits first.
+  // The agent session is always required; the two grader revisions are
+  // required only when trial.grade.gradingPath === "reproducer" - a
+  // legitimate "not-reproduced" miss never runs either one, so they are
+  // "not_applicable" there rather than "required but missing" (#207 review
+  // round 3, Blocking 1). trial.grade is undefined whenever the submission
+  // was never actually graded at all (e.g. "blocked"), which
+  // computeExecutionBinding() treats the same as any non-"reproducer" path -
+  // though that never reaches classifyPilotOutcome's binding check anyway,
+  // since a non-"completed" trial.status short-circuits first.
   const executionBinding = computeExecutionBinding({
     frozen: preflight.environmentFingerprint,
     agent: executionEnvironment,
+    gradingPath: trial.grade?.gradingPath,
     historicalGrader: trial.grade?.historical.executionEnvironment,
     referenceGrader: trial.grade?.reference.executionEnvironment
   });

@@ -482,19 +482,22 @@ test("no false miss: a passing preflight lets runHistoricalPostgresPilotTrial in
   assert.equal(pilot.preflight.status, "passed");
   assert.equal(pilot.trial?.status, "completed");
   assert.equal(pilot.trial?.grade?.status, "miss");
+  assert.equal(pilot.trial?.grade?.gradingPath, "not_reproduced");
   // A not-reproduced submission never invokes the two-revision grader at all
   // (gradeHistoricalPostgresSubmission's own early-return - see
-  // historical-task.test.ts), so neither grader revision ever executed
-  // anything to bind to the frozen environment. Fail-closed (#207 review
-  // round 2, P0 Blocking 1): this must never be silently treated as an
-  // official score just because the agent's own environment matched.
+  // historical-task.test.ts) *by design* - this grading path never required
+  // either grader revision to run, so they are "not_applicable", not
+  // "unverified" (#207 review round 3, Blocking 1 - a legitimate real-agent
+  // not-reproduced miss must remain in the #180 rediscovery-failure
+  // denominator, not be silently excluded merely because executions that
+  // were never required happen to be absent).
   assert.equal(pilot.executionBinding.agent.status, "verified");
-  assert.equal(pilot.executionBinding.historicalGrader.status, "unverified");
-  assert.equal(pilot.executionBinding.referenceGrader.status, "unverified");
-  assert.equal(pilot.executionBinding.overall.status, "unverified");
+  assert.equal(pilot.executionBinding.historicalGrader.status, "not_applicable");
+  assert.equal(pilot.executionBinding.referenceGrader.status, "not_applicable");
+  assert.equal(pilot.executionBinding.overall.status, "verified");
   assert.equal(pilot.status, "completed");
-  assert.equal(pilot.datasetEligible, false);
-  assert.equal(pilot.officialScoredResult, "N/A");
+  assert.equal(pilot.datasetEligible, true);
+  assert.equal(pilot.officialScoredResult, "miss");
 });
 
 // ---------------------------------------------------------------------------
@@ -518,17 +521,26 @@ async function reproducedWorkspace(root: string, label: string): Promise<string>
 }
 
 /** A fake `GradeRevision` reporting a controlled `executionEnvironment` per revision, and a self-asserting exit-status differential (historical reproduces, reference does not) so case 001's exit-status protocol classifies it "rediscovered". */
+/**
+ * Defaults to the "rediscovered" shape (historical reproduces, reference
+ * does not, matching case 001's self-asserting exit-status protocol) -
+ * override `historicalReproduced`/`referenceReproduced` for a "miss"
+ * (both `false`) or an "invalid_submission" (both `true`, not target-specific).
+ */
 function fakeGradeRevision(input: {
   historicalRevision: string;
+  historicalReproduced?: boolean;
+  referenceReproduced?: boolean;
   historicalExecutionEnvironment: HistoricalPostgresEnvironmentFingerprint | undefined;
   referenceExecutionEnvironment: HistoricalPostgresEnvironmentFingerprint | undefined;
 }): GradeRevision {
   return async ({ revision }) => {
     const isHistorical = revision === input.historicalRevision;
+    const reproduced = isHistorical ? (input.historicalReproduced ?? true) : (input.referenceReproduced ?? false);
     const ef = isHistorical ? input.historicalExecutionEnvironment : input.referenceExecutionEnvironment;
     return {
-      reproduced: isHistorical,
-      execution: { ok: isHistorical, stdout: "", stderr: "", exitCode: isHistorical ? 0 : 1, durationMs: 1 },
+      reproduced,
+      execution: { ok: reproduced, stdout: "", stderr: "", exitCode: reproduced ? 0 : 1, durationMs: 1 },
       executionEnvironment: ef
         ? { buildMode: ef.buildMode, buildProfileVersion: ef.buildProfileVersion, configureArgs: [...ef.configureArgs], buildEnv: { ...ef.buildEnv }, builderImage: ef.builderImage, runtimeImage: ef.runtimeImage, compiler: ef.compiler }
         : undefined
@@ -566,6 +578,84 @@ test("execution binding, all verified: agent + historical grader + reference gra
   assert.equal(pilot.status, "completed");
   assert.equal(pilot.datasetEligible, true);
   assert.equal(pilot.officialScoredResult, "rediscovered");
+});
+
+test("execution binding, reproducer-path miss remains eligible: agent + historical grader + reference grader all match => dataset-eligible miss", async () => {
+  const fx = await threeTaskFixture(FAKE_RUN_COMMAND);
+  const artifactDir = await materializeRootFor(fx.root, "binding-reproducer-miss");
+  const workspace = await reproducedWorkspace(artifactDir, "reproducer-miss");
+
+  const pilot = await runHistoricalPostgresPilotTrial({
+    corpusManifest: fx.manifest,
+    expectedCorpusId: fx.manifest.corpusId,
+    expectedCorpusHash: fx.manifest.corpusHash,
+    taskSpec: fx.spec001,
+    agent: { command: "unused" },
+    artifactDir,
+    runCommand: fx.runCommand,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace, environmentFingerprint: fx.environmentFingerprint }),
+    // Neither revision reproduces (a submitted-but-wrong reproducer) - a
+    // genuine miss via the reproducer grading path, not the not-reproduced
+    // shortcut, so both grader revisions really ran.
+    gradeRevision: fakeGradeRevision({
+      historicalRevision: fx.spec001.source.historicalRevision,
+      historicalReproduced: false,
+      referenceReproduced: false,
+      historicalExecutionEnvironment: fx.environmentFingerprint,
+      referenceExecutionEnvironment: fx.environmentFingerprint
+    })
+  });
+
+  assert.equal(pilot.trial?.status, "completed");
+  assert.equal(pilot.trial?.grade?.status, "miss");
+  assert.equal(pilot.trial?.grade?.gradingPath, "reproducer");
+  assert.equal(pilot.executionBinding.agent.status, "verified");
+  assert.equal(pilot.executionBinding.historicalGrader.status, "verified");
+  assert.equal(pilot.executionBinding.referenceGrader.status, "verified");
+  assert.equal(pilot.executionBinding.overall.status, "verified");
+  assert.equal(pilot.status, "completed");
+  assert.equal(pilot.datasetEligible, true);
+  assert.equal(pilot.officialScoredResult, "miss");
+});
+
+test("execution binding: invalid_submission is never dataset-eligible even when every required binding is verified", async () => {
+  const fx = await threeTaskFixture(FAKE_RUN_COMMAND);
+  const artifactDir = await materializeRootFor(fx.root, "binding-invalid-submission");
+  const workspace = await reproducedWorkspace(artifactDir, "invalid-submission");
+
+  const pilot = await runHistoricalPostgresPilotTrial({
+    corpusManifest: fx.manifest,
+    expectedCorpusId: fx.manifest.corpusId,
+    expectedCorpusHash: fx.manifest.corpusHash,
+    taskSpec: fx.spec001,
+    agent: { command: "unused" },
+    artifactDir,
+    runCommand: fx.runCommand,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace, environmentFingerprint: fx.environmentFingerprint }),
+    // Both revisions reproduce - not target-specific - so gradeHistoricalPostgresSubmission()
+    // classifies this "invalid_submission", #180's explicitly-excluded outcome.
+    gradeRevision: fakeGradeRevision({
+      historicalRevision: fx.spec001.source.historicalRevision,
+      historicalReproduced: true,
+      referenceReproduced: true,
+      historicalExecutionEnvironment: fx.environmentFingerprint,
+      referenceExecutionEnvironment: fx.environmentFingerprint
+    })
+  });
+
+  assert.equal(pilot.trial?.status, "completed");
+  assert.equal(pilot.trial?.grade?.status, "invalid_submission");
+  assert.equal(pilot.executionBinding.agent.status, "verified");
+  assert.equal(pilot.executionBinding.historicalGrader.status, "verified");
+  assert.equal(pilot.executionBinding.referenceGrader.status, "verified");
+  assert.equal(pilot.executionBinding.overall.status, "verified");
+  // Every required binding is verified, yet this must still never be
+  // dataset-eligible: invalid_submission is not a capability outcome (#207
+  // review round 3, Blocking 2). status stays "completed" - this is not an
+  // integrity/environment problem, just a non-capability grade.
+  assert.equal(pilot.status, "completed");
+  assert.equal(pilot.datasetEligible, false);
+  assert.equal(pilot.officialScoredResult, "N/A");
 });
 
 test("execution binding, historical grader mismatch: agent=A, historical grader=B, reference grader=A => integrity_error, no official score", async () => {
