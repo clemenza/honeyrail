@@ -812,7 +812,7 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
     promptHash: sha256(await readFile(promptPath)),
     scaffoldingLevel: input.scaffoldingLevel ?? "minimal",
     budget: input.budget ?? {},
-    buildProfile: input.build?.mode ?? "container",
+    buildProfile: input.build?.mode ?? defaultBuildMode(),
     // Both added #201 PR #206 review, Blocking 2: neither the agent-visible
     // workspace scaffolding nor the declarative build/runtime contract used
     // to be covered by any hash, so either could change while every existing
@@ -877,7 +877,7 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
     taskType: "historical-correctness-regression",
     scaffoldingLevel: input.scaffoldingLevel ?? "minimal",
     budget: input.budget ?? {},
-    buildProfile: input.build?.mode ?? "container",
+    buildProfile: input.build?.mode ?? defaultBuildMode(),
     artifacts: { sourceManifest: "source-manifest.json", prompt: "prompt.md", workspace: "workspace" },
     hashes: {
       sourceTree: source.sourceHash,
