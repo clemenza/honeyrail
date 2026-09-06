@@ -20,6 +20,7 @@ import {
   materializeHistoricalPostgresTask,
   resolveHistoricalPostgresEnvironmentFingerprint,
   sha256,
+  type HistoricalPostgresEnvironmentFingerprint,
   type HistoricalPostgresTaskSpec
 } from "../server/postgres/historical-task.js";
 import type { PostgresResearchSessionResult } from "../server/postgres/research-session.js";
@@ -57,8 +58,22 @@ const FAKE_RUN_COMMAND = fakeDockerEnvironmentRunCommand({ builderId: `sha256:${
  * identical technique to `test/historical-postgres-task.test.ts`'s own
  * `fakeSessionResult()` - so `runHistoricalPostgresPilotTrial()`'s downstream
  * call into `runHistoricalPostgresTrial()` can be exercised without Docker.
+ *
+ * `environmentFingerprint` populates `build`/`runtime` with a shape realistic
+ * enough for `runHistoricalPostgresTrial()`'s own
+ * `HistoricalPostgresTrialExecutionEnvironment` extraction to read - by
+ * default the *same* fingerprint the fixture's preflight verified (so the
+ * execution-binding check is "verified"); pass a deliberately different one
+ * to simulate a real execution that resolved a different environment than
+ * preflight did (#180 P0 2).
  */
-function fakeSessionResult(overrides: { scoredEligible: boolean; agentOk: boolean; workspaceDir: string }): PostgresResearchSessionResult {
+function fakeSessionResult(overrides: {
+  scoredEligible: boolean;
+  agentOk: boolean;
+  workspaceDir: string;
+  environmentFingerprint: HistoricalPostgresEnvironmentFingerprint;
+}): PostgresResearchSessionResult {
+  const ef = overrides.environmentFingerprint;
   return {
     agent: {
       command: "fake-agent",
@@ -86,8 +101,17 @@ function fakeSessionResult(overrides: { scoredEligible: boolean; agentOk: boolea
     },
     connection: {},
     source: {},
-    build: {},
-    runtime: {}
+    build: {
+      buildMode: ef.buildMode,
+      profileVersion: ef.buildProfileVersion,
+      configureArgs: [...ef.configureArgs],
+      buildEnv: { ...ef.buildEnv },
+      builderImage: ef.builderImage,
+      compiler: ef.compiler
+    },
+    runtime: {
+      runtime: { image: ef.runtimeImage }
+    }
   } as unknown as PostgresResearchSessionResult;
 }
 
@@ -101,7 +125,13 @@ function fakeSessionResult(overrides: { scoredEligible: boolean; agentOk: boolea
  */
 async function threeTaskFixture(runCommand: RunCommand) {
   const root = await mkdtemp(join(tmpdir(), "honeyrail-pg180-preflight-"));
-  const repo = await createSyntheticPostgresSourceRepo(root);
+  // A genuinely separate root from `root` (which the rest of this fixture and
+  // its callers use only as grader-side materialize/artifact scratch space) -
+  // mirrors real topology (a private source mirror living entirely outside
+  // the grader's own evidence tree) so the leak-regression test's sentinel
+  // check is meaningful rather than a path-nesting coincidence.
+  const privateMirrorRoot = await mkdtemp(join(tmpdir(), "honeyrail-pg180-private-mirror-"));
+  const repo = await createSyntheticPostgresSourceRepo(privateMirrorRoot);
   const fixedForCase002 = await createAdditionalSyntheticCommit(repo.repoPath, "case-002-fixed");
   const fixedForCase003 = await createAdditionalSyntheticCommit(repo.repoPath, "case-003-fixed");
 
@@ -425,7 +455,7 @@ for (const tamperCase of TASK_ENTRY_TAMPER_CASES) {
 // exactly once - proves the assertions above aren't vacuously true.
 // ---------------------------------------------------------------------------
 
-test("no false miss: a passing preflight lets runHistoricalPostgresPilotTrial invoke the agent exactly once", async () => {
+test("no false miss: a passing preflight lets runHistoricalPostgresPilotTrial invoke the agent exactly once, and a real eligible agent profile is dataset-eligible", async () => {
   const fx = await threeTaskFixture(FAKE_RUN_COMMAND);
   const artifactDir = await materializeRootFor(fx.root, "positive-control");
   const workspace = join(artifactDir, "agent-workspace-fixture");
@@ -443,7 +473,7 @@ test("no false miss: a passing preflight lets runHistoricalPostgresPilotTrial in
     runCommand: fx.runCommand,
     runSession: async () => {
       agentRunCount += 1;
-      return fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace });
+      return fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace, environmentFingerprint: fx.environmentFingerprint });
     }
   });
   assert.equal(agentRunCount, 1);
@@ -451,6 +481,209 @@ test("no false miss: a passing preflight lets runHistoricalPostgresPilotTrial in
   assert.equal(pilot.preflight.status, "passed");
   assert.equal(pilot.trial?.status, "completed");
   assert.equal(pilot.trial?.grade?.status, "miss");
+  // profileKind defaults to "agent"; execution matched what preflight
+  // verified, so this is a genuine official scored result (#180 P0 2/P0 3).
+  assert.equal(pilot.profileKind, "agent");
+  assert.equal(pilot.executionBinding.status, "verified");
+  assert.equal(pilot.status, "completed");
+  assert.equal(pilot.datasetEligible, true);
+  assert.equal(pilot.officialScoredResult, "miss");
+});
+
+// ---------------------------------------------------------------------------
+// P0 1 (PR #207 review): preflight-result.json / pilot-result.json must never
+// leak grader-private truth - proven with distinctive synthetic sentinels
+// (this fixture's own private upstreamBug string, both pinned revision SHAs,
+// and the private synthetic mirror path).
+// ---------------------------------------------------------------------------
+
+test("leak regression: persisted preflight/pilot evidence never contains private truth sentinels", async () => {
+  const fx = await threeTaskFixture(FAKE_RUN_COMMAND);
+  const artifactDir = await materializeRootFor(fx.root, "leak-check");
+  const workspace = join(artifactDir, "agent-workspace-fixture");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "Leak-check stub agent." }));
+
+  const pilot = await runHistoricalPostgresPilotTrial({
+    corpusManifest: fx.manifest,
+    expectedCorpusId: fx.manifest.corpusId,
+    expectedCorpusHash: fx.manifest.corpusHash,
+    taskSpec: fx.spec001,
+    agent: { command: "unused" },
+    artifactDir,
+    runCommand: fx.runCommand,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace, environmentFingerprint: fx.environmentFingerprint })
+  });
+
+  const preflightText = await readFile(join(artifactDir, pilot.pilotId, "preflight-result.json"), "utf8");
+  const pilotText = await readFile(join(artifactDir, pilot.pilotId, "pilot-result.json"), "utf8");
+
+  const sentinels = [
+    fx.spec001.truth.upstreamBug,
+    fx.spec001.source.historicalRevision,
+    fx.spec001.source.referenceRevision,
+    fx.repo.repoPath
+  ];
+  for (const sentinel of sentinels) {
+    assert.ok(!preflightText.includes(sentinel), `preflight-result.json leaked sentinel: ${sentinel}`);
+    assert.ok(!pilotText.includes(sentinel), `pilot-result.json leaked sentinel: ${sentinel}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// P0 2 (PR #207 review): the pilot must prove the actual scored execution
+// used the same immutable environment identity preflight verified - tested
+// through the wrapper boundary (a real preflight resolution, then an
+// injected session whose reported execution environment genuinely diverges),
+// never by hand-editing a final hash.
+// ---------------------------------------------------------------------------
+
+test("execution binding: an execution-time environment that differs from what preflight verified is integrity_error with no official scored result", async () => {
+  const fx = await threeTaskFixture(FAKE_RUN_COMMAND);
+  const artifactDir = await materializeRootFor(fx.root, "binding-mismatch");
+  const workspace = join(artifactDir, "agent-workspace-fixture");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "Binding-mismatch stub agent." }));
+
+  // Preflight sees image A (fx.environmentFingerprint.builderImage.id, via
+  // FAKE_RUN_COMMAND); the injected session reports that the real execution
+  // resolved a different id under the same reference - image B.
+  const executionTimeEnvironment: HistoricalPostgresEnvironmentFingerprint = {
+    ...fx.environmentFingerprint,
+    builderImage: { reference: fx.environmentFingerprint.builderImage.reference, id: `sha256:${"9".repeat(64)}` }
+  };
+
+  const pilot = await runHistoricalPostgresPilotTrial({
+    corpusManifest: fx.manifest,
+    expectedCorpusId: fx.manifest.corpusId,
+    expectedCorpusHash: fx.manifest.corpusHash,
+    taskSpec: fx.spec001,
+    agent: { command: "unused" },
+    artifactDir,
+    runCommand: fx.runCommand,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace, environmentFingerprint: executionTimeEnvironment })
+  });
+
+  assert.equal(pilot.preflight.status, "passed");
+  assert.equal(pilot.agentRunCount, 1);
+  assert.equal(pilot.executionBinding.status, "mismatched");
+  if (pilot.executionBinding.status === "mismatched") {
+    assert.ok(pilot.executionBinding.diagnostics.some((line) => line.includes("builderImage.id")), JSON.stringify(pilot.executionBinding.diagnostics));
+  }
+  assert.equal(pilot.status, "integrity_error");
+  assert.equal(pilot.datasetEligible, false);
+  assert.equal(pilot.officialScoredResult, "N/A");
+
+  const writtenEvidence = JSON.parse(await readFile(join(artifactDir, pilot.pilotId, "pilot-result.json"), "utf8"));
+  assert.equal(writtenEvidence.status, "integrity_error");
+  assert.equal(writtenEvidence.datasetEligible, false);
+});
+
+// ---------------------------------------------------------------------------
+// P0 3 (PR #207 review): a deterministic smoke-stub profile is legitimate
+// harness evidence but must never enter the capability dataset, even when
+// the underlying research run genuinely completed/scoredEligible/graded.
+// ---------------------------------------------------------------------------
+
+test("profileKind=smoke_stub: completed + scoredEligible=true + grade=miss is never dataset-eligible", async () => {
+  const fx = await threeTaskFixture(FAKE_RUN_COMMAND);
+  const artifactDir = await materializeRootFor(fx.root, "stub-profile");
+  const workspace = join(artifactDir, "agent-workspace-fixture");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "Stub smoke agent." }));
+
+  const pilot = await runHistoricalPostgresPilotTrial({
+    corpusManifest: fx.manifest,
+    expectedCorpusId: fx.manifest.corpusId,
+    expectedCorpusHash: fx.manifest.corpusHash,
+    taskSpec: fx.spec001,
+    agent: { command: "unused" },
+    artifactDir,
+    profileKind: "smoke_stub",
+    runCommand: fx.runCommand,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace, environmentFingerprint: fx.environmentFingerprint })
+  });
+
+  assert.equal(pilot.trial?.status, "completed");
+  assert.equal(pilot.trial?.scoredEligible, true);
+  assert.equal(pilot.trial?.grade?.status, "miss");
+  assert.equal(pilot.profileKind, "smoke_stub");
+  assert.equal(pilot.status, "completed");
+  assert.equal(pilot.datasetEligible, false);
+  assert.equal(pilot.officialScoredResult, "N/A");
+});
+
+// ---------------------------------------------------------------------------
+// P1 4 (PR #207 review): an infrastructure failure *during* preflight
+// (docker unavailable, image-inspect/probe failure) must normalize to a
+// stable pilot-level status with evidence written, never an uncaught throw.
+// ---------------------------------------------------------------------------
+
+test("infrastructure failure during preflight normalizes to infrastructure_error and still writes pilot-result.json; agent never starts", async () => {
+  const fx = await threeTaskFixture(FAKE_RUN_COMMAND);
+  const brokenRunCommand: RunCommand = (async () => {
+    throw new Error("docker daemon unavailable (simulated)");
+  }) as unknown as RunCommand;
+  const artifactDir = await materializeRootFor(fx.root, "infra-failure");
+
+  let agentRunCount = 0;
+  const pilot = await runHistoricalPostgresPilotTrial({
+    corpusManifest: fx.manifest,
+    expectedCorpusId: fx.manifest.corpusId,
+    expectedCorpusHash: fx.manifest.corpusHash,
+    taskSpec: fx.spec001,
+    agent: { command: "unused" },
+    artifactDir,
+    runCommand: brokenRunCommand,
+    runSession: async () => {
+      agentRunCount += 1;
+      throw new Error("agent must never be invoked when preflight itself could not complete");
+    }
+  });
+
+  assert.equal(pilot.preflight.status, "error");
+  assert.equal(pilot.status, "infrastructure_error");
+  assert.equal(pilot.agentRunCount, 0);
+  assert.equal(agentRunCount, 0);
+  assert.equal(pilot.datasetEligible, false);
+  assert.equal(pilot.officialScoredResult, "N/A");
+
+  const writtenEvidence = JSON.parse(await readFile(join(artifactDir, pilot.pilotId, "pilot-result.json"), "utf8"));
+  assert.equal(writtenEvidence.status, "infrastructure_error");
+});
+
+// ---------------------------------------------------------------------------
+// P1 5 (PR #207 review): pilotId is resolved before the artifact root is
+// created, and two attempts against the same parent artifactDir must never
+// overwrite each other's evidence.
+// ---------------------------------------------------------------------------
+
+test("two default pilot attempts against the same parent artifactDir retain distinct evidence", async () => {
+  const fx = await threeTaskFixture(FAKE_RUN_COMMAND);
+  // A fast, offline, preflight-failing manifest (freezeDate tampered without
+  // updating corpusHash) keeps both attempts quick and agent-free.
+  const tamperedManifest: HistoricalPostgresCorpusManifest = { ...fx.manifest, freezeDate: "2000-01-01T00:00:00.000Z" };
+  const parentArtifactDir = await materializeRootFor(fx.root, "distinct-evidence-parent");
+
+  const runOnce = () =>
+    runHistoricalPostgresPilotTrial({
+      corpusManifest: tamperedManifest,
+      expectedCorpusId: tamperedManifest.corpusId,
+      expectedCorpusHash: tamperedManifest.corpusHash,
+      taskSpec: fx.spec001,
+      agent: { command: "unused" },
+      artifactDir: parentArtifactDir,
+      runCommand: fx.runCommand
+    });
+
+  const [first, second] = await Promise.all([runOnce(), runOnce()]);
+  assert.notEqual(first.pilotId, second.pilotId);
+
+  const firstEvidence = JSON.parse(await readFile(join(parentArtifactDir, first.pilotId, "pilot-result.json"), "utf8"));
+  const secondEvidence = JSON.parse(await readFile(join(parentArtifactDir, second.pilotId, "pilot-result.json"), "utf8"));
+  assert.equal(firstEvidence.pilotId, first.pilotId);
+  assert.equal(secondEvidence.pilotId, second.pilotId);
+  assert.notEqual(firstEvidence.pilotId, secondEvidence.pilotId);
 });
 
 // ---------------------------------------------------------------------------

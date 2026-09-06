@@ -413,7 +413,11 @@ export class PostgresRuntimeContainer {
     const args = buildRuntimeContainerArgs(
       {
         mounts: this.mounts,
-        image: this.image.reference,
+        // Launch by the already-resolved content-addressed id, never the
+        // mutable reference/tag - closes the same TOCTOU window as the
+        // builder container (resolve-then-launch-by-tag would let the tag be
+        // repointed in between).
+        image: this.image.id,
         memory: this.memory,
         pidsLimit: this.pidsLimit,
         tmpfsSize: this.tmpfsSize,

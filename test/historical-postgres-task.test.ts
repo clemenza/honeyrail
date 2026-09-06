@@ -50,8 +50,17 @@ function fakeSessionResult(overrides: { scoredEligible: boolean; agentOk: boolea
     },
     connection: {},
     source: {},
-    build: {},
-    runtime: {}
+    build: {
+      buildMode: "container",
+      profileVersion: "test-profile-v1",
+      configureArgs: [],
+      buildEnv: {},
+      builderImage: { reference: "fake-builder:latest", id: `sha256:${"1".repeat(64)}` },
+      compiler: { command: "cc", version: "cc (GCC) 12.2.0", target: "x86_64-linux-gnu" }
+    },
+    runtime: {
+      runtime: { image: { reference: "fake-runtime:latest", id: `sha256:${"2".repeat(64)}` } }
+    }
   } as unknown as PostgresResearchSessionResult;
 }
 

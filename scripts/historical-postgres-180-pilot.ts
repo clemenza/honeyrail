@@ -7,7 +7,7 @@ import {
   loadHistoricalPostgres003PrivateTruth,
   type HistoricalPostgresTaskSpec
 } from "../server/postgres/historical-task.js";
-import { runHistoricalPostgresPilotTrial } from "../server/postgres/historical-postgres-preflight.js";
+import { runHistoricalPostgresPilotTrial, sanitizeHistoricalPostgresPilotEvidence } from "../server/postgres/historical-postgres-preflight.js";
 import type { HistoricalPostgresCorpusManifest } from "../server/postgres/historical-corpus.js";
 
 /**
@@ -90,6 +90,10 @@ await mkdir(artifactDir, { recursive: true });
 const result = await runHistoricalPostgresPilotTrial({
   corpusManifest,
   taskSpec: task,
+  // A stub is real, useful harness evidence but must never be mistaken for
+  // (or counted toward) the Historical PostgreSQL capability dataset - see
+  // datasetEligible below.
+  profileKind: useStubAgent ? "smoke_stub" : "agent",
   agent: {
     command,
     args,
@@ -99,35 +103,30 @@ const result = await runHistoricalPostgresPilotTrial({
   artifactDir,
   session: network || image ? { isolation: { ...(network ? { network: network as "none" | "bridge" } : {}), ...(image ? { image } : {}) } } : undefined
 });
-process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+// Only the explicit, whitelisted evidence projection ever gets printed - see
+// the module-level note in historical-postgres-preflight.ts on why the raw
+// result (whose trial.grade can embed grader-private pinned revisions) must
+// never be serialized or printed directly.
+process.stdout.write(`${JSON.stringify(sanitizeHistoricalPostgresPilotEvidence(result), null, 2)}\n`);
 
-// Three separate facts, printed together so a reader (or CI log) cannot
-// mistake a preflight-failed run, an unscored run, or a diagnostic grade for
-// an official score - see historical-postgres-184.ts's identical discipline.
-const officialScoredResult =
-  result.preflight.status === "passed" &&
-  result.trial?.status === "completed" &&
-  result.trial.scoredEligible &&
-  result.trial.grade
-    ? result.trial.grade.status
-    : "N/A";
 process.stdout.write(
   "\n#180 pilot trial summary:\n" +
+    `  pilotId:                  ${result.pilotId}\n` +
+    `  profileKind:              ${result.profileKind}\n` +
     `  preflight status:         ${result.preflight.status}${result.preflight.status === "failed" ? ` (${result.preflight.failedDimension})` : ""}\n` +
     `  agentRunCount:            ${result.agentRunCount}\n` +
+    `  executionBinding:         ${result.executionBinding.status}\n` +
     `  trial status:             ${result.trial?.status ?? "N/A"}\n` +
     `  scoredEligible:           ${result.trial?.scoredEligible ?? "N/A"}\n` +
-    `  diagnostic grader result: ${result.trial?.grade ? result.trial.grade.status : "N/A"}\n` +
-    `  official scored result:   ${officialScoredResult}\n`
+    `  pilot status:             ${result.status}\n` +
+    `  datasetEligible:          ${result.datasetEligible}\n` +
+    `  official scored result:   ${result.officialScoredResult}\n`
 );
 
-// A failed preflight is always a hard failure (integrity_error, agent never
-// started). Once the agent did run, "unscored" is a legitimate, successful
-// integration outcome and must not fail the CLI - only a genuine
-// setup/agent/grader failure should.
-const preflightFailed = result.preflight.status === "failed";
-const trialFailed =
-  result.trial?.status === "blocked" || result.trial?.status === "infrastructure_error" || result.trial?.status === "integrity_error";
-if (preflightFailed || trialFailed) {
+// "unscored" is a legitimate, successful integration run (real agent, real
+// environment, isolation just wasn't the scored configuration) and must not
+// fail the CLI - only a genuine blocked/setup/agent/grader failure should.
+const failed = result.status === "blocked" || result.status === "integrity_error" || result.status === "infrastructure_error";
+if (failed) {
   process.exitCode = 1;
 }

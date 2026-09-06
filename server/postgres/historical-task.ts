@@ -409,6 +409,28 @@ export type HistoricalPostgresGrade = {
  */
 export type HistoricalPostgresTrialStatus = "completed" | "unscored" | "blocked" | "infrastructure_error" | "integrity_error";
 
+/**
+ * The build/runtime identity actually used by this trial's real execution -
+ * as opposed to `HistoricalPostgresEnvironmentFingerprint`, which is what a
+ * *separate* preflight resolution observed beforehand. Two independent
+ * resolutions of a mutable image tag can disagree if the tag was repointed in
+ * between (#180 P0 2); a caller that needs to prove "the execution really
+ * used the environment preflight verified" compares this against that
+ * fingerprint after the fact. Only the fields that are actually re-resolved
+ * per execution (never a static declarative default) are included -
+ * `initdbArgs` is a fixed constant and cannot drift, so it is deliberately
+ * not part of this type.
+ */
+export type HistoricalPostgresTrialExecutionEnvironment = {
+  buildMode: string;
+  buildProfileVersion: string;
+  configureArgs: string[];
+  buildEnv: Record<string, string>;
+  builderImage: { reference: string; id: string } | null;
+  runtimeImage: { reference: string; id: string } | null;
+  compiler: { command: string; version: string; target: string };
+};
+
 export type HistoricalPostgresTrial = {
   taskId: string;
   status: HistoricalPostgresTrialStatus;
@@ -423,6 +445,8 @@ export type HistoricalPostgresTrial = {
   agent: Record<string, unknown>;
   /** Official score only when `scoredEligible` is true and `status` is `"completed"`; diagnostic otherwise. */
   grade?: HistoricalPostgresGrade;
+  /** Present whenever a session was actually obtained (i.e. not on a materialization/setup throw before one existed). */
+  executionEnvironment?: HistoricalPostgresTrialExecutionEnvironment;
   artifacts: string[];
   diagnostics: string[];
 };
@@ -1239,6 +1263,22 @@ export async function runHistoricalPostgresTrial(input: {
       input.session
     );
     const scoredEligible = session.isolation.scoredEligible;
+    // What this specific execution actually resolved - see
+    // HistoricalPostgresTrialExecutionEnvironment. Computed once, right after
+    // `session` exists, so both return paths below carry it.
+    const executionEnvironment: HistoricalPostgresTrialExecutionEnvironment = {
+      buildMode: session.build.buildMode,
+      buildProfileVersion: session.build.profileVersion,
+      configureArgs: [...session.build.configureArgs],
+      buildEnv: { ...session.build.buildEnv },
+      builderImage: session.build.builderImage
+        ? { reference: session.build.builderImage.reference, id: session.build.builderImage.id }
+        : null,
+      runtimeImage: session.runtime.runtime.image
+        ? { reference: session.runtime.runtime.image.reference, id: session.runtime.runtime.image.id }
+        : null,
+      compiler: { command: session.build.compiler.command, version: session.build.compiler.version, target: session.build.compiler.target }
+    };
     const returnedWorkspace = join(input.artifactDir, "agent-workspace");
     await assertWorkspaceWithinLimits(session.workspaceDir);
     await cp(session.workspaceDir, returnedWorkspace, { recursive: true, dereference: false });
@@ -1272,6 +1312,7 @@ export async function runHistoricalPostgresTrial(input: {
         scoredEligible,
         workspaceDir: returnedWorkspace,
         agent: session.agent,
+        executionEnvironment,
         artifacts,
         diagnostics: [
           session.agent.timedOut ? "Agent timed out before submission." : "Agent exited without a successful completed run.",
@@ -1302,6 +1343,7 @@ export async function runHistoricalPostgresTrial(input: {
       workspaceDir: returnedWorkspace,
       agent: session.agent,
       grade,
+      executionEnvironment,
       artifacts,
       diagnostics: [...unscoredNotice, ...grade.diagnostics, ...evidenceWarnings]
     };

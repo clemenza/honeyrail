@@ -927,9 +927,12 @@ export async function buildPostgres(input: BuildPostgresInput): Promise<Postgres
   // out of a container started from it, never assumed from the host: the host
   // compiler is not the compiler, and the host arch is not the target.
   const builderImage = mode === "container" ? await resolveBuilderImageIdentity(builderImageRef, runCommand) : null;
+  // Launch by the already-resolved content-addressed id, never the mutable
+  // reference/tag: resolving an id and then still launching by tag leaves a
+  // TOCTOU window where the tag could be repointed between the two calls.
   const toolchain =
     mode === "container"
-      ? await probeBuildContainerToolchain({ image: builderImageRef, runCommand, buildEnv })
+      ? await probeBuildContainerToolchain({ image: builderImage!.id, runCommand, buildEnv })
       : {
           compiler: await detectCompilerIdentity({ runCommand, buildEnv }),
           make: firstLine((await runCommand("make", ["--version"], { timeout: 15000 })).stdout)
@@ -1021,7 +1024,9 @@ export async function buildPostgres(input: BuildPostgresInput): Promise<Postgres
             {
               sourceDir: input.source.sourceDir,
               stagingDir: staging,
-              image: builderImageRef,
+              // Same TOCTOU closure as the toolchain probe above: launch by
+              // the id already resolved for this build, not the mutable tag.
+              image: builderImage!.id,
               command: argv,
               buildEnv,
               memory: input.build?.builderMemory
