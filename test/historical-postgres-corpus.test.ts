@@ -12,11 +12,12 @@ import {
   assertHistoricalPostgresCorpusNotMutated,
   buildHistoricalPostgresCorpusManifest,
   buildHistoricalPostgresCorpusTaskEntry,
+  reconcileHistoricalPostgresCorpusFreeze,
   validateHistoricalPostgresCorpusManifest,
   type HistoricalPostgresCorpusManifest,
   type HistoricalPostgresCorpusTaskEntry
 } from "../server/postgres/historical-corpus.js";
-import { materializeHistoricalPostgresTask, type HistoricalPostgresTaskSpec } from "../server/postgres/historical-task.js";
+import { materializeHistoricalPostgresTask, sha256, stableJson, type HistoricalPostgresTaskSpec } from "../server/postgres/historical-task.js";
 import { createAdditionalSyntheticCommit, createSyntheticPostgresSourceRepo } from "./helpers/postgres-source-fixture.js";
 
 /**
@@ -103,6 +104,30 @@ test("buildHistoricalPostgresCorpusTaskEntry refuses an unknown taskId rather th
   };
   const layout = await materializeHistoricalPostgresTask(unknownSpec, join(root, "unknown-case"));
   assert.throws(() => buildHistoricalPostgresCorpusTaskEntry(layout, []), HistoricalPostgresCorpusIntegrityError);
+});
+
+// ---------------------------------------------------------------------------
+// Cross-manifest invariants (#201 PR #206 review, Blocking 3)
+// ---------------------------------------------------------------------------
+
+test("buildHistoricalPostgresCorpusTaskEntry rejects a taskManifest/referenceManifest pair whose taskDefinition hashes disagree", async () => {
+  const { root, specs } = await corpusFixture();
+  const layout = await materializeHistoricalPostgresTask(specs[0], join(root, "task-definition-mismatch"));
+  const tamperedLayout = { ...layout, taskManifest: { ...layout.taskManifest, hashes: { ...layout.taskManifest.hashes, taskDefinition: "0".repeat(64) } } };
+  assert.throws(
+    () => buildHistoricalPostgresCorpusTaskEntry(tamperedLayout, []),
+    (error: unknown) => error instanceof HistoricalPostgresCorpusIntegrityError && /taskDefinition/.test((error as Error).message)
+  );
+});
+
+test("buildHistoricalPostgresCorpusTaskEntry rejects a taskManifest/referenceManifest pair whose truthBundle hashes disagree", async () => {
+  const { root, specs } = await corpusFixture();
+  const layout = await materializeHistoricalPostgresTask(specs[0], join(root, "truth-bundle-mismatch"));
+  const tamperedLayout = { ...layout, taskManifest: { ...layout.taskManifest, hashes: { ...layout.taskManifest.hashes, truthBundle: "0".repeat(64) } } };
+  assert.throws(
+    () => buildHistoricalPostgresCorpusTaskEntry(tamperedLayout, []),
+    (error: unknown) => error instanceof HistoricalPostgresCorpusIntegrityError && /truthBundle/.test((error as Error).message)
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -193,42 +218,234 @@ test("assertHistoricalPostgresCorpusNotMutated allows a genuinely new corpus ver
 });
 
 // ---------------------------------------------------------------------------
+// Freeze idempotency and same-corpusId mutation rejection (#201 PR #206
+// review, Blocking 1): `reconcileHistoricalPostgresCorpusFreeze()` is the
+// real freeze/re-freeze decision the freeze script defers to - these tests
+// exercise it directly, not just its `assertHistoricalPostgresCorpusNotMutated()`
+// building block.
+// ---------------------------------------------------------------------------
+
+test("reconcileHistoricalPostgresCorpusFreeze: first invocation creates; a second invocation against unchanged inputs is a true no-op (idempotent freeze)", async () => {
+  const { entries } = await corpusFixture();
+  const first = reconcileHistoricalPostgresCorpusFreeze({
+    existing: undefined,
+    corpusId: "historical-postgres-corpus-v0",
+    freezeDate: "2026-01-01T00:00:00.000Z",
+    tasks: entries
+  });
+  assert.equal(first.action, "created");
+  assert.equal(first.manifest.freezeDate, "2026-01-01T00:00:00.000Z");
+
+  // Simulates a second real invocation: same corpusId, same task inputs, but
+  // a freshly-generated `freezeDate` (exactly what `new Date().toISOString()`
+  // would produce on a later run) - it must be ignored, not adopted.
+  const second = reconcileHistoricalPostgresCorpusFreeze({
+    existing: first.manifest,
+    corpusId: "historical-postgres-corpus-v0",
+    freezeDate: "2026-06-15T00:00:00.000Z",
+    tasks: entries
+  });
+  assert.equal(second.action, "unchanged");
+  assert.deepEqual(second.manifest, first.manifest);
+  assert.equal(second.manifest.freezeDate, "2026-01-01T00:00:00.000Z");
+  assert.equal(second.manifest.corpusHash, first.manifest.corpusHash);
+});
+
+test("reconcileHistoricalPostgresCorpusFreeze: refuses to silently replace a manifest recorded under a different corpusId at the same output path", async () => {
+  const { entries } = await corpusFixture();
+  const first = reconcileHistoricalPostgresCorpusFreeze({
+    existing: undefined,
+    corpusId: "historical-postgres-corpus-v0",
+    freezeDate: "2026-01-01T00:00:00.000Z",
+    tasks: entries
+  });
+  assert.throws(
+    () =>
+      reconcileHistoricalPostgresCorpusFreeze({
+        existing: first.manifest,
+        corpusId: "historical-postgres-corpus-v1",
+        freezeDate: "2026-02-01T00:00:00.000Z",
+        tasks: entries
+      }),
+    HistoricalPostgresCorpusIntegrityError
+  );
+});
+
+test("reconcileHistoricalPostgresCorpusFreeze: same corpusId rejects when the agent-visible workspace contract changes", async () => {
+  const { entries } = await corpusFixture();
+  const first = reconcileHistoricalPostgresCorpusFreeze({
+    existing: undefined,
+    corpusId: "historical-postgres-corpus-v0",
+    freezeDate: "2026-01-01T00:00:00.000Z",
+    tasks: entries
+  });
+  const mutated = entries.map((entry) => (entry.taskId === "postgres-historical-002" ? { ...entry, agentWorkspaceHash: "a".repeat(64) } : entry));
+  assert.throws(
+    () =>
+      reconcileHistoricalPostgresCorpusFreeze({
+        existing: first.manifest,
+        corpusId: "historical-postgres-corpus-v0",
+        freezeDate: "2026-06-15T00:00:00.000Z",
+        tasks: mutated
+      }),
+    HistoricalPostgresCorpusIntegrityError
+  );
+});
+
+test("reconcileHistoricalPostgresCorpusFreeze: same corpusId rejects when the build contract changes", async () => {
+  const { entries } = await corpusFixture();
+  const first = reconcileHistoricalPostgresCorpusFreeze({
+    existing: undefined,
+    corpusId: "historical-postgres-corpus-v0",
+    freezeDate: "2026-01-01T00:00:00.000Z",
+    tasks: entries
+  });
+  const mutated = entries.map((entry) => (entry.taskId === "postgres-historical-001" ? { ...entry, buildContractHash: "b".repeat(64) } : entry));
+  assert.throws(
+    () =>
+      reconcileHistoricalPostgresCorpusFreeze({
+        existing: first.manifest,
+        corpusId: "historical-postgres-corpus-v0",
+        freezeDate: "2026-06-15T00:00:00.000Z",
+        tasks: mutated
+      }),
+    HistoricalPostgresCorpusIntegrityError
+  );
+});
+
+test("reconcileHistoricalPostgresCorpusFreeze: same corpusId rejects when grader semantics/version changes (truthBundleHash moves)", async () => {
+  const { entries } = await corpusFixture();
+  const first = reconcileHistoricalPostgresCorpusFreeze({
+    existing: undefined,
+    corpusId: "historical-postgres-corpus-v0",
+    freezeDate: "2026-01-01T00:00:00.000Z",
+    tasks: entries
+  });
+  // A grader-semantics/version bump (HISTORICAL_POSTGRES_GRADER_BUNDLE_VERSION)
+  // changes bundleHash/truthBundleHash without touching gradingProtocol - see
+  // the dedicated bundleHash-coverage test below for the mechanism itself.
+  const mutated = entries.map((entry) => (entry.taskId === "postgres-historical-003" ? { ...entry, truthBundleHash: "c".repeat(64) } : entry));
+  assert.throws(
+    () =>
+      reconcileHistoricalPostgresCorpusFreeze({
+        existing: first.manifest,
+        corpusId: "historical-postgres-corpus-v0",
+        freezeDate: "2026-06-15T00:00:00.000Z",
+        tasks: mutated
+      }),
+    HistoricalPostgresCorpusIntegrityError
+  );
+});
+
+test("reconcileHistoricalPostgresCorpusFreeze: same corpusId rejects an end-to-end task-input/truth change (real materializer, not a manual field edit)", async () => {
+  const { root, repo, entries } = await corpusFixture();
+
+  const first = reconcileHistoricalPostgresCorpusFreeze({
+    existing: undefined,
+    corpusId: "historical-postgres-corpus-v0",
+    freezeDate: "2026-01-01T00:00:00.000Z",
+    tasks: entries
+  });
+
+  const changedSpec: HistoricalPostgresTaskSpec = {
+    taskId: "postgres-historical-001",
+    source: { repoPath: repo.repoPath, historicalRevision: repo.ref, referenceRevision: repo.laterRef },
+    truth: { upstreamBug: "Synthetic upstream #10001 - revised", commitFest: 1001 },
+    prompt: "Investigate case 001."
+  };
+  const changedLayout = await materializeHistoricalPostgresTask(changedSpec, join(root, "reconcile-changed-001"));
+  const changedEntry = buildHistoricalPostgresCorpusTaskEntry(changedLayout, ["#reconcile"]);
+  const originalEntry = entries.find((entry) => entry.taskId === "postgres-historical-001")!;
+  assert.notEqual(changedEntry.truthBundleHash, originalEntry.truthBundleHash);
+
+  const changedTasks = entries.map((entry) => (entry.taskId === "postgres-historical-001" ? changedEntry : entry));
+  assert.throws(
+    () =>
+      reconcileHistoricalPostgresCorpusFreeze({
+        existing: first.manifest,
+        corpusId: "historical-postgres-corpus-v0",
+        freezeDate: "2026-06-15T00:00:00.000Z",
+        tasks: changedTasks
+      }),
+    HistoricalPostgresCorpusIntegrityError
+  );
+});
+
+test("graderBundleVersion participates in bundleHash: a grader-semantics/version bump forces a different truth bundle hash", async () => {
+  const { specs, root } = await corpusFixture();
+  const layout = await materializeHistoricalPostgresTask(specs[0], join(root, "grader-bundle-version"));
+  const { bundleHash, ...shape } = layout.truthManifest;
+  assert.equal(sha256(stableJson(shape)), bundleHash);
+  const bumped = { ...shape, graderBundleVersion: shape.graderBundleVersion + 1 };
+  assert.notEqual(sha256(stableJson(bumped)), bundleHash);
+});
+
+// ---------------------------------------------------------------------------
 // Integrity mismatch: missing/duplicate/malformed manifest, never a task grade
 // ---------------------------------------------------------------------------
 
-test("validateHistoricalPostgresCorpusManifest rejects a missing task", async () => {
+/**
+ * `buildHistoricalPostgresCorpusManifest()` always returns a manifest that
+ * already passes its own `corpusHash`; each test below builds a genuinely
+ * valid manifest first, then mutates a field *without* recomputing
+ * `corpusHash` - the real "loaded a frozen manifest from disk" tamper shape
+ * (#201 PR #206 review, Blocking 3) - and confirms
+ * `validateHistoricalPostgresCorpusManifest()` rejects the result, whether or
+ * not the specific structural check also independently catches it.
+ */
+async function validManifest() {
   const { entries } = await corpusFixture();
-  const incomplete = entries.filter((entry) => entry.taskId !== "postgres-historical-003");
+  return buildHistoricalPostgresCorpusManifest({ corpusId: "historical-postgres-corpus-v0", freezeDate: "2026-01-01T00:00:00.000Z", tasks: entries });
+}
+
+test("validateHistoricalPostgresCorpusManifest rejects a missing task (stale corpusHash)", async () => {
+  const manifest = await validManifest();
+  const tampered: HistoricalPostgresCorpusManifest = { ...manifest, tasks: manifest.tasks.filter((task) => task.taskId !== "postgres-historical-003") };
+  assert.throws(() => validateHistoricalPostgresCorpusManifest(tampered), HistoricalPostgresCorpusIntegrityError);
+});
+
+test("validateHistoricalPostgresCorpusManifest rejects a duplicate taskId (stale corpusHash)", async () => {
+  const manifest = await validManifest();
+  const tampered: HistoricalPostgresCorpusManifest = { ...manifest, tasks: [...manifest.tasks, manifest.tasks[0]] };
+  assert.throws(() => validateHistoricalPostgresCorpusManifest(tampered), HistoricalPostgresCorpusIntegrityError);
+});
+
+test("validateHistoricalPostgresCorpusManifest rejects a manifest with an unrecognized extra task (stale corpusHash)", async () => {
+  const manifest = await validManifest();
+  const tampered: HistoricalPostgresCorpusManifest = { ...manifest, tasks: [...manifest.tasks, { ...manifest.tasks[0], taskId: "postgres-historical-004" }] };
+  assert.throws(() => validateHistoricalPostgresCorpusManifest(tampered), HistoricalPostgresCorpusIntegrityError);
+});
+
+test("validateHistoricalPostgresCorpusManifest rejects a wrong/missing holdout disclaimer (stale corpusHash)", async () => {
+  const manifest = await validManifest();
+  const tampered: HistoricalPostgresCorpusManifest = { ...manifest, holdoutNote: "This corpus has a pristine HOLDOUT set." };
+  assert.throws(() => validateHistoricalPostgresCorpusManifest(tampered), HistoricalPostgresCorpusIntegrityError);
+});
+
+test("validateHistoricalPostgresCorpusManifest (loaded-manifest tamper detection): any field edited without updating corpusHash is rejected", async () => {
+  const manifest = await validManifest();
+  // A structurally-valid-looking edit (a real hex hash, just the wrong one)
+  // that none of the individual structural checks above would catch on its
+  // own - only the corpusHash recomputation closes this gap.
+  const tampered: HistoricalPostgresCorpusManifest = {
+    ...manifest,
+    tasks: manifest.tasks.map((task) => (task.taskId === "postgres-historical-002" ? { ...task, truthBundleHash: "f".repeat(64) } : task))
+  };
   assert.throws(
-    () => validateHistoricalPostgresCorpusManifest({ tasks: incomplete, holdoutNote: HISTORICAL_POSTGRES_CORPUS_HOLDOUT_NOTE }),
-    HistoricalPostgresCorpusIntegrityError
+    () => validateHistoricalPostgresCorpusManifest(tampered),
+    (error: unknown) => error instanceof HistoricalPostgresCorpusIntegrityError && /stale or tampered/.test((error as Error).message)
   );
 });
 
-test("validateHistoricalPostgresCorpusManifest rejects a duplicate taskId", async () => {
-  const { entries } = await corpusFixture();
-  const duplicated = [...entries, entries[0]];
-  assert.throws(
-    () => validateHistoricalPostgresCorpusManifest({ tasks: duplicated, holdoutNote: HISTORICAL_POSTGRES_CORPUS_HOLDOUT_NOTE }),
-    HistoricalPostgresCorpusIntegrityError
-  );
+test("validateHistoricalPostgresCorpusManifest rejects malformed hash field formats", async () => {
+  const manifest = await validManifest();
+  const tampered = { ...manifest, tasks: manifest.tasks.map((task) => (task.taskId === "postgres-historical-001" ? { ...task, sourceSnapshotHash: "not-a-hash" } : task)) };
+  assert.throws(() => validateHistoricalPostgresCorpusManifest(tampered as HistoricalPostgresCorpusManifest), HistoricalPostgresCorpusIntegrityError);
 });
 
-test("validateHistoricalPostgresCorpusManifest rejects a manifest with an unrecognized extra task", async () => {
-  const { entries } = await corpusFixture();
-  const extra = [...entries, { ...entries[0], taskId: "postgres-historical-004" }];
-  assert.throws(
-    () => validateHistoricalPostgresCorpusManifest({ tasks: extra, holdoutNote: HISTORICAL_POSTGRES_CORPUS_HOLDOUT_NOTE }),
-    HistoricalPostgresCorpusIntegrityError
-  );
-});
-
-test("validateHistoricalPostgresCorpusManifest rejects a wrong/missing holdout disclaimer", async () => {
-  const { entries } = await corpusFixture();
-  assert.throws(
-    () => validateHistoricalPostgresCorpusManifest({ tasks: entries, holdoutNote: "This corpus has a pristine HOLDOUT set." }),
-    HistoricalPostgresCorpusIntegrityError
-  );
+test("validateHistoricalPostgresCorpusManifest accepts a genuinely unmodified manifest", async () => {
+  const manifest = await validManifest();
+  assert.doesNotThrow(() => validateHistoricalPostgresCorpusManifest(manifest));
 });
 
 test("buildHistoricalPostgresCorpusManifest itself refuses to build an invalid manifest rather than silently freezing it", async () => {

@@ -6,11 +6,16 @@ import {
   createAgentEnvRoot,
   materializePostgresSource,
   withPostgresResearchEnvironment,
+  DEFAULT_BUILD_MODE,
+  DEFAULT_CONFIGURE_ARGS,
+  DEFAULT_INITDB_ARGS,
   type PostgresBuildSpec,
   type PostgresQueryResult,
   type PostgresResearchEnvironment,
   type PostgresResearchSpec
 } from "./research-environment.js";
+import { DEFAULT_BUILDER_IMAGE } from "./build-container.js";
+import { DEFAULT_RUNTIME_IMAGE } from "./runtime-container.js";
 import {
   runAgentInPostgresResearchEnvironment,
   type PostgresResearchAgentSpec,
@@ -76,6 +81,24 @@ export type HistoricalPostgresGradingProtocol =
   | typeof HISTORICAL_POSTGRES_EXIT_STATUS_PROTOCOL
   | typeof HISTORICAL_POSTGRES_BEHAVIORAL_ORACLE_PROTOCOL
   | typeof HISTORICAL_POSTGRES_STRUCTURED_ORACLE_PROTOCOL;
+
+/**
+ * A `gradingProtocol` string names which *family* of oracle graded a task
+ * (exit-status / behavioral / structured), but the classification logic
+ * inside that family - `gradeHistoricalPostgresSubmission()`'s 4-step
+ * classifier, `resolveOracleReproduction()`, `classifyExecutionValidity()`'s
+ * exit-code allow-list, `evaluateOracleAttribution()`/
+ * `evaluateStructuredOracleAttribution()` - can itself change scoring
+ * semantics for an *existing* task without changing that protocol string at
+ * all (#201 PR #206 review, Blocking 2). Bump this integer whenever such a
+ * change is made, so `truthShape.graderBundleVersion` below - and therefore
+ * `bundleHash`/`truthBundleHash`/the corpus hash that aggregates it - moves
+ * even though `gradingProtocol` itself is unchanged. A simple explicit
+ * version counter, not source-code introspection, per that review's
+ * preference for "a simple explicit versioned grader contract... over
+ * fragile runtime source-code introspection."
+ */
+export const HISTORICAL_POSTGRES_GRADER_BUNDLE_VERSION = 1;
 
 /**
  * The deliberately small v0 contract for one historical PostgreSQL task.
@@ -215,7 +238,29 @@ export type HistoricalPostgresTaskManifest = {
   budget: Record<string, number>;
   buildProfile: string;
   artifacts: { sourceManifest: string; prompt: string; workspace: string };
-  hashes: { sourceTree: string; prompt: string; taskDefinition: string; truthBundle: string };
+  hashes: {
+    sourceTree: string;
+    prompt: string;
+    taskDefinition: string;
+    truthBundle: string;
+    /**
+     * Hash of the initial agent-visible `task/workspace/` scaffolding (e.g.
+     * the generated README) at materialization time - never post-agent
+     * output. Closes the gap where the agent-visible workspace contract
+     * could change without moving any other hash (#201 PR #206 review,
+     * Blocking 2). Already folded into `taskDefinition` too; exposed here
+     * directly so the corpus layer can surface it per-task without
+     * recomputing it.
+     */
+    agentWorkspace: string;
+    /**
+     * Hash of the declarative build/runtime contract this task is scored
+     * under - see `resolveHistoricalPostgresBuildContract()`. Already folded
+     * into `taskDefinition` too; exposed here directly for the same reason
+     * as `agentWorkspace` above.
+     */
+    buildContract: string;
+  };
 };
 
 /**
@@ -248,6 +293,8 @@ export type HistoricalPostgresTruthManifest = {
   historicalRevision: string;
   referenceRevision: string;
   gradingProtocol: HistoricalPostgresGradingProtocol;
+  /** See HISTORICAL_POSTGRES_GRADER_BUNDLE_VERSION - always present, unlike the Policy-A-conditional oracle/fix-evidence fields below. */
+  graderBundleVersion: number;
   /** Grader-private relative path to the retained canonical verification reproducer; never used as an agent grading fallback. */
   canonicalReproducer: string | null;
   /** SHA-256 of the canonical verification reproducer, when one was supplied; never the agent's. */
@@ -433,6 +480,41 @@ async function hashDirectoryContents(root: string): Promise<string> {
   return sha256(entries.join("\n"));
 }
 
+/**
+ * The declarative build/runtime contract a task is scored under - not an
+ * observed, machine-specific fact (a locally built image's content-addressed
+ * id, a compiler version actually detected on some runner), which would make
+ * a frozen corpus hash non-reproducible across operators/machines, but the
+ * same declared knobs `withPostgresResearchEnvironment()` already resolves
+ * `PostgresBuildSpec` overrides against - reused directly from
+ * `research-environment.ts`/`build-container.ts`/`runtime-container.ts`
+ * rather than duplicated. `gradeHistoricalPostgresSubmission()` passes
+ * `task.build` unchanged to both revisions' `defaultGradeRevision()`, so one
+ * contract covers both. Closes the gap where `buildProfile: "container"`
+ * alone could not detect a changed configure argument, builder/runtime image
+ * reference, or build-environment override (#201 PR #206 review, Blocking
+ * 2). `HistoricalPostgresTaskSpec` has no per-task runtime-image override
+ * today, so the runtime image is always the resolved default; if one is ever
+ * added, it belongs here too.
+ */
+function resolveHistoricalPostgresBuildContract(build?: PostgresBuildSpec): {
+  mode: string;
+  builderImage: string;
+  configureArgs: string[];
+  initdbArgs: string[];
+  runtimeImage: string;
+  env: Record<string, string>;
+} {
+  return {
+    mode: build?.mode ?? DEFAULT_BUILD_MODE,
+    builderImage: build?.builderImage ?? DEFAULT_BUILDER_IMAGE,
+    configureArgs: [...(build?.configureArgs ?? DEFAULT_CONFIGURE_ARGS)],
+    initdbArgs: [...DEFAULT_INITDB_ARGS],
+    runtimeImage: DEFAULT_RUNTIME_IMAGE,
+    env: { ...(build?.env ?? {}) }
+  };
+}
+
 function exactRevision(value: string, field: string) {
   if (!/^[0-9a-f]{40}$/i.test(value)) throw new Error(`${field} must be a pinned 40-character commit SHA`);
   return value.toLowerCase();
@@ -538,6 +620,13 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
     join(workspaceDir, "README.md"),
     "Write finding.json and the runnable SQL reproducer here. HoneyRail grades the same reproducer on the supplied historical build and a grader-owned corrected build.\n"
   );
+  // Hashed here, immediately after the only file materialization ever writes
+  // into workspaceDir and before anything else touches it - never post-agent
+  // output, which lives in a wholly separate directory (see
+  // runHistoricalPostgresTrial()'s own `session.workspaceDir`).
+  const agentWorkspaceHash = await hashDirectoryContents(workspaceDir);
+  const buildContract = resolveHistoricalPostgresBuildContract(input.build);
+  const buildContractHash = sha256(stableJson(buildContract));
   await writeFile(
     join(verificationDir, "reproducer-contract.md"),
     "A creditable repro.sql exits successfully only when the observed behavior violates the assertion encoded by the " +
@@ -635,7 +724,16 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
     promptHash: sha256(await readFile(promptPath)),
     scaffoldingLevel: input.scaffoldingLevel ?? "minimal",
     budget: input.budget ?? {},
-    buildProfile: input.build?.mode ?? "container"
+    buildProfile: input.build?.mode ?? "container",
+    // Both added #201 PR #206 review, Blocking 2: neither the agent-visible
+    // workspace scaffolding nor the declarative build/runtime contract used
+    // to be covered by any hash, so either could change while every existing
+    // hash (including this one) stayed the same. Deliberately *not*
+    // `gradingProtocol`/oracle content - that stays truthShape/bundleHash's
+    // job, unchanged, per the documented taskDefinitionHash/bundleHash
+    // boundary below.
+    agentWorkspaceHash,
+    buildContractHash
   };
   const taskDefinitionHash = sha256(stableJson(taskDefinition));
 
@@ -647,6 +745,15 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
     historicalRevision: input.source.historicalRevision,
     referenceRevision: input.source.referenceRevision,
     gradingProtocol,
+    // Always present (unlike behavioralOracle/structuredOracle/fixEvidence
+    // below, which are Policy-A-conditional): every task, including a legacy
+    // exit-status one, is graded by *some* version of the classifier logic,
+    // so this always participates in bundleHash - closing the gap where a
+    // grader-semantics change (e.g. to gradeHistoricalPostgresSubmission's
+    // classification steps) would not move any hash at all as long as
+    // gradingProtocol itself stayed the same (#201 PR #206 review, Blocking
+    // 2). See HISTORICAL_POSTGRES_GRADER_BUNDLE_VERSION.
+    graderBundleVersion: HISTORICAL_POSTGRES_GRADER_BUNDLE_VERSION,
     canonicalReproducer,
     canonicalReproducerSha256,
     // Key presence itself is conditional (not just its value) so a legacy
@@ -684,7 +791,14 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
     budget: input.budget ?? {},
     buildProfile: input.build?.mode ?? "container",
     artifacts: { sourceManifest: "source-manifest.json", prompt: "prompt.md", workspace: "workspace" },
-    hashes: { sourceTree: source.sourceHash, prompt: taskDefinition.promptHash, taskDefinition: taskDefinitionHash, truthBundle: truthManifest.bundleHash }
+    hashes: {
+      sourceTree: source.sourceHash,
+      prompt: taskDefinition.promptHash,
+      taskDefinition: taskDefinitionHash,
+      truthBundle: truthManifest.bundleHash,
+      agentWorkspace: agentWorkspaceHash,
+      buildContract: buildContractHash
+    }
   };
 
   const taskManifestPath = join(taskDir, "task-manifest.json");

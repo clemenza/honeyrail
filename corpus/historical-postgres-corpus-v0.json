@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "corpusId": "historical-postgres-corpus-v0",
-  "freezeDate": "2026-09-05T16:29:51.541Z",
+  "freezeDate": "2026-09-06T03:16:56.422Z",
   "gradingEntryPoint": [
     "materializeHistoricalPostgresTask",
     "gradeHistoricalPostgresSubmission",
@@ -22,8 +22,10 @@
       "partition": "TRAIN",
       "sourceSnapshotHash": "345953caead8e74c1b6645d6be1fceac2a7388f2",
       "promptHash": "43d211a8be89a569fff0a07d88678508001c3ac87b583af069fe2434fba6e37f",
-      "taskDefinitionHash": "9ad24085b7406645f6ed682f0c6cd912de8cedd15d2a55eb7074ff4c4f623321",
-      "truthBundleHash": "934c7923465cade82768093e486b2910d47241572e19b4e5941eba4bf116b1c9",
+      "taskDefinitionHash": "1340399e092e0eccb4ff7cc1c08a37e2870488e4e08e6a20ada3a537e65e2480",
+      "truthBundleHash": "244e6b6abb59f54c072b77d230cf6515ddbeafbe11487f0b99ad69036ee1a323",
+      "agentWorkspaceHash": "4fd3095de5da034fff727abfb521ad2ab55f29dcab40999e356f59c91a8fe2ff",
+      "buildContractHash": "54a3d3328d7e2c0f200dc4a263db02fc0269ab8f6ad29248df87683d0a591a3d",
       "gradingProtocol": "submitted-reproducer-exit-status-v1",
       "scaffoldingLevel": "minimal",
       "budget": {},
@@ -62,8 +64,10 @@
       "partition": "FRONTIER",
       "sourceSnapshotHash": "0a70fe6725e2f5263fcf4806f99bada7c278f571",
       "promptHash": "3e687239da6ecd809e205fbb3ac205eb6c79365fd10f1d3885ee604c43cfc072",
-      "taskDefinitionHash": "73c3c101adf1c4270226398f9c240e4762d72c4afd18345ca58c0c06f4c1b23b",
-      "truthBundleHash": "106aee7eb0313ddcdf42846cb1433f62c3ba6b181a3bc8b7a68ac0f4fca5f296",
+      "taskDefinitionHash": "4be61e31ff4cd2a92441d6d500a2c23fa7963e71ba54222c17f6b65978574de5",
+      "truthBundleHash": "a9e5642a486fd00416c1e5748dc111037dbcb59038f08b3ab22e4d99425c250b",
+      "agentWorkspaceHash": "4fd3095de5da034fff727abfb521ad2ab55f29dcab40999e356f59c91a8fe2ff",
+      "buildContractHash": "54a3d3328d7e2c0f200dc4a263db02fc0269ab8f6ad29248df87683d0a591a3d",
       "gradingProtocol": "submitted-reproducer-behavioral-oracle-v1",
       "scaffoldingLevel": "minimal",
       "budget": {},
@@ -102,8 +106,10 @@
       "partition": "FRONTIER",
       "sourceSnapshotHash": "ab49034bfdf5935880666e2a503fe09bb5105838",
       "promptHash": "91009f52f4014e72c8071781eca89b51dbfefec0fcdc8ee6b213a6305e06bb4e",
-      "taskDefinitionHash": "c132c2911adb14b17942c7bec3fb0bc38a37ce3ba236ab1fc4a2c37ed67b1eef",
-      "truthBundleHash": "c92b37915ecda8955c94de5db20c4168ef522621578cb7ed2568385cd9e211c2",
+      "taskDefinitionHash": "b1c5ccf08d157d0c040530dbdefd5414b9bbdcefc34489b73e65f45f5f09bb28",
+      "truthBundleHash": "00b9cdaf995cd670be04f9069cf614d911b1547fcd1a2d98d5d566c762566fc5",
+      "agentWorkspaceHash": "4fd3095de5da034fff727abfb521ad2ab55f29dcab40999e356f59c91a8fe2ff",
+      "buildContractHash": "54a3d3328d7e2c0f200dc4a263db02fc0269ab8f6ad29248df87683d0a591a3d",
       "gradingProtocol": "submitted-reproducer-structured-oracle-v1",
       "scaffoldingLevel": "minimal",
       "budget": {},
@@ -138,5 +144,5 @@
       ]
     }
   ],
-  "corpusHash": "f1b6369296114c0f459dea04729306f2b7f41400a5922ed8dd44a1ba7b94d1f5"
+  "corpusHash": "435062c2a537cb24f8f9e57148b3254b1bc47b04c057714e501b5bf0376fa455"
 }
