@@ -227,6 +227,10 @@ test("Policy A: case 001 truth bundle is byte-for-byte identical after structure
     historicalRevision: task.truthManifest.historicalRevision,
     referenceRevision: task.truthManifest.referenceRevision,
     gradingProtocol: "submitted-reproducer-exit-status-v1" as const,
+    // Added #201 PR #206 review, Blocking 2 - always present; see the
+    // matching comment in historical-postgres-002-task.test.ts's own
+    // Policy-A test.
+    graderBundleVersion: task.truthManifest.graderBundleVersion,
     canonicalReproducer: task.truthManifest.canonicalReproducer,
     canonicalReproducerSha256: task.truthManifest.canonicalReproducerSha256,
     expectedBehaviorSha256: task.truthManifest.expectedBehaviorSha256,

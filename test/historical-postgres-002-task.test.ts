@@ -277,6 +277,12 @@ test("Policy A: a legacy truth bundle (no behavioralOracle, no fix evidence) is 
     historicalRevision: task.truthManifest.historicalRevision,
     referenceRevision: task.truthManifest.referenceRevision,
     gradingProtocol: "submitted-reproducer-exit-status-v1" as const,
+    // Added #201 PR #206 review, Blocking 2 - always present (unlike
+    // behavioralOracle/fixEvidence below), so this round's "pristine" legacy
+    // shape includes it deliberately, unlike the fields that stay
+    // Policy-A-conditional. This is an intentional, reviewer-acknowledged
+    // hash-contract change, not accidental drift.
+    graderBundleVersion: task.truthManifest.graderBundleVersion,
     canonicalReproducer: task.truthManifest.canonicalReproducer,
     canonicalReproducerSha256: task.truthManifest.canonicalReproducerSha256,
     expectedBehaviorSha256: task.truthManifest.expectedBehaviorSha256,

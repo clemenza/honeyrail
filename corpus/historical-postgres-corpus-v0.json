@@ -1,0 +1,178 @@
+{
+  "schemaVersion": 1,
+  "corpusId": "historical-postgres-corpus-v0",
+  "freezeDate": "2026-09-06T05:23:39.845Z",
+  "gradingEntryPoint": [
+    "materializeHistoricalPostgresTask",
+    "gradeHistoricalPostgresSubmission",
+    "runHistoricalPostgresTrial"
+  ],
+  "outcomeVocabulary": [
+    "blocked",
+    "infrastructure_error",
+    "integrity_error",
+    "invalid_submission",
+    "miss",
+    "rediscovered"
+  ],
+  "holdoutNote": "Corpus v0 is an engineering rediscovery corpus for Historical PostgreSQL MVP validation. It does not currently provide a pristine HOLDOUT generalization claim.",
+  "environmentFingerprint": {
+    "buildMode": "container",
+    "buildProfileVersion": "pg-research-env-v2",
+    "configureArgs": [
+      "--without-readline",
+      "--without-zlib",
+      "--without-icu"
+    ],
+    "initdbArgs": [
+      "-A",
+      "trust",
+      "-U",
+      "postgres",
+      "--no-locale"
+    ],
+    "buildEnv": {},
+    "builderImage": {
+      "reference": "honeyrail-postgres-builder:latest",
+      "id": "sha256:f964f19cbcbfc2eed5d6dedcd26581d5743f1d5037e7e854b8e952257dbd7ffe"
+    },
+    "runtimeImage": {
+      "reference": "honeyrail-postgres-runtime:latest",
+      "id": "sha256:8d590fde3567ddeea732e011e959af6d3ffc426543f405a02b63de7bd38b0522"
+    },
+    "compiler": {
+      "command": "cc",
+      "version": "cc (Debian 12.2.0-14+deb12u1) 12.2.0",
+      "target": "aarch64-linux-gnu"
+    }
+  },
+  "tasks": [
+    {
+      "taskId": "postgres-historical-001",
+      "partition": "TRAIN",
+      "sourceSnapshotHash": "345953caead8e74c1b6645d6be1fceac2a7388f2",
+      "promptHash": "43d211a8be89a569fff0a07d88678508001c3ac87b583af069fe2434fba6e37f",
+      "taskDefinitionHash": "3a0105b7769f1cfb2e955a66142c1978db3f1bfae071447f2aa8a1f4a08c92fd",
+      "truthBundleHash": "e2de58594dce301fe27cf955b629ee0e4b246edc4233edcb0e587d1f1596ebc6",
+      "agentWorkspaceHash": "4fd3095de5da034fff727abfb521ad2ab55f29dcab40999e356f59c91a8fe2ff",
+      "buildContractHash": "cceba3db7b6b950a59a0ee15542d394552ed2cdfd49bbba4ed5ed11646825947",
+      "gradingProtocol": "submitted-reproducer-exit-status-v1",
+      "scaffoldingLevel": "minimal",
+      "budget": {},
+      "buildProfile": "container",
+      "artifactContract": {
+        "agentVisible": [
+          "task/prompt.md",
+          "task/task-manifest.json",
+          "task/source-manifest.json",
+          "task/workspace/"
+        ],
+        "agentSubmitted": [
+          "finding.json",
+          "<reproducer file>? (required only when finding.json status is \"reproduced\")"
+        ],
+        "graderRetained": [
+          "reference/truth.json",
+          "reference/reference-manifest.json",
+          "agent-result.json",
+          "agent-stdout.txt",
+          "agent-stderr.txt",
+          "grader/historical/*",
+          "grader/reference/*",
+          "grader/grade.json"
+        ]
+      },
+      "provenanceReferences": [
+        "#178",
+        "#184",
+        "#185",
+        "#201"
+      ]
+    },
+    {
+      "taskId": "postgres-historical-002",
+      "partition": "FRONTIER",
+      "sourceSnapshotHash": "0a70fe6725e2f5263fcf4806f99bada7c278f571",
+      "promptHash": "3e687239da6ecd809e205fbb3ac205eb6c79365fd10f1d3885ee604c43cfc072",
+      "taskDefinitionHash": "f4af0dca97bd51e7e6aab85374be961e1ce1a09704ade8f80c64bfa959373e33",
+      "truthBundleHash": "e5a67ad8270d047a1bd0136cba87f8182e4f54c4a74318a1fd12aa249ecda317",
+      "agentWorkspaceHash": "4fd3095de5da034fff727abfb521ad2ab55f29dcab40999e356f59c91a8fe2ff",
+      "buildContractHash": "cceba3db7b6b950a59a0ee15542d394552ed2cdfd49bbba4ed5ed11646825947",
+      "gradingProtocol": "submitted-reproducer-behavioral-oracle-v1",
+      "scaffoldingLevel": "minimal",
+      "budget": {},
+      "buildProfile": "container",
+      "artifactContract": {
+        "agentVisible": [
+          "task/prompt.md",
+          "task/task-manifest.json",
+          "task/source-manifest.json",
+          "task/workspace/"
+        ],
+        "agentSubmitted": [
+          "finding.json",
+          "<reproducer file>? (required only when finding.json status is \"reproduced\")"
+        ],
+        "graderRetained": [
+          "reference/truth.json",
+          "reference/reference-manifest.json",
+          "agent-result.json",
+          "agent-stdout.txt",
+          "agent-stderr.txt",
+          "grader/historical/*",
+          "grader/reference/*",
+          "grader/grade.json"
+        ]
+      },
+      "provenanceReferences": [
+        "#178",
+        "#185",
+        "#200",
+        "#201"
+      ]
+    },
+    {
+      "taskId": "postgres-historical-003",
+      "partition": "FRONTIER",
+      "sourceSnapshotHash": "ab49034bfdf5935880666e2a503fe09bb5105838",
+      "promptHash": "91009f52f4014e72c8071781eca89b51dbfefec0fcdc8ee6b213a6305e06bb4e",
+      "taskDefinitionHash": "778505c32f8765a770bf54bb3b013e0ee0510b7291deba4253e9295828818c1f",
+      "truthBundleHash": "816461c0b6e695ed45861df2e1a551a9fe0981244037a3df06d547b34d578b50",
+      "agentWorkspaceHash": "4fd3095de5da034fff727abfb521ad2ab55f29dcab40999e356f59c91a8fe2ff",
+      "buildContractHash": "cceba3db7b6b950a59a0ee15542d394552ed2cdfd49bbba4ed5ed11646825947",
+      "gradingProtocol": "submitted-reproducer-structured-oracle-v1",
+      "scaffoldingLevel": "minimal",
+      "budget": {},
+      "buildProfile": "container",
+      "artifactContract": {
+        "agentVisible": [
+          "task/prompt.md",
+          "task/task-manifest.json",
+          "task/source-manifest.json",
+          "task/workspace/"
+        ],
+        "agentSubmitted": [
+          "finding.json",
+          "<reproducer file>? (required only when finding.json status is \"reproduced\")"
+        ],
+        "graderRetained": [
+          "reference/truth.json",
+          "reference/reference-manifest.json",
+          "agent-result.json",
+          "agent-stdout.txt",
+          "agent-stderr.txt",
+          "grader/historical/*",
+          "grader/reference/*",
+          "grader/grade.json"
+        ]
+      },
+      "provenanceReferences": [
+        "#178",
+        "#185",
+        "#199",
+        "#201"
+      ]
+    }
+  ],
+  "corpusHash": "066df0141a13a4b79e78d5737341ce2be82b36f72d1df9c1ec1ac3ae8cdd76f0"
+}

@@ -123,8 +123,17 @@ export const HOST_BUILD_UNSCORED_REASON =
   "rather than the pinned Linux build image's, so they are not the artifact a scored trial's agent container " +
   "executes. Development only - not a scored trial.";
 
-function defaultBuildMode(): PostgresBuildMode {
-  const raw = String(process.env.HONEYRAIL_PG_BUILD_MODE || "").trim();
+/**
+ * The effective build mode: an explicit `PostgresBuildSpec.mode` always wins;
+ * otherwise `HONEYRAIL_PG_BUILD_MODE` when it names a valid mode, else
+ * `DEFAULT_BUILD_MODE`. Exported (#201 PR #206 second review, Blocking 1)
+ * so every caller that needs to know the mode a build will actually run
+ * under - not just `buildPostgres()` itself - resolves it through this one
+ * function instead of re-deriving it, and an `env` override (default
+ * `process.env`) makes it testable without mutating global process state.
+ */
+export function defaultBuildMode(env: NodeJS.ProcessEnv = process.env): PostgresBuildMode {
+  const raw = String(env.HONEYRAIL_PG_BUILD_MODE || "").trim();
   return raw === "host" || raw === "container" ? raw : DEFAULT_BUILD_MODE;
 }
 
