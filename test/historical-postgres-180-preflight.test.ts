@@ -20,6 +20,7 @@ import {
   materializeHistoricalPostgresTask,
   resolveHistoricalPostgresEnvironmentFingerprint,
   sha256,
+  type GradeRevision,
   type HistoricalPostgresEnvironmentFingerprint,
   type HistoricalPostgresTaskSpec
 } from "../server/postgres/historical-task.js";
@@ -455,7 +456,7 @@ for (const tamperCase of TASK_ENTRY_TAMPER_CASES) {
 // exactly once - proves the assertions above aren't vacuously true.
 // ---------------------------------------------------------------------------
 
-test("no false miss: a passing preflight lets runHistoricalPostgresPilotTrial invoke the agent exactly once, and a real eligible agent profile is dataset-eligible", async () => {
+test("no false miss: a passing preflight lets runHistoricalPostgresPilotTrial invoke the agent exactly once", async () => {
   const fx = await threeTaskFixture(FAKE_RUN_COMMAND);
   const artifactDir = await materializeRootFor(fx.root, "positive-control");
   const workspace = join(artifactDir, "agent-workspace-fixture");
@@ -481,13 +482,197 @@ test("no false miss: a passing preflight lets runHistoricalPostgresPilotTrial in
   assert.equal(pilot.preflight.status, "passed");
   assert.equal(pilot.trial?.status, "completed");
   assert.equal(pilot.trial?.grade?.status, "miss");
-  // profileKind defaults to "agent"; execution matched what preflight
-  // verified, so this is a genuine official scored result (#180 P0 2/P0 3).
-  assert.equal(pilot.profileKind, "agent");
-  assert.equal(pilot.executionBinding.status, "verified");
+  // A not-reproduced submission never invokes the two-revision grader at all
+  // (gradeHistoricalPostgresSubmission's own early-return - see
+  // historical-task.test.ts), so neither grader revision ever executed
+  // anything to bind to the frozen environment. Fail-closed (#207 review
+  // round 2, P0 Blocking 1): this must never be silently treated as an
+  // official score just because the agent's own environment matched.
+  assert.equal(pilot.executionBinding.agent.status, "verified");
+  assert.equal(pilot.executionBinding.historicalGrader.status, "unverified");
+  assert.equal(pilot.executionBinding.referenceGrader.status, "unverified");
+  assert.equal(pilot.executionBinding.overall.status, "unverified");
+  assert.equal(pilot.status, "completed");
+  assert.equal(pilot.datasetEligible, false);
+  assert.equal(pilot.officialScoredResult, "N/A");
+});
+
+// ---------------------------------------------------------------------------
+// P0 Blocking 1 (PR #207 review round 2): the official rediscovered/miss/
+// invalid_submission result is produced by gradeHistoricalPostgresSubmission()'s
+// own two grader executions, not only the agent's investigation session -
+// all three must be individually bound to the frozen/preflight-verified
+// environment before a result can be official. Fail-closed: "unverified" is
+// never treated as equivalent to "verified". A "reproduced" submission (with
+// a fake gradeRevision injected exactly like historical-task.test.ts already
+// does directly against gradeHistoricalPostgresSubmission) is what actually
+// exercises both grader revisions, entirely offline.
+// ---------------------------------------------------------------------------
+
+async function reproducedWorkspace(root: string, label: string): Promise<string> {
+  const workspace = join(root, `agent-workspace-${label}`);
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "repro.sql"), "SELECT 1;\n");
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "reproduced", summary: `Fake reproduced finding (${label}).`, reproducer: "repro.sql" }));
+  return workspace;
+}
+
+/** A fake `GradeRevision` reporting a controlled `executionEnvironment` per revision, and a self-asserting exit-status differential (historical reproduces, reference does not) so case 001's exit-status protocol classifies it "rediscovered". */
+function fakeGradeRevision(input: {
+  historicalRevision: string;
+  historicalExecutionEnvironment: HistoricalPostgresEnvironmentFingerprint | undefined;
+  referenceExecutionEnvironment: HistoricalPostgresEnvironmentFingerprint | undefined;
+}): GradeRevision {
+  return async ({ revision }) => {
+    const isHistorical = revision === input.historicalRevision;
+    const ef = isHistorical ? input.historicalExecutionEnvironment : input.referenceExecutionEnvironment;
+    return {
+      reproduced: isHistorical,
+      execution: { ok: isHistorical, stdout: "", stderr: "", exitCode: isHistorical ? 0 : 1, durationMs: 1 },
+      executionEnvironment: ef
+        ? { buildMode: ef.buildMode, buildProfileVersion: ef.buildProfileVersion, configureArgs: [...ef.configureArgs], buildEnv: { ...ef.buildEnv }, builderImage: ef.builderImage, runtimeImage: ef.runtimeImage, compiler: ef.compiler }
+        : undefined
+    };
+  };
+}
+
+test("execution binding, all verified: agent + historical grader + reference grader all match the frozen environment => dataset-eligible official score", async () => {
+  const fx = await threeTaskFixture(FAKE_RUN_COMMAND);
+  const artifactDir = await materializeRootFor(fx.root, "binding-all-verified");
+  const workspace = await reproducedWorkspace(artifactDir, "all-verified");
+
+  const pilot = await runHistoricalPostgresPilotTrial({
+    corpusManifest: fx.manifest,
+    expectedCorpusId: fx.manifest.corpusId,
+    expectedCorpusHash: fx.manifest.corpusHash,
+    taskSpec: fx.spec001,
+    agent: { command: "unused" },
+    artifactDir,
+    runCommand: fx.runCommand,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace, environmentFingerprint: fx.environmentFingerprint }),
+    gradeRevision: fakeGradeRevision({
+      historicalRevision: fx.spec001.source.historicalRevision,
+      historicalExecutionEnvironment: fx.environmentFingerprint,
+      referenceExecutionEnvironment: fx.environmentFingerprint
+    })
+  });
+
+  assert.equal(pilot.trial?.status, "completed");
+  assert.equal(pilot.trial?.grade?.status, "rediscovered");
+  assert.equal(pilot.executionBinding.agent.status, "verified");
+  assert.equal(pilot.executionBinding.historicalGrader.status, "verified");
+  assert.equal(pilot.executionBinding.referenceGrader.status, "verified");
+  assert.equal(pilot.executionBinding.overall.status, "verified");
   assert.equal(pilot.status, "completed");
   assert.equal(pilot.datasetEligible, true);
-  assert.equal(pilot.officialScoredResult, "miss");
+  assert.equal(pilot.officialScoredResult, "rediscovered");
+});
+
+test("execution binding, historical grader mismatch: agent=A, historical grader=B, reference grader=A => integrity_error, no official score", async () => {
+  const fx = await threeTaskFixture(FAKE_RUN_COMMAND);
+  const artifactDir = await materializeRootFor(fx.root, "binding-historical-mismatch");
+  const workspace = await reproducedWorkspace(artifactDir, "historical-mismatch");
+  const divergentEnvironment: HistoricalPostgresEnvironmentFingerprint = {
+    ...fx.environmentFingerprint,
+    builderImage: { reference: fx.environmentFingerprint.builderImage.reference, id: `sha256:${"9".repeat(64)}` }
+  };
+
+  const pilot = await runHistoricalPostgresPilotTrial({
+    corpusManifest: fx.manifest,
+    expectedCorpusId: fx.manifest.corpusId,
+    expectedCorpusHash: fx.manifest.corpusHash,
+    taskSpec: fx.spec001,
+    agent: { command: "unused" },
+    artifactDir,
+    runCommand: fx.runCommand,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace, environmentFingerprint: fx.environmentFingerprint }),
+    gradeRevision: fakeGradeRevision({
+      historicalRevision: fx.spec001.source.historicalRevision,
+      historicalExecutionEnvironment: divergentEnvironment,
+      referenceExecutionEnvironment: fx.environmentFingerprint
+    })
+  });
+
+  assert.equal(pilot.trial?.status, "completed");
+  assert.equal(pilot.executionBinding.agent.status, "verified");
+  assert.equal(pilot.executionBinding.historicalGrader.status, "mismatched");
+  assert.equal(pilot.executionBinding.referenceGrader.status, "verified");
+  assert.equal(pilot.executionBinding.overall.status, "mismatched");
+  assert.equal(pilot.status, "integrity_error");
+  assert.equal(pilot.datasetEligible, false);
+  assert.equal(pilot.officialScoredResult, "N/A");
+});
+
+test("execution binding, reference grader mismatch: agent=A, historical grader=A, reference grader=B => integrity_error, no official score", async () => {
+  const fx = await threeTaskFixture(FAKE_RUN_COMMAND);
+  const artifactDir = await materializeRootFor(fx.root, "binding-reference-mismatch");
+  const workspace = await reproducedWorkspace(artifactDir, "reference-mismatch");
+  const divergentEnvironment: HistoricalPostgresEnvironmentFingerprint = {
+    ...fx.environmentFingerprint,
+    builderImage: { reference: fx.environmentFingerprint.builderImage.reference, id: `sha256:${"9".repeat(64)}` }
+  };
+
+  const pilot = await runHistoricalPostgresPilotTrial({
+    corpusManifest: fx.manifest,
+    expectedCorpusId: fx.manifest.corpusId,
+    expectedCorpusHash: fx.manifest.corpusHash,
+    taskSpec: fx.spec001,
+    agent: { command: "unused" },
+    artifactDir,
+    runCommand: fx.runCommand,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace, environmentFingerprint: fx.environmentFingerprint }),
+    gradeRevision: fakeGradeRevision({
+      historicalRevision: fx.spec001.source.historicalRevision,
+      historicalExecutionEnvironment: fx.environmentFingerprint,
+      referenceExecutionEnvironment: divergentEnvironment
+    })
+  });
+
+  assert.equal(pilot.trial?.status, "completed");
+  assert.equal(pilot.executionBinding.agent.status, "verified");
+  assert.equal(pilot.executionBinding.historicalGrader.status, "verified");
+  assert.equal(pilot.executionBinding.referenceGrader.status, "mismatched");
+  assert.equal(pilot.executionBinding.overall.status, "mismatched");
+  assert.equal(pilot.status, "integrity_error");
+  assert.equal(pilot.datasetEligible, false);
+  assert.equal(pilot.officialScoredResult, "N/A");
+});
+
+test("execution binding, unverified fails closed: a completed trial with one unavailable execution identity is never dataset-eligible", async () => {
+  const fx = await threeTaskFixture(FAKE_RUN_COMMAND);
+  const artifactDir = await materializeRootFor(fx.root, "binding-unverified");
+  const workspace = await reproducedWorkspace(artifactDir, "unverified");
+
+  const pilot = await runHistoricalPostgresPilotTrial({
+    corpusManifest: fx.manifest,
+    expectedCorpusId: fx.manifest.corpusId,
+    expectedCorpusHash: fx.manifest.corpusHash,
+    taskSpec: fx.spec001,
+    agent: { command: "unused" },
+    artifactDir,
+    runCommand: fx.runCommand,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace, environmentFingerprint: fx.environmentFingerprint }),
+    // The reference grader's own execution identity is unavailable (e.g. an
+    // older grader build that didn't record one) - not proven mismatched,
+    // just missing evidence. This must never fall through into an official
+    // score merely because nothing was "explicitly mismatched".
+    gradeRevision: fakeGradeRevision({
+      historicalRevision: fx.spec001.source.historicalRevision,
+      historicalExecutionEnvironment: fx.environmentFingerprint,
+      referenceExecutionEnvironment: undefined
+    })
+  });
+
+  assert.equal(pilot.trial?.status, "completed");
+  assert.equal(pilot.executionBinding.agent.status, "verified");
+  assert.equal(pilot.executionBinding.historicalGrader.status, "verified");
+  assert.equal(pilot.executionBinding.referenceGrader.status, "unverified");
+  assert.equal(pilot.executionBinding.overall.status, "unverified");
+  // Unverified is not a proven violation, so status stays "completed" - but
+  // it must never be dataset-eligible or produce an official score.
+  assert.equal(pilot.status, "completed");
+  assert.equal(pilot.datasetEligible, false);
+  assert.equal(pilot.officialScoredResult, "N/A");
 });
 
 // ---------------------------------------------------------------------------
@@ -566,10 +751,11 @@ test("execution binding: an execution-time environment that differs from what pr
 
   assert.equal(pilot.preflight.status, "passed");
   assert.equal(pilot.agentRunCount, 1);
-  assert.equal(pilot.executionBinding.status, "mismatched");
-  if (pilot.executionBinding.status === "mismatched") {
-    assert.ok(pilot.executionBinding.diagnostics.some((line) => line.includes("builderImage.id")), JSON.stringify(pilot.executionBinding.diagnostics));
+  assert.equal(pilot.executionBinding.agent.status, "mismatched");
+  if (pilot.executionBinding.agent.status === "mismatched") {
+    assert.ok(pilot.executionBinding.agent.diagnostics.some((line) => line.includes("builderImage.id")), JSON.stringify(pilot.executionBinding.agent.diagnostics));
   }
+  assert.equal(pilot.executionBinding.overall.status, "mismatched");
   assert.equal(pilot.status, "integrity_error");
   assert.equal(pilot.datasetEligible, false);
   assert.equal(pilot.officialScoredResult, "N/A");

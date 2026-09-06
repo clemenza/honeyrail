@@ -645,6 +645,48 @@ test("an explicit build.mode override wins over the ambient HONEYRAIL_PG_BUILD_M
   assert.equal(resolved.buildMode, "host");
 });
 
+test("resolveHistoricalPostgresEnvironmentFingerprint probes the toolchain using the already-resolved builder image id, never re-resolving the mutable tag (#207 review round 2, P0 Blocking 2)", async () => {
+  let builderInspectCalls = 0;
+  let toolchainProbeImage: string | undefined;
+  const runCommand: RunCommand = (async (command: string, args: string[] = []) => {
+    if (command === "docker" && args[0] === "image" && args[1] === "inspect") {
+      const image = String(args[2] ?? "");
+      if (image.includes("runtime")) {
+        return { ok: true, stdout: `${JSON.stringify([{ Id: `sha256:${"2".repeat(64)}`, RepoDigests: [], Os: "linux", Architecture: "amd64" }])}\n`, stderr: "", code: 0 };
+      }
+      builderInspectCalls += 1;
+      // A correct implementation resolves the builder tag exactly once. If
+      // it were (wrongly) re-resolved for the toolchain probe, this second
+      // call would return a *different* image - simulating the tag having
+      // been repointed in between (#207 review round 2's "tag changes"
+      // scenario) - and the assertions below would catch it.
+      const id = builderInspectCalls === 1 ? `sha256:${"a".repeat(64)}` : `sha256:${"b".repeat(64)}`;
+      return { ok: true, stdout: `${JSON.stringify([{ Id: id, RepoDigests: [], Os: "linux", Architecture: "amd64" }])}\n`, stderr: "", code: 0 };
+    }
+    if (command === "docker" && args[0] === "run") {
+      // The toolchain probe's own `docker run` argv places the image
+      // immediately before "/bin/sh" - see probeBuildContainerToolchain().
+      const shIndex = args.indexOf("/bin/sh");
+      toolchainProbeImage = shIndex > 0 ? args[shIndex - 1] : undefined;
+      const delimiterMatch = /echo '([^']+)'/.exec(String(args[args.length - 1] ?? ""));
+      const delimiter = delimiterMatch?.[1] ?? "@@FIELD@@";
+      const stdout = ["cc (GCC) 12.2.0", delimiter, "x86_64-linux-gnu", delimiter, "GNU Make 4.3"].join("\n");
+      return { ok: true, stdout, stderr: "", code: 0 };
+    }
+    throw new Error(`unexpected command "${command} ${args.join(" ")}"`);
+  }) as unknown as RunCommand;
+
+  const fingerprint = await resolveHistoricalPostgresEnvironmentFingerprint({ runCommand, ambientEnv: {} });
+
+  assert.equal(builderInspectCalls, 1, "the builder image tag must be resolved exactly once, never re-resolved for the toolchain probe");
+  assert.equal(toolchainProbeImage, `sha256:${"a".repeat(64)}`, "the toolchain probe must launch against the already-resolved builder image id, not the mutable tag");
+  assert.equal(fingerprint.builderImage.id, `sha256:${"a".repeat(64)}`);
+  // Internally self-consistent: the fingerprint's own recorded builderImage.id
+  // is exactly the id the toolchain was actually probed against - never an
+  // impossible mixed fingerprint ("id from A, compiler identity from B").
+  assert.equal(fingerprint.builderImage.id, toolchainProbeImage);
+});
+
 // ---------------------------------------------------------------------------
 // Integrity mismatch: missing/duplicate/malformed manifest, never a task grade
 // ---------------------------------------------------------------------------

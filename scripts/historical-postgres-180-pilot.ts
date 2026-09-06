@@ -115,7 +115,10 @@ process.stdout.write(
     `  profileKind:              ${result.profileKind}\n` +
     `  preflight status:         ${result.preflight.status}${result.preflight.status === "failed" ? ` (${result.preflight.failedDimension})` : ""}\n` +
     `  agentRunCount:            ${result.agentRunCount}\n` +
-    `  executionBinding:         ${result.executionBinding.status}\n` +
+    `  executionBinding.overall: ${result.executionBinding.overall.status}\n` +
+    `  executionBinding.agent:             ${result.executionBinding.agent.status}\n` +
+    `  executionBinding.historicalGrader:  ${result.executionBinding.historicalGrader.status}\n` +
+    `  executionBinding.referenceGrader:   ${result.executionBinding.referenceGrader.status}\n` +
     `  trial status:             ${result.trial?.status ?? "N/A"}\n` +
     `  scoredEligible:           ${result.trial?.scoredEligible ?? "N/A"}\n` +
     `  pilot status:             ${result.status}\n` +

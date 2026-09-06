@@ -15,6 +15,7 @@ import {
   resolveHistoricalPostgresEnvironmentFingerprint,
   runHistoricalPostgresTrial,
   stableJson,
+  type GradeRevision,
   type HistoricalPostgresEnvironmentFingerprint,
   type HistoricalPostgresGradeStatus,
   type HistoricalPostgresTaskSpec,
@@ -186,6 +187,69 @@ function diffExecutionEnvironment(frozen: HistoricalPostgresEnvironmentFingerpri
   return diffs;
 }
 
+/** One execution's binding status against the preflight-verified/frozen environment. */
+export type HistoricalPostgresExecutionBindingComponent =
+  | { status: "verified" }
+  | { status: "mismatched"; diagnostics: string[] }
+  | { status: "unverified" };
+
+function executionBindingComponent(
+  frozen: HistoricalPostgresEnvironmentFingerprint,
+  actual: HistoricalPostgresTrialExecutionEnvironment | undefined
+): HistoricalPostgresExecutionBindingComponent {
+  if (!actual) return { status: "unverified" };
+  const diffs = diffExecutionEnvironment(frozen, actual);
+  return diffs.length > 0 ? { status: "mismatched", diagnostics: diffs } : { status: "verified" };
+}
+
+const UNVERIFIED_EXECUTION_BINDING: HistoricalPostgresExecutionBinding = {
+  agent: { status: "unverified" },
+  historicalGrader: { status: "unverified" },
+  referenceGrader: { status: "unverified" },
+  overall: { status: "unverified" }
+};
+
+/**
+ * Whether every PostgreSQL execution that contributes to the final grade
+ * matches the environment preflight verified (#207 review round 2, P0
+ * Blocking 1). The final `rediscovered`/`miss`/`invalid_submission` result
+ * comes from `gradeHistoricalPostgresSubmission()`'s own two independent
+ * grader executions (`historicalGrader`, `referenceGrader`), not only the
+ * agent's investigation session (`agent`) - a valid official score requires
+ * all three bound. `overall` is fail-closed: `"verified"` only when every
+ * component is; a proven mismatch on any one component always wins over an
+ * `"unverified"` on another, and `"unverified"` never collapses into
+ * `"verified"` - see `classifyPilotOutcome()`, which never treats "not
+ * explicitly mismatched" as equivalent to verified.
+ */
+export type HistoricalPostgresExecutionBinding = {
+  agent: HistoricalPostgresExecutionBindingComponent;
+  historicalGrader: HistoricalPostgresExecutionBindingComponent;
+  referenceGrader: HistoricalPostgresExecutionBindingComponent;
+  overall: HistoricalPostgresExecutionBindingComponent;
+};
+
+function computeExecutionBinding(input: {
+  frozen: HistoricalPostgresEnvironmentFingerprint;
+  agent?: HistoricalPostgresTrialExecutionEnvironment;
+  historicalGrader?: HistoricalPostgresTrialExecutionEnvironment;
+  referenceGrader?: HistoricalPostgresTrialExecutionEnvironment;
+}): HistoricalPostgresExecutionBinding {
+  const agent = executionBindingComponent(input.frozen, input.agent);
+  const historicalGrader = executionBindingComponent(input.frozen, input.historicalGrader);
+  const referenceGrader = executionBindingComponent(input.frozen, input.referenceGrader);
+  const components = [agent, historicalGrader, referenceGrader];
+  const overall: HistoricalPostgresExecutionBindingComponent = components.some((component) => component.status === "mismatched")
+    ? {
+        status: "mismatched",
+        diagnostics: components.flatMap((component) => (component.status === "mismatched" ? component.diagnostics : []))
+      }
+    : components.some((component) => component.status === "unverified")
+      ? { status: "unverified" }
+      : { status: "verified" };
+  return { agent, historicalGrader, referenceGrader, overall };
+}
+
 /**
  * The required #180 state transition: load/validate the frozen manifest,
  * resolve the current actual environment and compare, materialize the
@@ -307,14 +371,6 @@ export type HistoricalPostgresPilotPreflightSummary =
   /** Preflight itself could not complete (docker unavailable, image-inspect/compiler-probe/materialization I/O failure) - not a proven contract mismatch. */
   | { status: "error"; diagnostics: string[] };
 
-/**
- * Whether the environment a completed trial *actually executed under*
- * matches the one preflight verified beforehand (#180 P0 2). `"unverified"`
- * means no comparison was possible (preflight failed, so no trial ran; or
- * the trial itself never obtained a session to report execution identity
- * from).
- */
-export type HistoricalPostgresExecutionBinding = { status: "unverified" } | { status: "verified" } | { status: "mismatched"; diagnostics: string[] };
 
 /** Which kind of agent profile produced this pilot attempt. A stub is real, useful harness evidence, but never enters the Historical PostgreSQL capability dataset - see `datasetEligible`. */
 export type HistoricalPostgresPilotProfileKind = "smoke_stub" | "agent";
@@ -418,9 +474,17 @@ export function sanitizeHistoricalPostgresPilotEvidence(result: HistoricalPostgr
 
 /**
  * The pilot-level outcome classifier (#180 P0 2 / P0 3 / P1 4, PR #207
- * review): a completed, scored-eligible trial is only ever an *official*
- * scored result when its execution is bound to the preflight-verified
- * environment *and* it came from a real agent profile, never a smoke stub.
+ * review rounds 1 and 2): a completed, scored-eligible trial is only ever an
+ * *official* scored result when EVERY execution that contributed to it -
+ * the agent session AND both grader revisions - is individually bound to the
+ * preflight-verified environment, AND it came from a real agent profile,
+ * never a smoke stub. Fail-closed: `executionBinding.overall.status !==
+ * "verified"` (which includes `"unverified"`, not only `"mismatched"`) is
+ * never dataset-eligible - "not explicitly mismatched" is never treated as
+ * equivalent to verified. A *proven* mismatch on any component additionally
+ * forces `status: "integrity_error"`; a merely unverified component keeps
+ * `status: "completed"` (the trial itself did complete) but still withholds
+ * an official score.
  */
 function classifyPilotOutcome(input: {
   trial: HistoricalPostgresTrial;
@@ -432,10 +496,10 @@ function classifyPilotOutcome(input: {
     return { status: trial.status, datasetEligible: false, officialScoredResult: "N/A" };
   }
   // trial.status === "completed"
-  if (executionBinding.status === "mismatched") {
+  if (executionBinding.overall.status === "mismatched") {
     return { status: "integrity_error", datasetEligible: false, officialScoredResult: "N/A" };
   }
-  if (profileKind === "smoke_stub") {
+  if (profileKind !== "agent" || executionBinding.overall.status !== "verified") {
     return { status: "completed", datasetEligible: false, officialScoredResult: "N/A" };
   }
   return { status: "completed", datasetEligible: true, officialScoredResult: trial.grade!.status };
@@ -465,6 +529,8 @@ export async function runHistoricalPostgresPilotTrial(input: {
   profileKind?: HistoricalPostgresPilotProfileKind;
   session?: PostgresResearchSessionOptions;
   runSession?: typeof runAgentInPostgresResearchEnvironment;
+  /** Injectable for tests (e.g. controlling each grader revision's reported `executionEnvironment` for execution-binding coverage); defaults to the real per-revision research environment. */
+  gradeRevision?: GradeRevision;
   runCommand?: RunCommand;
   ambientEnv?: NodeJS.ProcessEnv;
   pilotId?: string;
@@ -510,7 +576,7 @@ export async function runHistoricalPostgresPilotTrial(input: {
       partition: null,
       preflight: { status: "error", diagnostics: [(error as Error).message] },
       frozenEnvironmentFingerprint,
-      executionBinding: { status: "unverified" },
+      executionBinding: UNVERIFIED_EXECUTION_BINDING,
       status: "infrastructure_error",
       agentRunCount: 0,
       datasetEligible: false,
@@ -540,7 +606,7 @@ export async function runHistoricalPostgresPilotTrial(input: {
       preflight: { status: "failed", failedDimension: preflight.failedDimension, diagnostics: preflight.diagnostics },
       frozenEnvironmentFingerprint,
       environmentFingerprint: preflight.environmentFingerprint,
-      executionBinding: { status: "unverified" },
+      executionBinding: UNVERIFIED_EXECUTION_BINDING,
       status: "integrity_error",
       agentRunCount: 0,
       datasetEligible: false,
@@ -559,15 +625,24 @@ export async function runHistoricalPostgresPilotTrial(input: {
     agent: input.agent,
     artifactDir: join(pilotRoot, "trial"),
     session: input.session,
-    runSession
+    runSession,
+    gradeRevision: input.gradeRevision
   });
 
   const executionEnvironment = trial.executionEnvironment;
-  let executionBinding: HistoricalPostgresExecutionBinding = { status: "unverified" };
-  if (executionEnvironment) {
-    const bindingDiffs = diffExecutionEnvironment(preflight.environmentFingerprint, executionEnvironment);
-    executionBinding = bindingDiffs.length > 0 ? { status: "mismatched", diagnostics: bindingDiffs } : { status: "verified" };
-  }
+  // All three executions that can contribute to the final grade - the agent
+  // session, and both grader revisions - are bound individually (#207
+  // review round 2, P0 Blocking 1). trial.grade is undefined whenever the
+  // submission was never actually graded (e.g. "blocked"), in which case the
+  // grader components are correctly "unverified" - though that never reaches
+  // classifyPilotOutcome's binding check anyway, since a non-"completed"
+  // trial.status short-circuits first.
+  const executionBinding = computeExecutionBinding({
+    frozen: preflight.environmentFingerprint,
+    agent: executionEnvironment,
+    historicalGrader: trial.grade?.historical.executionEnvironment,
+    referenceGrader: trial.grade?.reference.executionEnvironment
+  });
 
   const { status, datasetEligible, officialScoredResult } = classifyPilotOutcome({ trial, executionBinding, profileKind });
 
@@ -591,8 +666,17 @@ export async function runHistoricalPostgresPilotTrial(input: {
     startedAt,
     finishedAt: nowIso(),
     diagnostics: [
-      ...(executionBinding.status === "mismatched"
-        ? ["Execution-time environment did not match the preflight-verified environment - no official scored result.", ...executionBinding.diagnostics]
+      ...(executionBinding.overall.status === "mismatched"
+        ? ["Execution-time environment did not match the preflight-verified environment - no official scored result.", ...executionBinding.overall.diagnostics]
+        : []),
+      ...(executionBinding.overall.status === "unverified" && trial.status === "completed"
+        ? [
+            "One or more executions that contribute to the grade could not be bound to the preflight-verified environment - no official scored result. " +
+              (["agent", "historicalGrader", "referenceGrader"] as const)
+                .filter((component) => executionBinding[component].status === "unverified")
+                .map((component) => `${component}=unverified`)
+                .join(", ")
+          ]
         : []),
       ...(profileKind === "smoke_stub" && status === "completed"
         ? ["profileKind=smoke_stub: not eligible for the Historical PostgreSQL capability dataset."]
