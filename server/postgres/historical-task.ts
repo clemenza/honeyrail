@@ -11,6 +11,7 @@ import {
   BUILD_PROFILE_VERSION,
   DEFAULT_CONFIGURE_ARGS,
   DEFAULT_INITDB_ARGS,
+  type PostgresBuildManifest,
   type PostgresBuildSpec,
   type PostgresQueryResult,
   type PostgresResearchEnvironment,
@@ -386,11 +387,47 @@ export type HistoricalPostgresRevisionObservation = {
   sourceManifest?: Record<string, unknown>;
   buildManifest?: Record<string, unknown>;
   runtimeManifest?: Record<string, unknown>;
+  /**
+   * The build/runtime identity this grader revision's own research
+   * environment actually resolved - same shape (and same extraction helper,
+   * `extractHistoricalPostgresTrialExecutionEnvironment()`) as
+   * `HistoricalPostgresTrial.executionEnvironment` for the agent's own
+   * session. The final `rediscovered`/`miss`/`invalid_submission` result
+   * comes from *this* revision's own execution, not the agent's - so a
+   * caller proving "the official score used the frozen environment" must
+   * check this too, not only the agent session (#180 P0 2 / #207 review
+   * round 2, P0 Blocking 1).
+   */
+  executionEnvironment?: HistoricalPostgresTrialExecutionEnvironment;
 };
+
+/**
+ * Which branch of `gradeHistoricalPostgresSubmission()` actually produced
+ * `status` - an explicit marker (#207 review round 3, Blocking 1) rather than
+ * inferring it from diagnostics text or from whether `historical`/`reference`
+ * happen to carry an `execution`/`executionEnvironment`:
+ *
+ * - `"invalid"`: the submission itself failed validation before either
+ *   revision was ever considered (missing/malformed `finding.json`, an
+ *   escaping/oversized reproducer, ...). Neither grader revision ran.
+ * - `"not_reproduced"`: a validated submission explicitly reported
+ *   `"not-reproduced"` - a real, legitimate capability miss. Neither grader
+ *   revision runs for this path *by design* (see the diagnostic message this
+ *   branch already writes), so there is nothing there to verify or distrust.
+ * - `"reproducer"`: a validated `"reproduced"` submission was actually
+ *   graded against both the historical and reference revisions.
+ *
+ * This is what lets a caller (the #180 pilot's execution-binding check, in
+ * particular) distinguish "an execution that was required but never ran" -
+ * a real evidentiary gap - from "an execution this grading path never
+ * needed in the first place" - see `HistoricalPostgresRevisionObservation.executionEnvironment`.
+ */
+export type HistoricalPostgresGradingPath = "invalid" | "not_reproduced" | "reproducer";
 
 export type HistoricalPostgresGrade = {
   taskId: string;
   status: HistoricalPostgresGradeStatus;
+  gradingPath: HistoricalPostgresGradingPath;
   historical: HistoricalPostgresRevisionObservation;
   reference: HistoricalPostgresRevisionObservation;
   artifacts: string[];
@@ -409,6 +446,52 @@ export type HistoricalPostgresGrade = {
  */
 export type HistoricalPostgresTrialStatus = "completed" | "unscored" | "blocked" | "infrastructure_error" | "integrity_error";
 
+/**
+ * The build/runtime identity actually used by this trial's real execution -
+ * as opposed to `HistoricalPostgresEnvironmentFingerprint`, which is what a
+ * *separate* preflight resolution observed beforehand. Two independent
+ * resolutions of a mutable image tag can disagree if the tag was repointed in
+ * between (#180 P0 2); a caller that needs to prove "the execution really
+ * used the environment preflight verified" compares this against that
+ * fingerprint after the fact. Only the fields that are actually re-resolved
+ * per execution (never a static declarative default) are included -
+ * `initdbArgs` is a fixed constant and cannot drift, so it is deliberately
+ * not part of this type.
+ */
+export type HistoricalPostgresTrialExecutionEnvironment = {
+  buildMode: string;
+  buildProfileVersion: string;
+  configureArgs: string[];
+  buildEnv: Record<string, string>;
+  builderImage: { reference: string; id: string } | null;
+  runtimeImage: { reference: string; id: string } | null;
+  compiler: { command: string; version: string; target: string };
+};
+
+/**
+ * Extracts `HistoricalPostgresTrialExecutionEnvironment` from a real
+ * `PostgresBuildManifest`/`runtimeManifest()` pair - the one shape shared by
+ * both the agent's own session (`PostgresResearchSessionResult.build`/
+ * `.runtime`) and each grader revision's independent research environment
+ * (`defaultGradeRevision()`'s `env.buildManifest`/`env.runtimeManifest()`),
+ * so both call sites derive execution-binding evidence identically rather
+ * than duplicating the extraction (#207 review round 2, P0 Blocking 1).
+ */
+function extractHistoricalPostgresTrialExecutionEnvironment(
+  build: PostgresBuildManifest,
+  runtime: ReturnType<PostgresResearchEnvironment["runtimeManifest"]>
+): HistoricalPostgresTrialExecutionEnvironment {
+  return {
+    buildMode: build.buildMode,
+    buildProfileVersion: build.profileVersion,
+    configureArgs: [...build.configureArgs],
+    buildEnv: { ...build.buildEnv },
+    builderImage: build.builderImage ? { reference: build.builderImage.reference, id: build.builderImage.id } : null,
+    runtimeImage: runtime.runtime.image ? { reference: runtime.runtime.image.reference, id: runtime.runtime.image.id } : null,
+    compiler: { command: build.compiler.command, version: build.compiler.version, target: build.compiler.target }
+  };
+}
+
 export type HistoricalPostgresTrial = {
   taskId: string;
   status: HistoricalPostgresTrialStatus;
@@ -423,18 +506,20 @@ export type HistoricalPostgresTrial = {
   agent: Record<string, unknown>;
   /** Official score only when `scoredEligible` is true and `status` is `"completed"`; diagnostic otherwise. */
   grade?: HistoricalPostgresGrade;
+  /** Present whenever a session was actually obtained (i.e. not on a materialization/setup throw before one existed). */
+  executionEnvironment?: HistoricalPostgresTrialExecutionEnvironment;
   artifacts: string[];
   diagnostics: string[];
 };
 
-type GradeRevisionInput = {
+export type GradeRevisionInput = {
   revision: string;
   reproducerPath: string;
   artifactDir: string;
   spec: HistoricalPostgresTaskSpec;
 };
 
-type GradeRevision = (input: GradeRevisionInput) => Promise<HistoricalPostgresRevisionObservation>;
+export type GradeRevision = (input: GradeRevisionInput) => Promise<HistoricalPostgresRevisionObservation>;
 
 class HistoricalPostgresIntegrityError extends Error {
   constructor(message: string) {
@@ -585,7 +670,13 @@ export async function resolveHistoricalPostgresEnvironmentFingerprint(input: {
   const runtimeImageRef = input.runtimeImage ?? DEFAULT_RUNTIME_IMAGE;
   const builderImage = await resolveBuilderImageIdentity(builderImageRef, runCommand);
   const runtimeImage = await resolveRuntimeImageIdentity(runtimeImageRef, runCommand);
-  const toolchain = await probeBuildContainerToolchain({ image: builderImageRef, runCommand, buildEnv });
+  // Probe the already-resolved content-addressed id, never the mutable
+  // tag again: resolving an id and then re-resolving the tag for the probe
+  // would leave a TOCTOU window where the tag could be repointed in between,
+  // producing an impossible mixed fingerprint (builderImage.id from A,
+  // compiler identity from B) - same closure as buildPostgres() itself
+  // (#207 review round 2, P0 Blocking 2).
+  const toolchain = await probeBuildContainerToolchain({ image: builderImage.id, runCommand, buildEnv });
   return {
     buildMode,
     buildProfileVersion: BUILD_PROFILE_VERSION,
@@ -812,7 +903,7 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
     promptHash: sha256(await readFile(promptPath)),
     scaffoldingLevel: input.scaffoldingLevel ?? "minimal",
     budget: input.budget ?? {},
-    buildProfile: input.build?.mode ?? "container",
+    buildProfile: input.build?.mode ?? defaultBuildMode(),
     // Both added #201 PR #206 review, Blocking 2: neither the agent-visible
     // workspace scaffolding nor the declarative build/runtime contract used
     // to be covered by any hash, so either could change while every existing
@@ -877,7 +968,7 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
     taskType: "historical-correctness-regression",
     scaffoldingLevel: input.scaffoldingLevel ?? "minimal",
     budget: input.budget ?? {},
-    buildProfile: input.build?.mode ?? "container",
+    buildProfile: input.build?.mode ?? defaultBuildMode(),
     artifacts: { sourceManifest: "source-manifest.json", prompt: "prompt.md", workspace: "workspace" },
     hashes: {
       sourceTree: source.sourceHash,
@@ -1047,7 +1138,15 @@ async function defaultGradeRevision(input: GradeRevisionInput): Promise<Historic
     await cp(env.logPath, join(input.artifactDir, "postgres.log"));
     const { reproduced, attribution } = resolveOracleReproduction({ execution, revision: input.revision, spec: input.spec });
     if (attribution) await writeJson(join(input.artifactDir, "attribution-result.json"), attribution);
-    observation = { reproduced, execution, attribution, sourceManifest: env.sourceManifest, buildManifest: env.buildManifest, runtimeManifest: env.runtimeManifest() };
+    observation = {
+      reproduced,
+      execution,
+      attribution,
+      sourceManifest: env.sourceManifest,
+      buildManifest: env.buildManifest,
+      runtimeManifest: env.runtimeManifest(),
+      executionEnvironment: extractHistoricalPostgresTrialExecutionEnvironment(env.buildManifest, env.runtimeManifest())
+    };
   });
   const finalRuntimeManifest = environment!.runtimeManifest();
   await writeJson(join(input.artifactDir, "runtime-manifest.json"), finalRuntimeManifest);
@@ -1078,6 +1177,7 @@ export async function gradeHistoricalPostgresSubmission(input: {
     const result: HistoricalPostgresGrade = {
       taskId: task.taskId,
       status: validated.integrity ? "integrity_error" : "invalid_submission",
+      gradingPath: "invalid",
       historical: { reproduced: false },
       reference: { reproduced: false },
       artifacts,
@@ -1091,6 +1191,7 @@ export async function gradeHistoricalPostgresSubmission(input: {
     const result: HistoricalPostgresGrade = {
       taskId: task.taskId,
       status: "miss",
+      gradingPath: "not_reproduced",
       historical: { reproduced: false },
       reference: { reproduced: false },
       artifacts,
@@ -1179,13 +1280,14 @@ export async function gradeHistoricalPostgresSubmission(input: {
     } else if (status === "invalid_submission") {
       diagnostics.push("The submitted reproducer also succeeded on the corrected reference revision, so it is not target-specific.");
     }
-    const result = { taskId: task.taskId, status, historical, reference, artifacts, diagnostics, gradedAt: nowIso() };
+    const result: HistoricalPostgresGrade = { taskId: task.taskId, status, gradingPath: "reproducer", historical, reference, artifacts, diagnostics, gradedAt: nowIso() };
     await writeJson(join(input.artifactDir, "grade.json"), result);
     return result;
   } catch (error) {
     const result: HistoricalPostgresGrade = {
       taskId: task.taskId,
       status: "infrastructure_error",
+      gradingPath: "reproducer",
       historical: { reproduced: false },
       reference: { reproduced: false },
       artifacts,
@@ -1211,6 +1313,8 @@ export async function runHistoricalPostgresTrial(input: {
   session?: PostgresResearchSessionOptions;
   /** Injectable for tests (e.g. a fixture with `isolation.scoredEligible: false`); defaults to the real session runner. */
   runSession?: typeof runAgentInPostgresResearchEnvironment;
+  /** Injectable for tests (e.g. controlling each grader revision's reported `executionEnvironment`); defaults to the real per-revision research environment. */
+  gradeRevision?: GradeRevision;
 }): Promise<HistoricalPostgresTrial> {
   const task = checkedTaskSpec(input.task);
   const artifacts: string[] = [];
@@ -1239,6 +1343,10 @@ export async function runHistoricalPostgresTrial(input: {
       input.session
     );
     const scoredEligible = session.isolation.scoredEligible;
+    // What this specific execution actually resolved - see
+    // HistoricalPostgresTrialExecutionEnvironment. Computed once, right after
+    // `session` exists, so both return paths below carry it.
+    const executionEnvironment = extractHistoricalPostgresTrialExecutionEnvironment(session.build, session.runtime);
     const returnedWorkspace = join(input.artifactDir, "agent-workspace");
     await assertWorkspaceWithinLimits(session.workspaceDir);
     await cp(session.workspaceDir, returnedWorkspace, { recursive: true, dereference: false });
@@ -1272,6 +1380,7 @@ export async function runHistoricalPostgresTrial(input: {
         scoredEligible,
         workspaceDir: returnedWorkspace,
         agent: session.agent,
+        executionEnvironment,
         artifacts,
         diagnostics: [
           session.agent.timedOut ? "Agent timed out before submission." : "Agent exited without a successful completed run.",
@@ -1284,7 +1393,12 @@ export async function runHistoricalPostgresTrial(input: {
     // see HistoricalPostgresTrialStatus - "unscored" exists precisely so a
     // consumer cannot mistake a bridge-network smoke run for a scored miss
     // or rediscovery.
-    const grade = await gradeHistoricalPostgresSubmission({ task, workspaceDir: returnedWorkspace, artifactDir: join(input.artifactDir, "grader") });
+    const grade = await gradeHistoricalPostgresSubmission({
+      task,
+      workspaceDir: returnedWorkspace,
+      artifactDir: join(input.artifactDir, "grader"),
+      gradeRevision: input.gradeRevision
+    });
     artifacts.push(join(input.artifactDir, "grader"));
     const status: HistoricalPostgresTrialStatus =
       grade.status === "integrity_error"
@@ -1302,6 +1416,7 @@ export async function runHistoricalPostgresTrial(input: {
       workspaceDir: returnedWorkspace,
       agent: session.agent,
       grade,
+      executionEnvironment,
       artifacts,
       diagnostics: [...unscoredNotice, ...grade.diagnostics, ...evidenceWarnings]
     };
