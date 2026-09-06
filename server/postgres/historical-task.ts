@@ -6,7 +6,9 @@ import {
   createAgentEnvRoot,
   materializePostgresSource,
   withPostgresResearchEnvironment,
-  DEFAULT_BUILD_MODE,
+  defaultBuildMode,
+  resolveBuildEnv,
+  BUILD_PROFILE_VERSION,
   DEFAULT_CONFIGURE_ARGS,
   DEFAULT_INITDB_ARGS,
   type PostgresBuildSpec,
@@ -14,8 +16,9 @@ import {
   type PostgresResearchEnvironment,
   type PostgresResearchSpec
 } from "./research-environment.js";
-import { DEFAULT_BUILDER_IMAGE } from "./build-container.js";
-import { DEFAULT_RUNTIME_IMAGE } from "./runtime-container.js";
+import { DEFAULT_BUILDER_IMAGE, resolveBuilderImageIdentity, probeBuildContainerToolchain } from "./build-container.js";
+import { DEFAULT_RUNTIME_IMAGE, resolveRuntimeImageIdentity } from "./runtime-container.js";
+import type { RunCommand } from "./runtime.js";
 import {
   runAgentInPostgresResearchEnvironment,
   type PostgresResearchAgentSpec,
@@ -496,9 +499,25 @@ async function hashDirectoryContents(root: string): Promise<string> {
  * 2). `HistoricalPostgresTaskSpec` has no per-task runtime-image override
  * today, so the runtime image is always the resolved default; if one is ever
  * added, it belongs here too.
+ *
+ * Deliberately stays synchronous and Docker-free, so materialization (and
+ * every offline/synthetic test that calls it) never needs a daemon: `mode`
+ * is resolved through the exact same `defaultBuildMode()`
+ * `buildPostgres()` itself calls (#201 PR #206 second review, Blocking 1,
+ * Problem C - the two resolution paths must not disagree, and now cannot,
+ * since both call the same function), and `env` is the exact same
+ * `resolveBuildEnv()` pass-through `buildPostgres()` hashes into its own
+ * build cache key (Problem B - an ambient `CFLAGS`/`pgac_cv_*` override that
+ * would change the actual binaries now changes this too). What this
+ * function cannot cover without Docker - the builder/runtime image's
+ * resolved content-addressed id and the compiler actually observed inside
+ * the build container (Problem A) - is `resolveHistoricalPostgresEnvironmentFingerprint()`
+ * below, a separate operator/grader-side step collected once during the
+ * real freeze rather than on every materialization.
  */
 function resolveHistoricalPostgresBuildContract(build?: PostgresBuildSpec): {
   mode: string;
+  buildProfileVersion: string;
   builderImage: string;
   configureArgs: string[];
   initdbArgs: string[];
@@ -506,13 +525,82 @@ function resolveHistoricalPostgresBuildContract(build?: PostgresBuildSpec): {
   env: Record<string, string>;
 } {
   return {
-    mode: build?.mode ?? DEFAULT_BUILD_MODE,
+    mode: build?.mode ?? defaultBuildMode(),
+    buildProfileVersion: BUILD_PROFILE_VERSION,
     builderImage: build?.builderImage ?? DEFAULT_BUILDER_IMAGE,
     configureArgs: [...(build?.configureArgs ?? DEFAULT_CONFIGURE_ARGS)],
     initdbArgs: [...DEFAULT_INITDB_ARGS],
     runtimeImage: DEFAULT_RUNTIME_IMAGE,
-    env: { ...(build?.env ?? {}) }
+    env: resolveBuildEnv(process.env, build?.env ?? {})
   };
+}
+
+export type HistoricalPostgresEnvironmentFingerprint = {
+  buildMode: string;
+  buildProfileVersion: string;
+  configureArgs: string[];
+  initdbArgs: string[];
+  /** Effective BUILD_ENV_VARS/BUILD_ENV_PREFIXES pass-through - see resolveBuildEnv(). */
+  buildEnv: Record<string, string>;
+  /** Resolved, content-addressed - never just the mutable tag. See resolveBuilderImageIdentity(). */
+  builderImage: { reference: string; id: string };
+  /** Resolved, content-addressed - never just the mutable tag. See resolveRuntimeImageIdentity(). */
+  runtimeImage: { reference: string; id: string };
+  /** Observed inside the build container - see probeBuildContainerToolchain(). */
+  compiler: { command: string; version: string; target: string };
+};
+
+/**
+ * The grader/operator-side resolved execution-environment fingerprint (#201
+ * PR #206 second review, Blocking 1): everything `resolveHistoricalPostgresBuildContract()`
+ * cannot know without a docker daemon. Collected once during the real Corpus
+ * v0 freeze (`scripts/historical-postgres-201-freeze.ts`), never during
+ * ordinary task materialization - `materializeHistoricalPostgresTask()` must
+ * stay usable against a synthetic fixture repo with no docker daemon at all
+ * (every offline test in this codebase depends on that), so this is a
+ * separate, explicitly-invoked step rather than something folded into it.
+ *
+ * Reuses the identical resolvers the real build/runtime path already uses
+ * - `resolveBuilderImageIdentity()`/`resolveRuntimeImageIdentity()`
+ * (content-addressed image ids, never a mutable tag alone - Problem A) and
+ * `probeBuildContainerToolchain()` (the compiler actually observed inside
+ * the build container) - rather than a second, weaker identity model.
+ * `runCommand` and `ambientEnv` are both injectable so this is unit-testable
+ * with a fake docker responder and a fake environment object, with no daemon
+ * and no mutation of global `process.env`.
+ */
+export async function resolveHistoricalPostgresEnvironmentFingerprint(input: {
+  build?: PostgresBuildSpec;
+  runtimeImage?: string;
+  runCommand?: RunCommand;
+  ambientEnv?: NodeJS.ProcessEnv;
+}): Promise<HistoricalPostgresEnvironmentFingerprint> {
+  const runCommand = input.runCommand ?? runCommandSafe;
+  const ambientEnv = input.ambientEnv ?? process.env;
+  const buildMode = input.build?.mode ?? defaultBuildMode(ambientEnv);
+  const configureArgs = [...(input.build?.configureArgs ?? DEFAULT_CONFIGURE_ARGS)];
+  const initdbArgs = [...DEFAULT_INITDB_ARGS];
+  const buildEnv = resolveBuildEnv(ambientEnv, input.build?.env ?? {});
+  const builderImageRef = input.build?.builderImage ?? DEFAULT_BUILDER_IMAGE;
+  const runtimeImageRef = input.runtimeImage ?? DEFAULT_RUNTIME_IMAGE;
+  const builderImage = await resolveBuilderImageIdentity(builderImageRef, runCommand);
+  const runtimeImage = await resolveRuntimeImageIdentity(runtimeImageRef, runCommand);
+  const toolchain = await probeBuildContainerToolchain({ image: builderImageRef, runCommand, buildEnv });
+  return {
+    buildMode,
+    buildProfileVersion: BUILD_PROFILE_VERSION,
+    configureArgs,
+    initdbArgs,
+    buildEnv,
+    builderImage: { reference: builderImage.reference, id: builderImage.id },
+    runtimeImage: { reference: runtimeImage.reference, id: runtimeImage.id },
+    compiler: toolchain.compiler
+  };
+}
+
+/** Stable hash of a resolved environment fingerprint - same canonicalize+sha256 algorithm as every other hash in this module. */
+export function hashHistoricalPostgresEnvironmentFingerprint(fingerprint: HistoricalPostgresEnvironmentFingerprint): string {
+  return sha256(stableJson(fingerprint));
 }
 
 function exactRevision(value: string, field: string) {

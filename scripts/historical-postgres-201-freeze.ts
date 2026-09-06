@@ -6,7 +6,8 @@ import {
   historicalPostgres002TaskSpec,
   historicalPostgres003TaskSpec,
   loadHistoricalPostgres003PrivateTruth,
-  materializeHistoricalPostgresTask
+  materializeHistoricalPostgresTask,
+  resolveHistoricalPostgresEnvironmentFingerprint
 } from "../server/postgres/historical-task.js";
 import {
   buildHistoricalPostgresCorpusTaskEntry,
@@ -67,6 +68,14 @@ for (const { spec, provenanceReferences } of specs) {
   entries.push(buildHistoricalPostgresCorpusTaskEntry(layout, provenanceReferences));
 }
 
+// Requires a real docker daemon (#201 PR #206 second review, Blocking 1):
+// resolved builder/runtime image content identity and the compiler actually
+// observed inside the build container, on top of the declarative build mode
+// already folded into each task's own buildContractHash. All three tasks
+// share one build/runtime environment - none of the specs above overrides
+// `build` - so one resolution covers the whole corpus.
+const environmentFingerprint = await resolveHistoricalPostgresEnvironmentFingerprint({});
+
 let existing: HistoricalPostgresCorpusManifest | undefined;
 try {
   existing = JSON.parse(await readFile(outputPath, "utf8")) as HistoricalPostgresCorpusManifest;
@@ -79,7 +88,13 @@ try {
 // reconcileHistoricalPostgresCorpusFreeze().
 const requestedFreezeDate = String(process.env.HONEYRAIL_PG_201_FREEZE_DATE || new Date().toISOString()).trim();
 
-const result = reconcileHistoricalPostgresCorpusFreeze({ existing, corpusId, freezeDate: requestedFreezeDate, tasks: entries });
+const result = reconcileHistoricalPostgresCorpusFreeze({
+  existing,
+  corpusId,
+  freezeDate: requestedFreezeDate,
+  environmentFingerprint,
+  tasks: entries
+});
 
 if (result.action === "created") {
   await mkdir(join(outputPath, ".."), { recursive: true });
@@ -93,6 +108,21 @@ const manifest = result.manifest;
 process.stdout.write(`corpusId:    ${manifest.corpusId}\n`);
 process.stdout.write(`freezeDate:  ${manifest.freezeDate}\n`);
 process.stdout.write(`corpusHash:  ${manifest.corpusHash}\n\n`);
+process.stdout.write(`environmentFingerprint:\n`);
+process.stdout.write(`  buildMode:          ${manifest.environmentFingerprint.buildMode}\n`);
+process.stdout.write(`  buildProfileVersion: ${manifest.environmentFingerprint.buildProfileVersion}\n`);
+process.stdout.write(`  configureArgs:      ${manifest.environmentFingerprint.configureArgs.join(" ")}\n`);
+process.stdout.write(`  initdbArgs:         ${manifest.environmentFingerprint.initdbArgs.join(" ")}\n`);
+process.stdout.write(`  buildEnv:           ${JSON.stringify(manifest.environmentFingerprint.buildEnv)}\n`);
+process.stdout.write(
+  `  builderImage:       ${manifest.environmentFingerprint.builderImage.reference} (id=${manifest.environmentFingerprint.builderImage.id})\n`
+);
+process.stdout.write(
+  `  runtimeImage:       ${manifest.environmentFingerprint.runtimeImage.reference} (id=${manifest.environmentFingerprint.runtimeImage.id})\n`
+);
+process.stdout.write(
+  `  compiler:           ${manifest.environmentFingerprint.compiler.command} ${manifest.environmentFingerprint.compiler.version} (${manifest.environmentFingerprint.compiler.target})\n\n`
+);
 for (const task of manifest.tasks) {
   process.stdout.write(
     `  ${task.taskId} [${task.partition}] gradingProtocol=${task.gradingProtocol}\n` +

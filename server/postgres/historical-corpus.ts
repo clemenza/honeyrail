@@ -2,6 +2,7 @@ import {
   canonicalize,
   sha256,
   stableJson,
+  type HistoricalPostgresEnvironmentFingerprint,
   type HistoricalPostgresGradeStatus,
   type HistoricalPostgresGradingProtocol,
   type HistoricalPostgresReferenceManifest,
@@ -189,6 +190,21 @@ export type HistoricalPostgresCorpusManifest = {
   gradingEntryPoint: readonly string[];
   outcomeVocabulary: readonly HistoricalPostgresGradeStatus[];
   holdoutNote: string;
+  /**
+   * The grader/operator-side resolved PostgreSQL build/runtime execution
+   * environment (#201 PR #206 second review, Blocking 1) - resolved
+   * builder/runtime image content identity, the compiler actually observed
+   * inside the build container, effective build mode, effective build
+   * environment pass-through, and the build profile version. Collected once
+   * per freeze via `resolveHistoricalPostgresEnvironmentFingerprint()`
+   * (requires a docker daemon; never invoked by task materialization
+   * itself), stored directly rather than only as a hash - none of it is
+   * private truth, and a reviewer/pilot needs to actually read it, not just
+   * compare it. It participates in `corpusHash` like every other field here,
+   * so a same-`corpusId` re-freeze under a changed resolved environment is
+   * rejected the same way a changed task entry already is.
+   */
+  environmentFingerprint: HistoricalPostgresEnvironmentFingerprint;
   tasks: HistoricalPostgresCorpusTaskEntry[];
   corpusHash: string;
 };
@@ -218,8 +234,72 @@ function assertDeepEqual(actual: unknown, expected: unknown, message: string): v
  * `HistoricalPostgresCorpusIntegrityError` - never returns a boolean - so a
  * missing/malformed corpus can never be silently treated as a task outcome.
  */
+/** Non-empty-string fields every resolved image identity on the environment fingerprint must carry. */
+function assertResolvedImageIdentity(value: unknown, label: string): asserts value is { reference: string; id: string } {
+  const candidate = value as { reference?: unknown; id?: unknown } | null | undefined;
+  if (!candidate || typeof candidate.reference !== "string" || !candidate.reference.trim()) {
+    throw new HistoricalPostgresCorpusIntegrityError(`environmentFingerprint.${label}.reference must be a non-empty string`);
+  }
+  if (typeof candidate.id !== "string" || !candidate.id.trim()) {
+    throw new HistoricalPostgresCorpusIntegrityError(`environmentFingerprint.${label}.id must be a non-empty string (the resolved content-addressed image id, never just the tag)`);
+  }
+}
+
+function assertStringArray(value: unknown, label: string): asserts value is string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new HistoricalPostgresCorpusIntegrityError(`environmentFingerprint.${label} must be an array of strings`);
+  }
+}
+
+/**
+ * Structural validation of the resolved execution-environment fingerprint
+ * (#201 PR #206 second review, Blocking 1): every field the frozen corpus
+ * relies on to detect an actual build/runtime identity change is present and
+ * well-formed, so a manifest missing one (e.g. a pre-fix committed manifest
+ * that predates this field entirely) fails loudly rather than being treated
+ * as if the environment were unchanged.
+ */
+function validateHistoricalPostgresEnvironmentFingerprint(fingerprint: HistoricalPostgresEnvironmentFingerprint): void {
+  if (!fingerprint || typeof fingerprint !== "object") {
+    throw new HistoricalPostgresCorpusIntegrityError(
+      "corpus manifest is missing environmentFingerprint (a manifest frozen before #201 PR #206 second review predates this field and must be re-frozen, not silently accepted)"
+    );
+  }
+  if (fingerprint.buildMode !== "container" && fingerprint.buildMode !== "host") {
+    throw new HistoricalPostgresCorpusIntegrityError(`environmentFingerprint.buildMode must be "container" or "host", got: ${String(fingerprint.buildMode)}`);
+  }
+  if (typeof fingerprint.buildProfileVersion !== "string" || !fingerprint.buildProfileVersion.trim()) {
+    throw new HistoricalPostgresCorpusIntegrityError("environmentFingerprint.buildProfileVersion must be a non-empty string");
+  }
+  assertStringArray(fingerprint.configureArgs, "configureArgs");
+  assertStringArray(fingerprint.initdbArgs, "initdbArgs");
+  if (!fingerprint.buildEnv || typeof fingerprint.buildEnv !== "object" || Array.isArray(fingerprint.buildEnv)) {
+    throw new HistoricalPostgresCorpusIntegrityError("environmentFingerprint.buildEnv must be an object");
+  }
+  for (const [key, value] of Object.entries(fingerprint.buildEnv)) {
+    if (typeof value !== "string") {
+      throw new HistoricalPostgresCorpusIntegrityError(`environmentFingerprint.buildEnv.${key} must be a string`);
+    }
+  }
+  assertResolvedImageIdentity(fingerprint.builderImage, "builderImage");
+  assertResolvedImageIdentity(fingerprint.runtimeImage, "runtimeImage");
+  const compiler = fingerprint.compiler as { command?: unknown; version?: unknown; target?: unknown } | null | undefined;
+  if (!compiler || typeof compiler.command !== "string" || !compiler.command.trim()) {
+    throw new HistoricalPostgresCorpusIntegrityError("environmentFingerprint.compiler.command must be a non-empty string");
+  }
+  if (typeof compiler.version !== "string" || !compiler.version.trim()) {
+    throw new HistoricalPostgresCorpusIntegrityError("environmentFingerprint.compiler.version must be a non-empty string");
+  }
+  if (typeof compiler.target !== "string" || !compiler.target.trim()) {
+    throw new HistoricalPostgresCorpusIntegrityError("environmentFingerprint.compiler.target must be a non-empty string");
+  }
+}
+
 function validateHistoricalPostgresCorpusManifestStructure(
-  manifest: Pick<HistoricalPostgresCorpusManifest, "schemaVersion" | "corpusId" | "freezeDate" | "gradingEntryPoint" | "outcomeVocabulary" | "holdoutNote" | "tasks">
+  manifest: Pick<
+    HistoricalPostgresCorpusManifest,
+    "schemaVersion" | "corpusId" | "freezeDate" | "gradingEntryPoint" | "outcomeVocabulary" | "holdoutNote" | "environmentFingerprint" | "tasks"
+  >
 ): void {
   if (manifest.schemaVersion !== HISTORICAL_POSTGRES_CORPUS_SCHEMA_VERSION) {
     throw new HistoricalPostgresCorpusIntegrityError(`corpus manifest schemaVersion must be ${HISTORICAL_POSTGRES_CORPUS_SCHEMA_VERSION}, got ${String(manifest.schemaVersion)}`);
@@ -235,6 +315,7 @@ function validateHistoricalPostgresCorpusManifestStructure(
   if (manifest.holdoutNote !== HISTORICAL_POSTGRES_CORPUS_HOLDOUT_NOTE) {
     throw new HistoricalPostgresCorpusIntegrityError("corpus manifest holdoutNote does not match the required Corpus v0 disclaimer");
   }
+  validateHistoricalPostgresEnvironmentFingerprint(manifest.environmentFingerprint);
 
   const ids = manifest.tasks.map((task) => task.taskId);
   const uniqueIds = new Set(ids);
@@ -337,6 +418,7 @@ export function validateHistoricalPostgresCorpusManifest(manifest: HistoricalPos
 export function buildHistoricalPostgresCorpusManifest(input: {
   corpusId: string;
   freezeDate: string;
+  environmentFingerprint: HistoricalPostgresEnvironmentFingerprint;
   tasks: HistoricalPostgresCorpusTaskEntry[];
 }): HistoricalPostgresCorpusManifest {
   const tasks = [...input.tasks].sort((left, right) => left.taskId.localeCompare(right.taskId));
@@ -347,6 +429,7 @@ export function buildHistoricalPostgresCorpusManifest(input: {
     gradingEntryPoint: HISTORICAL_POSTGRES_CORPUS_GRADING_ENTRY_POINT,
     outcomeVocabulary: HISTORICAL_POSTGRES_CORPUS_OUTCOME_VOCABULARY,
     holdoutNote: HISTORICAL_POSTGRES_CORPUS_HOLDOUT_NOTE,
+    environmentFingerprint: input.environmentFingerprint,
     tasks
   };
   validateHistoricalPostgresCorpusManifestStructure(shape);
@@ -376,10 +459,16 @@ export function assertHistoricalPostgresCorpusNotMutated(
   const changedTaskIds = [...new Set([...recordedById.keys(), ...recomputedById.keys()])]
     .filter((taskId) => stableJson(canonicalize(recordedById.get(taskId))) !== stableJson(canonicalize(recomputedById.get(taskId))))
     .sort();
+  const environmentChanged =
+    stableJson(canonicalize(recorded.environmentFingerprint)) !== stableJson(canonicalize(recomputed.environmentFingerprint));
+  const changedParts = [
+    ...changedTaskIds,
+    ...(environmentChanged ? ["environmentFingerprint (resolved build/runtime identity)"] : [])
+  ];
   throw new HistoricalPostgresCorpusIntegrityError(
     `corpus "${recorded.corpusId}" was silently mutated in place: recorded hash ${recorded.corpusHash} does not match recomputed hash ${recomputed.corpusHash}. ` +
-      `Any change to a task's source snapshot, prompt, task manifest, private truth, grader, build assumptions, scaffolding, or budget requires a new corpus version/id, not an in-place edit under the same id. ` +
-      `Changed/added/removed task entries: ${changedTaskIds.length ? changedTaskIds.join(", ") : "(non-task-level fields, e.g. freezeDate/holdoutNote/gradingEntryPoint/outcomeVocabulary)"}`
+      `Any change to a task's source snapshot, prompt, task manifest, private truth, grader, build/runtime environment, scaffolding, or budget requires a new corpus version/id, not an in-place edit under the same id. ` +
+      `Changed/added/removed: ${changedParts.length ? changedParts.join(", ") : "(non-task-level fields, e.g. freezeDate/holdoutNote/gradingEntryPoint/outcomeVocabulary)"}`
   );
 }
 
@@ -418,10 +507,19 @@ export function reconcileHistoricalPostgresCorpusFreeze(input: {
   existing: HistoricalPostgresCorpusManifest | undefined;
   corpusId: string;
   freezeDate: string;
+  environmentFingerprint: HistoricalPostgresEnvironmentFingerprint;
   tasks: HistoricalPostgresCorpusTaskEntry[];
 }): HistoricalPostgresCorpusFreezeResult {
   if (!input.existing) {
-    return { action: "created", manifest: buildHistoricalPostgresCorpusManifest({ corpusId: input.corpusId, freezeDate: input.freezeDate, tasks: input.tasks }) };
+    return {
+      action: "created",
+      manifest: buildHistoricalPostgresCorpusManifest({
+        corpusId: input.corpusId,
+        freezeDate: input.freezeDate,
+        environmentFingerprint: input.environmentFingerprint,
+        tasks: input.tasks
+      })
+    };
   }
   validateHistoricalPostgresCorpusManifest(input.existing);
   if (input.existing.corpusId !== input.corpusId) {
@@ -430,7 +528,12 @@ export function reconcileHistoricalPostgresCorpusFreeze(input: {
         `A genuinely new corpus version must be written to a new output path, never silently replace a different corpus under the same file.`
     );
   }
-  const recomputed = buildHistoricalPostgresCorpusManifest({ corpusId: input.corpusId, freezeDate: input.existing.freezeDate, tasks: input.tasks });
+  const recomputed = buildHistoricalPostgresCorpusManifest({
+    corpusId: input.corpusId,
+    freezeDate: input.existing.freezeDate,
+    environmentFingerprint: input.environmentFingerprint,
+    tasks: input.tasks
+  });
   assertHistoricalPostgresCorpusNotMutated(input.existing, recomputed);
   return { action: "unchanged", manifest: input.existing };
 }
