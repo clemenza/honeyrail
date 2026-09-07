@@ -973,3 +973,182 @@ test("PR #210 round 3 Blocking 3: agent-result.json.isolation.egressGateway is a
   const agentResult = JSON.parse(await readFile(join(artifactDir, "agent-result.json"), "utf8"));
   assert.equal(agentResult.isolation.egressGateway, undefined);
 });
+
+// ---------------------------------------------------------------------------
+// PR #210 review round 4: DSH trajectory evidence must survive a timeout/
+// blocked/over-limit trial, be redacted, and never gate scoring for a
+// non-DSH agent.
+// ---------------------------------------------------------------------------
+
+/** Writes a minimal, uncompressed DSH raw-session JSONL log into the exact host path runHistoricalPostgresTrial() reads (artifactDir/dsh-home/sessions/*.jsonl). */
+async function writeDshSessionLog(artifactDir: string, events: Array<Record<string, unknown>>): Promise<void> {
+  const sessionsDir = join(artifactDir, "dsh-home", "sessions");
+  await mkdir(sessionsDir, { recursive: true });
+  await writeFile(join(sessionsDir, "test-session.jsonl"), `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+}
+
+function fakeBashToolCallAndResult(callId: string, command: string, resultText: string, startTime: number, endTime: number): Array<Record<string, unknown>> {
+  return [
+    { type: "tool/call", time: startTime, data: { turn: 1, step: 1, callId, name: "bash", arguments: JSON.stringify({ command }) } },
+    {
+      type: "tool/result",
+      time: endTime,
+      data: { turn: 1, step: 1, message: { source: { callId }, content: [{ type: "tool-result", content: [{ type: "text", text: resultText }] }] } }
+    }
+  ];
+}
+
+test("PR #210 round 4 (A): a timed-out (blocked) trial retains a non-empty agent-transcript.ndjson, independent of stdout", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "transcript-timeout-workspace");
+  await mkdir(workspace, { recursive: true });
+
+  const artifactDir = join(root, "transcript-timeout-trial");
+  await writeDshSessionLog(artifactDir, [
+    { type: "step/start", time: 1000, data: { turn: 1, step: 1 } },
+    ...fakeBashToolCallAndResult("c1", "ls /workspace/source", "file1.c\nfile2.c", 1100, 1400)
+  ]);
+
+  const trial = await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture" },
+    artifactDir,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: false, timedOut: true, workspaceDir: workspace, stdout: "", stderr: "" })
+  });
+
+  assert.equal(trial.status, "blocked");
+  assert.equal(await readFile(join(artifactDir, "agent-stdout.txt"), "utf8"), "");
+  const transcriptRaw = await readFile(join(artifactDir, "agent-transcript.ndjson"), "utf8");
+  assert.ok(transcriptRaw.trim().length > 0, "transcript must be non-empty even though stdout is empty");
+  assert.ok(trial.artifacts.some((path) => path.endsWith("agent-transcript.ndjson")));
+});
+
+test("PR #210 round 4 (B): a workspace-over-limit (integrity_error) trial retains a non-empty agent-transcript.ndjson and workspace-inventory.json, with no full workspace copy", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "transcript-over-limit-workspace");
+  await writeManyFiles(workspace, MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES + 1, 1);
+
+  const artifactDir = join(root, "transcript-over-limit-trial");
+  await writeDshSessionLog(artifactDir, [
+    { type: "step/start", time: 1000, data: { turn: 1, step: 1 } },
+    { type: "step/end", time: 2000, data: { turn: 1, step: 1 } }
+  ]);
+
+  const trial = await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture" },
+    artifactDir,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace })
+  });
+
+  assert.equal(trial.status, "integrity_error");
+  assert.equal(await pathExists(join(artifactDir, "agent-workspace")), false);
+  const transcriptRaw = await readFile(join(artifactDir, "agent-transcript.ndjson"), "utf8");
+  assert.ok(transcriptRaw.trim().length > 0);
+  assert.ok(await pathExists(join(artifactDir, "workspace-inventory.json")));
+});
+
+test("PR #210 round 4 (C): a known secret embedded in a DSH raw event is redacted from agent-transcript.ndjson and agent-trajectory.jsonl", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "transcript-redaction-workspace");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "n/a" }));
+
+  const secret = "sk-fake-secret-sentinel-transcript-abcdef";
+  const artifactDir = join(root, "transcript-redaction-trial");
+  await writeDshSessionLog(artifactDir, fakeBashToolCallAndResult("c1", `echo ${secret}`, `ran with key ${secret}`, 1000, 1500));
+
+  await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture", env: { DEEPSEEK_API_KEY: secret } },
+    artifactDir,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace })
+  });
+
+  const transcriptRaw = await readFile(join(artifactDir, "agent-transcript.ndjson"), "utf8");
+  assert.ok(!transcriptRaw.includes(secret));
+  assert.ok(transcriptRaw.includes("[REDACTED]"));
+  const trajectoryRaw = await readFile(join(artifactDir, "agent-trajectory.jsonl"), "utf8");
+  assert.ok(!trajectoryRaw.includes(secret));
+  assert.ok(trajectoryRaw.includes("[REDACTED]"));
+});
+
+test("PR #210 round 4 (D): agent-trajectory.jsonl derives an ordered tool_call + shell_command pair from a completed bash call, without a fabricated exit code", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "trajectory-derivation-workspace");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "n/a" }));
+
+  const artifactDir = join(root, "trajectory-derivation-trial");
+  await writeDshSessionLog(artifactDir, fakeBashToolCallAndResult("c1", "psql -c 'select 1'", "1\n(1 row)", 1000, 1800));
+
+  await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture" },
+    artifactDir,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace })
+  });
+
+  const lines = (await readFile(join(artifactDir, "agent-trajectory.jsonl"), "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const toolCall = lines.find((event) => event.kind === "tool_call");
+  const shellCommand = lines.find((event) => event.kind === "shell_command");
+  assert.ok(toolCall);
+  assert.equal(toolCall.name, "bash");
+  assert.ok(shellCommand);
+  assert.equal(shellCommand.command, "psql -c 'select 1'");
+  assert.equal(shellCommand.stdout, "1\n(1 row)");
+  assert.ok(toolCall.seq < shellCommand.seq, "tool_call must precede its paired shell_command");
+  // dsh 0.1.0-rc.7 never reliably populates a bash exit code (see
+  // dsh-trajectory-bridge.ts's own provenance note) - null, not fabricated.
+  assert.equal(shellCommand.exit_code, null);
+});
+
+test("PR #210 round 4: a scored trial with no DSH session data (transcript not_applicable) still grades normally - the core-evidence gate never fires for a non-DSH agent", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "no-dsh-session-workspace");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "a genuine miss" }));
+
+  const artifactDir = join(root, "no-dsh-session-trial");
+  const trial = await runHistoricalPostgresTrial({
+    task: spec,
+    // Analogous to #180's own deterministic stub agent - never writes to $DSH_HOME.
+    agent: { command: "unused-in-this-fixture" },
+    artifactDir,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace })
+  });
+
+  assert.equal(trial.status, "completed");
+  assert.equal(trial.grade?.status, "miss");
+  assert.equal(await pathExists(join(artifactDir, "agent-transcript.ndjson")), false);
+});
+
+test("PR #210 round 4 (F): a scored-eligible, within-limit trial where DSH engaged but the transcript write fails never grades - infrastructure_error, transcript named as missing", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "transcript-required-gate-workspace");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "would otherwise be a valid miss" }));
+
+  const artifactDir = join(root, "transcript-required-gate-trial");
+  await writeDshSessionLog(artifactDir, [{ type: "step/start", time: 1000, data: { turn: 1, step: 1 } }]);
+  // Force the transcript write to fail deterministically.
+  await mkdir(join(artifactDir, "agent-transcript.ndjson"));
+
+  const trial = await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture" },
+    artifactDir,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace })
+  });
+
+  assert.equal(trial.status, "infrastructure_error");
+  assert.equal(trial.grade, undefined);
+  assert.ok(!trial.artifacts.some((path) => path.endsWith("agent-transcript.ndjson")));
+  assert.ok(trial.diagnostics.some((line) => line.includes("core evidence") && line.includes("agent-transcript.ndjson")));
+  // The other three core artifacts still succeeded and remain listed.
+  assert.ok(trial.artifacts.some((path) => path.endsWith("agent-result.json")));
+  assert.ok(trial.artifacts.some((path) => path.endsWith("workspace-inventory.json")));
+});

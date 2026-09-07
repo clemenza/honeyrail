@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFile } from "node:fs/promises";
+import { appendFile, mkdir } from "node:fs/promises";
 import { nowIso, runCommandSafe } from "../utils.js";
 import {
   DEFAULT_CANCEL_GRACE_MS,
@@ -454,6 +454,19 @@ export type PostgresResearchIsolationOptions = {
   /** Where per-trial build views are created; defaults next to the build cache. */
   buildViewsRoot?: string;
   /**
+   * A per-trial, grader-owned, initially-empty host directory to mount as
+   * the agent container's `$DSH_HOME` (#209/#210 round 4) - created here if
+   * it does not already exist. Deliberately separate from the agent's own
+   * workspace: DSH's session-persistence plugin writes incremental
+   * telemetry here as the trial runs, and this directory must never be
+   * confused with, or counted against, agent-authored task output. Container
+   * mode only - a caller that also sets `allowUnisolatedForDevelopment`
+   * gets no DSH telemetry mount (there is no container to mount it into).
+   * Harmless for a non-DSH agent: nothing reads or writes here, and nothing
+   * downstream is required to find anything under it.
+   */
+  dshHomeDir?: string;
+  /**
    * Runs the agent as a plain host process with no boundary at all, for local
    * development and CI without a docker daemon.
    *
@@ -883,6 +896,12 @@ export async function runAgentInPostgresResearchEnvironment(
         const injected = containerAgentEnvironment(env.connectionInfo(), agent.envPrefix);
         const containerName = `honeyrail-pg-research-${randomUUID()}`;
 
+        // #209/#210 round 4: created here (mirroring scripts/tinytable-exam-
+        // room.ts's own `dshHomeDir` mkdir) rather than requiring the caller
+        // to pre-create it - the caller only needs to choose and remember a
+        // path.
+        if (isolation.dshHomeDir) await mkdir(isolation.dshHomeDir, { recursive: true });
+
         // Started before the agent container exists, and deliberately with no
         // agent-side side effects behind it: if the gateway cannot be brought
         // up - or, more importantly, if its `--internal` network cannot be
@@ -916,7 +935,8 @@ export async function runAgentInPostgresResearchEnvironment(
               scratchDir,
               // The same view the runtime container is running, so the agent
               // inspects literally the files the server is executing.
-              buildViewDir: env.buildView.dir
+              buildViewDir: env.buildView.dir,
+              dshHomeDir: isolation.dshHomeDir
             },
             command: [agent.command, ...(agent.args ?? [])],
             image: agentImage.id,

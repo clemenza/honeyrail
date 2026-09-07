@@ -26,6 +26,9 @@ import {
   type PostgresResearchSessionOptions,
   type PostgresResearchSessionResult
 } from "./research-session.js";
+import { readRawSessionFiles, readSessionStats } from "../evals/dsh-session-stats.js";
+import { buildTranscriptLines } from "../evals/dsh-transcript.js";
+import { deriveTrajectoryEvents } from "../evals/dsh-trajectory-bridge.js";
 import {
   classifyExecutionValidity,
   evaluateOracleAttribution,
@@ -942,6 +945,23 @@ function redactKnownSecrets(text: string, secrets: readonly string[]): string {
   return redacted;
 }
 
+/**
+ * Same redaction boundary, applied recursively to an arbitrary JSON-shaped
+ * value (#209/#210 round 4) - DSH's own raw session events and derived
+ * trajectory events are nested objects (tool arguments, assistant messages,
+ * tool results), not flat strings, so a known secret could otherwise survive
+ * inside any string leaf of that structure.
+ */
+function redactSecretsDeep<T>(value: T, secrets: readonly string[]): T {
+  if (!secrets.length) return value;
+  if (typeof value === "string") return redactKnownSecrets(value, secrets) as unknown as T;
+  if (Array.isArray(value)) return value.map((item) => redactSecretsDeep(item, secrets)) as unknown as T;
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactSecretsDeep(item, secrets)])) as unknown as T;
+  }
+  return value;
+}
+
 export type HistoricalPostgresWorkspaceInventory = {
   schemaVersion: 1;
   totalFiles: number;
@@ -1629,6 +1649,15 @@ export async function runHistoricalPostgresTrial(input: {
     await mkdir(input.artifactDir, { recursive: true });
     const taskLayout = await materializeHistoricalPostgresTask(task, join(input.artifactDir, "task-bundle"));
     artifacts.push(taskLayout.taskDir, taskLayout.referenceDir);
+    // #209/#210 round 4: a dedicated, grader-owned, per-trial directory for
+    // DSH's own session-persistence telemetry - deliberately under
+    // input.artifactDir (grader-side), never session.workspaceDir (the
+    // agent's own, workspace-limit-policed surface). Passed through
+    // regardless of what agent actually runs: a non-DSH agent (or DSH not
+    // engaging its session-persistence plugin) simply never populates it,
+    // which readRawSessionFiles() below reports as "not applicable", not a
+    // failure - see its own docstring.
+    const dshHomeDir = join(input.artifactDir, "dsh-home");
     const session: PostgresResearchSessionResult = await runSession(
       {
         root: await createAgentEnvRoot("historical-agent-"),
@@ -1646,7 +1675,7 @@ export async function runHistoricalPostgresTrial(input: {
         // upstreamBug/commitFest/referenceRevision, which stay grader-private.
         env: { ...(input.agent.env ?? {}), HONEYRAIL_TASK_ID: task.taskId, HONEYRAIL_TASK_PROMPT: task.prompt }
       },
-      input.session
+      { ...input.session, isolation: { ...(input.session?.isolation ?? {}), dshHomeDir } }
     );
     const scoredEligible = session.isolation.scoredEligible;
     // What this specific execution actually resolved - see
@@ -1705,6 +1734,42 @@ export async function runHistoricalPostgresTrial(input: {
       writeJson(join(input.artifactDir, "workspace-inventory.json"), buildHistoricalPostgresWorkspaceInventory(workspaceMeasurement, knownSecrets))
     );
 
+    // #209/#210 round 4: DSH's own session-persistence plugin already writes
+    // incremental raw events to $DSH_HOME/sessions/**\/*.jsonl(.zstd) *as the
+    // trial runs* - durable on the host by the time a kill/timeout happens,
+    // exactly like tinytable's own dshHomeDir path (server/evals/dsh-
+    // session-stats.ts's own docstring). `readRawSessionFiles()` returning
+    // null means the mount was never populated at all - not a DSH agent, or
+    // this dsh build ships no session-persistence plugin - which is
+    // "not_applicable", not a failure, so nothing is required or even
+    // attempted in that case. A non-null result (even zero events) means DSH
+    // genuinely engaged, so a transcript is owed and becomes required core
+    // evidence for this trial specifically - see requiredEvidence below.
+    const rawSessions = await readRawSessionFiles(dshHomeDir);
+    const dshTrajectoryApplicable = rawSessions !== null;
+    if (dshTrajectoryApplicable) {
+      const transcriptLines = redactSecretsDeep(buildTranscriptLines(rawSessions), knownSecrets);
+      await persistEvidence("agent-transcript.ndjson", () =>
+        writeFile(join(input.artifactDir, "agent-transcript.ndjson"), transcriptLines.length ? `${transcriptLines.map((line) => JSON.stringify(line)).join("\n")}\n` : "")
+      );
+
+      // Derived/best-effort (regenerable from the transcript above) - never
+      // part of the required core evidence contract, same reasoning as
+      // agent-postgres.log: a failure here is a diagnostic, not a
+      // classification change.
+      const sessionStatsReport = await readSessionStats(dshHomeDir).catch(() => null);
+      if (sessionStatsReport) {
+        await persistEvidence("agent-session-stats.json", () => writeJson(join(input.artifactDir, "agent-session-stats.json"), sessionStatsReport.aggregate));
+      }
+      const trajectoryEvents = redactSecretsDeep(
+        rawSessions.flatMap(({ events }) => deriveTrajectoryEvents(events)),
+        knownSecrets
+      );
+      await persistEvidence("agent-trajectory.jsonl", () =>
+        writeFile(join(input.artifactDir, "agent-trajectory.jsonl"), trajectoryEvents.length ? `${trajectoryEvents.map((event) => JSON.stringify(event)).join("\n")}\n` : "")
+      );
+    }
+
     if (workspaceOverLimit) {
       return {
         taskId: task.taskId,
@@ -1761,7 +1826,18 @@ export async function runHistoricalPostgresTrial(input: {
     // Grading is skipped entirely rather than run and then discarded, per
     // the review's "do not grade a submission with an already-known-
     // incomplete evidence contract" requirement.
-    const missingCoreEvidence = HISTORICAL_POSTGRES_REQUIRED_CORE_EVIDENCE.filter((label) => !persistedEvidenceLabels.has(label));
+    // `agent-transcript.ndjson` joins the required set only when DSH's
+    // session-persistence plugin actually engaged for this trial (see
+    // dshTrajectoryApplicable above) - runHistoricalPostgresTrial() itself
+    // has no notion of "this profile is supposed to be a real DSH agent"
+    // (that distinction - profileKind "agent" vs "smoke_stub" - lives one
+    // layer up, in historical-postgres-preflight.ts), so requiring it
+    // unconditionally would wrongly fail every non-DSH agent invocation,
+    // including #180's own committed deterministic stub-agent smoke path.
+    const requiredEvidence: readonly string[] = dshTrajectoryApplicable
+      ? [...HISTORICAL_POSTGRES_REQUIRED_CORE_EVIDENCE, "agent-transcript.ndjson"]
+      : HISTORICAL_POSTGRES_REQUIRED_CORE_EVIDENCE;
+    const missingCoreEvidence = requiredEvidence.filter((label) => !persistedEvidenceLabels.has(label));
     if (scoredEligible && missingCoreEvidence.length > 0) {
       return {
         taskId: task.taskId,

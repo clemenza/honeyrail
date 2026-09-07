@@ -127,7 +127,24 @@ export type ResearchContainerMounts = {
    * never the shared cache entry itself.
    */
   buildViewDir: string;
+  /**
+   * Host path of a per-trial, grader-owned, initially-empty directory
+   * mounted read-write at `DSH_HOME_CONTAINER_PATH` with `$DSH_HOME` pointed
+   * at it (#209/#210 round 4) - deliberately not part of `scratchDir`
+   * (`$HR_PG_WORK_DIR`, the agent's own workspace): DSH's own
+   * `@deepseek-ai/dsh-session-persistence-jsonl` plugin writes incremental
+   * session telemetry here as the trial runs, which must never count
+   * against the Historical PostgreSQL agent-workspace file/byte policy or
+   * be mistaken for agent-authored task output. Same mount shape
+   * `scripts/tinytable-exam-room.ts`'s own `dshHomeDir` option already uses.
+   * Optional: absent for an agent that isn't DSH, or for unisolated
+   * development mode.
+   */
+  dshHomeDir?: string;
 };
+
+/** Same fixed neutral path `scripts/tinytable-exam-room.ts` uses for its own `dshHomeDir` mount - one convention across both DSH launch sites. */
+export const DSH_HOME_CONTAINER_PATH = "/dsh-home";
 
 export type ResearchContainerOptions = {
   mounts: ResearchContainerMounts;
@@ -211,6 +228,7 @@ export function buildResearchContainerArgs(options: ResearchContainerOptions, co
     "-v", `${resolve(m.logPath)}:${paths.log}:ro`,
     "-v", `${resolve(m.scratchDir)}:${paths.scratch}:rw`,
     "-v", `${resolve(m.buildViewDir)}:${paths.postgres}:ro`,
+    ...(m.dshHomeDir ? ["-v", `${resolve(m.dshHomeDir)}:${DSH_HOME_CONTAINER_PATH}:rw`, "-e", `DSH_HOME=${DSH_HOME_CONTAINER_PATH}`] : []),
     "-w", paths.scratch,
     "-e", `PATH=${CONTAINER_PATH}`,
     // Redundant now that configure --prefix *is* paths.postgres and the build
