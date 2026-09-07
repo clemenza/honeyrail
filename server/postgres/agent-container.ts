@@ -128,17 +128,26 @@ export type ResearchContainerMounts = {
    */
   buildViewDir: string;
   /**
-   * Host path of a per-trial, grader-owned, initially-empty directory
-   * mounted read-write at `DSH_HOME_CONTAINER_PATH` with `$DSH_HOME` pointed
-   * at it (#209/#210 round 4) - deliberately not part of `scratchDir`
-   * (`$HR_PG_WORK_DIR`, the agent's own workspace): DSH's own
+   * Host path of a per-trial, initially-empty directory mounted read-write
+   * at `DSH_HOME_CONTAINER_PATH` with `$DSH_HOME` pointed at it (#209/#210
+   * round 4) - deliberately not part of `scratchDir` (`$HR_PG_WORK_DIR`, the
+   * agent's own workspace): DSH's own
    * `@deepseek-ai/dsh-session-persistence-jsonl` plugin writes incremental
    * session telemetry here as the trial runs, which must never count
    * against the Historical PostgreSQL agent-workspace file/byte policy or
    * be mistaken for agent-authored task output. Same mount shape
    * `scripts/tinytable-exam-room.ts`'s own `dshHomeDir` option already uses.
    * Optional: absent for an agent that isn't DSH, or for unisolated
-   * development mode.
+   * development mode - only ever provided by a caller that actually expects
+   * a DSH trajectory (#210 review round 5, Blocking 2), never mounted into
+   * every isolated agent unconditionally.
+   *
+   * This is a read-write mount into a container with arbitrary shell
+   * access, so its contents are agent-process-originated, agent-tamperable
+   * diagnostic telemetry - never immutable grader-owned evidence. The
+   * grader-owned evidence derived from it (a redacted transcript) is
+   * persisted separately, after the container has exited, by whichever
+   * caller mounted this directory.
    */
   dshHomeDir?: string;
 };

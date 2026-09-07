@@ -46,7 +46,7 @@
  *     enters no wall-time figure.
  */
 
-import { readdir, readFile } from "node:fs/promises";
+import { lstat, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 
@@ -365,15 +365,9 @@ export async function readSessionStats(dshHomeDir: string): Promise<SessionStats
  * every real trial, since dsh writes zstd by default.
  */
 export async function readRawSessionFiles(dshHomeDir: string): Promise<Array<{ file: string; events: DshRawEvent[] }> | null> {
-  const sessionsDir = join(dshHomeDir, "sessions");
-  let entries: string[];
-  try {
-    entries = await readdir(sessionsDir, { recursive: true });
-  } catch {
-    return null;
-  }
-  const files = entries.filter((entry) => entry.endsWith(".jsonl") || entry.endsWith(".jsonl.zstd")).sort();
-  if (files.length === 0) return null;
+  const listing = await listDshSessionFiles(dshHomeDir);
+  if (listing === null) return null;
+  const { sessionsDir, files } = listing;
 
   return Promise.all(
     files.map(async (file) => {
@@ -383,4 +377,42 @@ export async function readRawSessionFiles(dshHomeDir: string): Promise<Array<{ f
       return { file, events: parseSessionLog(text) };
     })
   );
+}
+
+/** Shared session-file discovery between readRawSessionFiles() and measureDshSessionTelemetry() - one definition of "which files count", never two that could silently disagree. */
+async function listDshSessionFiles(dshHomeDir: string): Promise<{ sessionsDir: string; files: string[] } | null> {
+  const sessionsDir = join(dshHomeDir, "sessions");
+  let entries: string[];
+  try {
+    entries = await readdir(sessionsDir, { recursive: true });
+  } catch {
+    return null;
+  }
+  const files = entries.filter((entry) => entry.endsWith(".jsonl") || entry.endsWith(".jsonl.zstd")).sort();
+  if (files.length === 0) return null;
+  return { sessionsDir, files };
+}
+
+/**
+ * The cheap pre-parse measurement Historical PG's own telemetry sanity bound
+ * (see MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_FILES/BYTES in historical-
+ * task.ts) is checked against, before any file is actually read or parsed
+ * (PR #210 review round 5, Blocking 3b). `$DSH_HOME` is written by a process
+ * running *inside* the agent container - agent-tamperable diagnostic
+ * telemetry, not grader-owned evidence - so nothing bounds its growth except
+ * this check. Uses `lstat` (never `stat`) on each file, same
+ * non-following-of-symlinks discipline as measureHistoricalPostgresWorkspace().
+ * Returns null under the same "nothing captured" condition as
+ * readRawSessionFiles() - not a failure, just nothing to measure yet.
+ */
+export async function measureDshSessionTelemetry(dshHomeDir: string): Promise<{ fileCount: number; totalBytes: number } | null> {
+  const listing = await listDshSessionFiles(dshHomeDir);
+  if (listing === null) return null;
+  const { sessionsDir, files } = listing;
+  let totalBytes = 0;
+  for (const file of files) {
+    const details = await lstat(join(sessionsDir, file));
+    totalBytes += details.size;
+  }
+  return { fileCount: files.length, totalBytes };
 }

@@ -9,6 +9,7 @@ import {
   decodeZstdSessionLog,
   findSessionStatsTimingInconsistency,
   foldSessionStats,
+  measureDshSessionTelemetry,
   parseSessionLog,
   readSessionStats,
   type DshRawEvent,
@@ -227,4 +228,34 @@ test("findSessionStatsTimingInconsistency: flags llmMs exceeding wallTimeMs - th
 test("findSessionStatsTimingInconsistency: flags toolMs exceeding wallTimeMs too, not just llmMs", () => {
   const reason = findSessionStatsTimingInconsistency(baseStats({ toolMs: 500 }), 100);
   assert.match(reason!, /toolMs \(500ms\) exceeds wallTimeMs \(100ms\)/);
+});
+
+// PR #210 review round 5, Blocking 3b: the cheap pre-parse measurement
+// Historical PG's own telemetry sanity bound is checked against, before any
+// session file is actually read or parsed.
+test("measureDshSessionTelemetry: null when sessions/ does not exist - same not_applicable condition as readRawSessionFiles", async (t) => {
+  const dshHomeDir = await tempDir(t, "honeyrail-dsh-telemetry-measure-");
+  assert.equal(await measureDshSessionTelemetry(dshHomeDir), null);
+});
+
+test("measureDshSessionTelemetry: null when sessions/ exists but holds no .jsonl/.jsonl.zstd file", async (t) => {
+  const dshHomeDir = await tempDir(t, "honeyrail-dsh-telemetry-measure-");
+  await mkdir(join(dshHomeDir, "sessions"), { recursive: true });
+  await writeFile(join(dshHomeDir, "sessions", "not-a-session.txt"), "irrelevant");
+  assert.equal(await measureDshSessionTelemetry(dshHomeDir), null);
+});
+
+test("measureDshSessionTelemetry: reports exact file count and byte total without parsing any file content", async (t) => {
+  const dshHomeDir = await tempDir(t, "honeyrail-dsh-telemetry-measure-");
+  const sessionsDir = join(dshHomeDir, "sessions", "proj");
+  await mkdir(sessionsDir, { recursive: true });
+  // Deliberately invalid JSON - measureDshSessionTelemetry must never parse
+  // it, only lstat it, so this must not throw.
+  await writeFile(join(sessionsDir, "a.jsonl"), "{not valid json\n");
+  await writeFile(join(sessionsDir, "b.jsonl.zstd"), Buffer.from("12345"));
+
+  const measurement = await measureDshSessionTelemetry(dshHomeDir);
+  assert.ok(measurement);
+  assert.equal(measurement!.fileCount, 2);
+  assert.equal(measurement!.totalBytes, "{not valid json\n".length + 5);
 });

@@ -533,11 +533,17 @@ test("executeTrialSetCell: calls runHistoricalPostgresPilotTrial exactly once wi
 
   const input = capturedInput as {
     profileKind: string;
+    trajectoryExpectation?: string;
     agent: { command: string; args: string[]; env: Record<string, string> };
     artifactDir: string;
     session: { isolation: { image: string } };
   };
   assert.equal(input.profileKind, "agent");
+  // PR #210 review round 5, Blocking 1: this is the one real place a DSH
+  // agent is actually launched, so this is the one place that gets to
+  // explicitly declare a DSH trajectory is expected - never inferred
+  // downstream from profileKind, agent.command, or filesystem contents.
+  assert.equal(input.trajectoryExpectation, "dsh");
   assert.equal(input.artifactDir, "/tmp/whatever");
   // The actual execution-binding proof: session.isolation.image is the
   // frozen id, never a mutable tag/reference.
