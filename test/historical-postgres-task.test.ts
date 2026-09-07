@@ -56,6 +56,7 @@ function fakeSessionResult(overrides: {
       isolated: true,
       networkMode: overrides.scoredEligible ? "none" : "bridge",
       scoredEligible: overrides.scoredEligible,
+      imageIdentity: { reference: "fake-agent-image:latest", id: `sha256:${"3".repeat(64)}` },
       buildScoredEligible: true,
       runtimeScoredEligible: true,
       ...(overrides.scoredEligible ? {} : { warning: "Not a scored trial. Fixture forced isolation.scoredEligible=false for this test." })
@@ -465,8 +466,9 @@ test("#209: a file-count-over-limit workspace still retains stdout/stderr/saniti
   assert.equal(await readFile(join(artifactDir, "agent-stderr.txt"), "utf8"), "the agent's real stderr output");
 
   const agentResult = JSON.parse(await readFile(join(artifactDir, "agent-result.json"), "utf8"));
-  assert.equal(agentResult.ok, true);
-  assert.equal(agentResult.exitCode, 0);
+  assert.equal(agentResult.schemaVersion, 1);
+  assert.equal(agentResult.agent.ok, true);
+  assert.equal(agentResult.agent.exitCode, 0);
 
   const inventory = JSON.parse(await readFile(join(artifactDir, "workspace-inventory.json"), "utf8"));
   assert.equal(inventory.totalFiles, MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES + 1);
@@ -572,4 +574,241 @@ test("#209: measureHistoricalPostgresWorkspace bounds largestFiles/topLevelEntri
   assert.ok(measurement.topLevelEntries.length <= HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP);
   // Sorted descending by size - the single largest file (highest index) must lead.
   assert.equal(measurement.largestFiles[0].bytes, entryCount);
+});
+
+// ---------------------------------------------------------------------------
+// PR #210 review, Blocking 1: evidence persistence must never overwrite the
+// authoritative workspace-limit verdict.
+// ---------------------------------------------------------------------------
+
+test("PR #210 Blocking 1: a workspace-inventory.json write failure on an over-file-limit workspace still classifies as integrity_error, with the failure surfaced as a diagnostic and the other evidence still listed", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "over-limit-with-write-failure-workspace");
+  await writeManyFiles(workspace, MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES + 1, 1);
+
+  const artifactDir = join(root, "over-limit-with-write-failure-trial");
+  await mkdir(artifactDir, { recursive: true });
+  // Pre-occupy the exact path workspace-inventory.json needs with a
+  // directory, so that specific write fails with EISDIR while every other
+  // evidence write (which needs a different path) still succeeds - a
+  // deterministic, no-mocking way to force one artifact's persistence to fail.
+  await mkdir(join(artifactDir, "workspace-inventory.json"));
+
+  const trial = await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture" },
+    artifactDir,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace, stdout: "stdout-ok", stderr: "stderr-ok" })
+  });
+
+  // The authoritative verdict must be exactly what it would have been with
+  // no write failure at all - never reclassified to infrastructure_error.
+  assert.equal(trial.status, "integrity_error");
+  assert.equal(trial.scoredEligible, false);
+  assert.ok(trial.diagnostics.some((line) => line.includes("agent workspace exceeds limits")));
+
+  // Evidence that did persist is listed; evidence that failed is not falsely listed.
+  assert.ok(trial.artifacts.some((path) => path.endsWith("agent-stdout.txt")));
+  assert.ok(trial.artifacts.some((path) => path.endsWith("agent-stderr.txt")));
+  assert.ok(trial.artifacts.some((path) => path.endsWith("agent-result.json")));
+  assert.ok(!trial.artifacts.some((path) => path.endsWith("workspace-inventory.json")));
+
+  // The write failure itself is surfaced, not swallowed.
+  assert.ok(trial.diagnostics.some((line) => line.includes("evidence_warning") && line.includes("workspace-inventory.json")));
+
+  // The artifacts that could be written are genuinely on disk and correct.
+  assert.equal(await readFile(join(artifactDir, "agent-stdout.txt"), "utf8"), "stdout-ok");
+  const agentResult = JSON.parse(await readFile(join(artifactDir, "agent-result.json"), "utf8"));
+  assert.equal(agentResult.agent.ok, true);
+});
+
+test("PR #210 Blocking 1: an agent-stdout.txt write failure on an over-byte-limit workspace still classifies as integrity_error", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "over-byte-limit-with-write-failure-workspace");
+  const bytesEach = Math.ceil(MAX_HISTORICAL_POSTGRES_WORKSPACE_BYTES / 5) + 1024;
+  await writeManyFiles(workspace, 5, bytesEach);
+
+  const artifactDir = join(root, "over-byte-limit-with-write-failure-trial");
+  await mkdir(artifactDir, { recursive: true });
+  await mkdir(join(artifactDir, "agent-stdout.txt"));
+
+  const trial = await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture" },
+    artifactDir,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace })
+  });
+
+  assert.equal(trial.status, "integrity_error");
+  assert.equal(trial.scoredEligible, false);
+  assert.ok(!trial.artifacts.some((path) => path.endsWith("agent-stdout.txt")));
+  assert.ok(trial.artifacts.some((path) => path.endsWith("agent-stderr.txt")));
+  assert.ok(trial.diagnostics.some((line) => line.includes("evidence_warning") && line.includes("agent-stdout.txt")));
+});
+
+// ---------------------------------------------------------------------------
+// PR #210 review, Blocking 2: agent-result.json must remain sufficient to
+// explain isolation/execution attribution, and must exclude grader-private
+// truth and unsafe host paths.
+// ---------------------------------------------------------------------------
+
+test("PR #210 Blocking 2: agent-result.json's isolation/executionEnvironment fields survive the projection", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "attribution-workspace");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "n/a" }));
+
+  const artifactDir = join(root, "attribution-trial");
+  await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture" },
+    artifactDir,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace })
+  });
+
+  const agentResult = JSON.parse(await readFile(join(artifactDir, "agent-result.json"), "utf8"));
+  assert.equal(agentResult.schemaVersion, 1);
+  assert.equal(agentResult.isolation.mode, "container");
+  assert.equal(agentResult.isolation.isolated, true);
+  assert.equal(agentResult.isolation.scoredEligible, true);
+  assert.equal(agentResult.isolation.networkMode, "none");
+  assert.equal(agentResult.isolation.imageIdentity.reference, "fake-agent-image:latest");
+  assert.equal(agentResult.executionEnvironment.buildMode, "container");
+  assert.equal(agentResult.executionEnvironment.compiler.command, "cc");
+  assert.equal(agentResult.executionEnvironment.builderImage.reference, "fake-builder:latest");
+  assert.equal(agentResult.executionEnvironment.runtimeImage.reference, "fake-runtime:latest");
+});
+
+test("PR #210 Blocking 2: agent-result.json never carries grader-private truth, pinned revisions, or host source paths", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "no-truth-leak-workspace");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "n/a" }));
+
+  const artifactDir = join(root, "no-truth-leak-trial");
+  await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture" },
+    artifactDir,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace })
+  });
+
+  const agentResultRaw = await readFile(join(artifactDir, "agent-result.json"), "utf8");
+  assert.ok(!agentResultRaw.includes(spec.truth.upstreamBug));
+  assert.ok(!agentResultRaw.includes(spec.source.historicalRevision));
+  assert.ok(!agentResultRaw.includes(spec.source.referenceRevision));
+  assert.ok(!agentResultRaw.includes(spec.source.repoPath));
+  assert.ok(!agentResultRaw.includes(workspace));
+});
+
+// ---------------------------------------------------------------------------
+// PR #210 review, Blocking 3: bounded top-N measurement and redaction of
+// known-injected secret values from stdout/stderr/workspace-inventory paths.
+// ---------------------------------------------------------------------------
+
+test("PR #210 Blocking 3: a secret from agent.env is redacted from persisted stdout and stderr", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "redaction-stdout-workspace");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "n/a" }));
+
+  const secret = "sk-fake-secret-sentinel-abcdefghijklmnop";
+  const artifactDir = join(root, "redaction-stdout-trial");
+  await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture", env: { DEEPSEEK_API_KEY: secret } },
+    artifactDir,
+    runSession: async () =>
+      fakeSessionResult({
+        scoredEligible: true,
+        agentOk: true,
+        workspaceDir: workspace,
+        stdout: `the agent printed its own key: ${secret}`,
+        stderr: `a warning also echoed the key: ${secret}`
+      })
+  });
+
+  const stdout = await readFile(join(artifactDir, "agent-stdout.txt"), "utf8");
+  const stderr = await readFile(join(artifactDir, "agent-stderr.txt"), "utf8");
+  assert.ok(!stdout.includes(secret));
+  assert.ok(stdout.includes("[REDACTED]"));
+  assert.ok(!stderr.includes(secret));
+  assert.ok(stderr.includes("[REDACTED]"));
+});
+
+test("PR #210 Blocking 3: a secret embedded in a workspace filename is redacted from workspace-inventory.json", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "redaction-filename-workspace");
+  await mkdir(workspace, { recursive: true });
+  const secret = "sk-fake-secret-sentinel-qrstuvwxyz123456";
+  await writeFile(join(workspace, `leaked-${secret}.txt`), "small file");
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "n/a" }));
+
+  const artifactDir = join(root, "redaction-filename-trial");
+  await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture", env: { DEEPSEEK_API_KEY: secret } },
+    artifactDir,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace })
+  });
+
+  const inventoryRaw = await readFile(join(artifactDir, "workspace-inventory.json"), "utf8");
+  assert.ok(!inventoryRaw.includes(secret));
+  assert.ok(inventoryRaw.includes("[REDACTED]"));
+});
+
+test("PR #210 Blocking 3: short, non-secret-length env values are not redacted (only sufficiently long known-injected values are treated as secrets)", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "short-env-workspace");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "n/a" }));
+
+  const artifactDir = join(root, "short-env-trial");
+  await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture", env: { DSH_PERMISSION_MODE: "none" } },
+    artifactDir,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace, stdout: "network mode: none" })
+  });
+
+  const stdout = await readFile(join(artifactDir, "agent-stdout.txt"), "utf8");
+  assert.equal(stdout, "network mode: none");
+});
+
+test("PR #210 Blocking 3: measurement reports exact totals for a workspace far larger than the inventory cap, with deterministic tie-breaking for equal-size entries", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-workspace-inventory-tiebreak-"));
+  const entryCount = HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP * 4;
+  // Every file the same size - the cap must still hold exactly
+  // HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP entries, deterministically
+  // ordered (ascending path) rather than depending on filesystem readdir order.
+  for (let i = 0; i < entryCount; i += 1) {
+    await writeFile(join(root, `file-${String(i).padStart(6, "0")}.txt`), "x".repeat(100));
+  }
+
+  const measurement = await measureHistoricalPostgresWorkspace(root);
+  assert.equal(measurement.totalFiles, entryCount);
+  assert.equal(measurement.totalBytes, entryCount * 100);
+  assert.equal(measurement.largestFiles.length, HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP);
+  const paths = measurement.largestFiles.map((entry) => entry.path);
+  assert.deepEqual(paths, [...paths].sort());
+  assert.equal(paths[0], "file-000000.txt");
+
+  // Re-running the measurement against the same on-disk state is deterministic.
+  const again = await measureHistoricalPostgresWorkspace(root);
+  assert.deepEqual(again.largestFiles, measurement.largestFiles);
+});
+
+test("PR #210 Blocking 3: symlinks are measured by lstat (never dereferenced) and do not crash the walk", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-workspace-inventory-symlink-"));
+  await writeFile(join(root, "real-file.txt"), "x".repeat(5000));
+  await symlink(join(root, "real-file.txt"), join(root, "link-to-real-file.txt"));
+
+  const measurement = await measureHistoricalPostgresWorkspace(root);
+  assert.equal(measurement.totalFiles, 2);
+  // A symlink's own lstat size (the length of the link target string) is
+  // nowhere near the 5000-byte target it points at - proves the target was
+  // never dereferenced.
+  const linkEntry = measurement.largestFiles.find((entry) => entry.path === "link-to-real-file.txt");
+  assert.ok(linkEntry);
+  assert.ok(linkEntry!.bytes < 5000);
 });

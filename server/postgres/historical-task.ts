@@ -756,13 +756,38 @@ async function writeJson(path: string, value: unknown) {
 /** Bounded top-N lists in the persisted inventory (#209) - large enough to be useful, small enough to never itself become an unbounded-evidence problem. */
 export const HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP = 50;
 
+type CappedFileEntry = { path: string; bytes: number };
+
+/**
+ * Inserts `candidate` into `topN` (sorted descending by bytes, ties broken by
+ * ascending path for determinism) if it belongs in the top
+ * `HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP`, evicting the current
+ * smallest entry when already at capacity. `topN` never grows past the cap -
+ * this is the PR #210 review fix for the previous implementation, which
+ * pushed every single file into an unbounded array before sorting once at
+ * the end (unbounded memory/CPU for exactly the untrusted, potentially huge
+ * workspaces this code exists to handle).
+ */
+function offerCappedFile(topN: CappedFileEntry[], candidate: CappedFileEntry): void {
+  if (topN.length < HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP) {
+    const insertAt = topN.findIndex((entry) => candidate.bytes > entry.bytes || (candidate.bytes === entry.bytes && candidate.path < entry.path));
+    topN.splice(insertAt === -1 ? topN.length : insertAt, 0, candidate);
+    return;
+  }
+  const smallest = topN[topN.length - 1];
+  if (candidate.bytes < smallest.bytes || (candidate.bytes === smallest.bytes && candidate.path >= smallest.path)) return;
+  const insertAt = topN.findIndex((entry) => candidate.bytes > entry.bytes || (candidate.bytes === entry.bytes && candidate.path < entry.path));
+  topN.splice(insertAt, 0, candidate);
+  topN.pop();
+}
+
 export type HistoricalPostgresWorkspaceMeasurement = {
   totalFiles: number;
   totalBytes: number;
   /** Sorted descending by totalBytes, capped at HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP. */
   topLevelEntries: Array<{ path: string; fileCount: number; totalBytes: number }>;
-  /** Sorted descending by bytes, capped at HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP. */
-  largestFiles: Array<{ path: string; bytes: number }>;
+  /** Sorted descending by bytes (ties broken by ascending path), bounded to HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP entries throughout the walk - never a full file list. */
+  largestFiles: CappedFileEntry[];
 };
 
 /**
@@ -771,7 +796,9 @@ export type HistoricalPostgresWorkspaceMeasurement = {
  * can never disagree about what the workspace actually contained. Always
  * completes the full walk rather than early-exiting once a limit is crossed
  * (unlike the policy check this replaces) - the point of this function is an
- * accurate total, not a fast abort.
+ * accurate total, not a fast abort. `totalFiles`/`totalBytes` are exact
+ * regardless of workspace size; only the *lists* (`largestFiles`,
+ * `topLevelEntries`) are bounded.
  *
  * Same non-following-of-symlinks discipline as the check it replaces:
  * `lstat`, never `stat`, on each file - a reproducer symlink is validated
@@ -782,7 +809,17 @@ export async function measureHistoricalPostgresWorkspace(root: string): Promise<
   let totalFiles = 0;
   let totalBytes = 0;
   const topLevel = new Map<string, { fileCount: number; totalBytes: number }>();
-  const files: Array<{ path: string; bytes: number }> = [];
+  const largestFiles: CappedFileEntry[] = [];
+
+  function record(entryPath: string, topLevelName: string, bytes: number): void {
+    totalFiles += 1;
+    totalBytes += bytes;
+    const bucket = topLevel.get(topLevelName) ?? { fileCount: 0, totalBytes: 0 };
+    bucket.fileCount += 1;
+    bucket.totalBytes += bytes;
+    topLevel.set(topLevelName, bucket);
+    offerCappedFile(largestFiles, { path: relative(root, entryPath), bytes });
+  }
 
   async function visit(path: string, topLevelName: string): Promise<void> {
     const entries = await readdir(path, { withFileTypes: true });
@@ -793,13 +830,7 @@ export async function measureHistoricalPostgresWorkspace(root: string): Promise<
         continue;
       }
       const details = await lstat(entryPath);
-      totalFiles += 1;
-      totalBytes += details.size;
-      const bucket = topLevel.get(topLevelName) ?? { fileCount: 0, totalBytes: 0 };
-      bucket.fileCount += 1;
-      bucket.totalBytes += details.size;
-      topLevel.set(topLevelName, bucket);
-      files.push({ path: relative(root, entryPath), bytes: details.size });
+      record(entryPath, topLevelName, details.size);
     }
   }
   const rootEntries = await readdir(root, { withFileTypes: true });
@@ -809,13 +840,7 @@ export async function measureHistoricalPostgresWorkspace(root: string): Promise<
       await visit(entryPath, entry.name);
     } else {
       const details = await lstat(entryPath);
-      totalFiles += 1;
-      totalBytes += details.size;
-      const bucket = topLevel.get(entry.name) ?? { fileCount: 0, totalBytes: 0 };
-      bucket.fileCount += 1;
-      bucket.totalBytes += details.size;
-      topLevel.set(entry.name, bucket);
-      files.push({ path: relative(root, entryPath), bytes: details.size });
+      record(entryPath, entry.name, details.size);
     }
   }
 
@@ -823,8 +848,43 @@ export async function measureHistoricalPostgresWorkspace(root: string): Promise<
     .map(([path, stats]) => ({ path, ...stats }))
     .sort((a, b) => b.totalBytes - a.totalBytes)
     .slice(0, HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP);
-  const largestFiles = [...files].sort((a, b) => b.bytes - a.bytes).slice(0, HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP);
   return { totalFiles, totalBytes, topLevelEntries, largestFiles };
+}
+
+/** True exactly when a workspace measurement violates the (unchanged) 2048-file / 16MiB policy - the one authoritative decision this module makes, independent of whether any evidence artifact can be persisted. */
+export function isHistoricalPostgresWorkspaceOverLimit(measurement: HistoricalPostgresWorkspaceMeasurement): boolean {
+  return measurement.totalFiles > MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES || measurement.totalBytes > MAX_HISTORICAL_POSTGRES_WORKSPACE_BYTES;
+}
+
+function workspaceLimitExceededMessage(measurement: HistoricalPostgresWorkspaceMeasurement): string {
+  return `agent workspace exceeds limits (${measurement.totalFiles} files, ${measurement.totalBytes} bytes; maximum ${MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES} files and ${MAX_HISTORICAL_POSTGRES_WORKSPACE_BYTES} bytes)`;
+}
+
+/**
+ * The smallest reusable redaction boundary for "known injected sensitive
+ * values" (PR #210 review, Blocking 3) - not a generic secret scanner.
+ * `input.agent.env` (the caller-supplied environment for the agent process -
+ * e.g. a model API key) is, by construction, exactly the set of values this
+ * module was ever explicitly handed as sensitive; nothing else this module
+ * sees is treated as a secret. A short-value floor avoids redacting common,
+ * non-sensitive flags (`"none"`, `"1"`, ...) that happen to appear in
+ * `agent.env` too - real credentials are comfortably longer.
+ */
+const HISTORICAL_POSTGRES_SECRET_REDACTION_MIN_LENGTH = 12;
+
+function collectKnownSecretValues(env: Record<string, string> | undefined): string[] {
+  if (!env) return [];
+  return Object.values(env).filter((value) => value.length >= HISTORICAL_POSTGRES_SECRET_REDACTION_MIN_LENGTH);
+}
+
+/** Replaces every occurrence of a known secret value with a fixed marker - never logs or persists the value itself in the process of doing so. */
+function redactKnownSecrets(text: string, secrets: readonly string[]): string {
+  let redacted = text;
+  for (const secret of secrets) {
+    if (!secret) continue;
+    redacted = redacted.split(secret).join("[REDACTED]");
+  }
+  return redacted;
 }
 
 export type HistoricalPostgresWorkspaceInventory = {
@@ -837,29 +897,23 @@ export type HistoricalPostgresWorkspaceInventory = {
   largestFiles: HistoricalPostgresWorkspaceMeasurement["largestFiles"];
 };
 
-/** A bounded, sanitized-by-construction (paths and counts only, never file contents) evidence projection - never the full oversized workspace itself. */
-export function buildHistoricalPostgresWorkspaceInventory(measurement: HistoricalPostgresWorkspaceMeasurement): HistoricalPostgresWorkspaceInventory {
+/**
+ * A bounded evidence projection - counts only, plus paths - never the full
+ * oversized workspace itself. Paths are agent-controlled input, so
+ * `secrets` (see collectKnownSecretValues()) is applied to every persisted
+ * path: a filename is not inherently safe just because it is "only a path".
+ */
+export function buildHistoricalPostgresWorkspaceInventory(measurement: HistoricalPostgresWorkspaceMeasurement, secrets: readonly string[] = []): HistoricalPostgresWorkspaceInventory {
+  const redactPath = <T extends { path: string }>(entry: T): T => (secrets.length ? { ...entry, path: redactKnownSecrets(entry.path, secrets) } : entry);
   return {
     schemaVersion: 1,
     totalFiles: measurement.totalFiles,
     totalBytes: measurement.totalBytes,
     limits: { maxFiles: MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES, maxBytes: MAX_HISTORICAL_POSTGRES_WORKSPACE_BYTES },
-    exceeded: {
-      files: measurement.totalFiles > MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES,
-      bytes: measurement.totalBytes > MAX_HISTORICAL_POSTGRES_WORKSPACE_BYTES
-    },
-    topLevelEntries: measurement.topLevelEntries,
-    largestFiles: measurement.largestFiles
+    exceeded: { files: measurement.totalFiles > MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES, bytes: measurement.totalBytes > MAX_HISTORICAL_POSTGRES_WORKSPACE_BYTES },
+    topLevelEntries: measurement.topLevelEntries.map(redactPath),
+    largestFiles: measurement.largestFiles.map(redactPath)
   };
-}
-
-/** Same policy, same message shape as before #209 - now decided from an already-computed measurement so it can never disagree with the persisted inventory. */
-function assertWorkspaceMeasurementWithinLimits(measurement: HistoricalPostgresWorkspaceMeasurement): void {
-  if (measurement.totalFiles > MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES || measurement.totalBytes > MAX_HISTORICAL_POSTGRES_WORKSPACE_BYTES) {
-    throw new HistoricalPostgresIntegrityError(
-      `agent workspace exceeds limits (${measurement.totalFiles} files, ${measurement.totalBytes} bytes; maximum ${MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES} files and ${MAX_HISTORICAL_POSTGRES_WORKSPACE_BYTES} bytes)`
-    );
-  }
 }
 
 export type HistoricalPostgresSafeAgentExecutionSummary = {
@@ -874,16 +928,7 @@ export type HistoricalPostgresSafeAgentExecutionSummary = {
   durationMs: number;
 };
 
-/**
- * The one explicit, whitelisted projection of a real agent execution result
- * this module ever persists to `agent-result.json` (#209) - never the raw
- * `PostgresResearchSessionResult`/`PostgresResearchAgentResult`, which carry
- * `stdout`/`stderr` (already persisted separately, so duplicating them here
- * would be redundant, not just risky) and would grow to carry whatever else
- * a future session-result field adds without this module ever deciding that
- * was safe to write to disk.
- */
-function sanitizeAgentExecutionSummary(agent: PostgresResearchSessionResult["agent"]): HistoricalPostgresSafeAgentExecutionSummary {
+function sanitizeAgentExecutionSummary(agent: PostgresResearchSessionResult["agent"], secrets: readonly string[]): HistoricalPostgresSafeAgentExecutionSummary {
   return {
     ok: agent.ok,
     exitCode: agent.exitCode,
@@ -891,9 +936,65 @@ function sanitizeAgentExecutionSummary(agent: PostgresResearchSessionResult["age
     timedOut: agent.timedOut,
     timeoutSource: agent.timeoutSource,
     confirmedStopped: agent.confirmedStopped,
-    terminationError: agent.terminationError,
+    terminationError: agent.terminationError ? redactKnownSecrets(agent.terminationError, secrets) : agent.terminationError,
     startedAt: agent.startedAt,
     durationMs: agent.durationMs
+  };
+}
+
+export type HistoricalPostgresSafeIsolationSummary = {
+  mode: string;
+  isolated: boolean;
+  scoredEligible: boolean;
+  networkMode?: string;
+  restrictedEgressVerified?: boolean;
+  /** The resolved, immutable agent image identity - never the mutable tag alone (same discipline as #198's TrialSet identity). */
+  imageIdentity?: { reference: string; id: string };
+};
+
+function sanitizeIsolationSummary(isolation: PostgresResearchSessionResult["isolation"]): HistoricalPostgresSafeIsolationSummary {
+  const record = isolation as { mode: string; isolated: boolean; scoredEligible: boolean; networkMode?: string; restrictedEgressVerified?: boolean; imageIdentity?: { reference: string; id: string } };
+  return {
+    mode: record.mode,
+    isolated: record.isolated,
+    scoredEligible: record.scoredEligible,
+    networkMode: record.networkMode,
+    restrictedEgressVerified: record.restrictedEgressVerified,
+    imageIdentity: record.imageIdentity ? { reference: record.imageIdentity.reference, id: record.imageIdentity.id } : undefined
+  };
+}
+
+export type HistoricalPostgresSafeSessionEvidence = {
+  schemaVersion: 1;
+  agent: HistoricalPostgresSafeAgentExecutionSummary;
+  isolation: HistoricalPostgresSafeIsolationSummary;
+  /** Already-public build/runtime metadata only - see HistoricalPostgresTrialExecutionEnvironment's own docstring. Never grader-private truth, never a host path. */
+  executionEnvironment: HistoricalPostgresTrialExecutionEnvironment;
+};
+
+/**
+ * The one explicit, versioned, whitelisted projection of a real agent
+ * session this module ever persists to `agent-result.json` (#209/PR #210
+ * review, Blocking 2) - never the raw `PostgresResearchSessionResult`, which
+ * carries `agentEnvironment` (exactly what was exported into the agent
+ * process - e.g. a model API key), `source`/`build`/`runtime` (host paths
+ * and internal detail beyond what HistoricalPostgresTrialExecutionEnvironment
+ * already whitelists), and `stdout`/`stderr` (already persisted separately,
+ * so duplicating them here would be redundant, not just risky).
+ *
+ * Retains enough to explain *under what environment* the agent ran
+ * (isolation/confinement mode, network/restricted-egress verification,
+ * resolved agent image identity, build/runtime/compiler identity) alongside
+ * the agent's own execution outcome - the two things #209's investigation
+ * actually needed and the old raw-session dump accidentally buried a secret
+ * inside of.
+ */
+function buildSafeSessionEvidence(session: PostgresResearchSessionResult, executionEnvironment: HistoricalPostgresTrialExecutionEnvironment, secrets: readonly string[]): HistoricalPostgresSafeSessionEvidence {
+  return {
+    schemaVersion: 1,
+    agent: sanitizeAgentExecutionSummary(session.agent, secrets),
+    isolation: sanitizeIsolationSummary(session.isolation),
+    executionEnvironment
   };
 }
 
@@ -1466,6 +1567,33 @@ export async function runHistoricalPostgresTrial(input: {
     // `session` exists, so both return paths below carry it.
     const executionEnvironment = extractHistoricalPostgresTrialExecutionEnvironment(session.build, session.runtime);
     const returnedWorkspace = join(input.artifactDir, "agent-workspace");
+    const evidenceWarnings: string[] = [];
+    // The exact values this trial was ever explicitly handed as sensitive -
+    // see collectKnownSecretValues()'s own docstring. Computed once, reused
+    // by every redaction site below.
+    const knownSecrets = collectKnownSecretValues(input.agent.env);
+
+    // #209 (PR #210 review, Blocking 1): the workspace-size policy verdict
+    // is the one authoritative decision here, computed purely from the
+    // measurement and never affected by whether any evidence artifact below
+    // can actually be persisted. Evidence persistence is a separate,
+    // best-effort concern: a failed write is recorded as an evidence
+    // warning, never allowed to fall through to the outer catch and get
+    // silently reclassified as "infrastructure_error". A failure to obtain
+    // the measurement itself is a genuine, unmasked infrastructure failure
+    // and is deliberately left to propagate to that outer catch - without a
+    // measurement there is no authoritative verdict to protect at all.
+    const workspaceMeasurement = await measureHistoricalPostgresWorkspace(session.workspaceDir);
+    const workspaceOverLimit = isHistoricalPostgresWorkspaceOverLimit(workspaceMeasurement);
+
+    const persistEvidence = async (label: string, write: () => Promise<void>): Promise<void> => {
+      try {
+        await write();
+        artifacts.push(join(input.artifactDir, label));
+      } catch (error) {
+        evidenceWarnings.push(`evidence_warning: could not persist ${label}: ${(error as Error).message}`);
+      }
+    };
     // #209: persist cheap, bounded, sanitized agent evidence *before* the
     // workspace-size check can abort the trial. Previously every piece of
     // agent evidence (including stdout/stderr) was written only after this
@@ -1473,22 +1601,30 @@ export async function runHistoricalPostgresTrial(input: {
     // nothing at all about what the agent actually did - see #209's own
     // investigation. None of this changes the check's policy (limits are
     // unchanged) or its outcome (still integrity_error, still
-    // datasetEligible: false) - only what evidence survives it.
-    await writeJson(join(input.artifactDir, "agent-result.json"), sanitizeAgentExecutionSummary(session.agent));
-    await writeFile(join(input.artifactDir, "agent-stdout.txt"), session.agent.stdout ?? "");
-    await writeFile(join(input.artifactDir, "agent-stderr.txt"), session.agent.stderr ?? "");
-    artifacts.push(
-      join(input.artifactDir, "agent-result.json"),
-      join(input.artifactDir, "agent-stdout.txt"),
-      join(input.artifactDir, "agent-stderr.txt")
+    // datasetEligible: false) - only what evidence survives it, and how
+    // resiliently.
+    await persistEvidence("agent-result.json", () =>
+      writeJson(join(input.artifactDir, "agent-result.json"), buildSafeSessionEvidence(session, executionEnvironment, knownSecrets))
     );
-    const workspaceMeasurement = await measureHistoricalPostgresWorkspace(session.workspaceDir);
-    await writeJson(join(input.artifactDir, "workspace-inventory.json"), buildHistoricalPostgresWorkspaceInventory(workspaceMeasurement));
-    artifacts.push(join(input.artifactDir, "workspace-inventory.json"));
-    assertWorkspaceMeasurementWithinLimits(workspaceMeasurement);
+    await persistEvidence("agent-stdout.txt", () => writeFile(join(input.artifactDir, "agent-stdout.txt"), redactKnownSecrets(session.agent.stdout ?? "", knownSecrets)));
+    await persistEvidence("agent-stderr.txt", () => writeFile(join(input.artifactDir, "agent-stderr.txt"), redactKnownSecrets(session.agent.stderr ?? "", knownSecrets)));
+    await persistEvidence("workspace-inventory.json", () =>
+      writeJson(join(input.artifactDir, "workspace-inventory.json"), buildHistoricalPostgresWorkspaceInventory(workspaceMeasurement, knownSecrets))
+    );
+
+    if (workspaceOverLimit) {
+      return {
+        taskId: task.taskId,
+        status: "integrity_error",
+        scoredEligible: false,
+        agent: session.agent,
+        executionEnvironment,
+        artifacts,
+        diagnostics: [`Historical PostgreSQL trial integrity failed: ${workspaceLimitExceededMessage(workspaceMeasurement)}`, ...evidenceWarnings]
+      };
+    }
     await cp(session.workspaceDir, returnedWorkspace, { recursive: true, dereference: false });
     artifacts.push(returnedWorkspace);
-    const evidenceWarnings: string[] = [];
     // The PostgreSQL server log from the agent's own live investigation
     // session - distinct from (and in addition to) any per-revision grading
     // log the two-revision grader below writes under grader/{historical,reference}.
