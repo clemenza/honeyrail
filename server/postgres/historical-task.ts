@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { cp, lstat, mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, opendir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import { nowIso, runCommandSafe } from "../utils.js";
 import {
@@ -756,36 +756,53 @@ async function writeJson(path: string, value: unknown) {
 /** Bounded top-N lists in the persisted inventory (#209) - large enough to be useful, small enough to never itself become an unbounded-evidence problem. */
 export const HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP = 50;
 
+/**
+ * The core evidence contract a scored Historical PostgreSQL capability
+ * sample requires (PR #210 review round 3, Blocking 1). An otherwise
+ * scored-eligible, `agent.ok === true`, within-limit trial must not proceed
+ * to grading - and therefore can never become an official `rediscovered`/
+ * `miss` dataset sample - unless every one of these persisted successfully.
+ * Tracked directly from each artifact's own persistence attempt, never
+ * inferred later by scanning the artifact directory.
+ */
+export const HISTORICAL_POSTGRES_REQUIRED_CORE_EVIDENCE = ["agent-result.json", "agent-stdout.txt", "agent-stderr.txt", "workspace-inventory.json"] as const;
+
 type CappedFileEntry = { path: string; bytes: number };
+type CappedTopLevelEntry = { path: string; fileCount: number; totalBytes: number };
 
 /**
- * Inserts `candidate` into `topN` (sorted descending by bytes, ties broken by
- * ascending path for determinism) if it belongs in the top
- * `HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP`, evicting the current
- * smallest entry when already at capacity. `topN` never grows past the cap -
- * this is the PR #210 review fix for the previous implementation, which
- * pushed every single file into an unbounded array before sorting once at
- * the end (unbounded memory/CPU for exactly the untrusted, potentially huge
- * workspaces this code exists to handle).
+ * Inserts `candidate` into `topN` (bounded to `cap`, ordered by `isBetter`)
+ * if it belongs there, evicting the current worst-ranked entry when already
+ * at capacity. `topN` never grows past `cap` - the PR #210 review fix for an
+ * earlier implementation that accumulated every entry into an unbounded
+ * array before sorting once at the end (unbounded memory/CPU for exactly the
+ * untrusted, potentially huge workspaces this code exists to handle). Used
+ * for both `largestFiles` and `topLevelEntries` - one small generic helper
+ * rather than two near-duplicate ones.
  */
-function offerCappedFile(topN: CappedFileEntry[], candidate: CappedFileEntry): void {
-  if (topN.length < HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP) {
-    const insertAt = topN.findIndex((entry) => candidate.bytes > entry.bytes || (candidate.bytes === entry.bytes && candidate.path < entry.path));
+function offerCapped<T>(topN: T[], candidate: T, cap: number, isBetter: (a: T, b: T) => boolean): void {
+  if (topN.length < cap) {
+    const insertAt = topN.findIndex((entry) => isBetter(candidate, entry));
     topN.splice(insertAt === -1 ? topN.length : insertAt, 0, candidate);
     return;
   }
-  const smallest = topN[topN.length - 1];
-  if (candidate.bytes < smallest.bytes || (candidate.bytes === smallest.bytes && candidate.path >= smallest.path)) return;
-  const insertAt = topN.findIndex((entry) => candidate.bytes > entry.bytes || (candidate.bytes === entry.bytes && candidate.path < entry.path));
+  const worst = topN[topN.length - 1];
+  if (!isBetter(candidate, worst)) return;
+  const insertAt = topN.findIndex((entry) => isBetter(candidate, entry));
   topN.splice(insertAt, 0, candidate);
   topN.pop();
 }
 
+/** Descending bytes, ties broken by ascending path - deterministic regardless of filesystem readdir order. */
+const fileRanksBefore = (a: CappedFileEntry, b: CappedFileEntry): boolean => a.bytes > b.bytes || (a.bytes === b.bytes && a.path < b.path);
+/** Same rule, keyed on a subtree's aggregate bytes instead of one file's. */
+const topLevelRanksBefore = (a: CappedTopLevelEntry, b: CappedTopLevelEntry): boolean => a.totalBytes > b.totalBytes || (a.totalBytes === b.totalBytes && a.path < b.path);
+
 export type HistoricalPostgresWorkspaceMeasurement = {
   totalFiles: number;
   totalBytes: number;
-  /** Sorted descending by totalBytes, capped at HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP. */
-  topLevelEntries: Array<{ path: string; fileCount: number; totalBytes: number }>;
+  /** Sorted descending by totalBytes (ties broken by ascending path), bounded to HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP entries throughout the walk. */
+  topLevelEntries: CappedTopLevelEntry[];
   /** Sorted descending by bytes (ties broken by ascending path), bounded to HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP entries throughout the walk - never a full file list. */
   largestFiles: CappedFileEntry[];
 };
@@ -800,6 +817,17 @@ export type HistoricalPostgresWorkspaceMeasurement = {
  * regardless of workspace size; only the *lists* (`largestFiles`,
  * `topLevelEntries`) are bounded.
  *
+ * Bounded-memory with respect to file count (PR #210 review round 3,
+ * Blocking 2): uses `opendir()`'s async iterator rather than
+ * `readdir(..., {withFileTypes:true})`, which materializes an entire
+ * directory's entries into one array before returning - a real concern once
+ * a single directory can hold tens of thousands of agent-authored files, as
+ * a real TRAIN001 run already did. Each top-level entry's own subtree is
+ * fully aggregated (`walkSubtree`) before being offered to the bounded
+ * `topLevelEntries` top-N and discarded - at most one subtree aggregate plus
+ * the two bounded top-N lists are ever held at once, never a map keyed by
+ * every top-level name.
+ *
  * Same non-following-of-symlinks discipline as the check it replaces:
  * `lstat`, never `stat`, on each file - a reproducer symlink is validated
  * only when actually selected as the submission, never dereferenced while
@@ -808,46 +836,73 @@ export type HistoricalPostgresWorkspaceMeasurement = {
 export async function measureHistoricalPostgresWorkspace(root: string): Promise<HistoricalPostgresWorkspaceMeasurement> {
   let totalFiles = 0;
   let totalBytes = 0;
-  const topLevel = new Map<string, { fileCount: number; totalBytes: number }>();
+  const topLevelEntries: CappedTopLevelEntry[] = [];
   const largestFiles: CappedFileEntry[] = [];
 
-  function record(entryPath: string, topLevelName: string, bytes: number): void {
+  const recordFile = (entryPath: string, bytes: number): void => {
     totalFiles += 1;
     totalBytes += bytes;
-    const bucket = topLevel.get(topLevelName) ?? { fileCount: 0, totalBytes: 0 };
-    bucket.fileCount += 1;
-    bucket.totalBytes += bytes;
-    topLevel.set(topLevelName, bucket);
-    offerCappedFile(largestFiles, { path: relative(root, entryPath), bytes });
+    offerCapped(largestFiles, { path: relative(root, entryPath), bytes }, HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP, fileRanksBefore);
+  };
+
+  /**
+   * `for await...of` on an `fs.Dir` already closes the handle once iteration
+   * completes normally; closing it again throws `ERR_DIR_CLOSED`. On an
+   * early exit (an exception thrown from inside the loop body, e.g. `lstat`
+   * failing mid-walk) the handle is not guaranteed closed, so `finally`
+   * still needs to try - this just tolerates the already-closed case rather
+   * than assuming one or the other.
+   */
+  async function closeDirQuietly(dir: { close: () => Promise<void> }): Promise<void> {
+    try {
+      await dir.close();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "ERR_DIR_CLOSED") throw error;
+    }
   }
 
-  async function visit(path: string, topLevelName: string): Promise<void> {
-    const entries = await readdir(path, { withFileTypes: true });
-    for (const entry of entries) {
-      const entryPath = join(path, entry.name);
-      if (entry.isDirectory()) {
-        await visit(entryPath, topLevelName);
-        continue;
+  /** Fully aggregates one subtree's own fileCount/totalBytes - the only per-subtree state ever held at once. */
+  async function walkSubtree(path: string): Promise<{ fileCount: number; totalBytes: number }> {
+    let fileCount = 0;
+    let bytes = 0;
+    const dir = await opendir(path);
+    try {
+      for await (const entry of dir) {
+        const entryPath = join(path, entry.name);
+        if (entry.isDirectory()) {
+          const sub = await walkSubtree(entryPath);
+          fileCount += sub.fileCount;
+          bytes += sub.totalBytes;
+          continue;
+        }
+        const details = await lstat(entryPath);
+        fileCount += 1;
+        bytes += details.size;
+        recordFile(entryPath, details.size);
       }
-      const details = await lstat(entryPath);
-      record(entryPath, topLevelName, details.size);
+    } finally {
+      await closeDirQuietly(dir);
     }
-  }
-  const rootEntries = await readdir(root, { withFileTypes: true });
-  for (const entry of rootEntries) {
-    const entryPath = join(root, entry.name);
-    if (entry.isDirectory()) {
-      await visit(entryPath, entry.name);
-    } else {
-      const details = await lstat(entryPath);
-      record(entryPath, entry.name, details.size);
-    }
+    return { fileCount, totalBytes: bytes };
   }
 
-  const topLevelEntries = [...topLevel.entries()]
-    .map(([path, stats]) => ({ path, ...stats }))
-    .sort((a, b) => b.totalBytes - a.totalBytes)
-    .slice(0, HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP);
+  const rootDir = await opendir(root);
+  try {
+    for await (const entry of rootDir) {
+      const entryPath = join(root, entry.name);
+      if (entry.isDirectory()) {
+        const subtree = await walkSubtree(entryPath);
+        offerCapped(topLevelEntries, { path: entry.name, ...subtree }, HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP, topLevelRanksBefore);
+      } else {
+        const details = await lstat(entryPath);
+        recordFile(entryPath, details.size);
+        offerCapped(topLevelEntries, { path: entry.name, fileCount: 1, totalBytes: details.size }, HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP, topLevelRanksBefore);
+      }
+    }
+  } finally {
+    await closeDirQuietly(rootDir);
+  }
+
   return { totalFiles, totalBytes, topLevelEntries, largestFiles };
 }
 
@@ -950,17 +1005,49 @@ export type HistoricalPostgresSafeIsolationSummary = {
   restrictedEgressVerified?: boolean;
   /** The resolved, immutable agent image identity - never the mutable tag alone (same discipline as #198's TrialSet identity). */
   imageIdentity?: { reference: string; id: string };
+  /**
+   * #197 evidence (PR #210 review round 3, Blocking 3): which gateway
+   * enforced the restricted-egress boundary, not just that a boolean claims
+   * one did. `restrictedEgressVerified: true` alone cannot answer "which
+   * gateway bytes actually relayed model traffic" - this can. Never the raw
+   * `egressGateway` record, which additionally carries `containerName` (no
+   * evidentiary value beyond what `internalNetworkName` already gives) and
+   * an internal `imageIdentitySchemaVersion` counter this projection
+   * deliberately omits rather than growing to track.
+   */
+  egressGateway?: {
+    internalNetworkName: string;
+    upstreamHost: string;
+    internalVerified: boolean;
+    imageIdentity: { reference: string; id: string };
+  };
 };
 
 function sanitizeIsolationSummary(isolation: PostgresResearchSessionResult["isolation"]): HistoricalPostgresSafeIsolationSummary {
-  const record = isolation as { mode: string; isolated: boolean; scoredEligible: boolean; networkMode?: string; restrictedEgressVerified?: boolean; imageIdentity?: { reference: string; id: string } };
+  const record = isolation as {
+    mode: string;
+    isolated: boolean;
+    scoredEligible: boolean;
+    networkMode?: string;
+    restrictedEgressVerified?: boolean;
+    imageIdentity?: { reference: string; id: string };
+    egressGateway?: { internalNetworkName: string; upstreamHost: string; internalVerified: boolean; imageIdentity: { reference: string; id: string } };
+  };
   return {
     mode: record.mode,
     isolated: record.isolated,
     scoredEligible: record.scoredEligible,
     networkMode: record.networkMode,
     restrictedEgressVerified: record.restrictedEgressVerified,
-    imageIdentity: record.imageIdentity ? { reference: record.imageIdentity.reference, id: record.imageIdentity.id } : undefined
+    imageIdentity: record.imageIdentity ? { reference: record.imageIdentity.reference, id: record.imageIdentity.id } : undefined,
+    egressGateway: record.egressGateway
+      ? {
+          internalNetworkName: record.egressGateway.internalNetworkName,
+          upstreamHost: record.egressGateway.upstreamHost,
+          internalVerified: record.egressGateway.internalVerified,
+          imageIdentity: { reference: record.egressGateway.imageIdentity.reference, id: record.egressGateway.imageIdentity.id }
+        }
+      : undefined
   };
 }
 
@@ -1586,10 +1673,16 @@ export async function runHistoricalPostgresTrial(input: {
     const workspaceMeasurement = await measureHistoricalPostgresWorkspace(session.workspaceDir);
     const workspaceOverLimit = isHistoricalPostgresWorkspaceOverLimit(workspaceMeasurement);
 
+    // The core evidence contract a scored capability sample requires (PR
+    // #210 review round 3, Blocking 1) - tracked directly from the
+    // persistence step below, never inferred later by scanning the
+    // artifact directory.
+    const persistedEvidenceLabels = new Set<string>();
     const persistEvidence = async (label: string, write: () => Promise<void>): Promise<void> => {
       try {
         await write();
         artifacts.push(join(input.artifactDir, label));
+        persistedEvidenceLabels.add(label);
       } catch (error) {
         evidenceWarnings.push(`evidence_warning: could not persist ${label}: ${(error as Error).message}`);
       }
@@ -1654,6 +1747,32 @@ export async function runHistoricalPostgresTrial(input: {
         artifacts,
         diagnostics: [
           session.agent.timedOut ? "Agent timed out before submission." : "Agent exited without a successful completed run.",
+          ...evidenceWarnings
+        ]
+      };
+    }
+    // PR #210 review round 3, Blocking 1: an official scored capability
+    // sample must never enter the Historical PostgreSQL dataset unless its
+    // required core evidence contract was successfully persisted. This
+    // check only applies to a trial that could otherwise become one -
+    // `scoredEligible === false` already routes to "unscored" below with no
+    // official score regardless, and must keep that distinct attribution
+    // rather than being folded into an infrastructure failure it isn't.
+    // Grading is skipped entirely rather than run and then discarded, per
+    // the review's "do not grade a submission with an already-known-
+    // incomplete evidence contract" requirement.
+    const missingCoreEvidence = HISTORICAL_POSTGRES_REQUIRED_CORE_EVIDENCE.filter((label) => !persistedEvidenceLabels.has(label));
+    if (scoredEligible && missingCoreEvidence.length > 0) {
+      return {
+        taskId: task.taskId,
+        status: "infrastructure_error",
+        scoredEligible,
+        workspaceDir: returnedWorkspace,
+        agent: session.agent,
+        executionEnvironment,
+        artifacts,
+        diagnostics: [
+          `Historical PostgreSQL trial infrastructure failed: required core evidence incomplete before grading (missing: ${missingCoreEvidence.join(", ")}).`,
           ...evidenceWarnings
         ]
       };

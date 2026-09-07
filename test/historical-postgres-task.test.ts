@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  HISTORICAL_POSTGRES_REQUIRED_CORE_EVIDENCE,
   HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP,
   MAX_HISTORICAL_POSTGRES_REPRO_BYTES,
   MAX_HISTORICAL_POSTGRES_WORKSPACE_BYTES,
@@ -34,6 +35,7 @@ function fakeSessionResult(overrides: {
   stdout?: string;
   stderr?: string;
   agentEnvironment?: Record<string, string>;
+  egressGateway?: { internalNetworkName: string; upstreamHost: string; internalVerified: boolean; imageIdentity: { reference: string; id: string } };
 }): PostgresResearchSessionResult {
   return {
     agent: {
@@ -57,6 +59,7 @@ function fakeSessionResult(overrides: {
       networkMode: overrides.scoredEligible ? "none" : "bridge",
       scoredEligible: overrides.scoredEligible,
       imageIdentity: { reference: "fake-agent-image:latest", id: `sha256:${"3".repeat(64)}` },
+      egressGateway: overrides.egressGateway,
       buildScoredEligible: true,
       runtimeScoredEligible: true,
       ...(overrides.scoredEligible ? {} : { warning: "Not a scored trial. Fixture forced isolation.scoredEligible=false for this test." })
@@ -792,10 +795,40 @@ test("PR #210 Blocking 3: measurement reports exact totals for a workspace far l
   const paths = measurement.largestFiles.map((entry) => entry.path);
   assert.deepEqual(paths, [...paths].sort());
   assert.equal(paths[0], "file-000000.txt");
+  // A root with far more than the cap of direct entries (each flat file is
+  // its own top-level entry) still produces only capped topLevelEntries.
+  assert.equal(measurement.topLevelEntries.length, HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP);
 
   // Re-running the measurement against the same on-disk state is deterministic.
   const again = await measureHistoricalPostgresWorkspace(root);
   assert.deepEqual(again.largestFiles, measurement.largestFiles);
+  assert.deepEqual(again.topLevelEntries, measurement.topLevelEntries);
+});
+
+test("PR #210 Blocking 2: topLevelEntries are capped with deterministic tie-breaking for equal-size subtrees, and totals stay exact for a workspace with far more than the cap of top-level subdirectories", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-workspace-toplevel-tiebreak-"));
+  const dirCount = HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP * 3;
+  // Every subtree the same aggregate size - the cap must still hold exactly
+  // HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP entries, ordered by ascending
+  // path rather than filesystem readdir order.
+  for (let i = 0; i < dirCount; i += 1) {
+    const dirName = `dir-${String(i).padStart(6, "0")}`;
+    await mkdir(join(root, dirName), { recursive: true });
+    await writeFile(join(root, dirName, "a.txt"), "x".repeat(50));
+    await writeFile(join(root, dirName, "b.txt"), "x".repeat(50));
+  }
+
+  const measurement = await measureHistoricalPostgresWorkspace(root);
+  assert.equal(measurement.totalFiles, dirCount * 2);
+  assert.equal(measurement.totalBytes, dirCount * 100);
+  assert.equal(measurement.topLevelEntries.length, HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP);
+  const topLevelPaths = measurement.topLevelEntries.map((entry) => entry.path);
+  assert.deepEqual(topLevelPaths, [...topLevelPaths].sort());
+  assert.equal(topLevelPaths[0], "dir-000000");
+  for (const entry of measurement.topLevelEntries) {
+    assert.equal(entry.fileCount, 2);
+    assert.equal(entry.totalBytes, 100);
+  }
 });
 
 test("PR #210 Blocking 3: symlinks are measured by lstat (never dereferenced) and do not crash the walk", async () => {
@@ -811,4 +844,132 @@ test("PR #210 Blocking 3: symlinks are measured by lstat (never dereferenced) an
   const linkEntry = measurement.largestFiles.find((entry) => entry.path === "link-to-real-file.txt");
   assert.ok(linkEntry);
   assert.ok(linkEntry!.bytes < 5000);
+});
+
+// ---------------------------------------------------------------------------
+// PR #210 review round 3, Blocking 1: an official scored capability sample
+// must never enter the dataset unless its core evidence contract persisted.
+// ---------------------------------------------------------------------------
+
+test("PR #210 round 3 Blocking 1: a within-limit, scored-eligible, agent-ok trial with one failed core evidence write never grades - it becomes infrastructure_error, not an official miss/rediscovered", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "core-evidence-gate-workspace");
+  await mkdir(workspace, { recursive: true });
+  // A submission that would otherwise be graded "miss" - proving the gate
+  // fires *before* grading, not that grading itself is broken.
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "would otherwise be a valid miss" }));
+
+  const artifactDir = join(root, "core-evidence-gate-trial");
+  await mkdir(artifactDir, { recursive: true });
+  // Force exactly one core evidence artifact to fail deterministically.
+  await mkdir(join(artifactDir, "agent-result.json"));
+
+  const trial = await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture" },
+    artifactDir,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace, stdout: "stdout-ok", stderr: "stderr-ok" })
+  });
+
+  // Never an official completed capability result.
+  assert.notEqual(trial.status, "completed");
+  assert.equal(trial.status, "infrastructure_error");
+  assert.equal(trial.grade, undefined);
+  assert.equal(trial.scoredEligible, true);
+
+  // Successful evidence remains listed; the failed artifact does not.
+  assert.ok(trial.artifacts.some((path) => path.endsWith("agent-stdout.txt")));
+  assert.ok(trial.artifacts.some((path) => path.endsWith("agent-stderr.txt")));
+  assert.ok(trial.artifacts.some((path) => path.endsWith("workspace-inventory.json")));
+  assert.ok(!trial.artifacts.some((path) => path.endsWith("agent-result.json")));
+
+  // The diagnostic identifies exactly which core evidence artifact is missing.
+  assert.ok(trial.diagnostics.some((line) => line.includes("core evidence") && line.includes("agent-result.json")));
+
+  // The workspace was still copied (this is not the over-limit path) and the
+  // successfully-written artifacts are genuinely correct on disk.
+  assert.equal(await readFile(join(artifactDir, "agent-stdout.txt"), "utf8"), "stdout-ok");
+});
+
+test("PR #210 round 3 Blocking 1: HISTORICAL_POSTGRES_REQUIRED_CORE_EVIDENCE names exactly the four artifacts the gate checks", () => {
+  assert.deepEqual([...HISTORICAL_POSTGRES_REQUIRED_CORE_EVIDENCE].sort(), ["agent-result.json", "agent-stderr.txt", "agent-stdout.txt", "workspace-inventory.json"].sort());
+});
+
+test("PR #210 round 3 Blocking 1: the over-limit evidence-write-failure path still classifies as integrity_error (unaffected by the new scored-path gate)", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "over-limit-still-integrity-workspace");
+  await writeManyFiles(workspace, MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES + 1, 1);
+
+  const artifactDir = join(root, "over-limit-still-integrity-trial");
+  await mkdir(artifactDir, { recursive: true });
+  await mkdir(join(artifactDir, "workspace-inventory.json"));
+
+  const trial = await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture" },
+    artifactDir,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace })
+  });
+
+  assert.equal(trial.status, "integrity_error");
+  assert.ok(trial.diagnostics.some((line) => line.includes("agent workspace exceeds limits")));
+});
+
+// ---------------------------------------------------------------------------
+// PR #210 review round 3, Blocking 3: restricted-egress gateway provenance.
+// ---------------------------------------------------------------------------
+
+test("PR #210 round 3 Blocking 3: agent-result.json.isolation.egressGateway survives the safe projection with exact gateway identity, and no API-key sentinel leaks", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "egress-gateway-workspace");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "n/a" }));
+
+  const secret = "sk-fake-secret-sentinel-egress-abcdefgh";
+  const gatewayImageId = `sha256:${"7".repeat(64)}`;
+  const artifactDir = join(root, "egress-gateway-trial");
+  await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture", env: { DEEPSEEK_API_KEY: secret } },
+    artifactDir,
+    runSession: async () =>
+      fakeSessionResult({
+        scoredEligible: true,
+        agentOk: true,
+        workspaceDir: workspace,
+        egressGateway: {
+          internalNetworkName: "honeyrail-pg-egress-net-fake-uuid",
+          upstreamHost: "api.deepseek.com",
+          internalVerified: true,
+          imageIdentity: { reference: "honeyrail-postgres-egress-gateway:latest", id: gatewayImageId }
+        }
+      })
+  });
+
+  const agentResultRaw = await readFile(join(artifactDir, "agent-result.json"), "utf8");
+  const agentResult = JSON.parse(agentResultRaw);
+  assert.equal(agentResult.isolation.egressGateway.internalNetworkName, "honeyrail-pg-egress-net-fake-uuid");
+  assert.equal(agentResult.isolation.egressGateway.upstreamHost, "api.deepseek.com");
+  assert.equal(agentResult.isolation.egressGateway.internalVerified, true);
+  assert.equal(agentResult.isolation.egressGateway.imageIdentity.id, gatewayImageId);
+  assert.equal(agentResult.isolation.egressGateway.imageIdentity.reference, "honeyrail-postgres-egress-gateway:latest");
+  assert.ok(!agentResultRaw.includes(secret));
+});
+
+test("PR #210 round 3 Blocking 3: agent-result.json.isolation.egressGateway is absent when the session provides no gateway (unisolated/non-restricted-egress runs)", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "no-egress-gateway-workspace");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "n/a" }));
+
+  const artifactDir = join(root, "no-egress-gateway-trial");
+  await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture" },
+    artifactDir,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace })
+  });
+
+  const agentResult = JSON.parse(await readFile(join(artifactDir, "agent-result.json"), "utf8"));
+  assert.equal(agentResult.isolation.egressGateway, undefined);
 });
