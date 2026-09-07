@@ -6,9 +6,11 @@ import test from "node:test";
 import {
   HISTORICAL_PG_TRIALSET_RUNNER_VERSION,
   TrialSetExperimentIdentityMismatchError,
+  TrialSetManifestIntegrityError,
   TrialSetStateCorruptError,
   TrialSetStateValidationError,
   assertCompatibleExperimentManifest,
+  assertTrialSetExperimentManifestIntegrity,
   assertTrialSetStateMatchesPlan,
   assertUniqueProfileIds,
   buildExperimentManifest,
@@ -277,6 +279,58 @@ test("assertCompatibleExperimentManifest: an agentTimeoutMs change rejects resum
 });
 
 // ---------------------------------------------------------------------------
+// Resume: loaded manifest self-integrity (PR #208 review round 3, Blocking 2)
+// ---------------------------------------------------------------------------
+
+test("assertTrialSetExperimentManifestIntegrity: a freshly built, untouched manifest passes", () => {
+  assert.doesNotThrow(() => assertTrialSetExperimentManifestIntegrity(fakeManifest()));
+});
+
+test("assertTrialSetExperimentManifestIntegrity: tampering agentTimeoutMs while leaving experimentId unchanged is rejected", () => {
+  const manifest = fakeManifest();
+  const tampered = { ...manifest, agentTimeoutMs: manifest.agentTimeoutMs * 3 };
+  assert.throws(() => assertTrialSetExperimentManifestIntegrity(tampered), TrialSetManifestIntegrityError);
+});
+
+test("assertTrialSetExperimentManifestIntegrity: tampering sessionTimeoutMs while leaving experimentId unchanged is rejected", () => {
+  const manifest = fakeManifest();
+  const tampered = { ...manifest, sessionTimeoutMs: manifest.sessionTimeoutMs * 3 };
+  assert.throws(() => assertTrialSetExperimentManifestIntegrity(tampered), TrialSetManifestIntegrityError);
+});
+
+test("assertTrialSetExperimentManifestIntegrity: tampering repositoryCommit while leaving experimentId unchanged is rejected", () => {
+  const manifest = fakeManifest();
+  const tampered = { ...manifest, repositoryCommit: "a-different-commit" };
+  assert.throws(() => assertTrialSetExperimentManifestIntegrity(tampered), TrialSetManifestIntegrityError);
+});
+
+test("assertTrialSetExperimentManifestIntegrity: tampering agentImage.id while leaving experimentId unchanged is rejected", () => {
+  const manifest = fakeManifest();
+  const tampered = { ...manifest, agentImage: fakeImageIdentity({ id: `sha256:${"9".repeat(64)}` }) };
+  assert.throws(() => assertTrialSetExperimentManifestIntegrity(tampered), TrialSetManifestIntegrityError);
+});
+
+test("assertTrialSetExperimentManifestIntegrity: tampering a profile's profileHash while leaving experimentId unchanged is rejected", () => {
+  const manifest = fakeManifest();
+  const tampered = { ...manifest, profiles: [{ profileId: "baseline", profileHash: "not-the-real-hash" }] };
+  assert.throws(() => assertTrialSetExperimentManifestIntegrity(tampered), TrialSetManifestIntegrityError);
+});
+
+test("assertTrialSetExperimentManifestIntegrity: tampering corpusHash while leaving experimentId unchanged is rejected", () => {
+  const manifest = fakeManifest();
+  const tampered = { ...manifest, corpusHash: "c".repeat(64) };
+  assert.throws(() => assertTrialSetExperimentManifestIntegrity(tampered), TrialSetManifestIntegrityError);
+});
+
+test("assertTrialSetExperimentManifestIntegrity: is called before assertCompatibleExperimentManifest in the resume path, so a tampered existing manifest never gets a false positive resume", () => {
+  const manifest = fakeManifest();
+  const tampered = { ...manifest, agentTimeoutMs: manifest.agentTimeoutMs * 3 };
+  // Even though nothing about `current` changed, the tampered `existing` must
+  // never reach (or pass) assertCompatibleExperimentManifest.
+  assert.throws(() => assertTrialSetExperimentManifestIntegrity(tampered), TrialSetManifestIntegrityError);
+});
+
+// ---------------------------------------------------------------------------
 // Resume: pending-cell selection
 // ---------------------------------------------------------------------------
 
@@ -333,6 +387,16 @@ test("assertTrialSetStateMatchesPlan: a valid state (matching manifest and plan)
     pilot: fakePilotResult({ datasetEligible: true, officialScoredResult: "miss", status: "completed" })
   });
   assert.doesNotThrow(() => assertTrialSetStateMatchesPlan({ state, manifest, plannedCells }));
+});
+
+test("report-only sequence: a tampered manifest is rejected by assertTrialSetExperimentManifestIntegrity before state validation or report generation ever runs", () => {
+  const manifest = fakeManifest();
+  const tampered = { ...manifest, agentTimeoutMs: manifest.agentTimeoutMs * 3 };
+  // Exactly the sequence scripts/historical-pg-evals.ts's --report-only path
+  // runs: self-integrity first, then plan/state validation - never load state
+  // or reach buildHistoricalPgTrialSetReport() on a manifest that fails the
+  // first check.
+  assert.throws(() => assertTrialSetExperimentManifestIntegrity(tampered), TrialSetManifestIntegrityError);
 });
 
 test("assertTrialSetStateMatchesPlan: state.experimentId mismatch is rejected", () => {
@@ -430,13 +494,14 @@ test("assertTrialSetStateMatchesPlan: trialIndex mismatch against the plan is re
 // executeTrialSetCell wiring (injected pilot boundary - never a real docker/dsh call)
 // ---------------------------------------------------------------------------
 
-test("executeTrialSetCell: calls runHistoricalPostgresPilotTrial exactly once with profileKind 'agent' and records the exact per-pilot artifact directory", async () => {
+test("executeTrialSetCell: calls runHistoricalPostgresPilotTrial exactly once with profileKind 'agent', binds execution to the frozen image ID (not the mutable tag/reference), and records the exact per-pilot artifact directory", async () => {
   let capturedInput: unknown;
   const fakeRunPilotTrial = (async (input: unknown) => {
     capturedInput = input;
     return fakePilotResult({ datasetEligible: true, officialScoredResult: "miss", status: "completed", pilotId: "pilot-xyz" });
   }) as unknown as typeof import("../server/postgres/historical-postgres-preflight.js").runHistoricalPostgresPilotTrial;
 
+  const frozenImageId = `sha256:${"a".repeat(64)}`;
   const identity = planTrialSetCells({ tasks: [{ taskId: "postgres-historical-001", partition: "TRAIN" }], profiles: [{ profileId: "baseline", profileHash: "bb" }], trialsPerCell: 1 })[0];
   const record = await executeTrialSetCell({
     identity,
@@ -446,7 +511,11 @@ test("executeTrialSetCell: calls runHistoricalPostgresPilotTrial exactly once wi
     profile: { profileId: "baseline", sourcePath: "/a.yml", content: "profile-body", profileHash: "bb" },
     cellArtifactRoot: "/tmp/whatever",
     apiKey: "fake-key",
-    agentImageReference: "honeyrail-postgres-research-agent-dsh:latest",
+    // PR #208 review round 3, Blocking 1: deliberately not the same string as
+    // the image's mutable tag/reference (e.g. "...:latest") - proves
+    // executeTrialSetCell() never has to be given, and never passes through,
+    // anything but the frozen id.
+    agentImageId: frozenImageId,
     upstreamUrl: "https://api.deepseek.com",
     agentTimeoutMs: 1000,
     sessionTimeoutMs: 2000,
@@ -462,9 +531,17 @@ test("executeTrialSetCell: calls runHistoricalPostgresPilotTrial exactly once wi
   assert.equal(record.datasetEligible, true);
   assert.equal(record.officialScoredResult, "miss");
 
-  const input = capturedInput as { profileKind: string; agent: { command: string; args: string[]; env: Record<string, string> }; artifactDir: string };
+  const input = capturedInput as {
+    profileKind: string;
+    agent: { command: string; args: string[]; env: Record<string, string> };
+    artifactDir: string;
+    session: { isolation: { image: string } };
+  };
   assert.equal(input.profileKind, "agent");
   assert.equal(input.artifactDir, "/tmp/whatever");
+  // The actual execution-binding proof: session.isolation.image is the
+  // frozen id, never a mutable tag/reference.
+  assert.equal(input.session.isolation.image, frozenImageId);
   assert.equal(input.agent.command, "sh");
   assert.equal(input.agent.env.HR_TRIALSET_PROFILE_CONTENT, "profile-body");
   assert.equal(input.agent.env.DEEPSEEK_API_KEY, "fake-key");

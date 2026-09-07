@@ -62,6 +62,7 @@ import {
   HISTORICAL_PG_TRIALSET_DEFAULT_UPSTREAM_URL,
   HISTORICAL_PG_TRIALSET_RUNNER_VERSION,
   assertCompatibleExperimentManifest,
+  assertTrialSetExperimentManifestIntegrity,
   assertTrialSetStateMatchesPlan,
   assertUniqueProfileIds,
   buildExperimentManifest,
@@ -175,6 +176,10 @@ async function main(): Promise<void> {
 
   if (options.reportOnly) {
     const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as TrialSetExperimentManifest;
+    // PR #208 review round 3, Blocking 2: prove the loaded manifest's own
+    // stored experimentId still matches its identity-defining fields before
+    // trusting anything else about it.
+    assertTrialSetExperimentManifestIntegrity(manifest);
     const state = await loadTrialSetState(statePath);
     if (!state) throw new Error(`--report-only requires an existing state.json at "${statePath}".`);
     // PR #208 review, Blocking 2: report-only must not trust state.json on
@@ -219,26 +224,37 @@ async function main(): Promise<void> {
   };
 
   // Observable provenance only (PR #208 review, Blocking 1d) - never
-  // identity-relevant. dshVersion needs an actual (non-agent, non-model)
-  // container run, so it's skipped under --dry-run, same precedent as
-  // scripts/dsh-evals-demo.ts's own dry-run path; "unknown" is never
-  // persisted anyway since dry-run writes no manifest to disk.
-  const dshVersion = options.dryRun ? "unknown (not fingerprinted under --dry-run)" : await fingerprintDshVersion(options.agentImage);
+  // identity-relevant, so a placeholder here cannot affect experimentId or
+  // resume compatibility. Real dshVersion fingerprinting is deferred until
+  // we know whether this is a brand-new experiment (see below) - resuming an
+  // existing one reuses its already-recorded dshVersion rather than paying
+  // for another container run each time.
   const modelProvider = deriveModelProviderFromUpstreamUrl(options.upstreamUrl);
   const modelVersion = "unknown";
-
-  const currentManifest = buildExperimentManifest({ identity, profiles, dshVersion, modelProvider, modelVersion });
+  const provisionalManifest = buildExperimentManifest({ identity, profiles, dshVersion: "unresolved", modelProvider, modelVersion });
 
   let manifest: TrialSetExperimentManifest;
   let state: TrialSetState;
   const existingManifestRaw = await readFile(manifestPath, "utf8").catch(() => null);
   if (existingManifestRaw) {
     const existingManifest = JSON.parse(existingManifestRaw) as TrialSetExperimentManifest;
-    assertCompatibleExperimentManifest(existingManifest, currentManifest);
+    // PR #208 review round 3, Blocking 2: prove the loaded manifest's own
+    // stored experimentId still matches its identity-defining fields *before*
+    // comparing it against the current configuration - a tampered-but-
+    // internally-consistent-looking manifest must never pass just because
+    // today's CLI inputs happen to still hash to its stored id.
+    assertTrialSetExperimentManifestIntegrity(existingManifest);
+    assertCompatibleExperimentManifest(existingManifest, provisionalManifest);
     manifest = existingManifest;
     state = (await loadTrialSetState(statePath)) ?? emptyTrialSetState(manifest.experimentId);
   } else {
-    manifest = currentManifest;
+    // PR #208 review round 3, Blocking 1: fingerprint DSH from the exact
+    // frozen image id every real cell will execute, not the mutable
+    // tag/reference - skipped under --dry-run since it needs an actual
+    // (non-agent, non-model) container run and nothing is persisted in that
+    // mode anyway.
+    const dshVersion = options.dryRun ? "unknown (not fingerprinted under --dry-run)" : await fingerprintDshVersion(agentImageIdentity.id);
+    manifest = buildExperimentManifest({ identity, profiles, dshVersion, modelProvider, modelVersion });
     state = emptyTrialSetState(manifest.experimentId);
     if (!options.dryRun) await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   }
@@ -289,7 +305,11 @@ async function main(): Promise<void> {
       profile,
       cellArtifactRoot,
       apiKey,
-      agentImageReference: manifest.agentImage.reference,
+      // PR #208 review round 3, Blocking 1: every cell in this experiment
+      // executes the exact frozen image content, never the mutable tag - a
+      // retag mid-experiment cannot silently change what baseline/candidate
+      // cells actually ran under.
+      agentImageId: manifest.agentImage.id,
       upstreamUrl: options.upstreamUrl,
       agentTimeoutMs: manifest.agentTimeoutMs,
       sessionTimeoutMs: manifest.sessionTimeoutMs

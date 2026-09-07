@@ -191,7 +191,58 @@ export class TrialSetExperimentIdentityMismatchError extends Error {
   }
 }
 
-/** Fails closed rather than silently resuming into incompatible state - see historical-pg-trialset's module docstring and #198's required resume semantics. */
+export class TrialSetManifestIntegrityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TrialSetManifestIntegrityError";
+  }
+}
+
+/**
+ * Proves that a *loaded* manifest's stored `experimentId` still matches its
+ * own identity-defining fields (PR #208 review round 3, Blocking 2) -
+ * `assertCompatibleExperimentManifest()` below only compares two
+ * `experimentId` strings, which says nothing about whether the loaded
+ * manifest's `experimentId` was ever honest in the first place. Without this,
+ * a manifest file hand-edited after creation (e.g. `agentTimeoutMs` widened
+ * post-hoc, `experimentId` left untouched) would sail through the identity
+ * comparison as long as the *current* CLI inputs happen to still hash to that
+ * same stored id.
+ *
+ * Deliberately reconstructs only the exact `TrialSetExperimentIdentityInput`
+ * fields from the manifest - never `computeExperimentId(manifest)` directly,
+ * which would fold in non-identity fields (`schemaVersion`, `experimentId`
+ * itself, `createdAt`, `profileSources`, `dshVersion`, `modelProvider`,
+ * `modelVersion`) and recompute a hash that could never legitimately match
+ * what was hashed at creation time.
+ */
+export function assertTrialSetExperimentManifestIntegrity(manifest: TrialSetExperimentManifest): void {
+  if (manifest.schemaVersion !== 1 || typeof manifest.experimentId !== "string" || !manifest.experimentId) {
+    throw new TrialSetManifestIntegrityError("experiment-manifest.json is missing or has an invalid schemaVersion/experimentId.");
+  }
+  const identity: TrialSetExperimentIdentityInput = {
+    repositoryCommit: manifest.repositoryCommit,
+    corpusId: manifest.corpusId,
+    corpusHash: manifest.corpusHash,
+    tasks: manifest.tasks,
+    profiles: manifest.profiles,
+    trialsPerCell: manifest.trialsPerCell,
+    agentImage: manifest.agentImage,
+    agentTimeoutMs: manifest.agentTimeoutMs,
+    sessionTimeoutMs: manifest.sessionTimeoutMs,
+    isolationPolicy: manifest.isolationPolicy,
+    runnerVersion: manifest.runnerVersion
+  };
+  const recomputed = computeExperimentId(identity);
+  if (recomputed !== manifest.experimentId) {
+    throw new TrialSetManifestIntegrityError(
+      `experiment-manifest.json's stored experimentId "${manifest.experimentId}" does not match a fresh hash of its own identity-defining ` +
+        `fields (recomputed "${recomputed}") - the file may have been edited after creation. Refusing to use it.`
+    );
+  }
+}
+
+/** Fails closed rather than silently resuming into incompatible state - see historical-pg-trialset's module docstring and #198's required resume semantics. Callers must call assertTrialSetExperimentManifestIntegrity() on `existing` first (PR #208 review round 3, Blocking 2) - this function only proves the two manifests agree with each other, not that `existing` was ever honest. */
 export function assertCompatibleExperimentManifest(existing: TrialSetExperimentManifest, current: TrialSetExperimentManifest): void {
   if (existing.experimentId !== current.experimentId) {
     throw new TrialSetExperimentIdentityMismatchError(
@@ -387,8 +438,15 @@ export type ExecuteTrialSetCellInput = {
   /** The cell's own artifact root (`.../trials/<task>/<profile>/trial-N`) - `runHistoricalPostgresPilotTrial()` nests its own `<pilotId>/` evidence under this; see buildTrialSetCellRecord's caller below for why the *record* stores the nested path, not this root. */
   cellArtifactRoot: string;
   apiKey: string;
-  /** The mutable reference actually passed to `docker run` - identity/resume compatibility is decided from the separately-resolved ResearchAgentImageIdentity, not this string. */
-  agentImageReference: string;
+  /**
+   * The frozen, resolved image content identity (`ContainerImageIdentity.id`,
+   * e.g. `sha256:...`) - never the mutable tag/reference (PR #208 review
+   * round 3, Blocking 1). Docker accepts a full `sha256:...` config digest
+   * anywhere it accepts an image reference, so this requires no new
+   * abstraction: every real cell in one experiment executes the exact same
+   * image content, immune to the tag being repointed mid-experiment.
+   */
+  agentImageId: string;
   upstreamUrl: string;
   agentTimeoutMs: number;
   sessionTimeoutMs: number;
@@ -419,7 +477,7 @@ export async function executeTrialSetCell(input: ExecuteTrialSetCellInput): Prom
     artifactDir: input.cellArtifactRoot,
     session: {
       isolation: {
-        image: input.agentImageReference,
+        image: input.agentImageId,
         restrictedEgress: { upstreamUrl: input.upstreamUrl }
       },
       timeoutMs: input.sessionTimeoutMs
