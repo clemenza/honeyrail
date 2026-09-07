@@ -1,12 +1,6 @@
 import { mkdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import {
-  historicalPostgres001TaskSpec,
-  historicalPostgres002TaskSpec,
-  historicalPostgres003TaskSpec,
-  loadHistoricalPostgres003PrivateTruth,
-  type HistoricalPostgresTaskSpec
-} from "../server/postgres/historical-task.js";
+import { resolveHistoricalPostgresTaskSpecFromEnv } from "../server/postgres/historical-postgres-task-env.js";
 import { runHistoricalPostgresPilotTrial, sanitizeHistoricalPostgresPilotEvidence } from "../server/postgres/historical-postgres-preflight.js";
 import type { HistoricalPostgresCorpusManifest } from "../server/postgres/historical-corpus.js";
 
@@ -25,35 +19,11 @@ const corpusManifest = JSON.parse(await readFile(corpusPath, "utf8")) as Histori
 
 const taskId = String(process.env.HONEYRAIL_PG_180_TASK_ID || "postgres-historical-001").trim();
 
-async function resolveTaskSpec(): Promise<HistoricalPostgresTaskSpec> {
-  if (taskId === "postgres-historical-001") {
-    const mirror = String(process.env.HONEYRAIL_PG_184_MIRROR || "").trim();
-    if (!mirror) throw new Error("Set HONEYRAIL_PG_184_MIRROR to the local PostgreSQL mirror for postgres-historical-001.");
-    const knownReproducer = String(process.env.HONEYRAIL_PG_184_REPRODUCER || "").trim();
-    return historicalPostgres001TaskSpec(resolve(mirror), knownReproducer ? resolve(knownReproducer) : undefined);
-  }
-  if (taskId === "postgres-historical-002") {
-    const mirror = String(process.env.HONEYRAIL_PG_200_MIRROR || "").trim();
-    const knownReproducer = String(process.env.HONEYRAIL_PG_200_REPRODUCER || "").trim();
-    if (!mirror || !knownReproducer) {
-      throw new Error("Set HONEYRAIL_PG_200_MIRROR and HONEYRAIL_PG_200_REPRODUCER for postgres-historical-002.");
-    }
-    return historicalPostgres002TaskSpec(resolve(mirror), resolve(knownReproducer));
-  }
-  if (taskId === "postgres-historical-003") {
-    const mirror = String(process.env.HONEYRAIL_PG_199_MIRROR || "").trim();
-    const knownReproducer = String(process.env.HONEYRAIL_PG_199_REPRODUCER || "").trim();
-    const privateTruthPath = String(process.env.HONEYRAIL_PG_199_PRIVATE_TRUTH || "").trim();
-    if (!mirror || !knownReproducer || !privateTruthPath) {
-      throw new Error("Set HONEYRAIL_PG_199_MIRROR, HONEYRAIL_PG_199_REPRODUCER, and HONEYRAIL_PG_199_PRIVATE_TRUTH for postgres-historical-003.");
-    }
-    const privateTruth = await loadHistoricalPostgres003PrivateTruth(privateTruthPath);
-    return historicalPostgres003TaskSpec(resolve(mirror), privateTruth, resolve(knownReproducer));
-  }
-  throw new Error(`HONEYRAIL_PG_180_TASK_ID must be one of postgres-historical-001|002|003, got "${taskId}"`);
-}
-
-const task = await resolveTaskSpec();
+// Shared with scripts/historical-pg-evals.ts (#198's TrialSet runner) - see
+// server/postgres/historical-postgres-task-env.ts's module docstring
+// (PR #208 review, Blocking 3): this pilot script must not keep its own copy
+// of the per-taskId mirror/reproducer/private-truth resolution.
+const task = await resolveHistoricalPostgresTaskSpecFromEnv(taskId);
 
 /**
  * `HONEYRAIL_PG_180_STUB_AGENT=1` selects a deterministic, scored

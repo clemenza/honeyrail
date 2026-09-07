@@ -7,7 +7,9 @@ import {
   HISTORICAL_PG_TRIALSET_RUNNER_VERSION,
   TrialSetExperimentIdentityMismatchError,
   TrialSetStateCorruptError,
+  TrialSetStateValidationError,
   assertCompatibleExperimentManifest,
+  assertTrialSetStateMatchesPlan,
   assertUniqueProfileIds,
   buildExperimentManifest,
   buildHistoricalPgTrialSetReport,
@@ -15,6 +17,7 @@ import {
   computeExperimentId,
   computeProfileHash,
   defaultTaskIdSelection,
+  deriveModelProviderFromUpstreamUrl,
   emptyTrialSetState,
   executeTrialSetCell,
   loadTrialSetState,
@@ -29,6 +32,7 @@ import {
 } from "../server/postgres/historical-pg-trialset.js";
 import type { HistoricalPostgresCorpusManifest } from "../server/postgres/historical-corpus.js";
 import type { HistoricalPostgresPilotResult } from "../server/postgres/historical-postgres-preflight.js";
+import type { ContainerImageIdentity } from "../server/postgres/image-identity.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -52,18 +56,39 @@ function fakeCorpusManifest(): HistoricalPostgresCorpusManifest {
   };
 }
 
+function fakeImageIdentity(overrides: Partial<ContainerImageIdentity> = {}): ContainerImageIdentity {
+  return {
+    reference: "honeyrail-postgres-research-agent-dsh:latest",
+    id: `sha256:${"1".repeat(64)}`,
+    digest: null,
+    platform: "linux/amd64",
+    os: "linux",
+    architecture: "amd64",
+    variant: null,
+    ...overrides
+  };
+}
+
 function baseIdentity(overrides: Partial<TrialSetExperimentIdentityInput> = {}): TrialSetExperimentIdentityInput {
   return {
+    repositoryCommit: "commit-a",
     corpusId: "test-corpus-v0",
     corpusHash: "a".repeat(64),
     tasks: [{ taskId: "postgres-historical-001", partition: "TRAIN" }],
     profiles: [{ profileId: "baseline", profileHash: computeProfileHash("baseline-content") }],
     trialsPerCell: 1,
-    agentImage: "honeyrail-postgres-research-agent-dsh:latest",
+    agentImage: fakeImageIdentity(),
+    agentTimeoutMs: 20 * 60_000,
+    sessionTimeoutMs: 30 * 60_000,
     isolationPolicy: { restrictedEgress: true, upstreamUrl: "https://api.deepseek.com" },
     runnerVersion: HISTORICAL_PG_TRIALSET_RUNNER_VERSION,
     ...overrides
   };
+}
+
+function fakeManifest(identityOverrides: Partial<TrialSetExperimentIdentityInput> = {}, createdAt?: string) {
+  const profiles: TrialSetProfileSpec[] = [{ profileId: "baseline", sourcePath: "/a.yml", content: "baseline-content", profileHash: computeProfileHash("baseline-content") }];
+  return buildExperimentManifest({ identity: baseIdentity(identityOverrides), profiles, dshVersion: "0.1.0-rc.7", modelProvider: "api.deepseek.com", modelVersion: "unknown", createdAt });
 }
 
 function fakePilotResult(overrides: Partial<HistoricalPostgresPilotResult> & Pick<HistoricalPostgresPilotResult, "datasetEligible" | "officialScoredResult" | "status">): HistoricalPostgresPilotResult {
@@ -158,11 +183,28 @@ test("computeExperimentId: a corpus hash change changes the experiment id", () =
   assert.notEqual(idA, idB);
 });
 
-test("computeExperimentId: trialsPerCell / agentImage / isolationPolicy changes each change the experiment id", () => {
+test("computeExperimentId: trialsPerCell / isolationPolicy changes each change the experiment id", () => {
   const idA = computeExperimentId(baseIdentity());
   assert.notEqual(idA, computeExperimentId(baseIdentity({ trialsPerCell: 2 })));
-  assert.notEqual(idA, computeExperimentId(baseIdentity({ agentImage: "some-other-image:latest" })));
   assert.notEqual(idA, computeExperimentId(baseIdentity({ isolationPolicy: { restrictedEgress: false, network: "bridge" } })));
+});
+
+test("computeExperimentId: repositoryCommit change changes the experiment id (PR #208 review, Blocking 1c)", () => {
+  const idA = computeExperimentId(baseIdentity({ repositoryCommit: "commit-a" }));
+  const idB = computeExperimentId(baseIdentity({ repositoryCommit: "commit-b" }));
+  assert.notEqual(idA, idB);
+});
+
+test("computeExperimentId: agentTimeoutMs / sessionTimeoutMs changes each change the experiment id (PR #208 review, Blocking 1)", () => {
+  const idA = computeExperimentId(baseIdentity());
+  assert.notEqual(idA, computeExperimentId(baseIdentity({ agentTimeoutMs: 60 * 60_000 })));
+  assert.notEqual(idA, computeExperimentId(baseIdentity({ sessionTimeoutMs: 90 * 60_000 })));
+});
+
+test("computeExperimentId: same image reference but a different resolved image id changes the experiment id (PR #208 review, Blocking 1b)", () => {
+  const idA = computeExperimentId(baseIdentity({ agentImage: fakeImageIdentity({ id: `sha256:${"1".repeat(64)}` }) }));
+  const idB = computeExperimentId(baseIdentity({ agentImage: fakeImageIdentity({ id: `sha256:${"2".repeat(64)}` }) }));
+  assert.notEqual(idA, idB);
 });
 
 test("computeExperimentId: task/profile array order does not change the experiment id (order-independent identity)", () => {
@@ -175,33 +217,68 @@ test("computeExperimentId: task/profile array order does not change the experime
   assert.equal(idA, idB);
 });
 
-test("buildExperimentManifest: never carries a mirror path, reproducer path, or private truth field", () => {
-  const profiles: TrialSetProfileSpec[] = [{ profileId: "baseline", sourcePath: "/tmp/whatever.yml", content: "baseline-content", profileHash: computeProfileHash("baseline-content") }];
-  const manifest = buildExperimentManifest({ identity: baseIdentity(), repositoryCommit: "deadbeef", profiles });
+test("buildExperimentManifest: never carries a mirror path, reproducer path, or private truth field; unknown-but-present dshVersion/modelProvider/modelVersion are recorded, not omitted", () => {
+  const manifest = fakeManifest();
   const serialized = JSON.stringify(manifest).toLowerCase();
   for (const forbidden of ["mirror", "reproducer", "private_truth", "privatetruth", "upstreambug", "commitfest"]) {
     assert.equal(serialized.includes(forbidden), false, `manifest must never mention "${forbidden}"`);
   }
   assert.equal(manifest.experimentId, computeExperimentId(baseIdentity()));
+  assert.equal(manifest.dshVersion, "0.1.0-rc.7");
+  assert.equal(manifest.modelProvider, "api.deepseek.com");
+  assert.equal(manifest.modelVersion, "unknown");
+});
+
+test("deriveModelProviderFromUpstreamUrl: extracts the observable hostname; falls back to 'unknown' rather than guessing", () => {
+  assert.equal(deriveModelProviderFromUpstreamUrl("https://api.deepseek.com"), "api.deepseek.com");
+  assert.equal(deriveModelProviderFromUpstreamUrl(undefined), "unknown");
+  assert.equal(deriveModelProviderFromUpstreamUrl("not a url"), "unknown");
 });
 
 // ---------------------------------------------------------------------------
-// Resume
+// Resume: experiment identity
 // ---------------------------------------------------------------------------
 
-test("assertCompatibleExperimentManifest: identical identity resumes even when createdAt/repositoryCommit differ", () => {
-  const profiles: TrialSetProfileSpec[] = [{ profileId: "baseline", sourcePath: "/a.yml", content: "baseline-content", profileHash: computeProfileHash("baseline-content") }];
-  const existing = buildExperimentManifest({ identity: baseIdentity(), repositoryCommit: "commit-a", profiles, createdAt: "2026-01-01T00:00:00.000Z" });
-  const current = buildExperimentManifest({ identity: baseIdentity(), repositoryCommit: "commit-b", profiles, createdAt: "2026-02-02T00:00:00.000Z" });
+test("assertCompatibleExperimentManifest: identical identity resumes even when createdAt/dshVersion differ", () => {
+  const existing = fakeManifest({}, "2026-01-01T00:00:00.000Z");
+  const current = buildExperimentManifest({
+    identity: baseIdentity(),
+    profiles: [{ profileId: "baseline", sourcePath: "/a.yml", content: "baseline-content", profileHash: computeProfileHash("baseline-content") }],
+    dshVersion: "0.1.0-rc.9",
+    modelProvider: "api.deepseek.com",
+    modelVersion: "unknown",
+    createdAt: "2026-02-02T00:00:00.000Z"
+  });
   assert.doesNotThrow(() => assertCompatibleExperimentManifest(existing, current));
 });
 
 test("assertCompatibleExperimentManifest: a changed identity-relevant input fails closed rather than silently resuming", () => {
-  const profiles: TrialSetProfileSpec[] = [{ profileId: "baseline", sourcePath: "/a.yml", content: "baseline-content", profileHash: computeProfileHash("baseline-content") }];
-  const existing = buildExperimentManifest({ identity: baseIdentity(), repositoryCommit: "commit-a", profiles });
-  const current = buildExperimentManifest({ identity: baseIdentity({ trialsPerCell: 3 }), repositoryCommit: "commit-a", profiles });
+  const existing = fakeManifest();
+  const current = fakeManifest({ trialsPerCell: 3 });
   assert.throws(() => assertCompatibleExperimentManifest(existing, current), TrialSetExperimentIdentityMismatchError);
 });
+
+test("assertCompatibleExperimentManifest: a repositoryCommit change rejects resume (PR #208 review, Blocking 1c)", () => {
+  const existing = fakeManifest({ repositoryCommit: "commit-a" });
+  const current = fakeManifest({ repositoryCommit: "commit-b" });
+  assert.throws(() => assertCompatibleExperimentManifest(existing, current), TrialSetExperimentIdentityMismatchError);
+});
+
+test("assertCompatibleExperimentManifest: a resolved agent image id change rejects resume even under the same tag (PR #208 review, Blocking 1b)", () => {
+  const existing = fakeManifest({ agentImage: fakeImageIdentity({ id: `sha256:${"1".repeat(64)}` }) });
+  const current = fakeManifest({ agentImage: fakeImageIdentity({ id: `sha256:${"2".repeat(64)}` }) });
+  assert.throws(() => assertCompatibleExperimentManifest(existing, current), TrialSetExperimentIdentityMismatchError);
+});
+
+test("assertCompatibleExperimentManifest: an agentTimeoutMs change rejects resume (PR #208 review, Blocking 1)", () => {
+  const existing = fakeManifest({ agentTimeoutMs: 20 * 60_000 });
+  const current = fakeManifest({ agentTimeoutMs: 60 * 60_000 });
+  assert.throws(() => assertCompatibleExperimentManifest(existing, current), TrialSetExperimentIdentityMismatchError);
+});
+
+// ---------------------------------------------------------------------------
+// Resume: pending-cell selection
+// ---------------------------------------------------------------------------
 
 test("selectPendingCells: a completed cell is not re-planned as pending", () => {
   const cells = planTrialSetCells({ tasks: [{ taskId: "postgres-historical-001", partition: "TRAIN" }], profiles: [{ profileId: "baseline", profileHash: "bb" }], trialsPerCell: 2 });
@@ -242,10 +319,118 @@ test("loadTrialSetState: a corrupted/incompatible state.json fails clearly rathe
 });
 
 // ---------------------------------------------------------------------------
+// Resume: state bound strongly to the experiment (PR #208 review, Blocking 2)
+// ---------------------------------------------------------------------------
+
+test("assertTrialSetStateMatchesPlan: a valid state (matching manifest and plan) passes", () => {
+  const manifest = fakeManifest();
+  const plannedCells = planTrialSetCells({ tasks: manifest.tasks, profiles: manifest.profiles, trialsPerCell: manifest.trialsPerCell });
+  const state = emptyTrialSetState(manifest.experimentId);
+  state.cells[plannedCells[0].cellId] = buildTrialSetCellRecord({
+    experimentId: manifest.experimentId,
+    identity: plannedCells[0],
+    artifactDir: "/tmp/x",
+    pilot: fakePilotResult({ datasetEligible: true, officialScoredResult: "miss", status: "completed" })
+  });
+  assert.doesNotThrow(() => assertTrialSetStateMatchesPlan({ state, manifest, plannedCells }));
+});
+
+test("assertTrialSetStateMatchesPlan: state.experimentId mismatch is rejected", () => {
+  const manifest = fakeManifest();
+  const plannedCells = planTrialSetCells({ tasks: manifest.tasks, profiles: manifest.profiles, trialsPerCell: manifest.trialsPerCell });
+  const state = emptyTrialSetState("some-other-experiment-id");
+  assert.throws(() => assertTrialSetStateMatchesPlan({ state, manifest, plannedCells }), TrialSetStateValidationError);
+});
+
+test("assertTrialSetStateMatchesPlan: record.experimentId mismatch is rejected", () => {
+  const manifest = fakeManifest();
+  const plannedCells = planTrialSetCells({ tasks: manifest.tasks, profiles: manifest.profiles, trialsPerCell: manifest.trialsPerCell });
+  const state = emptyTrialSetState(manifest.experimentId);
+  state.cells[plannedCells[0].cellId] = buildTrialSetCellRecord({
+    experimentId: "a-different-experiment-id",
+    identity: plannedCells[0],
+    artifactDir: "/tmp/x",
+    pilot: fakePilotResult({ datasetEligible: true, officialScoredResult: "miss", status: "completed" })
+  });
+  assert.throws(() => assertTrialSetStateMatchesPlan({ state, manifest, plannedCells }), TrialSetStateValidationError);
+});
+
+test("assertTrialSetStateMatchesPlan: a state key that disagrees with its own record.cellId is rejected", () => {
+  const manifest = fakeManifest();
+  const plannedCells = planTrialSetCells({ tasks: manifest.tasks, profiles: manifest.profiles, trialsPerCell: manifest.trialsPerCell });
+  const state = emptyTrialSetState(manifest.experimentId);
+  const goodRecord = buildTrialSetCellRecord({
+    experimentId: manifest.experimentId,
+    identity: plannedCells[0],
+    artifactDir: "/tmp/x",
+    pilot: fakePilotResult({ datasetEligible: true, officialScoredResult: "miss", status: "completed" })
+  });
+  state.cells["some-other-key"] = goodRecord;
+  assert.throws(() => assertTrialSetStateMatchesPlan({ state, manifest, plannedCells }), TrialSetStateValidationError);
+});
+
+test("assertTrialSetStateMatchesPlan: an unknown state cell (not among planned cells) is rejected", () => {
+  const manifest = fakeManifest();
+  const plannedCells = planTrialSetCells({ tasks: manifest.tasks, profiles: manifest.profiles, trialsPerCell: manifest.trialsPerCell });
+  const state = emptyTrialSetState(manifest.experimentId);
+  const bogusIdentity = { cellId: "postgres-historical-001__unknown-profile__trial-1", taskId: "postgres-historical-001", partition: "TRAIN" as const, profileId: "unknown-profile", profileHash: "zz", trialIndex: 1 };
+  state.cells[bogusIdentity.cellId] = buildTrialSetCellRecord({
+    experimentId: manifest.experimentId,
+    identity: bogusIdentity,
+    artifactDir: "/tmp/x",
+    pilot: fakePilotResult({ datasetEligible: true, officialScoredResult: "miss", status: "completed" })
+  });
+  assert.throws(() => assertTrialSetStateMatchesPlan({ state, manifest, plannedCells }), TrialSetStateValidationError);
+});
+
+test("assertTrialSetStateMatchesPlan: taskId/partition mismatch against the plan is rejected", () => {
+  const manifest = fakeManifest();
+  const plannedCells = planTrialSetCells({ tasks: manifest.tasks, profiles: manifest.profiles, trialsPerCell: manifest.trialsPerCell });
+  const state = emptyTrialSetState(manifest.experimentId);
+  const tampered = { ...plannedCells[0], taskId: "postgres-historical-002", partition: "FRONTIER" as const };
+  state.cells[plannedCells[0].cellId] = buildTrialSetCellRecord({
+    experimentId: manifest.experimentId,
+    identity: tampered,
+    artifactDir: "/tmp/x",
+    pilot: fakePilotResult({ datasetEligible: true, officialScoredResult: "miss", status: "completed" })
+  });
+  assert.throws(() => assertTrialSetStateMatchesPlan({ state, manifest, plannedCells }), TrialSetStateValidationError);
+});
+
+test("assertTrialSetStateMatchesPlan: profileId/profileHash mismatch against the plan is rejected", () => {
+  const manifest = fakeManifest();
+  const plannedCells = planTrialSetCells({ tasks: manifest.tasks, profiles: manifest.profiles, trialsPerCell: manifest.trialsPerCell });
+  const state = emptyTrialSetState(manifest.experimentId);
+  const tampered = { ...plannedCells[0], profileHash: "not-the-real-hash" };
+  state.cells[plannedCells[0].cellId] = buildTrialSetCellRecord({
+    experimentId: manifest.experimentId,
+    identity: tampered,
+    artifactDir: "/tmp/x",
+    pilot: fakePilotResult({ datasetEligible: true, officialScoredResult: "miss", status: "completed" })
+  });
+  assert.throws(() => assertTrialSetStateMatchesPlan({ state, manifest, plannedCells }), TrialSetStateValidationError);
+});
+
+test("assertTrialSetStateMatchesPlan: trialIndex mismatch against the plan is rejected", () => {
+  const manifest = fakeManifest({ trialsPerCell: 2 });
+  const plannedCells = planTrialSetCells({ tasks: manifest.tasks, profiles: manifest.profiles, trialsPerCell: manifest.trialsPerCell });
+  const state = emptyTrialSetState(manifest.experimentId);
+  const firstCellKey = plannedCells[0].cellId;
+  const tampered = { ...plannedCells[0], trialIndex: 2 };
+  state.cells[firstCellKey] = buildTrialSetCellRecord({
+    experimentId: manifest.experimentId,
+    identity: tampered,
+    artifactDir: "/tmp/x",
+    pilot: fakePilotResult({ datasetEligible: true, officialScoredResult: "miss", status: "completed" })
+  });
+  assert.throws(() => assertTrialSetStateMatchesPlan({ state, manifest, plannedCells }), TrialSetStateValidationError);
+});
+
+// ---------------------------------------------------------------------------
 // executeTrialSetCell wiring (injected pilot boundary - never a real docker/dsh call)
 // ---------------------------------------------------------------------------
 
-test("executeTrialSetCell: calls runHistoricalPostgresPilotTrial exactly once with profileKind 'agent' and returns a traceable record", async () => {
+test("executeTrialSetCell: calls runHistoricalPostgresPilotTrial exactly once with profileKind 'agent' and records the exact per-pilot artifact directory", async () => {
   let capturedInput: unknown;
   const fakeRunPilotTrial = (async (input: unknown) => {
     capturedInput = input;
@@ -259,9 +444,9 @@ test("executeTrialSetCell: calls runHistoricalPostgresPilotTrial exactly once wi
     corpusManifest: fakeCorpusManifest(),
     taskSpec: { taskId: "postgres-historical-001" } as never,
     profile: { profileId: "baseline", sourcePath: "/a.yml", content: "profile-body", profileHash: "bb" },
-    artifactDir: "/tmp/whatever",
+    cellArtifactRoot: "/tmp/whatever",
     apiKey: "fake-key",
-    agentImage: "honeyrail-postgres-research-agent-dsh:latest",
+    agentImageReference: "honeyrail-postgres-research-agent-dsh:latest",
     upstreamUrl: "https://api.deepseek.com",
     agentTimeoutMs: 1000,
     sessionTimeoutMs: 2000,
@@ -271,12 +456,15 @@ test("executeTrialSetCell: calls runHistoricalPostgresPilotTrial exactly once wi
   assert.equal(record.pilotId, "pilot-xyz");
   assert.equal(record.taskId, "postgres-historical-001");
   assert.equal(record.profileId, "baseline");
-  assert.equal(record.artifactDir, "/tmp/whatever");
+  // PR #208 review, small correctness fix: the exact nested pilot directory,
+  // not the parent cell root.
+  assert.equal(record.artifactDir, join("/tmp/whatever", "pilot-xyz"));
   assert.equal(record.datasetEligible, true);
   assert.equal(record.officialScoredResult, "miss");
 
-  const input = capturedInput as { profileKind: string; agent: { command: string; args: string[]; env: Record<string, string> } };
+  const input = capturedInput as { profileKind: string; agent: { command: string; args: string[]; env: Record<string, string> }; artifactDir: string };
   assert.equal(input.profileKind, "agent");
+  assert.equal(input.artifactDir, "/tmp/whatever");
   assert.equal(input.agent.command, "sh");
   assert.equal(input.agent.env.HR_TRIALSET_PROFILE_CONTENT, "profile-body");
   assert.equal(input.agent.env.DEEPSEEK_API_KEY, "fake-key");
@@ -360,8 +548,7 @@ test("buildTrialSetCellRecord: every field needed for evidence traceability is p
 });
 
 test("buildHistoricalPgTrialSetReport: every cell row carries pilotId and artifactDir, and the denominator note names the authoritative fields", () => {
-  const profiles: TrialSetProfileSpec[] = [{ profileId: "baseline", sourcePath: "/a.yml", content: "x", profileHash: "bb" }];
-  const manifest = buildExperimentManifest({ identity: baseIdentity(), repositoryCommit: "deadbeef", profiles });
+  const manifest = fakeManifest();
   const records = [record({ cellId: "c1", pilotId: "pilot-1", artifactDir: "/artifacts/c1" })];
   const report = buildHistoricalPgTrialSetReport({ manifest, records });
   assert.match(report, /datasetEligible/);

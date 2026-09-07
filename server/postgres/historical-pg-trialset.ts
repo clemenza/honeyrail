@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { nowIso } from "../utils.js";
+import { nowIso, runCommandSafe } from "../utils.js";
 import { canonicalize, stableJson, type HistoricalPostgresGradeStatus, type HistoricalPostgresGradingPath, type HistoricalPostgresTaskSpec } from "./historical-task.js";
 import type { HistoricalPostgresCorpusManifest, HistoricalPostgresCorpusPartition } from "./historical-corpus.js";
+import { resolveResearchAgentImageIdentity, type ResearchAgentImageIdentity } from "./agent-container.js";
+import type { RunCommand } from "./runtime.js";
 import {
   runHistoricalPostgresPilotTrial,
   sanitizeHistoricalPostgresPilotEvidence,
@@ -92,14 +94,28 @@ export function resolveTrialSetTaskSelection(corpusManifest: HistoricalPostgresC
 // Experiment identity / manifest
 // ---------------------------------------------------------------------------
 
-/** Exactly the fields that define "the same experiment" for resume purposes. Deliberately excludes createdAt/repositoryCommit/sourcePath - administrative provenance that legitimately differs across a resumed run without changing what is being measured. */
+/**
+ * Exactly the fields that define "the same experiment" for resume purposes.
+ * Deliberately excludes createdAt/sourcePath - pure administrative
+ * provenance that never changes what is being measured. `repositoryCommit`,
+ * `agentTimeoutMs`/`sessionTimeoutMs`, and `agentImage` (the *resolved*
+ * content identity, never a mutable tag) are deliberately included (PR #208
+ * review, Blockings 1/1b/1c): runner/pilot/research-session behavior can
+ * change across commits, a paired baseline/candidate comparison run under
+ * different budgets is not a valid comparison, and a mutable `:latest` tag
+ * can silently repoint between cells.
+ */
 export type TrialSetExperimentIdentityInput = {
+  repositoryCommit: string;
   corpusId: string;
   corpusHash: string;
   tasks: TrialSetTaskSelection[];
   profiles: Array<{ profileId: string; profileHash: string }>;
   trialsPerCell: number;
-  agentImage: string;
+  /** The resolved image identity Docker reported before execution - not the mutable reference/tag alone. See resolveResearchAgentImageIdentity(). */
+  agentImage: ResearchAgentImageIdentity;
+  agentTimeoutMs: number;
+  sessionTimeoutMs: number;
   isolationPolicy: { restrictedEgress: boolean; upstreamUrl?: string; network?: string };
   runnerVersion: string;
 };
@@ -112,7 +128,7 @@ function normalizedIdentityInput(input: TrialSetExperimentIdentityInput): TrialS
   };
 }
 
-/** Content-addressed: identical inputs always produce the identical experimentId, and any identity-relevant change (profile content, corpus hash, budget/model/trial definition) changes it. */
+/** Content-addressed: identical inputs always produce the identical experimentId, and any identity-relevant change (profile content, corpus hash, budget/model/trial definition, resolved agent image, repository commit) changes it. */
 export function computeExperimentId(input: TrialSetExperimentIdentityInput): string {
   return createHash("sha256").update(stableJson(canonicalize(normalizedIdentityInput(input)))).digest("hex");
 }
@@ -121,14 +137,19 @@ export type TrialSetExperimentManifest = TrialSetExperimentIdentityInput & {
   schemaVersion: 1;
   experimentId: string;
   createdAt: string;
-  repositoryCommit: string;
   profileSources: Array<{ profileId: string; profileHash: string; sourcePath: string }>;
+  /** Observable provenance only (PR #208 review, Blocking 1d) - never identity-relevant, so a mid-experiment DSH point-release does not itself invalidate resume. "unknown" when not reliably discoverable, never silently omitted. */
+  dshVersion: string;
+  modelProvider: string;
+  modelVersion: string;
 };
 
 export function buildExperimentManifest(input: {
   identity: TrialSetExperimentIdentityInput;
-  repositoryCommit: string;
   profiles: readonly TrialSetProfileSpec[];
+  dshVersion: string;
+  modelProvider: string;
+  modelVersion: string;
   createdAt?: string;
 }): TrialSetExperimentManifest {
   return {
@@ -136,10 +157,32 @@ export function buildExperimentManifest(input: {
     schemaVersion: 1,
     experimentId: computeExperimentId(input.identity),
     createdAt: input.createdAt ?? nowIso(),
-    repositoryCommit: input.repositoryCommit,
-    profileSources: input.profiles.map((profile) => ({ profileId: profile.profileId, profileHash: profile.profileHash, sourcePath: profile.sourcePath }))
+    profileSources: input.profiles.map((profile) => ({ profileId: profile.profileId, profileHash: profile.profileHash, sourcePath: profile.sourcePath })),
+    dshVersion: input.dshVersion,
+    modelProvider: input.modelProvider,
+    modelVersion: input.modelVersion
   };
 }
+
+/** Cheap, docker-independent, no guessing: the literal upstream hostname the agent's model traffic is restricted to. "unknown" only if the URL itself is unparseable. */
+export function deriveModelProviderFromUpstreamUrl(upstreamUrl: string | undefined): string {
+  if (!upstreamUrl) return "unknown";
+  try {
+    return new URL(upstreamUrl).hostname || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+/** One `docker run --rm <image> dsh --version` - the same fingerprinting technique scripts/dsh-evals-demo.ts already uses. "unknown" on any failure (image missing dsh, docker unavailable) rather than throwing - this is provenance, not a precondition for executing cells. */
+export async function fingerprintDshVersion(agentImageReference: string, runCommand: RunCommand = runCommandSafe): Promise<string> {
+  const result = await runCommand("docker", ["run", "--rm", agentImageReference, "dsh", "--version"]);
+  const version = result.ok ? result.stdout.trim() : "";
+  return version || "unknown";
+}
+
+/** Resolves the agent image's real content identity before experiment execution (PR #208 review, Blocking 1b) - thin re-export so callers need only import from this module. */
+export const resolveTrialSetAgentImageIdentity = resolveResearchAgentImageIdentity;
 
 export class TrialSetExperimentIdentityMismatchError extends Error {
   constructor(message: string) {
@@ -154,8 +197,8 @@ export function assertCompatibleExperimentManifest(existing: TrialSetExperimentM
     throw new TrialSetExperimentIdentityMismatchError(
       `The existing experiment at this --out directory is "${existing.experimentId}" (created ${existing.createdAt}), but the current ` +
         `configuration resolves to a different experiment "${current.experimentId}". Refusing to resume with mismatched identity - ` +
-        "a profile, corpus, task selection, trial count, agent image, or isolation policy changed. Use a different --out directory, " +
-        "or restore the exact original inputs."
+        "a profile, corpus, task selection, trial count, timeout/budget, repository commit, resolved agent image, or isolation policy " +
+        "changed. Use a different --out directory, or restore the exact original inputs."
     );
   }
 }
@@ -341,9 +384,11 @@ export type ExecuteTrialSetCellInput = {
   corpusManifest: HistoricalPostgresCorpusManifest;
   taskSpec: HistoricalPostgresTaskSpec;
   profile: TrialSetProfileSpec;
-  artifactDir: string;
+  /** The cell's own artifact root (`.../trials/<task>/<profile>/trial-N`) - `runHistoricalPostgresPilotTrial()` nests its own `<pilotId>/` evidence under this; see buildTrialSetCellRecord's caller below for why the *record* stores the nested path, not this root. */
+  cellArtifactRoot: string;
   apiKey: string;
-  agentImage: string;
+  /** The mutable reference actually passed to `docker run` - identity/resume compatibility is decided from the separately-resolved ResearchAgentImageIdentity, not this string. */
+  agentImageReference: string;
   upstreamUrl: string;
   agentTimeoutMs: number;
   sessionTimeoutMs: number;
@@ -352,7 +397,7 @@ export type ExecuteTrialSetCellInput = {
 };
 
 export async function executeTrialSetCell(input: ExecuteTrialSetCellInput): Promise<TrialSetCellRecord> {
-  await mkdir(input.artifactDir, { recursive: true });
+  await mkdir(input.cellArtifactRoot, { recursive: true });
   const runPilotTrial = input.runPilotTrial ?? runHistoricalPostgresPilotTrial;
   const { command, args } = buildDshAgentCommand();
   const pilot = await runPilotTrial({
@@ -371,16 +416,23 @@ export async function executeTrialSetCell(input: ExecuteTrialSetCellInput): Prom
       },
       timeoutMs: input.agentTimeoutMs
     },
-    artifactDir: input.artifactDir,
+    artifactDir: input.cellArtifactRoot,
     session: {
       isolation: {
-        image: input.agentImage,
+        image: input.agentImageReference,
         restrictedEgress: { upstreamUrl: input.upstreamUrl }
       },
       timeoutMs: input.sessionTimeoutMs
     }
   });
-  return buildTrialSetCellRecord({ experimentId: input.experimentId, identity: input.identity, artifactDir: input.artifactDir, pilot });
+  // PR #208 review, small correctness fix: runHistoricalPostgresPilotTrial()
+  // nests every artifact this pilot attempt wrote under
+  // `<cellArtifactRoot>/<pilotId>/` (see its own "pilotId is resolved before
+  // the artifact root is created" docstring) - the *cell* root is not itself
+  // where the evidence lives, so the record must point at the exact nested
+  // directory, not its parent.
+  const pilotArtifactDir = join(input.cellArtifactRoot, pilot.pilotId);
+  return buildTrialSetCellRecord({ experimentId: input.experimentId, identity: input.identity, artifactDir: pilotArtifactDir, pilot });
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +486,65 @@ export async function writeTrialSetStateAtomic(statePath: string, state: TrialSe
   const tmpPath = `${statePath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   await writeFile(tmpPath, `${JSON.stringify(state, null, 2)}\n`);
   await rename(tmpPath, statePath);
+}
+
+export class TrialSetStateValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TrialSetStateValidationError";
+  }
+}
+
+/**
+ * Binds `state.json` strongly to the experiment it claims to belong to (PR
+ * #208 review, Blocking 2) - `loadTrialSetState()` only checks rough JSON
+ * shape, not that the state actually matches *this* manifest and *this*
+ * planned matrix. Used identically for normal resume and `--report-only`, so
+ * neither path can silently trust stale or hand-edited state.
+ *
+ * Every stored cell must agree with the manifest's own experimentId and with
+ * its corresponding planned cell on task/partition/profile/profileHash/
+ * trialIndex - a record present under an unplanned cellId, or one whose own
+ * identity fields disagree with the plan, is rejected outright rather than
+ * silently dropped or reinterpreted.
+ */
+export function assertTrialSetStateMatchesPlan(input: {
+  state: TrialSetState;
+  manifest: TrialSetExperimentManifest;
+  plannedCells: readonly TrialSetCellIdentity[];
+}): void {
+  const { state, manifest, plannedCells } = input;
+  if (state.experimentId !== manifest.experimentId) {
+    throw new TrialSetStateValidationError(
+      `state.json experimentId "${state.experimentId}" does not match the experiment manifest's "${manifest.experimentId}" - refusing to reuse mismatched state.`
+    );
+  }
+  const plannedById = new Map(plannedCells.map((cell) => [cell.cellId, cell]));
+  for (const [key, record] of Object.entries(state.cells)) {
+    if (key !== record.cellId) {
+      throw new TrialSetStateValidationError(`state.json cell key "${key}" does not match its own record.cellId "${record.cellId}".`);
+    }
+    if (record.experimentId !== manifest.experimentId) {
+      throw new TrialSetStateValidationError(`state.json cell "${key}" has experimentId "${record.experimentId}", expected "${manifest.experimentId}".`);
+    }
+    const planned = plannedById.get(key);
+    if (!planned) {
+      throw new TrialSetStateValidationError(`state.json cell "${key}" is not among the currently planned cells for this experiment - refusing to reuse unknown state.`);
+    }
+    if (record.taskId !== planned.taskId || record.partition !== planned.partition) {
+      throw new TrialSetStateValidationError(
+        `state.json cell "${key}" recorded taskId/partition "${record.taskId}/${record.partition}", but the plan expects "${planned.taskId}/${planned.partition}".`
+      );
+    }
+    if (record.profileId !== planned.profileId || record.profileHash !== planned.profileHash) {
+      throw new TrialSetStateValidationError(
+        `state.json cell "${key}" recorded profileId/profileHash "${record.profileId}/${record.profileHash}", but the plan expects "${planned.profileId}/${planned.profileHash}".`
+      );
+    }
+    if (record.trialIndex !== planned.trialIndex) {
+      throw new TrialSetStateValidationError(`state.json cell "${key}" recorded trialIndex ${record.trialIndex}, but the plan expects ${planned.trialIndex}.`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -505,7 +616,9 @@ export function buildHistoricalPgTrialSetReport(input: { manifest: TrialSetExper
   lines.push(`Experiment: \`${manifest.experimentId}\` (created ${manifest.createdAt}, runner ${manifest.runnerVersion})`);
   lines.push(`Repository commit: \`${manifest.repositoryCommit}\``);
   lines.push(`Corpus: \`${manifest.corpusId}\` @ \`${manifest.corpusHash}\``);
-  lines.push(`Agent image: \`${manifest.agentImage}\``);
+  lines.push(`Agent image: \`${manifest.agentImage.reference}\` (resolved id \`${manifest.agentImage.id}\`)`);
+  lines.push(`DSH version: \`${manifest.dshVersion}\` | Model provider: \`${manifest.modelProvider}\` | Model version: \`${manifest.modelVersion}\``);
+  lines.push(`Agent timeout: ${Math.round(manifest.agentTimeoutMs / 60_000)}m | Session timeout: ${Math.round(manifest.sessionTimeoutMs / 60_000)}m`);
   lines.push(
     `Isolation: ${manifest.isolationPolicy.restrictedEgress ? `restricted-egress (upstream \`${manifest.isolationPolicy.upstreamUrl}\`)` : `network=${manifest.isolationPolicy.network ?? "none"}`}`
   );

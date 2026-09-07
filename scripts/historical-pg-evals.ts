@@ -34,28 +34,27 @@
  *   --profiles <id=path,...>       DSH cordis.patch.yml profiles, arbitrary ids/files (required unless --report-only)
  *   --trials <n>                   Trials per cell (default 1)
  *   --out <dir>                    Output directory for experiment-manifest.json/state.json/trials/comparison-report.md
- *   --dry-run                      Plan and validate the matrix; invoke no agent/model
+ *   --dry-run                      Plan and validate the matrix; invoke no agent/model (still resolves the agent image's
+ *                                  content identity via `docker image inspect` - an identity check, not an agent/model call)
  *   --report-only                  Skip execution; rebuild comparison-report.md from the existing state.json
  *   --smoke                        Trials=1, and if --tasks was not given, restricts the default selection to TRAIN partition tasks only
- *   --agent-image <ref>            DSH-installed research-agent image (default honeyrail-postgres-research-agent-dsh:latest)
+ *   --agent-image <ref>            DSH-installed research-agent image reference (default honeyrail-postgres-research-agent-dsh:latest) -
+ *                                  resolved to its content identity before execution; see Blocking 1b in PR #208's review.
  *   --upstream-url <url>           Restricted-egress upstream (default https://api.deepseek.com)
  *   --agent-timeout-minutes <n>    Per-cell agent wall clock (default 20)
  *
  * Real (non-dry-run, non-report-only) cells require DEEPSEEK_API_KEY in the
  * launching environment, plus whichever of HONEYRAIL_PG_184_MIRROR/
  * HONEYRAIL_PG_200_MIRROR+REPRODUCER/HONEYRAIL_PG_199_MIRROR+REPRODUCER+PRIVATE_TRUTH
- * the selected task IDs need - same env vars scripts/historical-postgres-180-pilot.ts
- * already uses, so the two drivers can share a launch environment.
+ * the selected task IDs need - the same env vars
+ * scripts/historical-postgres-180-pilot.ts already uses (both share
+ * server/postgres/historical-postgres-task-env.ts's resolver), so the two
+ * drivers can share a launch environment.
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import {
-  historicalPostgres001TaskSpec,
-  historicalPostgres002TaskSpec,
-  historicalPostgres003TaskSpec,
-  loadHistoricalPostgres003PrivateTruth,
-  type HistoricalPostgresTaskSpec
-} from "../server/postgres/historical-task.js";
+import { resolveHistoricalPostgresTaskSpecFromEnv } from "../server/postgres/historical-postgres-task-env.js";
+import type { HistoricalPostgresTaskSpec } from "../server/postgres/historical-task.js";
 import type { HistoricalPostgresCorpusManifest } from "../server/postgres/historical-corpus.js";
 import { runCommandSafe } from "../server/utils.js";
 import {
@@ -63,15 +62,19 @@ import {
   HISTORICAL_PG_TRIALSET_DEFAULT_UPSTREAM_URL,
   HISTORICAL_PG_TRIALSET_RUNNER_VERSION,
   assertCompatibleExperimentManifest,
+  assertTrialSetStateMatchesPlan,
   assertUniqueProfileIds,
   buildExperimentManifest,
   buildHistoricalPgTrialSetReport,
   defaultTaskIdSelection,
+  deriveModelProviderFromUpstreamUrl,
   emptyTrialSetState,
   executeTrialSetCell,
+  fingerprintDshVersion,
   loadTrialSetProfile,
   loadTrialSetState,
   planTrialSetCells,
+  resolveTrialSetAgentImageIdentity,
   resolveTrialSetTaskSelection,
   selectPendingCells,
   writeTrialSetStateAtomic,
@@ -142,32 +145,6 @@ function parseArgs(argv: string[]): CliOptions {
   return options;
 }
 
-async function resolveTaskSpec(taskId: string): Promise<HistoricalPostgresTaskSpec> {
-  if (taskId === "postgres-historical-001") {
-    const mirror = String(process.env.HONEYRAIL_PG_184_MIRROR || "").trim();
-    if (!mirror) throw new Error("Set HONEYRAIL_PG_184_MIRROR to the local PostgreSQL mirror for postgres-historical-001.");
-    const knownReproducer = String(process.env.HONEYRAIL_PG_184_REPRODUCER || "").trim();
-    return historicalPostgres001TaskSpec(resolve(mirror), knownReproducer ? resolve(knownReproducer) : undefined);
-  }
-  if (taskId === "postgres-historical-002") {
-    const mirror = String(process.env.HONEYRAIL_PG_200_MIRROR || "").trim();
-    const knownReproducer = String(process.env.HONEYRAIL_PG_200_REPRODUCER || "").trim();
-    if (!mirror || !knownReproducer) throw new Error("Set HONEYRAIL_PG_200_MIRROR and HONEYRAIL_PG_200_REPRODUCER for postgres-historical-002.");
-    return historicalPostgres002TaskSpec(resolve(mirror), resolve(knownReproducer));
-  }
-  if (taskId === "postgres-historical-003") {
-    const mirror = String(process.env.HONEYRAIL_PG_199_MIRROR || "").trim();
-    const knownReproducer = String(process.env.HONEYRAIL_PG_199_REPRODUCER || "").trim();
-    const privateTruthPath = String(process.env.HONEYRAIL_PG_199_PRIVATE_TRUTH || "").trim();
-    if (!mirror || !knownReproducer || !privateTruthPath) {
-      throw new Error("Set HONEYRAIL_PG_199_MIRROR, HONEYRAIL_PG_199_REPRODUCER, and HONEYRAIL_PG_199_PRIVATE_TRUTH for postgres-historical-003.");
-    }
-    const privateTruth = await loadHistoricalPostgres003PrivateTruth(privateTruthPath);
-    return historicalPostgres003TaskSpec(resolve(mirror), privateTruth, resolve(knownReproducer));
-  }
-  throw new Error(`No task-spec resolver registered for taskId "${taskId}".`);
-}
-
 async function resolveRepositoryCommit(): Promise<string> {
   const result = await runCommandSafe("git", ["rev-parse", "HEAD"]);
   return result.ok ? result.stdout.trim() : "unknown";
@@ -200,6 +177,12 @@ async function main(): Promise<void> {
     const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as TrialSetExperimentManifest;
     const state = await loadTrialSetState(statePath);
     if (!state) throw new Error(`--report-only requires an existing state.json at "${statePath}".`);
+    // PR #208 review, Blocking 2: report-only must not trust state.json on
+    // shape alone either - reconstruct the plan from the manifest itself
+    // (no corpus/profile files needed for this) and validate identically to
+    // the real-run resume path below.
+    const plannedCells = planTrialSetCells({ tasks: manifest.tasks, profiles: manifest.profiles, trialsPerCell: manifest.trialsPerCell });
+    assertTrialSetStateMatchesPlan({ state, manifest, plannedCells });
     await writeFile(reportPath, buildHistoricalPgTrialSetReport({ manifest, records: Object.values(state.cells) }));
     console.log(`Report rebuilt from ${statePath}: ${reportPath}`);
     return;
@@ -211,20 +194,40 @@ async function main(): Promise<void> {
   const tasks = resolveTrialSetTaskSelection(corpusManifest, taskIds);
   const profiles = await loadProfiles(options);
 
+  // Identity-relevant docker call (image inspect, not an agent/model
+  // invocation) - resolved even under --dry-run so the printed experimentId
+  // reflects the real content identity that would actually execute (PR #208
+  // review, Blocking 1b).
+  const agentImageIdentity = await resolveTrialSetAgentImageIdentity(options.agentImage);
+  const repositoryCommit = await resolveRepositoryCommit();
+  const agentTimeoutMs = options.agentTimeoutMinutes * 60_000;
+  const sessionTimeoutMs = agentTimeoutMs + 10 * 60_000;
+
   const isolationPolicy = { restrictedEgress: true, upstreamUrl: options.upstreamUrl };
   const identity = {
+    repositoryCommit,
     corpusId: corpusManifest.corpusId,
     corpusHash: corpusManifest.corpusHash,
     tasks,
     profiles: profiles.map(({ profileId, profileHash }) => ({ profileId, profileHash })),
     trialsPerCell: options.trials,
-    agentImage: options.agentImage,
+    agentImage: agentImageIdentity,
+    agentTimeoutMs,
+    sessionTimeoutMs,
     isolationPolicy,
     runnerVersion: HISTORICAL_PG_TRIALSET_RUNNER_VERSION
   };
 
-  const repositoryCommit = await resolveRepositoryCommit();
-  const currentManifest = buildExperimentManifest({ identity, repositoryCommit, profiles });
+  // Observable provenance only (PR #208 review, Blocking 1d) - never
+  // identity-relevant. dshVersion needs an actual (non-agent, non-model)
+  // container run, so it's skipped under --dry-run, same precedent as
+  // scripts/dsh-evals-demo.ts's own dry-run path; "unknown" is never
+  // persisted anyway since dry-run writes no manifest to disk.
+  const dshVersion = options.dryRun ? "unknown (not fingerprinted under --dry-run)" : await fingerprintDshVersion(options.agentImage);
+  const modelProvider = deriveModelProviderFromUpstreamUrl(options.upstreamUrl);
+  const modelVersion = "unknown";
+
+  const currentManifest = buildExperimentManifest({ identity, profiles, dshVersion, modelProvider, modelVersion });
 
   let manifest: TrialSetExperimentManifest;
   let state: TrialSetState;
@@ -240,9 +243,14 @@ async function main(): Promise<void> {
     if (!options.dryRun) await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
   }
 
-  const cells = planTrialSetCells({ tasks, profiles: identity.profiles, trialsPerCell: options.trials });
+  const cells = planTrialSetCells({ tasks: manifest.tasks, profiles: manifest.profiles, trialsPerCell: manifest.trialsPerCell });
+  // Same validation as --report-only above (Blocking 2) - a hand-edited or
+  // stale state.json is rejected before any cell is skipped or re-run, not
+  // just before reporting.
+  assertTrialSetStateMatchesPlan({ state, manifest, plannedCells: cells });
 
   console.log(`Experiment: ${manifest.experimentId}`);
+  console.log(`Agent image: ${manifest.agentImage.reference} (resolved id ${manifest.agentImage.id})`);
   console.log(`Matrix: ${tasks.length} tasks x ${profiles.length} profiles x ${options.trials} trials = ${cells.length} cells.`);
   for (const cell of cells) {
     console.log(`  ${options.dryRun ? "would run" : "planned"}: ${cell.cellId} (partition=${cell.partition})`);
@@ -267,10 +275,10 @@ async function main(): Promise<void> {
   }
   let ran = 0;
   for (const cell of pendingCells) {
-    if (!taskSpecCache.has(cell.taskId)) taskSpecCache.set(cell.taskId, await resolveTaskSpec(cell.taskId));
+    if (!taskSpecCache.has(cell.taskId)) taskSpecCache.set(cell.taskId, await resolveHistoricalPostgresTaskSpecFromEnv(cell.taskId));
     const taskSpec = taskSpecCache.get(cell.taskId)!;
     const profile = profileByLabel.get(cell.profileId)!;
-    const artifactDir = join(outDir, "trials", cell.taskId, cell.profileId, `trial-${cell.trialIndex}`);
+    const cellArtifactRoot = join(outDir, "trials", cell.taskId, cell.profileId, `trial-${cell.trialIndex}`);
 
     console.log(`Running ${cell.cellId} (${ran + skipped + 1}/${cells.length})...`);
     const record: TrialSetCellRecord = await executeTrialSetCell({
@@ -279,12 +287,12 @@ async function main(): Promise<void> {
       corpusManifest,
       taskSpec,
       profile,
-      artifactDir,
+      cellArtifactRoot,
       apiKey,
-      agentImage: options.agentImage,
+      agentImageReference: manifest.agentImage.reference,
       upstreamUrl: options.upstreamUrl,
-      agentTimeoutMs: options.agentTimeoutMinutes * 60_000,
-      sessionTimeoutMs: options.agentTimeoutMinutes * 60_000 + 10 * 60_000
+      agentTimeoutMs: manifest.agentTimeoutMs,
+      sessionTimeoutMs: manifest.sessionTimeoutMs
     });
     state.cells[cell.cellId] = record;
     await writeTrialSetStateAtomic(statePath, state);
