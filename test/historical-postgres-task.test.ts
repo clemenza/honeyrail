@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1423,7 +1423,7 @@ test("PR #210 round 5 (I): DSH telemetry exceeding the file-count sanity bound i
   });
   assert.equal(trialA.status, "infrastructure_error");
   assert.equal(trialA.grade, undefined);
-  assert.ok(trialA.diagnostics.some((line) => line.startsWith("evidence_warning") && line.includes("retention")));
+  assert.ok(trialA.diagnostics.some((line) => line.startsWith("evidence_warning") && line.includes("matching-file bound")));
 
   // Already integrity_error (over-limit workspace): overflow must not
   // reclassify it as an unrelated workspace-policy failure or as
@@ -1441,5 +1441,139 @@ test("PR #210 round 5 (I): DSH telemetry exceeding the file-count sanity bound i
     }
   });
   assert.equal(trialB.status, "integrity_error");
-  assert.ok(trialB.diagnostics.some((line) => line.startsWith("evidence_warning") && line.includes("retention")));
+  assert.ok(trialB.diagnostics.some((line) => line.startsWith("evidence_warning") && line.includes("matching-file bound")));
+});
+
+// ---------------------------------------------------------------------------
+// PR #210 review round 6: a valid required transcript must survive a
+// best-effort derived-artifact failure (Blocking 2), and private raw
+// telemetry cleanup failure must be observable without ever reclassifying
+// the trial (Blocking 3).
+// ---------------------------------------------------------------------------
+
+test("PR #210 round 6 (D): a valid non-empty transcript survives a derived-trajectory write failure - the trial still grades", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "round6-d-workspace");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "would otherwise be a valid miss" }));
+
+  const artifactDir = join(root, "round6-d-trial");
+  // Force only agent-trajectory.jsonl's write to fail deterministically -
+  // agent-transcript.ndjson itself is unaffected.
+  await mkdir(join(artifactDir, "agent-trajectory.jsonl"), { recursive: true });
+
+  const trial = await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture" },
+    artifactDir,
+    trajectoryExpectation: "dsh",
+    runSession: async (_spec, _agent, options) => {
+      await writeDshSessionLog(options!.isolation!.dshHomeDir!, [{ type: "step/start", time: 1000, data: { turn: 1, step: 1 } }]);
+      return fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace });
+    }
+  });
+
+  assert.equal(trial.status, "completed");
+  assert.equal(trial.grade?.status, "miss");
+  const transcriptRaw = await readFile(join(artifactDir, "agent-transcript.ndjson"), "utf8");
+  assert.ok(transcriptRaw.trim().length > 0);
+  assert.ok(trial.artifacts.some((path) => path.endsWith("agent-transcript.ndjson")));
+  assert.ok(!trial.artifacts.some((path) => path.endsWith("agent-trajectory.jsonl")));
+  assert.ok(trial.diagnostics.some((line) => line.startsWith("evidence_warning") && line.includes("agent-trajectory.jsonl")));
+});
+
+test("PR #210 round 6 (E): a valid non-empty transcript survives a session-stats write failure - the trial still grades", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "round6-e-workspace");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "would otherwise be a valid miss" }));
+
+  const artifactDir = join(root, "round6-e-trial");
+  // Force only agent-session-stats.json's write to fail deterministically.
+  await mkdir(join(artifactDir, "agent-session-stats.json"), { recursive: true });
+
+  const trial = await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture" },
+    artifactDir,
+    trajectoryExpectation: "dsh",
+    runSession: async (_spec, _agent, options) => {
+      await writeDshSessionLog(options!.isolation!.dshHomeDir!, [{ type: "step/start", time: 1000, data: { turn: 1, step: 1 } }]);
+      return fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace });
+    }
+  });
+
+  assert.equal(trial.status, "completed");
+  assert.equal(trial.grade?.status, "miss");
+  const transcriptRaw = await readFile(join(artifactDir, "agent-transcript.ndjson"), "utf8");
+  assert.ok(transcriptRaw.trim().length > 0);
+  assert.ok(trial.artifacts.some((path) => path.endsWith("agent-transcript.ndjson")));
+  assert.ok(!trial.artifacts.some((path) => path.endsWith("agent-session-stats.json")));
+  assert.ok(trial.diagnostics.some((line) => line.startsWith("evidence_warning") && line.includes("agent-session-stats.json")));
+});
+
+test("PR #210 round 6 (F): private raw telemetry cleanup failure is observable but never reclassifies the trial - blocked, integrity_error, and completed each keep their own status", async () => {
+  const { root, spec } = await fixture();
+
+  async function runWithUncleanableDshHome(overrides: {
+    scoredEligible: boolean;
+    agentOk: boolean;
+    timedOut?: boolean;
+    workspaceDir: string;
+  }): Promise<{ trial: Awaited<ReturnType<typeof runHistoricalPostgresTrial>>; dshHomeDir: string }> {
+    let capturedDshHomeDir = "";
+    const trial = await runHistoricalPostgresTrial({
+      task: spec,
+      agent: { command: "unused-in-this-fixture" },
+      artifactDir: join(root, `round6-f-trial-${Math.random().toString(36).slice(2, 8)}`),
+      trajectoryExpectation: "dsh",
+      runSession: async (_spec, _agent, options) => {
+        capturedDshHomeDir = options!.isolation!.dshHomeDir!;
+        await writeDshSessionLog(capturedDshHomeDir, [{ type: "step/start", time: 1000, data: { turn: 1, step: 1 } }]);
+        // Strip write permission on the mount root itself: recursive
+        // removal must unlink its child session file first, which
+        // requires write permission on this directory - a real,
+        // deterministic OS-level failure, not a mock.
+        await chmod(capturedDshHomeDir, 0o500);
+        return fakeSessionResult(overrides);
+      }
+    });
+    return { trial, dshHomeDir: capturedDshHomeDir };
+  }
+
+  const cases: Array<{ overrides: { scoredEligible: boolean; agentOk: boolean; timedOut?: boolean; workspaceDir: string }; expectedStatus: string }> = [];
+  const blockedWorkspace = join(root, "round6-f-blocked-workspace");
+  await mkdir(blockedWorkspace, { recursive: true });
+  cases.push({ overrides: { scoredEligible: true, agentOk: false, timedOut: true, workspaceDir: blockedWorkspace }, expectedStatus: "blocked" });
+
+  const integrityWorkspace = join(root, "round6-f-integrity-workspace");
+  await writeManyFiles(integrityWorkspace, MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES + 1, 1);
+  cases.push({ overrides: { scoredEligible: true, agentOk: true, workspaceDir: integrityWorkspace }, expectedStatus: "integrity_error" });
+
+  const completedWorkspace = join(root, "round6-f-completed-workspace");
+  await mkdir(completedWorkspace, { recursive: true });
+  await writeFile(join(completedWorkspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "would otherwise be a valid miss" }));
+  cases.push({ overrides: { scoredEligible: true, agentOk: true, workspaceDir: completedWorkspace }, expectedStatus: "completed" });
+
+  const dshHomeDirsToRestore: string[] = [];
+  try {
+    for (const { overrides, expectedStatus } of cases) {
+      const { trial, dshHomeDir } = await runWithUncleanableDshHome(overrides);
+      dshHomeDirsToRestore.push(dshHomeDir);
+      assert.equal(trial.status, expectedStatus, `status must stay ${expectedStatus} despite cleanup failure`);
+      assert.ok(
+        trial.diagnostics.some((line) => line.startsWith("evidence_warning") && line.includes("failed to remove private raw DSH telemetry root")),
+        `expected a cleanup-failure evidence_warning for the ${expectedStatus} case`
+      );
+      // The private host path itself must never leak into persisted diagnostics.
+      assert.ok(!trial.diagnostics.some((line) => line.includes(dshHomeDir)), "the raw private telemetry path must not appear in persisted diagnostics");
+    }
+  } finally {
+    // Test cleanup only - restore permissions so the shared temp root can
+    // actually be removed; production code never runs this path.
+    for (const dir of dshHomeDirsToRestore) {
+      await chmod(dir, 0o700).catch(() => {});
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
 });

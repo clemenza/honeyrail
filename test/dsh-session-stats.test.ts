@@ -1,18 +1,20 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { zstdCompressSync, zstdDecompressSync } from "node:zlib";
 
 import {
+  DshSessionTelemetryLimitExceededError,
   decodeZstdSessionLog,
   findSessionStatsTimingInconsistency,
   foldSessionStats,
-  measureDshSessionTelemetry,
   parseSessionLog,
+  readBoundedDshSessionTelemetry,
   readSessionStats,
   type DshRawEvent,
+  type DshSessionTelemetryLimits,
   type SessionStats
 } from "../server/evals/dsh-session-stats.js";
 
@@ -182,6 +184,17 @@ test("decodeZstdSessionLog: rejects a buffer that isn't a Zstandard frame at all
   assert.throws(() => decodeZstdSessionLog(Buffer.from("not zstd")), /corrupt Zstandard session log/);
 });
 
+test("decodeZstdSessionLog: maxOutputLength is unbounded by default and rejects decoded output over the given bound when set", () => {
+  const text = "x".repeat(100_000);
+  const compressed = zstdCompressSync(Buffer.from(text));
+  // Default (no options): unbounded, exactly the prior behavior.
+  assert.equal(decodeZstdSessionLog(compressed).length, text.length);
+  // Bounded: rejected with the module's own typed error, not a raw zlib one.
+  assert.throws(() => decodeZstdSessionLog(compressed, { maxOutputLength: 10 }), DshSessionTelemetryLimitExceededError);
+  // A bound comfortably above the real decoded size still succeeds.
+  assert.equal(decodeZstdSessionLog(compressed, { maxOutputLength: text.length + 100 }).length, text.length);
+});
+
 test("readSessionStats: reads a real .jsonl.zstd session log (dsh's default compression), matching a .jsonl sibling's stats", async (t) => {
   const dshHomeDir = await tempDir(t, "honeyrail-dsh-home-zstd-");
   const sessionsDir = join(dshHomeDir, "sessions", "proj");
@@ -230,32 +243,131 @@ test("findSessionStatsTimingInconsistency: flags toolMs exceeding wallTimeMs too
   assert.match(reason!, /toolMs \(500ms\) exceeds wallTimeMs \(100ms\)/);
 });
 
-// PR #210 review round 5, Blocking 3b: the cheap pre-parse measurement
-// Historical PG's own telemetry sanity bound is checked against, before any
-// session file is actually read or parsed.
-test("measureDshSessionTelemetry: null when sessions/ does not exist - same not_applicable condition as readRawSessionFiles", async (t) => {
-  const dshHomeDir = await tempDir(t, "honeyrail-dsh-telemetry-measure-");
-  assert.equal(await measureDshSessionTelemetry(dshHomeDir), null);
+// ---------------------------------------------------------------------------
+// PR #210 review round 6, Blocking 1: readBoundedDshSessionTelemetry() -
+// the streaming, fully-bounded replacement for the round-5
+// measure-then-read-unbounded two-step path.
+// ---------------------------------------------------------------------------
+
+const GENEROUS_LIMITS: DshSessionTelemetryLimits = {
+  maxEntries: 10_000,
+  maxFiles: 500,
+  maxBytes: 200 * 1024 * 1024,
+  maxDecodedBytes: 200 * 1024 * 1024,
+  maxEvents: 200_000
+};
+
+test("readBoundedDshSessionTelemetry: null when sessions/ does not exist - same not_applicable condition as readRawSessionFiles", async (t) => {
+  const dshHomeDir = await tempDir(t, "honeyrail-dsh-telemetry-bounded-");
+  assert.equal(await readBoundedDshSessionTelemetry(dshHomeDir, GENEROUS_LIMITS), null);
 });
 
-test("measureDshSessionTelemetry: null when sessions/ exists but holds no .jsonl/.jsonl.zstd file", async (t) => {
-  const dshHomeDir = await tempDir(t, "honeyrail-dsh-telemetry-measure-");
+test("readBoundedDshSessionTelemetry: null when sessions/ exists but holds no .jsonl/.jsonl.zstd file", async (t) => {
+  const dshHomeDir = await tempDir(t, "honeyrail-dsh-telemetry-bounded-");
   await mkdir(join(dshHomeDir, "sessions"), { recursive: true });
   await writeFile(join(dshHomeDir, "sessions", "not-a-session.txt"), "irrelevant");
-  assert.equal(await measureDshSessionTelemetry(dshHomeDir), null);
+  assert.equal(await readBoundedDshSessionTelemetry(dshHomeDir, GENEROUS_LIMITS), null);
 });
 
-test("measureDshSessionTelemetry: reports exact file count and byte total without parsing any file content", async (t) => {
-  const dshHomeDir = await tempDir(t, "honeyrail-dsh-telemetry-measure-");
-  const sessionsDir = join(dshHomeDir, "sessions", "proj");
+test("readBoundedDshSessionTelemetry: reads and parses matching files under generous limits, nested one level deep like a real DSH session tree", async (t) => {
+  const dshHomeDir = await tempDir(t, "honeyrail-dsh-telemetry-bounded-");
+  const sessionsDir = join(dshHomeDir, "sessions", "--workspace-agent--");
   await mkdir(sessionsDir, { recursive: true });
-  // Deliberately invalid JSON - measureDshSessionTelemetry must never parse
-  // it, only lstat it, so this must not throw.
-  await writeFile(join(sessionsDir, "a.jsonl"), "{not valid json\n");
-  await writeFile(join(sessionsDir, "b.jsonl.zstd"), Buffer.from("12345"));
+  const events = [{ type: "step/start", time: 1, data: { turn: 1, step: 1 } }, { type: "step/end", time: 2, data: { turn: 1, step: 1 } }];
+  await writeFile(join(sessionsDir, "session.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + "\n");
 
-  const measurement = await measureDshSessionTelemetry(dshHomeDir);
-  assert.ok(measurement);
-  assert.equal(measurement!.fileCount, 2);
-  assert.equal(measurement!.totalBytes, "{not valid json\n".length + 5);
+  const sessions = await readBoundedDshSessionTelemetry(dshHomeDir, GENEROUS_LIMITS);
+  assert.ok(sessions);
+  assert.equal(sessions!.length, 1);
+  assert.equal(sessions![0]!.events.length, 2);
+});
+
+// (A) Discovery itself is bounded: a tree of many non-matching entries must
+// stop at the entry sanity bound rather than being fully enumerated first.
+test("readBoundedDshSessionTelemetry (A): streaming discovery rejects once the entry sanity bound is exceeded, without requiring the whole tree to be enumerated", async (t) => {
+  const dshHomeDir = await tempDir(t, "honeyrail-dsh-telemetry-bounded-");
+  const sessionsDir = join(dshHomeDir, "sessions");
+  await mkdir(sessionsDir, { recursive: true });
+  const entryCount = 40; // comfortably more than the tiny maxEntries below; kept small so the test stays fast.
+  for (let i = 0; i < entryCount; i += 1) {
+    await writeFile(join(sessionsDir, `junk-${String(i).padStart(4, "0")}.txt`), "irrelevant");
+  }
+  await assert.rejects(
+    readBoundedDshSessionTelemetry(dshHomeDir, { ...GENEROUS_LIMITS, maxEntries: 10 }),
+    (error: unknown) => error instanceof DshSessionTelemetryLimitExceededError && /entry sanity bound/.test(error.message)
+  );
+});
+
+test("readBoundedDshSessionTelemetry (A continued): the bounded discovery path never calls readdir(..., { recursive: true }) - only opendir()'s streaming iterator", async () => {
+  const source = await readFile("server/evals/dsh-session-stats.ts", "utf8");
+  const start = source.indexOf("async function discoverBoundedDshSessionFiles");
+  const end = source.indexOf("export async function readBoundedDshSessionTelemetry");
+  assert.ok(start > 0 && end > start, "expected to locate the bounded discovery function in dsh-session-stats.ts");
+  const boundedDiscoverySource = source.slice(start, end);
+  assert.ok(!boundedDiscoverySource.includes("recursive: true"), "bounded discovery must never materialize a whole subtree via readdir(..., {recursive:true})");
+  assert.ok(boundedDiscoverySource.includes("opendir("), "bounded discovery must walk via opendir()'s async iterator");
+});
+
+// (B) A matching-name entry that is a symlink is never followed.
+test("readBoundedDshSessionTelemetry (B): a matching-name symlink is skipped outright - never counted, never read, its target never opened", async (t) => {
+  const dshHomeDir = await tempDir(t, "honeyrail-dsh-telemetry-bounded-");
+  const sessionsDir = join(dshHomeDir, "sessions");
+  await mkdir(sessionsDir, { recursive: true });
+  const realLargeFile = join(sessionsDir, "real-large-file");
+  await writeFile(realLargeFile, Buffer.alloc(2_000_000, 1)); // 2MB - well over the tiny byte bound below.
+  await symlink(realLargeFile, join(sessionsDir, "fake.jsonl"));
+
+  // If the symlink were followed, this would throw on the byte bound
+  // (2MB > 1000 bytes). Instead the only sessions/-matching name is a
+  // symlink, which is skipped outright, so there is no matching regular
+  // file at all - "nothing captured", not an overflow.
+  const result = await readBoundedDshSessionTelemetry(dshHomeDir, { maxEntries: 100, maxFiles: 10, maxBytes: 1000, maxDecodedBytes: 1000, maxEvents: 100 });
+  assert.equal(result, null);
+});
+
+// (C) Decoded telemetry output is bounded, independent of on-disk/compressed size.
+test("readBoundedDshSessionTelemetry (C): a small compressed file that decodes far larger than the decoded-byte bound is rejected before the full decoded buffer is materialized", async (t) => {
+  const dshHomeDir = await tempDir(t, "honeyrail-dsh-telemetry-bounded-");
+  const sessionsDir = join(dshHomeDir, "sessions");
+  await mkdir(sessionsDir, { recursive: true });
+  const line = `${JSON.stringify({ type: "step/start", time: 1, data: { turn: 1, step: 1 } })}\n`;
+  const decodedText = line.repeat(200_000); // ~11.6MB decoded
+  const compressed = zstdCompressSync(Buffer.from(decodedText));
+  assert.ok(compressed.length < 10_000, "fixture must compress to a tiny fraction of its decoded size to prove the bound is on decoded bytes, not compressed bytes");
+  await writeFile(join(sessionsDir, "bomb.jsonl.zstd"), compressed);
+
+  await assert.rejects(
+    readBoundedDshSessionTelemetry(dshHomeDir, { ...GENEROUS_LIMITS, maxBytes: 1_000_000, maxDecodedBytes: 1_000_000 }),
+    (error: unknown) => error instanceof DshSessionTelemetryLimitExceededError && /decoded-byte bound/.test(error.message)
+  );
+});
+
+test("readBoundedDshSessionTelemetry: the recovered-event bound is enforced independent of decoded bytes", async (t) => {
+  const dshHomeDir = await tempDir(t, "honeyrail-dsh-telemetry-bounded-");
+  const sessionsDir = join(dshHomeDir, "sessions");
+  await mkdir(sessionsDir, { recursive: true });
+  const line = `${JSON.stringify({ type: "turn/end", time: 1, data: {} })}\n`;
+  await writeFile(join(sessionsDir, "many-events.jsonl"), line.repeat(500));
+
+  await assert.rejects(
+    readBoundedDshSessionTelemetry(dshHomeDir, { ...GENEROUS_LIMITS, maxEvents: 100 }),
+    (error: unknown) => error instanceof DshSessionTelemetryLimitExceededError && /recovered-event bound/.test(error.message)
+  );
+});
+
+test("readBoundedDshSessionTelemetry: the matching-file bound and the on-disk byte bound are both enforced", async (t) => {
+  const dshHomeDir = await tempDir(t, "honeyrail-dsh-telemetry-bounded-");
+  const sessionsDir = join(dshHomeDir, "sessions");
+  await mkdir(sessionsDir, { recursive: true });
+  for (let i = 0; i < 5; i += 1) {
+    await writeFile(join(sessionsDir, `s${i}.jsonl`), `${JSON.stringify({ type: "turn/end", time: 1, data: {} })}\n`);
+  }
+  await assert.rejects(
+    readBoundedDshSessionTelemetry(dshHomeDir, { ...GENEROUS_LIMITS, maxFiles: 3 }),
+    (error: unknown) => error instanceof DshSessionTelemetryLimitExceededError && /matching-file bound/.test(error.message)
+  );
+  await assert.rejects(
+    readBoundedDshSessionTelemetry(dshHomeDir, { ...GENEROUS_LIMITS, maxBytes: 10 }),
+    (error: unknown) => error instanceof DshSessionTelemetryLimitExceededError && /on-disk byte bound/.test(error.message)
+  );
 });

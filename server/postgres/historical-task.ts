@@ -26,7 +26,7 @@ import {
   type PostgresResearchSessionOptions,
   type PostgresResearchSessionResult
 } from "./research-session.js";
-import { measureDshSessionTelemetry, readRawSessionFiles, readSessionStats } from "../evals/dsh-session-stats.js";
+import { foldSessionStatsReport, readBoundedDshSessionTelemetry, type DshRawEvent } from "../evals/dsh-session-stats.js";
 import { buildTranscriptLines } from "../evals/dsh-transcript.js";
 import { deriveTrajectoryEvents } from "../evals/dsh-trajectory-bridge.js";
 import {
@@ -771,19 +771,48 @@ export const HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP = 50;
 export const HISTORICAL_POSTGRES_REQUIRED_CORE_EVIDENCE = ["agent-result.json", "agent-stdout.txt", "agent-stderr.txt", "workspace-inventory.json"] as const;
 
 /**
- * Historical PG's own DSH raw-telemetry sanity bound (PR #210 review round
- * 5, Blocking 3b) - harness safety, never a substitute for
+ * Historical PG's own DSH raw-telemetry sanity policy (PR #210 review round
+ * 5, Blocking 3b; bounded-discovery/decoded/event limits added round 6,
+ * Blocking 1) - harness safety, never a substitute for
  * `MAX_HISTORICAL_POSTGRES_WORKSPACE_{FILES,BYTES}`, which polices
  * agent-authored task output, not agent-tamperable diagnostic telemetry.
  * `$DSH_HOME` is writable by a process running inside the agent container,
  * so nothing else bounds its growth. Chosen comfortably above every real
- * TRAIN001 run observed so far (~3.3-3.4MB, one session file) rather than
- * tuned to that one run - large enough that ordinary DSH telemetry never
- * approaches the boundary, small enough to still catch a runaway or
- * adversarially large `$DSH_HOME`.
+ * TRAIN001 run observed so far (single-digit thousands of raw events,
+ * single-digit megabytes of raw/decoded telemetry, a handful of directory
+ * entries under `sessions/`) rather than tuned to any one run - large
+ * enough that ordinary DSH telemetry never approaches any of these
+ * boundaries, small enough to still catch a runaway or adversarially large
+ * `$DSH_HOME` before it can force a large allocation.
+ *
+ * `MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_ENTRIES` bounds the cheapest
+ * resource first: every directory entry visited while walking `sessions/`
+ * (matching or not), so a tree of purely non-matching junk files stops
+ * during discovery rather than after fully enumerating it.
+ * `MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_FILES`/`_BYTES` bound the matching
+ * `.jsonl`/`.jsonl.zstd` files themselves and their on-disk (compressed, for
+ * `.zstd`) bytes. `MAX_HISTORICAL_POSTGRES_DSH_DECODED_BYTES` is a
+ * deliberately separate bound on *decoded* bytes - a small compressed file
+ * can still expand into a much larger plaintext buffer, so the on-disk
+ * bound alone cannot protect against that. `MAX_HISTORICAL_POSTGRES_DSH_EVENTS`
+ * bounds the total recovered raw events, independent of decoded bytes
+ * (many tiny events could otherwise stay under the byte bound while still
+ * producing a pathologically large in-memory array).
  */
+export const MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_ENTRIES = 5_000;
 export const MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_FILES = 500;
 export const MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_BYTES = 200 * 1024 * 1024;
+export const MAX_HISTORICAL_POSTGRES_DSH_DECODED_BYTES = 256 * 1024 * 1024;
+export const MAX_HISTORICAL_POSTGRES_DSH_EVENTS = 200_000;
+
+/** The `DshSessionTelemetryLimits` this module passes to `readBoundedDshSessionTelemetry()` for every trial - one definition, reused rather than reconstructed at each call site. */
+const HISTORICAL_POSTGRES_DSH_TELEMETRY_LIMITS = {
+  maxEntries: MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_ENTRIES,
+  maxFiles: MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_FILES,
+  maxBytes: MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_BYTES,
+  maxDecodedBytes: MAX_HISTORICAL_POSTGRES_DSH_DECODED_BYTES,
+  maxEvents: MAX_HISTORICAL_POSTGRES_DSH_EVENTS
+};
 
 type CappedFileEntry = { path: string; bytes: number };
 type CappedTopLevelEntry = { path: string; fileCount: number; totalBytes: number };
@@ -1692,7 +1721,9 @@ export async function runHistoricalPostgresTrial(input: {
   // already use - unique per trial, starts empty, removed in this
   // function's `finally` below regardless of which return path is taken.
   let dshHomeDir: string | undefined;
+  let result: HistoricalPostgresTrial;
   try {
+    result = await (async (): Promise<HistoricalPostgresTrial> => {
     await mkdir(input.artifactDir, { recursive: true });
     const taskLayout = await materializeHistoricalPostgresTask(task, join(input.artifactDir, "task-bundle"));
     artifacts.push(taskLayout.taskDir, taskLayout.referenceDir);
@@ -1773,67 +1804,79 @@ export async function runHistoricalPostgresTrial(input: {
       writeJson(join(input.artifactDir, "workspace-inventory.json"), buildHistoricalPostgresWorkspaceInventory(workspaceMeasurement, knownSecrets))
     );
 
-    // PR #210 review round 5, Blocking 3: the entire DSH trajectory read/
-    // parse/derive/persist path is an explicit evidence operation, contained
-    // within its own boundary - a DSH telemetry parse/persist failure
-    // (filesystem read failure, corrupt JSONL, invalid JSON, zstd decode
-    // failure, unexpected telemetry shape) must never propagate to the
-    // function's outer catch and silently overwrite an already-known
-    // authoritative trial attribution (an over-limit workspace's
-    // integrity_error, a timed-out agent's blocked) with
-    // infrastructure_error. `usable` (Blocking 1b) requires an actual
-    // recovered event, not merely "a file was written": a zero-event/
-    // zero-line transcript is missing/incomplete required evidence, not
-    // success.
+    // PR #210 review round 5, Blocking 3 (evidence-boundary isolation) /
+    // round 6, Blocking 1-2 (bounded ingestion, required-vs-best-effort
+    // separation): the required transcript path and the derived best-effort
+    // paths are two *separate* try/catch blocks, both inside the overall
+    // trajectory evidence boundary - a failure in either must never
+    // propagate to the function's outer catch and silently overwrite an
+    // already-known authoritative trial attribution (an over-limit
+    // workspace's integrity_error, a timed-out agent's blocked) with
+    // infrastructure_error, and a failure in the derived, best-effort paths
+    // (session-stats, trajectory derivation) must never retroactively
+    // invalidate an already-successfully-persisted required transcript
+    // (round 6, Blocking 2) - `trajectoryUsable` is only ever set inside the
+    // transcript try block below, nowhere else.
     let trajectoryUsable = false;
     if (dshHomeDir) {
+      // `readBoundedDshSessionTelemetry()` performs its own bounded
+      // discovery/read/decode (round 6, Blocking 1: a streaming
+      // `opendir()` walk, never `readdir(..., {recursive:true})`; symlinks
+      // rejected via `lstat().isFile()`; on-disk, decoded, and event-count
+      // bounds all enforced before any unbounded downstream structure is
+      // built) and throws `DshSessionTelemetryLimitExceededError` when any
+      // bound is exceeded - a harness/evidence-retention failure, handled
+      // identically to a genuine corruption error (corrupt JSONL, a
+      // malformed Zstandard frame) by the single catch below. Returning
+      // null means the mount was never populated at all, even though a DSH
+      // trajectory was expected - itself an evidence gap the
+      // required-evidence gate below must catch (trajectoryUsable stays
+      // false), not "not_applicable" (that outcome now belongs only to a
+      // trial with no trajectoryExpectation at all).
+      let rawSessions: Array<{ file: string; events: DshRawEvent[] }> | null = null;
       try {
-        const telemetryMeasurement = await measureDshSessionTelemetry(dshHomeDir);
-        if (
-          telemetryMeasurement &&
-          (telemetryMeasurement.fileCount > MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_FILES || telemetryMeasurement.totalBytes > MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_BYTES)
-        ) {
-          // Harness/evidence-retention problem, not an agent workspace
-          // integrity_error (Blocking 3b) - never counted against the
-          // unrelated 2048-file/16MiB workspace policy.
-          evidenceWarnings.push(
-            `evidence_warning: DSH telemetry exceeds diagnostic retention limits (${telemetryMeasurement.fileCount} files / ${telemetryMeasurement.totalBytes} bytes; maximum ${MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_FILES} files / ${MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_BYTES} bytes) and was not parsed.`
+        rawSessions = await readBoundedDshSessionTelemetry(dshHomeDir, HISTORICAL_POSTGRES_DSH_TELEMETRY_LIMITS);
+        if (rawSessions !== null) {
+          const transcriptLines = redactSecretsDeep(buildTranscriptLines(rawSessions), knownSecrets);
+          await persistEvidence("agent-transcript.ndjson", () =>
+            writeFile(join(input.artifactDir, "agent-transcript.ndjson"), transcriptLines.length ? `${transcriptLines.map((line) => JSON.stringify(line)).join("\n")}\n` : "")
           );
-        } else {
-          // `readRawSessionFiles()` returning null here means the mount was
-          // never populated at all, even though a DSH trajectory was
-          // expected - itself an evidence gap the required-evidence gate
-          // below must catch (trajectoryUsable stays false), not
-          // "not_applicable" (that outcome now belongs only to a trial with
-          // no trajectoryExpectation at all - see dshTrajectoryExpected).
-          const rawSessions = await readRawSessionFiles(dshHomeDir);
-          if (rawSessions !== null) {
-            const transcriptLines = redactSecretsDeep(buildTranscriptLines(rawSessions), knownSecrets);
-            await persistEvidence("agent-transcript.ndjson", () =>
-              writeFile(join(input.artifactDir, "agent-transcript.ndjson"), transcriptLines.length ? `${transcriptLines.map((line) => JSON.stringify(line)).join("\n")}\n` : "")
-            );
-            trajectoryUsable = transcriptLines.length > 0 && persistedEvidenceLabels.has("agent-transcript.ndjson");
-
-            // Derived/best-effort (regenerable from the transcript above) -
-            // never part of the required core evidence contract, same
-            // reasoning as agent-postgres.log: a failure here is a
-            // diagnostic, not a classification change.
-            const sessionStatsReport = await readSessionStats(dshHomeDir).catch(() => null);
-            if (sessionStatsReport) {
-              await persistEvidence("agent-session-stats.json", () => writeJson(join(input.artifactDir, "agent-session-stats.json"), sessionStatsReport.aggregate));
-            }
-            const trajectoryEvents = redactSecretsDeep(
-              rawSessions.flatMap(({ events }) => deriveTrajectoryEvents(events)),
-              knownSecrets
-            );
-            await persistEvidence("agent-trajectory.jsonl", () =>
-              writeFile(join(input.artifactDir, "agent-trajectory.jsonl"), trajectoryEvents.length ? `${trajectoryEvents.map((event) => JSON.stringify(event)).join("\n")}\n` : "")
-            );
-          }
+          trajectoryUsable = transcriptLines.length > 0 && persistedEvidenceLabels.has("agent-transcript.ndjson");
         }
       } catch (error) {
-        evidenceWarnings.push(`evidence_warning: DSH trajectory evidence extraction failed: ${(error as Error).message}`);
-        trajectoryUsable = false;
+        // Never leak the private host temp path into persisted/public
+        // evidence (round 6, Blocking 3's same discipline, applied here
+        // too): a bounded-discovery/decode error can legitimately embed
+        // the filesystem path it was operating on.
+        evidenceWarnings.push(`evidence_warning: DSH trajectory evidence extraction failed: ${redactKnownSecrets((error as Error).message, [dshHomeDir])}`);
+      }
+
+      // Derived/best-effort (regenerable from the transcript above) - never
+      // part of the required core evidence contract, same reasoning as
+      // agent-postgres.log: a failure here is a diagnostic, not a
+      // classification change, and - round 6, Blocking 2 - must never touch
+      // `trajectoryUsable`, which is already finalized above. Folded
+      // directly from the already-bounded `rawSessions` this function just
+      // obtained, rather than re-reading/re-decoding the same files a
+      // second time via a second, independent call.
+      if (rawSessions !== null) {
+        try {
+          const sessionStatsReport = foldSessionStatsReport(rawSessions);
+          await persistEvidence("agent-session-stats.json", () => writeJson(join(input.artifactDir, "agent-session-stats.json"), sessionStatsReport.aggregate));
+        } catch (error) {
+          evidenceWarnings.push(`evidence_warning: DSH session-stats derivation failed: ${redactKnownSecrets((error as Error).message, [dshHomeDir])}`);
+        }
+        try {
+          const trajectoryEvents = redactSecretsDeep(
+            rawSessions.flatMap(({ events }) => deriveTrajectoryEvents(events)),
+            knownSecrets
+          );
+          await persistEvidence("agent-trajectory.jsonl", () =>
+            writeFile(join(input.artifactDir, "agent-trajectory.jsonl"), trajectoryEvents.length ? `${trajectoryEvents.map((event) => JSON.stringify(event)).join("\n")}\n` : "")
+          );
+        } catch (error) {
+          evidenceWarnings.push(`evidence_warning: DSH trajectory derivation failed: ${redactKnownSecrets((error as Error).message, [dshHomeDir])}`);
+        }
       }
     }
 
@@ -1956,8 +1999,9 @@ export async function runHistoricalPostgresTrial(input: {
       artifacts,
       diagnostics: [...unscoredNotice, ...grade.diagnostics, ...evidenceWarnings]
     };
+    })();
   } catch (error) {
-    return {
+    result = {
       taskId: task.taskId,
       status: error instanceof HistoricalPostgresIntegrityError ? "integrity_error" : "infrastructure_error",
       scoredEligible: false,
@@ -1969,14 +2013,25 @@ export async function runHistoricalPostgresTrial(input: {
           : `Historical PostgreSQL trial infrastructure failed: ${(error as Error).message}`
       ]
     };
-  } finally {
-    // PR #210 review round 5, Blocking 2: the private raw DSH telemetry root
-    // is never a normal public/shareable trial artifact - removed
-    // unconditionally, regardless of which return path was taken or whether
-    // the trial threw, so it never survives as leftover private state on
-    // disk once this function returns.
-    if (dshHomeDir) await rm(dshHomeDir, { recursive: true, force: true }).catch(() => {});
   }
+  // PR #210 review round 6, Blocking 3: the private raw DSH telemetry root
+  // is never a normal public/shareable trial artifact and is always removed
+  // - but a removal *failure* must be observable, not silently swallowed:
+  // the raw source can carry tool arguments/output, echoed environment
+  // values, or a credential before redaction, so a caller needs to know
+  // when it was possibly retained on disk. This never reclassifies the
+  // trial's own status (integrity_error/blocked/completed/
+  // infrastructure_error all stay exactly what they already were) - it only
+  // appends a diagnostic, and never leaks the private host path itself.
+  if (dshHomeDir) {
+    try {
+      await rm(dshHomeDir, { recursive: true, force: true });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? "unknown_error";
+      result.diagnostics.push(`evidence_warning: failed to remove private raw DSH telemetry root (${code}) - raw, unredacted DSH telemetry may still be retained on disk.`);
+    }
+  }
+  return result;
 }
 
 /**
