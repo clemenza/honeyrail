@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP,
   MAX_HISTORICAL_POSTGRES_REPRO_BYTES,
+  MAX_HISTORICAL_POSTGRES_WORKSPACE_BYTES,
+  MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES,
   gradeHistoricalPostgresSubmission,
   materializeHistoricalPostgresTask,
+  measureHistoricalPostgresWorkspace,
   runHistoricalPostgresTrial,
   validateHistoricalPostgresSubmission,
   type HistoricalPostgresTaskSpec
@@ -22,7 +26,15 @@ import { readTreeAsText } from "./helpers/read-tree-as-text.js";
  * production code actually reads are given real values; everything else is a
  * placeholder, hence the `as unknown as` cast.
  */
-function fakeSessionResult(overrides: { scoredEligible: boolean; agentOk: boolean; workspaceDir: string; timedOut?: boolean }): PostgresResearchSessionResult {
+function fakeSessionResult(overrides: {
+  scoredEligible: boolean;
+  agentOk: boolean;
+  workspaceDir: string;
+  timedOut?: boolean;
+  stdout?: string;
+  stderr?: string;
+  agentEnvironment?: Record<string, string>;
+}): PostgresResearchSessionResult {
   return {
     agent: {
       command: "fake-agent",
@@ -32,13 +44,13 @@ function fakeSessionResult(overrides: { scoredEligible: boolean; agentOk: boolea
       exitCode: overrides.agentOk ? 0 : 1,
       signal: null,
       timedOut: overrides.timedOut ?? false,
-      stdout: "",
-      stderr: "",
+      stdout: overrides.stdout ?? "",
+      stderr: overrides.stderr ?? "",
       startedAt: new Date().toISOString(),
       durationMs: 1
     },
     workspaceDir: overrides.workspaceDir,
-    agentEnvironment: {},
+    agentEnvironment: overrides.agentEnvironment ?? {},
     isolation: {
       mode: "container",
       isolated: true,
@@ -403,4 +415,161 @@ test("an agent that never produced agent.ok=true is blocked regardless of scored
   assert.equal(trial.status, "blocked");
   assert.equal(trial.scoredEligible, false);
   assert.equal(trial.grade, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// #209: bounded agent evidence must survive a workspace-limit integrity_error
+// ---------------------------------------------------------------------------
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function writeManyFiles(dir: string, count: number, bytesEach: number): Promise<void> {
+  await mkdir(dir, { recursive: true });
+  const content = "x".repeat(bytesEach);
+  for (let i = 0; i < count; i += 1) {
+    await writeFile(join(dir, `file-${i}.txt`), content);
+  }
+}
+
+test("#209: a file-count-over-limit workspace still retains stdout/stderr/sanitized-result/inventory, and skips the full workspace copy", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "over-file-limit-workspace");
+  await writeManyFiles(workspace, MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES + 1, 1);
+
+  const artifactDir = join(root, "over-file-limit-trial");
+  const trial = await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture" },
+    artifactDir,
+    runSession: async () =>
+      fakeSessionResult({
+        scoredEligible: true,
+        agentOk: true,
+        workspaceDir: workspace,
+        stdout: "the agent's real investigation output",
+        stderr: "the agent's real stderr output"
+      })
+  });
+
+  assert.equal(trial.status, "integrity_error");
+  assert.ok(trial.diagnostics.some((line) => line.includes("agent workspace exceeds limits")));
+
+  assert.equal(await readFile(join(artifactDir, "agent-stdout.txt"), "utf8"), "the agent's real investigation output");
+  assert.equal(await readFile(join(artifactDir, "agent-stderr.txt"), "utf8"), "the agent's real stderr output");
+
+  const agentResult = JSON.parse(await readFile(join(artifactDir, "agent-result.json"), "utf8"));
+  assert.equal(agentResult.ok, true);
+  assert.equal(agentResult.exitCode, 0);
+
+  const inventory = JSON.parse(await readFile(join(artifactDir, "workspace-inventory.json"), "utf8"));
+  assert.equal(inventory.totalFiles, MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES + 1);
+  assert.equal(inventory.exceeded.files, true);
+  assert.equal(inventory.exceeded.bytes, false);
+
+  // The oversized workspace itself must never be fully copied into the artifact tree.
+  assert.equal(await pathExists(join(artifactDir, "agent-workspace")), false);
+  assert.ok(!trial.artifacts.some((path) => path.endsWith("agent-workspace")));
+});
+
+test("#209: a byte-count-over-limit workspace (files within limit) still retains evidence, with exceeded.bytes true and exceeded.files false", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "over-byte-limit-workspace");
+  const bytesEach = Math.ceil(MAX_HISTORICAL_POSTGRES_WORKSPACE_BYTES / 5) + 1024;
+  await writeManyFiles(workspace, 5, bytesEach);
+
+  const artifactDir = join(root, "over-byte-limit-trial");
+  const trial = await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture" },
+    artifactDir,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace, stdout: "stdout-ok", stderr: "stderr-ok" })
+  });
+
+  assert.equal(trial.status, "integrity_error");
+  assert.equal(await readFile(join(artifactDir, "agent-stdout.txt"), "utf8"), "stdout-ok");
+  assert.equal(await readFile(join(artifactDir, "agent-stderr.txt"), "utf8"), "stderr-ok");
+  assert.ok(await pathExists(join(artifactDir, "agent-result.json")));
+
+  const inventory = JSON.parse(await readFile(join(artifactDir, "workspace-inventory.json"), "utf8"));
+  assert.equal(inventory.totalFiles, 5);
+  assert.equal(inventory.exceeded.files, false);
+  assert.equal(inventory.exceeded.bytes, true);
+  assert.equal(await pathExists(join(artifactDir, "agent-workspace")), false);
+});
+
+test("#209: a valid (within-limits) workspace is unaffected - full copy still occurs and grading/result semantics are unchanged", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "valid-workspace");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "Explicit agent miss." }));
+
+  const artifactDir = join(root, "valid-trial");
+  const trial = await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture" },
+    artifactDir,
+    runSession: async () => fakeSessionResult({ scoredEligible: true, agentOk: true, workspaceDir: workspace })
+  });
+
+  assert.equal(trial.status, "completed");
+  assert.equal(trial.grade?.status, "miss");
+  assert.ok(await pathExists(join(artifactDir, "agent-workspace")));
+  assert.ok(await pathExists(join(artifactDir, "agent-workspace", "finding.json")));
+  assert.ok(trial.artifacts.some((path) => path.endsWith("agent-workspace")));
+
+  const inventory = JSON.parse(await readFile(join(artifactDir, "workspace-inventory.json"), "utf8"));
+  assert.equal(inventory.exceeded.files, false);
+  assert.equal(inventory.exceeded.bytes, false);
+  assert.equal(inventory.totalFiles, 1);
+});
+
+test("#209: agent-result.json never carries a secret from session.agentEnvironment (a raw-session dump would have)", async () => {
+  const { root, spec } = await fixture();
+  const workspace = join(root, "sanitization-workspace");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "finding.json"), JSON.stringify({ status: "not-reproduced", summary: "n/a" }));
+
+  const secretSentinel = "sk-fake-secret-sentinel-XYZ123";
+  const artifactDir = join(root, "sanitization-trial");
+  await runHistoricalPostgresTrial({
+    task: spec,
+    agent: { command: "unused-in-this-fixture" },
+    artifactDir,
+    runSession: async () =>
+      fakeSessionResult({
+        scoredEligible: true,
+        agentOk: true,
+        workspaceDir: workspace,
+        agentEnvironment: { DEEPSEEK_API_KEY: secretSentinel }
+      })
+  });
+
+  const agentResultRaw = await readFile(join(artifactDir, "agent-result.json"), "utf8");
+  assert.ok(!agentResultRaw.includes(secretSentinel));
+  assert.ok(!agentResultRaw.includes("agentEnvironment"));
+  const inventoryRaw = await readFile(join(artifactDir, "workspace-inventory.json"), "utf8");
+  assert.ok(!inventoryRaw.includes(secretSentinel));
+});
+
+test("#209: measureHistoricalPostgresWorkspace bounds largestFiles/topLevelEntries to the cap regardless of how many files/directories exist", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-workspace-inventory-"));
+  const entryCount = HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP + 30;
+  for (let i = 0; i < entryCount; i += 1) {
+    await mkdir(join(root, `dir-${i}`), { recursive: true });
+    await writeFile(join(root, `dir-${i}`, "file.txt"), "x".repeat(i + 1));
+  }
+
+  const measurement = await measureHistoricalPostgresWorkspace(root);
+  assert.equal(measurement.totalFiles, entryCount);
+  assert.ok(measurement.largestFiles.length <= HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP);
+  assert.ok(measurement.topLevelEntries.length <= HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP);
+  // Sorted descending by size - the single largest file (highest index) must lead.
+  assert.equal(measurement.largestFiles[0].bytes, entryCount);
 });
