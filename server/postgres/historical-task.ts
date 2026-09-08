@@ -778,9 +778,11 @@ export const HISTORICAL_POSTGRES_REQUIRED_CORE_EVIDENCE = ["agent-result.json", 
  * agent-authored task output, not agent-tamperable diagnostic telemetry.
  * `$DSH_HOME` is writable by a process running inside the agent container,
  * so nothing else bounds its growth. Chosen comfortably above every real
- * TRAIN001 run observed so far (single-digit thousands of raw events,
- * single-digit megabytes of raw/decoded telemetry, a handful of directory
- * entries under `sessions/`) rather than tuned to any one run - large
+ * TRAIN001 run observed so far (observed real runs range from several
+ * thousand to tens of thousands of raw events - e.g. 43,156 on one round-6
+ * candidate cell - across single-digit megabytes of raw/decoded telemetry,
+ * a handful of directory entries under `sessions/`) rather than tuned to
+ * any one run - large
  * enough that ordinary DSH telemetry never approaches any of these
  * boundaries, small enough to still catch a runaway or adversarially large
  * `$DSH_HOME` before it can force a large allocation.

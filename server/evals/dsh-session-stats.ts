@@ -228,6 +228,40 @@ export function parseSessionLog(text: string): DshRawEvent[] {
   return text.split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line) as DshRawEvent);
 }
 
+/**
+ * The Historical-PG bounded-ingestion counterpart to `parseSessionLog()`
+ * (PR #210 review, final round): scans `text` one line at a time via
+ * `indexOf("\n", pos)` rather than `text.split("\n")` - the recovered-event
+ * bound must actually protect against materializing every line/event
+ * before it is enforced, not just reject the *result* of having already
+ * done so. The moment the next non-blank line would push the recovered
+ * count past `maxEvents`, this throws `DshSessionTelemetryLimitExceededError`
+ * immediately, *before* that line (or anything after it) is ever
+ * `JSON.parse`'d - so a malformed line sitting past the bound is never
+ * reached, let alone reported as a parse error instead of a limit error.
+ * Blank-line skipping, parse-error behavior for a line under the bound,
+ * and event order are all otherwise identical to `parseSessionLog()`.
+ * `parseSessionLog()` itself is untouched and remains fully unbounded for
+ * every existing caller that doesn't opt into a Historical-PG limit.
+ */
+export function parseSessionLogBounded(text: string, maxEvents: number): DshRawEvent[] {
+  const events: DshRawEvent[] = [];
+  let pos = 0;
+  while (pos <= text.length) {
+    const newlineIndex = text.indexOf("\n", pos);
+    const line = newlineIndex === -1 ? text.slice(pos) : text.slice(pos, newlineIndex);
+    if (line.trim() !== "") {
+      if (events.length >= maxEvents) {
+        throw new DshSessionTelemetryLimitExceededError(`DSH telemetry exceeds the recovered-event bound (> ${maxEvents} events across .jsonl/.jsonl.zstd files under sessions/)`);
+      }
+      events.push(JSON.parse(line) as DshRawEvent);
+    }
+    if (newlineIndex === -1) break;
+    pos = newlineIndex + 1;
+  }
+  return events;
+}
+
 // `@deepseek-ai/dsh-session-persistence-jsonl`'s DEFAULT_COMPRESSION is
 // "zstd" (confirmed in its published lib/index.js), so a real session log is
 // `session.jsonl.zstd`, not `session.jsonl`, on every trial unless an
@@ -628,13 +662,12 @@ export async function readBoundedDshSessionTelemetry(
       text = raw.toString("utf8");
     }
     decodedBytesSoFar += Buffer.byteLength(text, "utf8");
-    const events = parseSessionLog(text);
+    // Bounded parse (PR #210 review, final round): the remaining cumulative
+    // event budget is enforced *during* parsing, not after - a line past
+    // the budget is never JSON.parse'd, so a malformed line sitting beyond
+    // it can never surface as a parse error instead of the limit error.
+    const events = parseSessionLogBounded(text, limits.maxEvents - eventsSoFar);
     eventsSoFar += events.length;
-    if (eventsSoFar > limits.maxEvents) {
-      throw new DshSessionTelemetryLimitExceededError(
-        `DSH telemetry exceeds the recovered-event bound (> ${limits.maxEvents} events across .jsonl/.jsonl.zstd files under sessions/)`
-      );
-    }
     sessions.push({ file: file.relativePath, events });
   }
   return sessions;

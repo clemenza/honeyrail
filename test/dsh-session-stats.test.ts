@@ -11,6 +11,7 @@ import {
   findSessionStatsTimingInconsistency,
   foldSessionStats,
   parseSessionLog,
+  parseSessionLogBounded,
   readBoundedDshSessionTelemetry,
   readSessionStats,
   type DshRawEvent,
@@ -106,6 +107,87 @@ test("parseSessionLog: one JSON object per line, tolerant of a trailing blank li
   assert.equal(events.length, 2);
   assert.equal(events[0].type, "step/start");
   assert.equal(events[1].type, "step/end");
+});
+
+// ---------------------------------------------------------------------------
+// PR #210 review, final round: parseSessionLogBounded() must enforce the
+// recovered-event bound *during* parsing (never text.split("\n") first),
+// so a line past the bound is never JSON.parse'd at all.
+// ---------------------------------------------------------------------------
+
+function repeatedValidEventLines(count: number): string {
+  return Array.from({ length: count }, (_, i) => JSON.stringify({ type: "turn/end", time: i, data: {} })).join("\n") + "\n";
+}
+
+test("parseSessionLogBounded: parses every event in order when at or under the budget, and rejects (never silently truncates) when over it", () => {
+  // Exactly at budget: succeeds, in order.
+  const atBudget = parseSessionLogBounded(repeatedValidEventLines(5), 5);
+  assert.equal(atBudget.length, 5);
+  for (let i = 0; i < 5; i += 1) assert.equal(atBudget[i].time, i);
+
+  // More valid events than the budget: this is a hard limit, not a
+  // truncation policy - the caller must never receive a silently
+  // shortened result that looks like a complete, valid read.
+  assert.throws(
+    () => parseSessionLogBounded(repeatedValidEventLines(10), 5),
+    (error: unknown) => error instanceof DshSessionTelemetryLimitExceededError
+  );
+});
+
+test("parseSessionLogBounded (A): a malformed line sitting past the event bound is never parsed - the limit error fires first", () => {
+  const validLines = repeatedValidEventLines(101).trimEnd(); // events 1..101, valid
+  const text = `${validLines}\nnot valid json at all\n`; // event 102: malformed
+  assert.throws(() => parseSessionLogBounded(text, 100), (error: unknown) => {
+    // Must be the limit error, never a JSON.parse SyntaxError from the
+    // malformed 102nd line - proof that line was never reached.
+    return error instanceof DshSessionTelemetryLimitExceededError;
+  });
+});
+
+test("parseSessionLogBounded: preserves blank-line tolerance and parse errors for a malformed line still under the bound", () => {
+  assert.equal(parseSessionLogBounded("\n\n", 10).length, 0);
+  assert.throws(() => parseSessionLogBounded("not valid json\n", 10), SyntaxError);
+});
+
+test("readBoundedDshSessionTelemetry (A): a malformed line past the cumulative event bound is never parsed, in the full ingestion pipeline", async (t) => {
+  const dshHomeDir = await tempDir(t, "honeyrail-dsh-telemetry-bounded-");
+  const sessionsDir = join(dshHomeDir, "sessions");
+  await mkdir(sessionsDir, { recursive: true });
+  const validLines = repeatedValidEventLines(101).trimEnd();
+  await writeFile(join(sessionsDir, "session.jsonl"), `${validLines}\nnot valid json at all\n`);
+
+  await assert.rejects(
+    readBoundedDshSessionTelemetry(dshHomeDir, { maxEntries: 100, maxFiles: 10, maxBytes: 1_000_000, maxDecodedBytes: 1_000_000, maxEvents: 100 }),
+    (error: unknown) => error instanceof DshSessionTelemetryLimitExceededError && /recovered-event bound/.test((error as Error).message)
+  );
+});
+
+test("parseSessionLogBounded (B, boundary): a 40-event remaining budget (as computed for a second file after a first file already consumed 60 of a 100 total) accepts exactly 40 events and rejects at the 41st", () => {
+  const sixtyValidLines = repeatedValidEventLines(60);
+  // The exact remaining budget readBoundedDshSessionTelemetry would pass
+  // for file B: limits.maxEvents(100) - eventsSoFar(60) = 40.
+  const remainingBudget = 40;
+  assert.equal(parseSessionLogBounded(repeatedValidEventLines(remainingBudget), remainingBudget).length, remainingBudget);
+  assert.throws(
+    () => parseSessionLogBounded(sixtyValidLines, remainingBudget),
+    (error: unknown) => error instanceof DshSessionTelemetryLimitExceededError
+  );
+});
+
+test("readBoundedDshSessionTelemetry (B): the recovered-event bound is cumulative across multiple session files, not reset per file", async (t) => {
+  const dshHomeDir = await tempDir(t, "honeyrail-dsh-telemetry-bounded-");
+  const sessionsDir = join(dshHomeDir, "sessions");
+  await mkdir(sessionsDir, { recursive: true });
+  // File A: 60 valid events. File B: 60 valid events. maxEvents: 100 -
+  // file A parses in full, file B gets only its first 40 before the
+  // cumulative bound (100) is hit on its 41st event.
+  await writeFile(join(sessionsDir, "a-session.jsonl"), repeatedValidEventLines(60));
+  await writeFile(join(sessionsDir, "b-session.jsonl"), repeatedValidEventLines(60));
+
+  await assert.rejects(
+    readBoundedDshSessionTelemetry(dshHomeDir, { maxEntries: 100, maxFiles: 10, maxBytes: 1_000_000, maxDecodedBytes: 1_000_000, maxEvents: 100 }),
+    (error: unknown) => error instanceof DshSessionTelemetryLimitExceededError && /recovered-event bound/.test((error as Error).message)
+  );
 });
 
 test("readSessionStats: sums independently-folded per-session files, returns null when nothing was captured", async (t) => {
