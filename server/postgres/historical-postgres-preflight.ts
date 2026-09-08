@@ -567,6 +567,14 @@ export async function runHistoricalPostgresPilotTrial(input: {
   artifactDir: string;
   /** Defaults to `"agent"` - the real, dataset-eligible profile. Set `"smoke_stub"` for a deterministic harness-validation agent that must never enter the capability dataset. */
   profileKind?: HistoricalPostgresPilotProfileKind;
+  /**
+   * Explicit pass-through to `runHistoricalPostgresTrial()` - see its own
+   * docstring (PR #210 review round 5, Blocking 1). This module never
+   * derives it from `profileKind` or any other heuristic; the caller that
+   * actually knows the agent is DSH (`executeTrialSetCell()`) sets it
+   * itself.
+   */
+  trajectoryExpectation?: "dsh";
   session?: PostgresResearchSessionOptions;
   runSession?: typeof runAgentInPostgresResearchEnvironment;
   /** Injectable for tests (e.g. controlling each grader revision's reported `executionEnvironment` for execution-binding coverage); defaults to the real per-revision research environment. */
@@ -664,6 +672,7 @@ export async function runHistoricalPostgresPilotTrial(input: {
     task: input.taskSpec,
     agent: input.agent,
     artifactDir: join(pilotRoot, "trial"),
+    trajectoryExpectation: input.trajectoryExpectation,
     session: input.session,
     runSession,
     gradeRevision: input.gradeRevision

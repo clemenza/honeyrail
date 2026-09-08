@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFile } from "node:fs/promises";
+import { appendFile, mkdir } from "node:fs/promises";
 import { nowIso, runCommandSafe } from "../utils.js";
 import {
   DEFAULT_CANCEL_GRACE_MS,
@@ -454,6 +454,31 @@ export type PostgresResearchIsolationOptions = {
   /** Where per-trial build views are created; defaults next to the build cache. */
   buildViewsRoot?: string;
   /**
+   * A per-trial, initially-empty host directory to mount as the agent
+   * container's `$DSH_HOME` (#209/#210 round 4; private-root relocation
+   * #210 review round 5, Blocking 2) - created here if it does not already
+   * exist, and expected to be a private temporary root the caller (
+   * `runHistoricalPostgresTrial()`) removes once it has extracted and
+   * redacted whatever it needs, never a location this session type persists
+   * or publishes on its own. Deliberately separate from the agent's own
+   * workspace: DSH's session-persistence plugin writes incremental
+   * telemetry here as the trial runs, and this directory must never be
+   * confused with, or counted against, agent-authored task output.
+   *
+   * The directory itself is created host-side before the agent starts, but
+   * its *contents* are written by a process running *inside* the agent
+   * container, which has arbitrary shell access - so this is
+   * agent-process-originated, agent-tamperable diagnostic telemetry, never
+   * immutable grader-owned evidence; a caller must not treat "the agent can
+   * only write telemetry here" as a trust boundary. Container mode only - a
+   * caller that also sets `allowUnisolatedForDevelopment` gets no DSH
+   * telemetry mount (there is no container to mount it into). Harmless for
+   * a non-DSH agent: nothing reads or writes here, and nothing downstream is
+   * required to find anything under it. Only ever set by a caller that
+   * actually expects a DSH trajectory - never mounted unconditionally.
+   */
+  dshHomeDir?: string;
+  /**
    * Runs the agent as a plain host process with no boundary at all, for local
    * development and CI without a docker daemon.
    *
@@ -883,6 +908,12 @@ export async function runAgentInPostgresResearchEnvironment(
         const injected = containerAgentEnvironment(env.connectionInfo(), agent.envPrefix);
         const containerName = `honeyrail-pg-research-${randomUUID()}`;
 
+        // #209/#210 round 4: created here (mirroring scripts/tinytable-exam-
+        // room.ts's own `dshHomeDir` mkdir) rather than requiring the caller
+        // to pre-create it - the caller only needs to choose and remember a
+        // path.
+        if (isolation.dshHomeDir) await mkdir(isolation.dshHomeDir, { recursive: true });
+
         // Started before the agent container exists, and deliberately with no
         // agent-side side effects behind it: if the gateway cannot be brought
         // up - or, more importantly, if its `--internal` network cannot be
@@ -916,7 +947,8 @@ export async function runAgentInPostgresResearchEnvironment(
               scratchDir,
               // The same view the runtime container is running, so the agent
               // inspects literally the files the server is executing.
-              buildViewDir: env.buildView.dir
+              buildViewDir: env.buildView.dir,
+              dshHomeDir: isolation.dshHomeDir
             },
             command: [agent.command, ...(agent.args ?? [])],
             image: agentImage.id,

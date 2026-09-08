@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { cp, lstat, mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, opendir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import { nowIso, runCommandSafe } from "../utils.js";
 import {
@@ -26,6 +26,9 @@ import {
   type PostgresResearchSessionOptions,
   type PostgresResearchSessionResult
 } from "./research-session.js";
+import { foldSessionStatsReport, readBoundedDshSessionTelemetry, type DshRawEvent } from "../evals/dsh-session-stats.js";
+import { buildTranscriptLines } from "../evals/dsh-transcript.js";
+import { deriveTrajectoryEvents } from "../evals/dsh-trajectory-bridge.js";
 import {
   classifyExecutionValidity,
   evaluateOracleAttribution,
@@ -753,30 +756,399 @@ async function writeJson(path: string, value: unknown) {
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-async function assertWorkspaceWithinLimits(root: string) {
-  let bytes = 0;
-  let files = 0;
-  async function visit(path: string): Promise<void> {
-    const entries = await readdir(path, { withFileTypes: true });
-    for (const entry of entries) {
-      const entryPath = join(path, entry.name);
-      if (entry.isDirectory()) {
-        await visit(entryPath);
-        continue;
-      }
-      // Symlinks are copied as links and validated only when selected as the
-      // reproducer; never follow one while measuring agent-owned output.
-      const details = await lstat(entryPath);
-      files += 1;
-      bytes += details.size;
-      if (files > MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES || bytes > MAX_HISTORICAL_POSTGRES_WORKSPACE_BYTES) {
-        throw new HistoricalPostgresIntegrityError(
-          `agent workspace exceeds limits (${files} files, ${bytes} bytes; maximum ${MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES} files and ${MAX_HISTORICAL_POSTGRES_WORKSPACE_BYTES} bytes)`
-        );
-      }
+/** Bounded top-N lists in the persisted inventory (#209) - large enough to be useful, small enough to never itself become an unbounded-evidence problem. */
+export const HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP = 50;
+
+/**
+ * The core evidence contract a scored Historical PostgreSQL capability
+ * sample requires (PR #210 review round 3, Blocking 1). An otherwise
+ * scored-eligible, `agent.ok === true`, within-limit trial must not proceed
+ * to grading - and therefore can never become an official `rediscovered`/
+ * `miss` dataset sample - unless every one of these persisted successfully.
+ * Tracked directly from each artifact's own persistence attempt, never
+ * inferred later by scanning the artifact directory.
+ */
+export const HISTORICAL_POSTGRES_REQUIRED_CORE_EVIDENCE = ["agent-result.json", "agent-stdout.txt", "agent-stderr.txt", "workspace-inventory.json"] as const;
+
+/**
+ * Historical PG's own DSH raw-telemetry sanity policy (PR #210 review round
+ * 5, Blocking 3b; bounded-discovery/decoded/event limits added round 6,
+ * Blocking 1) - harness safety, never a substitute for
+ * `MAX_HISTORICAL_POSTGRES_WORKSPACE_{FILES,BYTES}`, which polices
+ * agent-authored task output, not agent-tamperable diagnostic telemetry.
+ * `$DSH_HOME` is writable by a process running inside the agent container,
+ * so nothing else bounds its growth. Chosen comfortably above every real
+ * TRAIN001 run observed so far (observed real runs range from several
+ * thousand to tens of thousands of raw events - e.g. 43,156 on one round-6
+ * candidate cell - across single-digit megabytes of raw/decoded telemetry,
+ * a handful of directory entries under `sessions/`) rather than tuned to
+ * any one run - large
+ * enough that ordinary DSH telemetry never approaches any of these
+ * boundaries, small enough to still catch a runaway or adversarially large
+ * `$DSH_HOME` before it can force a large allocation.
+ *
+ * `MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_ENTRIES` bounds the cheapest
+ * resource first: every directory entry visited while walking `sessions/`
+ * (matching or not), so a tree of purely non-matching junk files stops
+ * during discovery rather than after fully enumerating it.
+ * `MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_FILES`/`_BYTES` bound the matching
+ * `.jsonl`/`.jsonl.zstd` files themselves and their on-disk (compressed, for
+ * `.zstd`) bytes. `MAX_HISTORICAL_POSTGRES_DSH_DECODED_BYTES` is a
+ * deliberately separate bound on *decoded* bytes - a small compressed file
+ * can still expand into a much larger plaintext buffer, so the on-disk
+ * bound alone cannot protect against that. `MAX_HISTORICAL_POSTGRES_DSH_EVENTS`
+ * bounds the total recovered raw events, independent of decoded bytes
+ * (many tiny events could otherwise stay under the byte bound while still
+ * producing a pathologically large in-memory array).
+ */
+export const MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_ENTRIES = 5_000;
+export const MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_FILES = 500;
+export const MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_BYTES = 200 * 1024 * 1024;
+export const MAX_HISTORICAL_POSTGRES_DSH_DECODED_BYTES = 256 * 1024 * 1024;
+export const MAX_HISTORICAL_POSTGRES_DSH_EVENTS = 200_000;
+
+/** The `DshSessionTelemetryLimits` this module passes to `readBoundedDshSessionTelemetry()` for every trial - one definition, reused rather than reconstructed at each call site. */
+const HISTORICAL_POSTGRES_DSH_TELEMETRY_LIMITS = {
+  maxEntries: MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_ENTRIES,
+  maxFiles: MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_FILES,
+  maxBytes: MAX_HISTORICAL_POSTGRES_DSH_TELEMETRY_BYTES,
+  maxDecodedBytes: MAX_HISTORICAL_POSTGRES_DSH_DECODED_BYTES,
+  maxEvents: MAX_HISTORICAL_POSTGRES_DSH_EVENTS
+};
+
+type CappedFileEntry = { path: string; bytes: number };
+type CappedTopLevelEntry = { path: string; fileCount: number; totalBytes: number };
+
+/**
+ * Inserts `candidate` into `topN` (bounded to `cap`, ordered by `isBetter`)
+ * if it belongs there, evicting the current worst-ranked entry when already
+ * at capacity. `topN` never grows past `cap` - the PR #210 review fix for an
+ * earlier implementation that accumulated every entry into an unbounded
+ * array before sorting once at the end (unbounded memory/CPU for exactly the
+ * untrusted, potentially huge workspaces this code exists to handle). Used
+ * for both `largestFiles` and `topLevelEntries` - one small generic helper
+ * rather than two near-duplicate ones.
+ */
+function offerCapped<T>(topN: T[], candidate: T, cap: number, isBetter: (a: T, b: T) => boolean): void {
+  if (topN.length < cap) {
+    const insertAt = topN.findIndex((entry) => isBetter(candidate, entry));
+    topN.splice(insertAt === -1 ? topN.length : insertAt, 0, candidate);
+    return;
+  }
+  const worst = topN[topN.length - 1];
+  if (!isBetter(candidate, worst)) return;
+  const insertAt = topN.findIndex((entry) => isBetter(candidate, entry));
+  topN.splice(insertAt, 0, candidate);
+  topN.pop();
+}
+
+/** Descending bytes, ties broken by ascending path - deterministic regardless of filesystem readdir order. */
+const fileRanksBefore = (a: CappedFileEntry, b: CappedFileEntry): boolean => a.bytes > b.bytes || (a.bytes === b.bytes && a.path < b.path);
+/** Same rule, keyed on a subtree's aggregate bytes instead of one file's. */
+const topLevelRanksBefore = (a: CappedTopLevelEntry, b: CappedTopLevelEntry): boolean => a.totalBytes > b.totalBytes || (a.totalBytes === b.totalBytes && a.path < b.path);
+
+export type HistoricalPostgresWorkspaceMeasurement = {
+  totalFiles: number;
+  totalBytes: number;
+  /** Sorted descending by totalBytes (ties broken by ascending path), bounded to HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP entries throughout the walk. */
+  topLevelEntries: CappedTopLevelEntry[];
+  /** Sorted descending by bytes (ties broken by ascending path), bounded to HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP entries throughout the walk - never a full file list. */
+  largestFiles: CappedFileEntry[];
+};
+
+/**
+ * The single walk both the workspace-size policy check and the persisted
+ * `workspace-inventory.json` evidence (#209) are derived from, so the two
+ * can never disagree about what the workspace actually contained. Always
+ * completes the full walk rather than early-exiting once a limit is crossed
+ * (unlike the policy check this replaces) - the point of this function is an
+ * accurate total, not a fast abort. `totalFiles`/`totalBytes` are exact
+ * regardless of workspace size; only the *lists* (`largestFiles`,
+ * `topLevelEntries`) are bounded.
+ *
+ * Bounded-memory with respect to file count (PR #210 review round 3,
+ * Blocking 2): uses `opendir()`'s async iterator rather than
+ * `readdir(..., {withFileTypes:true})`, which materializes an entire
+ * directory's entries into one array before returning - a real concern once
+ * a single directory can hold tens of thousands of agent-authored files, as
+ * a real TRAIN001 run already did. Each top-level entry's own subtree is
+ * fully aggregated (`walkSubtree`) before being offered to the bounded
+ * `topLevelEntries` top-N and discarded - at most one subtree aggregate plus
+ * the two bounded top-N lists are ever held at once, never a map keyed by
+ * every top-level name.
+ *
+ * Same non-following-of-symlinks discipline as the check it replaces:
+ * `lstat`, never `stat`, on each file - a reproducer symlink is validated
+ * only when actually selected as the submission, never dereferenced while
+ * merely measuring agent-owned output.
+ */
+export async function measureHistoricalPostgresWorkspace(root: string): Promise<HistoricalPostgresWorkspaceMeasurement> {
+  let totalFiles = 0;
+  let totalBytes = 0;
+  const topLevelEntries: CappedTopLevelEntry[] = [];
+  const largestFiles: CappedFileEntry[] = [];
+
+  const recordFile = (entryPath: string, bytes: number): void => {
+    totalFiles += 1;
+    totalBytes += bytes;
+    offerCapped(largestFiles, { path: relative(root, entryPath), bytes }, HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP, fileRanksBefore);
+  };
+
+  /**
+   * `for await...of` on an `fs.Dir` already closes the handle once iteration
+   * completes normally; closing it again throws `ERR_DIR_CLOSED`. On an
+   * early exit (an exception thrown from inside the loop body, e.g. `lstat`
+   * failing mid-walk) the handle is not guaranteed closed, so `finally`
+   * still needs to try - this just tolerates the already-closed case rather
+   * than assuming one or the other.
+   */
+  async function closeDirQuietly(dir: { close: () => Promise<void> }): Promise<void> {
+    try {
+      await dir.close();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "ERR_DIR_CLOSED") throw error;
     }
   }
-  await visit(root);
+
+  /** Fully aggregates one subtree's own fileCount/totalBytes - the only per-subtree state ever held at once. */
+  async function walkSubtree(path: string): Promise<{ fileCount: number; totalBytes: number }> {
+    let fileCount = 0;
+    let bytes = 0;
+    const dir = await opendir(path);
+    try {
+      for await (const entry of dir) {
+        const entryPath = join(path, entry.name);
+        if (entry.isDirectory()) {
+          const sub = await walkSubtree(entryPath);
+          fileCount += sub.fileCount;
+          bytes += sub.totalBytes;
+          continue;
+        }
+        const details = await lstat(entryPath);
+        fileCount += 1;
+        bytes += details.size;
+        recordFile(entryPath, details.size);
+      }
+    } finally {
+      await closeDirQuietly(dir);
+    }
+    return { fileCount, totalBytes: bytes };
+  }
+
+  const rootDir = await opendir(root);
+  try {
+    for await (const entry of rootDir) {
+      const entryPath = join(root, entry.name);
+      if (entry.isDirectory()) {
+        const subtree = await walkSubtree(entryPath);
+        offerCapped(topLevelEntries, { path: entry.name, ...subtree }, HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP, topLevelRanksBefore);
+      } else {
+        const details = await lstat(entryPath);
+        recordFile(entryPath, details.size);
+        offerCapped(topLevelEntries, { path: entry.name, fileCount: 1, totalBytes: details.size }, HISTORICAL_POSTGRES_WORKSPACE_INVENTORY_CAP, topLevelRanksBefore);
+      }
+    }
+  } finally {
+    await closeDirQuietly(rootDir);
+  }
+
+  return { totalFiles, totalBytes, topLevelEntries, largestFiles };
+}
+
+/** True exactly when a workspace measurement violates the (unchanged) 2048-file / 16MiB policy - the one authoritative decision this module makes, independent of whether any evidence artifact can be persisted. */
+export function isHistoricalPostgresWorkspaceOverLimit(measurement: HistoricalPostgresWorkspaceMeasurement): boolean {
+  return measurement.totalFiles > MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES || measurement.totalBytes > MAX_HISTORICAL_POSTGRES_WORKSPACE_BYTES;
+}
+
+function workspaceLimitExceededMessage(measurement: HistoricalPostgresWorkspaceMeasurement): string {
+  return `agent workspace exceeds limits (${measurement.totalFiles} files, ${measurement.totalBytes} bytes; maximum ${MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES} files and ${MAX_HISTORICAL_POSTGRES_WORKSPACE_BYTES} bytes)`;
+}
+
+/**
+ * The smallest reusable redaction boundary for "known injected sensitive
+ * values" (PR #210 review, Blocking 3) - not a generic secret scanner.
+ * `input.agent.env` (the caller-supplied environment for the agent process -
+ * e.g. a model API key) is, by construction, exactly the set of values this
+ * module was ever explicitly handed as sensitive; nothing else this module
+ * sees is treated as a secret. A short-value floor avoids redacting common,
+ * non-sensitive flags (`"none"`, `"1"`, ...) that happen to appear in
+ * `agent.env` too - real credentials are comfortably longer.
+ */
+const HISTORICAL_POSTGRES_SECRET_REDACTION_MIN_LENGTH = 12;
+
+function collectKnownSecretValues(env: Record<string, string> | undefined): string[] {
+  if (!env) return [];
+  return Object.values(env).filter((value) => value.length >= HISTORICAL_POSTGRES_SECRET_REDACTION_MIN_LENGTH);
+}
+
+/** Replaces every occurrence of a known secret value with a fixed marker - never logs or persists the value itself in the process of doing so. */
+function redactKnownSecrets(text: string, secrets: readonly string[]): string {
+  let redacted = text;
+  for (const secret of secrets) {
+    if (!secret) continue;
+    redacted = redacted.split(secret).join("[REDACTED]");
+  }
+  return redacted;
+}
+
+/**
+ * Same redaction boundary, applied recursively to an arbitrary JSON-shaped
+ * value (#209/#210 round 4) - DSH's own raw session events and derived
+ * trajectory events are nested objects (tool arguments, assistant messages,
+ * tool results), not flat strings, so a known secret could otherwise survive
+ * inside any string leaf of that structure.
+ */
+function redactSecretsDeep<T>(value: T, secrets: readonly string[]): T {
+  if (!secrets.length) return value;
+  if (typeof value === "string") return redactKnownSecrets(value, secrets) as unknown as T;
+  if (Array.isArray(value)) return value.map((item) => redactSecretsDeep(item, secrets)) as unknown as T;
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactSecretsDeep(item, secrets)])) as unknown as T;
+  }
+  return value;
+}
+
+export type HistoricalPostgresWorkspaceInventory = {
+  schemaVersion: 1;
+  totalFiles: number;
+  totalBytes: number;
+  limits: { maxFiles: number; maxBytes: number };
+  exceeded: { files: boolean; bytes: boolean };
+  topLevelEntries: HistoricalPostgresWorkspaceMeasurement["topLevelEntries"];
+  largestFiles: HistoricalPostgresWorkspaceMeasurement["largestFiles"];
+};
+
+/**
+ * A bounded evidence projection - counts only, plus paths - never the full
+ * oversized workspace itself. Paths are agent-controlled input, so
+ * `secrets` (see collectKnownSecretValues()) is applied to every persisted
+ * path: a filename is not inherently safe just because it is "only a path".
+ */
+export function buildHistoricalPostgresWorkspaceInventory(measurement: HistoricalPostgresWorkspaceMeasurement, secrets: readonly string[] = []): HistoricalPostgresWorkspaceInventory {
+  const redactPath = <T extends { path: string }>(entry: T): T => (secrets.length ? { ...entry, path: redactKnownSecrets(entry.path, secrets) } : entry);
+  return {
+    schemaVersion: 1,
+    totalFiles: measurement.totalFiles,
+    totalBytes: measurement.totalBytes,
+    limits: { maxFiles: MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES, maxBytes: MAX_HISTORICAL_POSTGRES_WORKSPACE_BYTES },
+    exceeded: { files: measurement.totalFiles > MAX_HISTORICAL_POSTGRES_WORKSPACE_FILES, bytes: measurement.totalBytes > MAX_HISTORICAL_POSTGRES_WORKSPACE_BYTES },
+    topLevelEntries: measurement.topLevelEntries.map(redactPath),
+    largestFiles: measurement.largestFiles.map(redactPath)
+  };
+}
+
+export type HistoricalPostgresSafeAgentExecutionSummary = {
+  ok: boolean;
+  exitCode: number | null;
+  signal: string | null;
+  timedOut: boolean;
+  timeoutSource?: "agent" | "session";
+  confirmedStopped?: boolean;
+  terminationError?: string;
+  startedAt: string;
+  durationMs: number;
+};
+
+function sanitizeAgentExecutionSummary(agent: PostgresResearchSessionResult["agent"], secrets: readonly string[]): HistoricalPostgresSafeAgentExecutionSummary {
+  return {
+    ok: agent.ok,
+    exitCode: agent.exitCode,
+    signal: agent.signal,
+    timedOut: agent.timedOut,
+    timeoutSource: agent.timeoutSource,
+    confirmedStopped: agent.confirmedStopped,
+    terminationError: agent.terminationError ? redactKnownSecrets(agent.terminationError, secrets) : agent.terminationError,
+    startedAt: agent.startedAt,
+    durationMs: agent.durationMs
+  };
+}
+
+export type HistoricalPostgresSafeIsolationSummary = {
+  mode: string;
+  isolated: boolean;
+  scoredEligible: boolean;
+  networkMode?: string;
+  restrictedEgressVerified?: boolean;
+  /** The resolved, immutable agent image identity - never the mutable tag alone (same discipline as #198's TrialSet identity). */
+  imageIdentity?: { reference: string; id: string };
+  /**
+   * #197 evidence (PR #210 review round 3, Blocking 3): which gateway
+   * enforced the restricted-egress boundary, not just that a boolean claims
+   * one did. `restrictedEgressVerified: true` alone cannot answer "which
+   * gateway bytes actually relayed model traffic" - this can. Never the raw
+   * `egressGateway` record, which additionally carries `containerName` (no
+   * evidentiary value beyond what `internalNetworkName` already gives) and
+   * an internal `imageIdentitySchemaVersion` counter this projection
+   * deliberately omits rather than growing to track.
+   */
+  egressGateway?: {
+    internalNetworkName: string;
+    upstreamHost: string;
+    internalVerified: boolean;
+    imageIdentity: { reference: string; id: string };
+  };
+};
+
+function sanitizeIsolationSummary(isolation: PostgresResearchSessionResult["isolation"]): HistoricalPostgresSafeIsolationSummary {
+  const record = isolation as {
+    mode: string;
+    isolated: boolean;
+    scoredEligible: boolean;
+    networkMode?: string;
+    restrictedEgressVerified?: boolean;
+    imageIdentity?: { reference: string; id: string };
+    egressGateway?: { internalNetworkName: string; upstreamHost: string; internalVerified: boolean; imageIdentity: { reference: string; id: string } };
+  };
+  return {
+    mode: record.mode,
+    isolated: record.isolated,
+    scoredEligible: record.scoredEligible,
+    networkMode: record.networkMode,
+    restrictedEgressVerified: record.restrictedEgressVerified,
+    imageIdentity: record.imageIdentity ? { reference: record.imageIdentity.reference, id: record.imageIdentity.id } : undefined,
+    egressGateway: record.egressGateway
+      ? {
+          internalNetworkName: record.egressGateway.internalNetworkName,
+          upstreamHost: record.egressGateway.upstreamHost,
+          internalVerified: record.egressGateway.internalVerified,
+          imageIdentity: { reference: record.egressGateway.imageIdentity.reference, id: record.egressGateway.imageIdentity.id }
+        }
+      : undefined
+  };
+}
+
+export type HistoricalPostgresSafeSessionEvidence = {
+  schemaVersion: 1;
+  agent: HistoricalPostgresSafeAgentExecutionSummary;
+  isolation: HistoricalPostgresSafeIsolationSummary;
+  /** Already-public build/runtime metadata only - see HistoricalPostgresTrialExecutionEnvironment's own docstring. Never grader-private truth, never a host path. */
+  executionEnvironment: HistoricalPostgresTrialExecutionEnvironment;
+};
+
+/**
+ * The one explicit, versioned, whitelisted projection of a real agent
+ * session this module ever persists to `agent-result.json` (#209/PR #210
+ * review, Blocking 2) - never the raw `PostgresResearchSessionResult`, which
+ * carries `agentEnvironment` (exactly what was exported into the agent
+ * process - e.g. a model API key), `source`/`build`/`runtime` (host paths
+ * and internal detail beyond what HistoricalPostgresTrialExecutionEnvironment
+ * already whitelists), and `stdout`/`stderr` (already persisted separately,
+ * so duplicating them here would be redundant, not just risky).
+ *
+ * Retains enough to explain *under what environment* the agent ran
+ * (isolation/confinement mode, network/restricted-egress verification,
+ * resolved agent image identity, build/runtime/compiler identity) alongside
+ * the agent's own execution outcome - the two things #209's investigation
+ * actually needed and the old raw-session dump accidentally buried a secret
+ * inside of.
+ */
+function buildSafeSessionEvidence(session: PostgresResearchSessionResult, executionEnvironment: HistoricalPostgresTrialExecutionEnvironment, secrets: readonly string[]): HistoricalPostgresSafeSessionEvidence {
+  return {
+    schemaVersion: 1,
+    agent: sanitizeAgentExecutionSummary(session.agent, secrets),
+    isolation: sanitizeIsolationSummary(session.isolation),
+    executionEnvironment
+  };
 }
 
 /** Materializes a clean scored task tree and a separate grader-only reference tree. */
@@ -1311,6 +1683,21 @@ export async function runHistoricalPostgresTrial(input: {
   agent: PostgresResearchAgentSpec;
   artifactDir: string;
   session?: PostgresResearchSessionOptions;
+  /**
+   * Explicit, caller-known expectation that this trial's agent is DSH and
+   * will therefore engage `@deepseek-ai/dsh-session-persistence-jsonl`
+   * (PR #210 review round 5, Blocking 1) - never inferred here from
+   * `agent.command`, filesystem contents, `$DSH_HOME` existence after
+   * execution, or any profile id/name. The caller that actually chose the
+   * agent (the TrialSet real-agent path, `executeTrialSetCell()`) sets this
+   * explicitly; the deterministic `smoke_stub` path does not. Absent means
+   * "no DSH trajectory is owed" - a missing/empty `$DSH_HOME` is then
+   * legitimately `not_applicable`, exactly the pre-round-5 behavior. Present
+   * (`"dsh"`) means a non-empty, successfully persisted transcript is
+   * required core evidence for an otherwise scored-eligible, `agent.ok`,
+   * within-limit trial - see the required-evidence gate below.
+   */
+  trajectoryExpectation?: "dsh";
   /** Injectable for tests (e.g. a fixture with `isolation.scoredEligible: false`); defaults to the real session runner. */
   runSession?: typeof runAgentInPostgresResearchEnvironment;
   /** Injectable for tests (e.g. controlling each grader revision's reported `executionEnvironment`); defaults to the real per-revision research environment. */
@@ -1319,10 +1706,30 @@ export async function runHistoricalPostgresTrial(input: {
   const task = checkedTaskSpec(input.task);
   const artifacts: string[] = [];
   const runSession = input.runSession ?? runAgentInPostgresResearchEnvironment;
+  const dshTrajectoryExpected = input.trajectoryExpectation === "dsh";
+  // Created only when a DSH trajectory is actually expected (PR #210 review
+  // round 5, Blocking 2 "only mount it when expected") - a non-DSH agent
+  // gets no extra writable mount at all. Lives outside input.artifactDir on
+  // purpose: raw DSH session events are written by a process running
+  // *inside* the agent container (arbitrary shell access - agent-tamperable
+  // diagnostic telemetry, never immutable grader-owned evidence) and can
+  // carry tool arguments/output or credential values an agent happened to
+  // echo, which the derived agent-transcript.ndjson/agent-trajectory.jsonl
+  // artifacts deliberately redact. Publishing the raw source into the same
+  // tree those sanitized artifacts live in would let anyone who copies/
+  // shares/archives the trial artifact directory recover exactly the values
+  // the redaction exists to remove. `createAgentEnvRoot()` is the same
+  // private per-trial temp root `historical-agent-`/`historical-grade-`
+  // already use - unique per trial, starts empty, removed in this
+  // function's `finally` below regardless of which return path is taken.
+  let dshHomeDir: string | undefined;
+  let result: HistoricalPostgresTrial;
   try {
+    result = await (async (): Promise<HistoricalPostgresTrial> => {
     await mkdir(input.artifactDir, { recursive: true });
     const taskLayout = await materializeHistoricalPostgresTask(task, join(input.artifactDir, "task-bundle"));
     artifacts.push(taskLayout.taskDir, taskLayout.referenceDir);
+    if (dshTrajectoryExpected) dshHomeDir = await createAgentEnvRoot("historical-dsh-home-");
     const session: PostgresResearchSessionResult = await runSession(
       {
         root: await createAgentEnvRoot("historical-agent-"),
@@ -1340,7 +1747,7 @@ export async function runHistoricalPostgresTrial(input: {
         // upstreamBug/commitFest/referenceRevision, which stay grader-private.
         env: { ...(input.agent.env ?? {}), HONEYRAIL_TASK_ID: task.taskId, HONEYRAIL_TASK_PROMPT: task.prompt }
       },
-      input.session
+      { ...input.session, isolation: { ...(input.session?.isolation ?? {}), ...(dshHomeDir ? { dshHomeDir } : {}) } }
     );
     const scoredEligible = session.isolation.scoredEligible;
     // What this specific execution actually resolved - see
@@ -1348,13 +1755,146 @@ export async function runHistoricalPostgresTrial(input: {
     // `session` exists, so both return paths below carry it.
     const executionEnvironment = extractHistoricalPostgresTrialExecutionEnvironment(session.build, session.runtime);
     const returnedWorkspace = join(input.artifactDir, "agent-workspace");
-    await assertWorkspaceWithinLimits(session.workspaceDir);
+    const evidenceWarnings: string[] = [];
+    // The exact values this trial was ever explicitly handed as sensitive -
+    // see collectKnownSecretValues()'s own docstring. Computed once, reused
+    // by every redaction site below.
+    const knownSecrets = collectKnownSecretValues(input.agent.env);
+
+    // #209 (PR #210 review, Blocking 1): the workspace-size policy verdict
+    // is the one authoritative decision here, computed purely from the
+    // measurement and never affected by whether any evidence artifact below
+    // can actually be persisted. Evidence persistence is a separate,
+    // best-effort concern: a failed write is recorded as an evidence
+    // warning, never allowed to fall through to the outer catch and get
+    // silently reclassified as "infrastructure_error". A failure to obtain
+    // the measurement itself is a genuine, unmasked infrastructure failure
+    // and is deliberately left to propagate to that outer catch - without a
+    // measurement there is no authoritative verdict to protect at all.
+    const workspaceMeasurement = await measureHistoricalPostgresWorkspace(session.workspaceDir);
+    const workspaceOverLimit = isHistoricalPostgresWorkspaceOverLimit(workspaceMeasurement);
+
+    // The core evidence contract a scored capability sample requires (PR
+    // #210 review round 3, Blocking 1) - tracked directly from the
+    // persistence step below, never inferred later by scanning the
+    // artifact directory.
+    const persistedEvidenceLabels = new Set<string>();
+    const persistEvidence = async (label: string, write: () => Promise<void>): Promise<void> => {
+      try {
+        await write();
+        artifacts.push(join(input.artifactDir, label));
+        persistedEvidenceLabels.add(label);
+      } catch (error) {
+        evidenceWarnings.push(`evidence_warning: could not persist ${label}: ${(error as Error).message}`);
+      }
+    };
+    // #209: persist cheap, bounded, sanitized agent evidence *before* the
+    // workspace-size check can abort the trial. Previously every piece of
+    // agent evidence (including stdout/stderr) was written only after this
+    // check passed, so a workspace-over-limit integrity_error retained
+    // nothing at all about what the agent actually did - see #209's own
+    // investigation. None of this changes the check's policy (limits are
+    // unchanged) or its outcome (still integrity_error, still
+    // datasetEligible: false) - only what evidence survives it, and how
+    // resiliently.
+    await persistEvidence("agent-result.json", () =>
+      writeJson(join(input.artifactDir, "agent-result.json"), buildSafeSessionEvidence(session, executionEnvironment, knownSecrets))
+    );
+    await persistEvidence("agent-stdout.txt", () => writeFile(join(input.artifactDir, "agent-stdout.txt"), redactKnownSecrets(session.agent.stdout ?? "", knownSecrets)));
+    await persistEvidence("agent-stderr.txt", () => writeFile(join(input.artifactDir, "agent-stderr.txt"), redactKnownSecrets(session.agent.stderr ?? "", knownSecrets)));
+    await persistEvidence("workspace-inventory.json", () =>
+      writeJson(join(input.artifactDir, "workspace-inventory.json"), buildHistoricalPostgresWorkspaceInventory(workspaceMeasurement, knownSecrets))
+    );
+
+    // PR #210 review round 5, Blocking 3 (evidence-boundary isolation) /
+    // round 6, Blocking 1-2 (bounded ingestion, required-vs-best-effort
+    // separation): the required transcript path and the derived best-effort
+    // paths are two *separate* try/catch blocks, both inside the overall
+    // trajectory evidence boundary - a failure in either must never
+    // propagate to the function's outer catch and silently overwrite an
+    // already-known authoritative trial attribution (an over-limit
+    // workspace's integrity_error, a timed-out agent's blocked) with
+    // infrastructure_error, and a failure in the derived, best-effort paths
+    // (session-stats, trajectory derivation) must never retroactively
+    // invalidate an already-successfully-persisted required transcript
+    // (round 6, Blocking 2) - `trajectoryUsable` is only ever set inside the
+    // transcript try block below, nowhere else.
+    let trajectoryUsable = false;
+    if (dshHomeDir) {
+      // `readBoundedDshSessionTelemetry()` performs its own bounded
+      // discovery/read/decode (round 6, Blocking 1: a streaming
+      // `opendir()` walk, never `readdir(..., {recursive:true})`; symlinks
+      // rejected via `lstat().isFile()`; on-disk, decoded, and event-count
+      // bounds all enforced before any unbounded downstream structure is
+      // built) and throws `DshSessionTelemetryLimitExceededError` when any
+      // bound is exceeded - a harness/evidence-retention failure, handled
+      // identically to a genuine corruption error (corrupt JSONL, a
+      // malformed Zstandard frame) by the single catch below. Returning
+      // null means the mount was never populated at all, even though a DSH
+      // trajectory was expected - itself an evidence gap the
+      // required-evidence gate below must catch (trajectoryUsable stays
+      // false), not "not_applicable" (that outcome now belongs only to a
+      // trial with no trajectoryExpectation at all).
+      let rawSessions: Array<{ file: string; events: DshRawEvent[] }> | null = null;
+      try {
+        rawSessions = await readBoundedDshSessionTelemetry(dshHomeDir, HISTORICAL_POSTGRES_DSH_TELEMETRY_LIMITS);
+        if (rawSessions !== null) {
+          const transcriptLines = redactSecretsDeep(buildTranscriptLines(rawSessions), knownSecrets);
+          await persistEvidence("agent-transcript.ndjson", () =>
+            writeFile(join(input.artifactDir, "agent-transcript.ndjson"), transcriptLines.length ? `${transcriptLines.map((line) => JSON.stringify(line)).join("\n")}\n` : "")
+          );
+          trajectoryUsable = transcriptLines.length > 0 && persistedEvidenceLabels.has("agent-transcript.ndjson");
+        }
+      } catch (error) {
+        // Never leak the private host temp path into persisted/public
+        // evidence (round 6, Blocking 3's same discipline, applied here
+        // too): a bounded-discovery/decode error can legitimately embed
+        // the filesystem path it was operating on.
+        evidenceWarnings.push(`evidence_warning: DSH trajectory evidence extraction failed: ${redactKnownSecrets((error as Error).message, [dshHomeDir])}`);
+      }
+
+      // Derived/best-effort (regenerable from the transcript above) - never
+      // part of the required core evidence contract, same reasoning as
+      // agent-postgres.log: a failure here is a diagnostic, not a
+      // classification change, and - round 6, Blocking 2 - must never touch
+      // `trajectoryUsable`, which is already finalized above. Folded
+      // directly from the already-bounded `rawSessions` this function just
+      // obtained, rather than re-reading/re-decoding the same files a
+      // second time via a second, independent call.
+      if (rawSessions !== null) {
+        try {
+          const sessionStatsReport = foldSessionStatsReport(rawSessions);
+          await persistEvidence("agent-session-stats.json", () => writeJson(join(input.artifactDir, "agent-session-stats.json"), sessionStatsReport.aggregate));
+        } catch (error) {
+          evidenceWarnings.push(`evidence_warning: DSH session-stats derivation failed: ${redactKnownSecrets((error as Error).message, [dshHomeDir])}`);
+        }
+        try {
+          const trajectoryEvents = redactSecretsDeep(
+            rawSessions.flatMap(({ events }) => deriveTrajectoryEvents(events)),
+            knownSecrets
+          );
+          await persistEvidence("agent-trajectory.jsonl", () =>
+            writeFile(join(input.artifactDir, "agent-trajectory.jsonl"), trajectoryEvents.length ? `${trajectoryEvents.map((event) => JSON.stringify(event)).join("\n")}\n` : "")
+          );
+        } catch (error) {
+          evidenceWarnings.push(`evidence_warning: DSH trajectory derivation failed: ${redactKnownSecrets((error as Error).message, [dshHomeDir])}`);
+        }
+      }
+    }
+
+    if (workspaceOverLimit) {
+      return {
+        taskId: task.taskId,
+        status: "integrity_error",
+        scoredEligible: false,
+        agent: session.agent,
+        executionEnvironment,
+        artifacts,
+        diagnostics: [`Historical PostgreSQL trial integrity failed: ${workspaceLimitExceededMessage(workspaceMeasurement)}`, ...evidenceWarnings]
+      };
+    }
     await cp(session.workspaceDir, returnedWorkspace, { recursive: true, dereference: false });
     artifacts.push(returnedWorkspace);
-    await writeJson(join(input.artifactDir, "agent-result.json"), session);
-    await writeFile(join(input.artifactDir, "agent-stdout.txt"), session.agent.stdout ?? "");
-    await writeFile(join(input.artifactDir, "agent-stderr.txt"), session.agent.stderr ?? "");
-    const evidenceWarnings: string[] = [];
     // The PostgreSQL server log from the agent's own live investigation
     // session - distinct from (and in addition to) any per-revision grading
     // log the two-revision grader below writes under grader/{historical,reference}.
@@ -1384,6 +1924,47 @@ export async function runHistoricalPostgresTrial(input: {
         artifacts,
         diagnostics: [
           session.agent.timedOut ? "Agent timed out before submission." : "Agent exited without a successful completed run.",
+          ...evidenceWarnings
+        ]
+      };
+    }
+    // PR #210 review round 3, Blocking 1: an official scored capability
+    // sample must never enter the Historical PostgreSQL dataset unless its
+    // required core evidence contract was successfully persisted. This
+    // check only applies to a trial that could otherwise become one -
+    // `scoredEligible === false` already routes to "unscored" below with no
+    // official score regardless, and must keep that distinct attribution
+    // rather than being folded into an infrastructure failure it isn't.
+    // Grading is skipped entirely rather than run and then discarded, per
+    // the review's "do not grade a submission with an already-known-
+    // incomplete evidence contract" requirement.
+    // PR #210 review round 5, Blocking 1/1b: whether a DSH trajectory is
+    // required at all comes only from the caller-supplied
+    // `trajectoryExpectation` (dshTrajectoryExpected) - never from whether
+    // evidence happened to survive. A trial that expected DSH but ended up
+    // with no usable transcript (mount never populated, zero recovered
+    // events, or a parse/persist failure caught by the evidence boundary
+    // above) is an infrastructure failure for an otherwise scored-eligible
+    // run, exactly like a missing core-evidence file - it just isn't folded
+    // into `HISTORICAL_POSTGRES_REQUIRED_CORE_EVIDENCE` itself, since that
+    // constant's membership must stay identical for every trial regardless
+    // of trajectory expectation.
+    const missingCoreEvidence = HISTORICAL_POSTGRES_REQUIRED_CORE_EVIDENCE.filter((label) => !persistedEvidenceLabels.has(label));
+    const dshTrajectoryMissing = dshTrajectoryExpected && !trajectoryUsable;
+    if (scoredEligible && (missingCoreEvidence.length > 0 || dshTrajectoryMissing)) {
+      return {
+        taskId: task.taskId,
+        status: "infrastructure_error",
+        scoredEligible,
+        workspaceDir: returnedWorkspace,
+        agent: session.agent,
+        executionEnvironment,
+        artifacts,
+        diagnostics: [
+          `Historical PostgreSQL trial infrastructure failed: required core evidence incomplete before grading` +
+            (missingCoreEvidence.length > 0 ? ` (missing: ${missingCoreEvidence.join(", ")})` : "") +
+            (dshTrajectoryMissing ? " (expected DSH trajectory/session evidence is missing or unusable: agent-transcript.ndjson)" : "") +
+            ".",
           ...evidenceWarnings
         ]
       };
@@ -1420,8 +2001,9 @@ export async function runHistoricalPostgresTrial(input: {
       artifacts,
       diagnostics: [...unscoredNotice, ...grade.diagnostics, ...evidenceWarnings]
     };
+    })();
   } catch (error) {
-    return {
+    result = {
       taskId: task.taskId,
       status: error instanceof HistoricalPostgresIntegrityError ? "integrity_error" : "infrastructure_error",
       scoredEligible: false,
@@ -1434,6 +2016,24 @@ export async function runHistoricalPostgresTrial(input: {
       ]
     };
   }
+  // PR #210 review round 6, Blocking 3: the private raw DSH telemetry root
+  // is never a normal public/shareable trial artifact and is always removed
+  // - but a removal *failure* must be observable, not silently swallowed:
+  // the raw source can carry tool arguments/output, echoed environment
+  // values, or a credential before redaction, so a caller needs to know
+  // when it was possibly retained on disk. This never reclassifies the
+  // trial's own status (integrity_error/blocked/completed/
+  // infrastructure_error all stay exactly what they already were) - it only
+  // appends a diagnostic, and never leaks the private host path itself.
+  if (dshHomeDir) {
+    try {
+      await rm(dshHomeDir, { recursive: true, force: true });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? "unknown_error";
+      result.diagnostics.push(`evidence_warning: failed to remove private raw DSH telemetry root (${code}) - raw, unredacted DSH telemetry may still be retained on disk.`);
+    }
+  }
+  return result;
 }
 
 /**

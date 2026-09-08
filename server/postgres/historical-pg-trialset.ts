@@ -464,6 +464,12 @@ export async function executeTrialSetCell(input: ExecuteTrialSetCellInput): Prom
     // Real DSH agent cells are always profileKind "agent" - never "smoke_stub",
     // which exists only for #180's own deterministic pipeline-integrity check.
     profileKind: "agent",
+    // This is the one place in the codebase that actually launches a real
+    // DSH agent (see buildDshAgentCommand() above) - so this is the one
+    // place that gets to say a DSH trajectory is expected (PR #210 review
+    // round 5, Blocking 1). Never inferred downstream from agent.command,
+    // filesystem contents, or profileKind itself.
+    trajectoryExpectation: "dsh",
     agent: {
       command,
       args,

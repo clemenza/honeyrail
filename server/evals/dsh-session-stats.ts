@@ -46,8 +46,8 @@
  *     enters no wall-time figure.
  */
 
-import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { lstat, opendir, readdir, readFile } from "node:fs/promises";
+import { join, relative } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 
 export type DshRawEvent = {
@@ -228,6 +228,40 @@ export function parseSessionLog(text: string): DshRawEvent[] {
   return text.split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line) as DshRawEvent);
 }
 
+/**
+ * The Historical-PG bounded-ingestion counterpart to `parseSessionLog()`
+ * (PR #210 review, final round): scans `text` one line at a time via
+ * `indexOf("\n", pos)` rather than `text.split("\n")` - the recovered-event
+ * bound must actually protect against materializing every line/event
+ * before it is enforced, not just reject the *result* of having already
+ * done so. The moment the next non-blank line would push the recovered
+ * count past `maxEvents`, this throws `DshSessionTelemetryLimitExceededError`
+ * immediately, *before* that line (or anything after it) is ever
+ * `JSON.parse`'d - so a malformed line sitting past the bound is never
+ * reached, let alone reported as a parse error instead of a limit error.
+ * Blank-line skipping, parse-error behavior for a line under the bound,
+ * and event order are all otherwise identical to `parseSessionLog()`.
+ * `parseSessionLog()` itself is untouched and remains fully unbounded for
+ * every existing caller that doesn't opt into a Historical-PG limit.
+ */
+export function parseSessionLogBounded(text: string, maxEvents: number): DshRawEvent[] {
+  const events: DshRawEvent[] = [];
+  let pos = 0;
+  while (pos <= text.length) {
+    const newlineIndex = text.indexOf("\n", pos);
+    const line = newlineIndex === -1 ? text.slice(pos) : text.slice(pos, newlineIndex);
+    if (line.trim() !== "") {
+      if (events.length >= maxEvents) {
+        throw new DshSessionTelemetryLimitExceededError(`DSH telemetry exceeds the recovered-event bound (> ${maxEvents} events across .jsonl/.jsonl.zstd files under sessions/)`);
+      }
+      events.push(JSON.parse(line) as DshRawEvent);
+    }
+    if (newlineIndex === -1) break;
+    pos = newlineIndex + 1;
+  }
+  return events;
+}
+
 // `@deepseek-ai/dsh-session-persistence-jsonl`'s DEFAULT_COMPRESSION is
 // "zstd" (confirmed in its published lib/index.js), so a real session log is
 // `session.jsonl.zstd`, not `session.jsonl`, on every trial unless an
@@ -305,15 +339,70 @@ function scanZstdFrames(buffer: Buffer): { frames: ZstdFrameRange[]; tornStart?:
 }
 
 /**
+ * Thrown when a Historical-PG bounded telemetry read (see
+ * `readBoundedDshSessionTelemetry()` below) exceeds one of its caller-supplied
+ * limits - discovery entries, matching files, on-disk bytes, decoded bytes,
+ * or recovered events (PR #210 review round 6, Blocking 1). A distinct type
+ * from a genuine corruption error (invalid JSON, a malformed Zstandard
+ * frame): both are still evidence-extraction failures from the caller's
+ * point of view and are handled identically by
+ * `runHistoricalPostgresTrial()`'s existing evidence boundary, but keeping
+ * this as its own class lets a limit violation be recognized unambiguously
+ * wherever that turns out to matter.
+ */
+export class DshSessionTelemetryLimitExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DshSessionTelemetryLimitExceededError";
+  }
+}
+
+/**
  * Decode a dsh session log's concatenated-frame Zstandard container into its
  * plaintext JSONL. A structurally torn final frame is dropped, not thrown
  * on - readSessionStats already treats a session as best-effort telemetry,
  * not an integrity check, and a trial's log is sometimes read immediately
  * after the writer's last append.
+ *
+ * `options.maxOutputLength`, when given, bounds the *decoded* output across
+ * every frame in this buffer combined (PR #210 review round 6, Blocking 1b):
+ * a small compressed `.jsonl.zstd` file can still expand into a much larger
+ * plaintext buffer, so the on-disk/compressed byte bound alone
+ * (`measureDshSessionTelemetry`'s bound, or the caller's own file-size check)
+ * cannot protect against that. Each frame is decompressed with Node's own
+ * `maxOutputLength` enforcement (`zlib.zstdDecompressSync`, which rejects
+ * before allocating past the bound - never fully materializes an oversized
+ * decoded buffer first) against the *remaining* budget, so the cumulative
+ * decoded size across all frames in this buffer can never exceed the given
+ * bound. Omitted (the default): fully unbounded, exactly the prior
+ * behavior - existing callers (scripts/dsh-evals-demo.ts's tinytable path,
+ * and this module's own unbounded `readRawSessionFiles`) are unaffected.
  */
-export function decodeZstdSessionLog(buffer: Buffer): string {
+export function decodeZstdSessionLog(buffer: Buffer, options: { maxOutputLength?: number } = {}): string {
   const { frames } = scanZstdFrames(buffer);
-  const decoded = frames.map((frame) => zstdDecompressSync(buffer.subarray(frame.start, frame.end)));
+  const decoded: Buffer[] = [];
+  let total = 0;
+  for (const frame of frames) {
+    const frameBuffer = buffer.subarray(frame.start, frame.end);
+    let chunk: Buffer;
+    if (options.maxOutputLength === undefined) {
+      chunk = zstdDecompressSync(frameBuffer);
+    } else {
+      const remaining = Math.max(0, options.maxOutputLength - total);
+      try {
+        chunk = zstdDecompressSync(frameBuffer, { maxOutputLength: remaining });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ERR_BUFFER_TOO_LARGE") {
+          throw new DshSessionTelemetryLimitExceededError(
+            `DSH telemetry decoded output exceeds the decoded-byte bound (> ${options.maxOutputLength} bytes)`
+          );
+        }
+        throw error;
+      }
+    }
+    decoded.push(chunk);
+    total += chunk.length;
+  }
   return Buffer.concat(decoded).toString("utf8");
 }
 
@@ -347,6 +436,20 @@ export type SessionStatsReport = {
 export async function readSessionStats(dshHomeDir: string): Promise<SessionStatsReport | null> {
   const sessions = await readRawSessionFiles(dshHomeDir);
   if (sessions === null) return null;
+  return foldSessionStatsReport(sessions);
+}
+
+/**
+ * Folds already-loaded raw session events into a `SessionStatsReport`,
+ * without touching the filesystem - shared by `readSessionStats()` (which
+ * reads via the unbounded `readRawSessionFiles()`) and
+ * `runHistoricalPostgresTrial()` (PR #210 review round 6), which already
+ * holds its own bounded `readBoundedDshSessionTelemetry()` result and must
+ * not re-read/re-decode the same files a second time - independent of, and
+ * without reintroducing, the unbounded discovery this round's Blocking 1
+ * removes from the Historical-PG path.
+ */
+export function foldSessionStatsReport(sessions: Array<{ file: string; events: DshRawEvent[] }>): SessionStatsReport {
   const folded = sessions.map(({ file, events }) => ({ file, stats: foldSessionStats(events) }));
   return { aggregate: sumStats(folded.map((s) => s.stats)), sessions: folded };
 }
@@ -365,15 +468,9 @@ export async function readSessionStats(dshHomeDir: string): Promise<SessionStats
  * every real trial, since dsh writes zstd by default.
  */
 export async function readRawSessionFiles(dshHomeDir: string): Promise<Array<{ file: string; events: DshRawEvent[] }> | null> {
-  const sessionsDir = join(dshHomeDir, "sessions");
-  let entries: string[];
-  try {
-    entries = await readdir(sessionsDir, { recursive: true });
-  } catch {
-    return null;
-  }
-  const files = entries.filter((entry) => entry.endsWith(".jsonl") || entry.endsWith(".jsonl.zstd")).sort();
-  if (files.length === 0) return null;
+  const listing = await listDshSessionFiles(dshHomeDir);
+  if (listing === null) return null;
+  const { sessionsDir, files } = listing;
 
   return Promise.all(
     files.map(async (file) => {
@@ -383,4 +480,195 @@ export async function readRawSessionFiles(dshHomeDir: string): Promise<Array<{ f
       return { file, events: parseSessionLog(text) };
     })
   );
+}
+
+/** Shared session-file discovery between readRawSessionFiles() and measureDshSessionTelemetry() - one definition of "which files count", never two that could silently disagree. */
+async function listDshSessionFiles(dshHomeDir: string): Promise<{ sessionsDir: string; files: string[] } | null> {
+  const sessionsDir = join(dshHomeDir, "sessions");
+  let entries: string[];
+  try {
+    entries = await readdir(sessionsDir, { recursive: true });
+  } catch {
+    return null;
+  }
+  const files = entries.filter((entry) => entry.endsWith(".jsonl") || entry.endsWith(".jsonl.zstd")).sort();
+  if (files.length === 0) return null;
+  return { sessionsDir, files };
+}
+
+/**
+ * The Historical-PG-specific telemetry sanity policy `readBoundedDshSessionTelemetry()`
+ * enforces (PR #210 review round 6, Blocking 1). `$DSH_HOME` is written by a
+ * process running *inside* the agent container - agent-tamperable
+ * diagnostic telemetry, not grader-owned evidence - so nothing else bounds
+ * its growth. Every field is a hard ceiling on a distinct resource, checked
+ * in the order a caller would actually pay for it (cheapest first):
+ * directory entries visited, matching files found, their on-disk bytes,
+ * their decoded bytes, and finally the raw events recovered from them.
+ */
+export type DshSessionTelemetryLimits = {
+  /** Every directory entry visited during discovery under `sessions/` - files, directories, and non-matching files all count, checked before any `lstat`/read on that entry. */
+  maxEntries: number;
+  /** Matching (`.jsonl`/`.jsonl.zstd`) *regular* files - a symlink or any other non-regular entry is never counted here (see below). */
+  maxFiles: number;
+  /** Sum of on-disk bytes (compressed, for `.jsonl.zstd`) across matching files, from `lstat`, before any file content is read. */
+  maxBytes: number;
+  /** Sum of decoded/plaintext JSONL bytes across matching files - independent of `maxBytes`, since a small compressed file can still decode much larger. */
+  maxDecodedBytes: number;
+  /** Sum of recovered raw events across matching files. */
+  maxEvents: number;
+};
+
+type BoundedDshSessionFile = { relativePath: string; absolutePath: string };
+
+/** Tolerates a `for await...of`-already-closed `fs.Dir` the same way `measureHistoricalPostgresWorkspace()` (historical-task.ts) does - shared discipline, not shared code. */
+async function closeDirQuietly(dir: { close: () => Promise<void> }): Promise<void> {
+  try {
+    await dir.close();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== "ERR_DIR_CLOSED") throw error;
+  }
+}
+
+/**
+ * Bounded discovery for the Historical-PG telemetry path (PR #210 review
+ * round 6, Blocking 1): walks `${dshHomeDir}/sessions/` with `opendir()`'s
+ * async iterator - never `readdir(..., {recursive: true})`, which
+ * materializes an entire, potentially agent-controlled directory tree into
+ * one array *before* any limit in `limits` is ever consulted. Every visited
+ * entry - matching or not, file or directory - counts against
+ * `limits.maxEntries`, checked immediately on each entry, so a tree of
+ * millions of non-matching files stops cheaply rather than being fully
+ * enumerated first.
+ *
+ * A matching entry is `lstat`'d (never `stat`) and accepted only when
+ * `isFile()` is true (Blocking 1a): a symlink - `fake.jsonl ->
+ * huge-file-elsewhere` - is skipped outright, counted as neither a matching
+ * file nor toward `maxBytes`, and its target is never read by this
+ * function or by `readBoundedDshSessionTelemetry()` below. `lstat`
+ * reporting a symlink's own tiny size cannot be used to smuggle a much
+ * larger target past the byte bound, because the target is simply never
+ * opened.
+ *
+ * Returns null under the same "nothing captured" condition as
+ * `readRawSessionFiles()` - `sessions/` doesn't exist, or holds no matching
+ * regular file after a full (bounded) walk.
+ */
+async function discoverBoundedDshSessionFiles(dshHomeDir: string, limits: DshSessionTelemetryLimits): Promise<BoundedDshSessionFile[] | null> {
+  const sessionsDir = join(dshHomeDir, "sessions");
+  let rootDir;
+  try {
+    rootDir = await opendir(sessionsDir);
+  } catch {
+    return null;
+  }
+
+  let entriesVisited = 0;
+  let totalBytes = 0;
+  const matched: BoundedDshSessionFile[] = [];
+
+  const visitEntry = async (entryPath: string, name: string, isDirectory: boolean): Promise<void> => {
+    entriesVisited += 1;
+    if (entriesVisited > limits.maxEntries) {
+      throw new DshSessionTelemetryLimitExceededError(
+        `DSH telemetry discovery exceeds the entry sanity bound (> ${limits.maxEntries} directory entries visited under sessions/)`
+      );
+    }
+    if (isDirectory) {
+      await walkDir(entryPath);
+      return;
+    }
+    if (!(name.endsWith(".jsonl") || name.endsWith(".jsonl.zstd"))) return;
+    const details = await lstat(entryPath);
+    if (!details.isFile()) return; // symlinks (and anything else non-regular): never followed, never counted.
+    matched.push({ relativePath: relative(sessionsDir, entryPath), absolutePath: entryPath });
+    if (matched.length > limits.maxFiles) {
+      throw new DshSessionTelemetryLimitExceededError(
+        `DSH telemetry exceeds the matching-file bound (> ${limits.maxFiles} .jsonl/.jsonl.zstd files under sessions/)`
+      );
+    }
+    totalBytes += details.size;
+    if (totalBytes > limits.maxBytes) {
+      throw new DshSessionTelemetryLimitExceededError(
+        `DSH telemetry exceeds the on-disk byte bound (> ${limits.maxBytes} bytes across .jsonl/.jsonl.zstd files under sessions/)`
+      );
+    }
+  };
+
+  async function walkDir(dir: string): Promise<void> {
+    const handle = await opendir(dir);
+    try {
+      for await (const entry of handle) {
+        await visitEntry(join(dir, entry.name), entry.name, entry.isDirectory());
+      }
+    } finally {
+      await closeDirQuietly(handle);
+    }
+  }
+
+  try {
+    for await (const entry of rootDir) {
+      await visitEntry(join(sessionsDir, entry.name), entry.name, entry.isDirectory());
+    }
+  } finally {
+    await closeDirQuietly(rootDir);
+  }
+
+  if (matched.length === 0) return null;
+  matched.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+  return matched;
+}
+
+/**
+ * The bounded replacement for `readRawSessionFiles()` on the Historical-PG
+ * path (PR #210 review round 6): bounded discovery
+ * (`discoverBoundedDshSessionFiles()`, Blocking 1/1a), then reads and
+ * decodes each matching file with an explicit, shrinking decoded-byte
+ * budget (Blocking 1b - `decodeZstdSessionLog()`'s own `maxOutputLength`,
+ * which rejects a frame before fully materializing an oversized decoded
+ * buffer, never after), and finally bounds the cumulative recovered event
+ * count. Any limit violation throws `DshSessionTelemetryLimitExceededError`;
+ * a genuine corruption error (invalid JSON, a malformed Zstandard frame)
+ * propagates as whatever error `parseSessionLog()`/`decodeZstdSessionLog()`
+ * already throws for it - both are left for the caller's own evidence
+ * boundary to handle identically, exactly as `readRawSessionFiles()`'s
+ * corruption errors already were before this round.
+ *
+ * Returns null under the same "nothing captured" condition as
+ * `readRawSessionFiles()`.
+ */
+export async function readBoundedDshSessionTelemetry(
+  dshHomeDir: string,
+  limits: DshSessionTelemetryLimits
+): Promise<Array<{ file: string; events: DshRawEvent[] }> | null> {
+  const matched = await discoverBoundedDshSessionFiles(dshHomeDir, limits);
+  if (matched === null) return null;
+
+  let decodedBytesSoFar = 0;
+  let eventsSoFar = 0;
+  const sessions: Array<{ file: string; events: DshRawEvent[] }> = [];
+  for (const file of matched) {
+    const raw = await readFile(file.absolutePath);
+    const remainingDecodedBudget = limits.maxDecodedBytes - decodedBytesSoFar;
+    let text: string;
+    if (file.relativePath.endsWith(".jsonl.zstd")) {
+      text = decodeZstdSessionLog(raw, { maxOutputLength: Math.max(0, remainingDecodedBudget) });
+    } else {
+      if (raw.length > remainingDecodedBudget) {
+        throw new DshSessionTelemetryLimitExceededError(
+          `DSH telemetry exceeds the decoded-byte bound (> ${limits.maxDecodedBytes} bytes decoded across .jsonl/.jsonl.zstd files under sessions/)`
+        );
+      }
+      text = raw.toString("utf8");
+    }
+    decodedBytesSoFar += Buffer.byteLength(text, "utf8");
+    // Bounded parse (PR #210 review, final round): the remaining cumulative
+    // event budget is enforced *during* parsing, not after - a line past
+    // the budget is never JSON.parse'd, so a malformed line sitting beyond
+    // it can never surface as a parse error instead of the limit error.
+    const events = parseSessionLogBounded(text, limits.maxEvents - eventsSoFar);
+    eventsSoFar += events.length;
+    sessions.push({ file: file.relativePath, events });
+  }
+  return sessions;
 }
