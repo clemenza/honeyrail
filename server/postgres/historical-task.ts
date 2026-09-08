@@ -201,6 +201,49 @@ export type HistoricalPostgresTaskSpec = {
   scaffoldingLevel?: string;
   budget?: Record<string, number>;
   prompt: string;
+  /**
+   * Optional change-oriented context for `HistoricalChangeTask v0` (#212).
+   * When present, enables E0-E3 scaffolding levels that progressively expose
+   * a contemporaneous SPEC, the full introducing change-set diff, and a
+   * generic test-engineering HarnessProfile to the agent. All existing tasks
+   * (001/002/003) omit this entirely — Policy A: the serialized key itself
+   * is absent, so no legacy hash moves.
+   *
+   * The materializer handles this generically: "if changeContext is present,
+   * materialize the artifacts the scaffoldingLevel selects" — never
+   * "if taskId == postgres-change-16867".
+   */
+  changeContext?: HistoricalPostgresChangeContext;
+};
+
+/**
+ * Change-oriented context for a `HistoricalChangeTask v0` (#212). Supplies
+ * the content that `materializeHistoricalPostgresTask()` writes into agent-
+ * visible files when the task's `scaffoldingLevel` selects them:
+ *
+ * - `E0`: none of these artifacts are materialized (blind baseline)
+ * - `E1`: `spec` → `task/spec.md`
+ * - `E2`: `spec` + introducing diff → `task/spec.md` + `task/change-set.diff`
+ * - `E3`: all of the above + `harnessProfile` → `task/harness-profile.md`
+ *
+ * The introducing diff is generated deterministically at materialization
+ * time from `introducingCommit` and the local mirror in `source.repoPath`.
+ */
+export type HistoricalPostgresChangeContext = {
+  /** Contemporaneous specification content (written as `task/spec.md` at E1+). */
+  spec: string;
+  /**
+   * The introducing commit whose full `git diff <parent>..<commit>` becomes
+   * `task/change-set.diff` at E2+. Must be a pinned 40-character hex SHA
+   * resolvable in `source.repoPath`.
+   */
+  introducingCommit: string;
+  /**
+   * Generic test-engineering methodology profile (written as
+   * `task/harness-profile.md` at E3). Must not contain bug-specific
+   * terminology — it should be reusable across unrelated tasks.
+   */
+  harnessProfile?: string;
 };
 
 export type HistoricalPostgresTaskLayout = {
@@ -244,7 +287,27 @@ export type HistoricalPostgresTaskManifest = {
   scaffoldingLevel: string;
   budget: Record<string, number>;
   buildProfile: string;
-  artifacts: { sourceManifest: string; prompt: string; workspace: string };
+  artifacts: {
+    sourceManifest: string;
+    prompt: string;
+    workspace: string;
+    /**
+     * Present only when the task declares `changeContext` and `scaffoldingLevel`
+     * selects E1+. Omitted (not null) for legacy tasks — Policy A.
+     */
+    spec?: string;
+    /**
+     * Present only when the task declares `changeContext` and `scaffoldingLevel`
+     * selects E2+. Omitted (not null) for legacy tasks — Policy A.
+     */
+    changeSet?: string;
+    /**
+     * Present only when the task declares `changeContext` with a
+     * `harnessProfile` and `scaffoldingLevel` selects E3. Omitted (not null)
+     * for legacy tasks — Policy A.
+     */
+    harnessProfile?: string;
+  };
   hashes: {
     sourceTree: string;
     prompt: string;
@@ -746,6 +809,18 @@ function checkedTaskSpec(spec: HistoricalPostgresTaskSpec): HistoricalPostgresTa
   if (spec.truth?.behavioralOracle !== undefined && spec.truth?.structuredOracle !== undefined) {
     throw new Error("A task spec may declare at most one oracle: truth.behavioralOracle and truth.structuredOracle are mutually exclusive");
   }
+  // Change-context validation (#212). Only validates when present — legacy
+  // tasks that omit changeContext skip this entirely, keeping their behaviour
+  // byte-identical.
+  if (spec.changeContext !== undefined) {
+    if (!String(spec.changeContext.spec || "").trim()) {
+      throw new Error("changeContext.spec is required when changeContext is present");
+    }
+    exactRevision(spec.changeContext.introducingCommit, "changeContext.introducingCommit");
+    if (spec.changeContext.harnessProfile !== undefined && !String(spec.changeContext.harnessProfile || "").trim()) {
+      throw new Error("changeContext.harnessProfile must be non-empty when present");
+    }
+  }
   const historicalRevision = exactRevision(spec.source.historicalRevision, "source.historicalRevision");
   const referenceRevision = exactRevision(spec.source.referenceRevision, "source.referenceRevision");
   if (historicalRevision === referenceRevision) throw new Error("historical and reference revisions must differ");
@@ -1178,6 +1253,56 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
   const agentWorkspaceHash = await hashDirectoryContents(workspaceDir);
   const buildContract = resolveHistoricalPostgresBuildContract(input.build);
   const buildContractHash = sha256(stableJson(buildContract));
+
+  // Change-context artifact materialization (#212). Progressively exposes
+  // contemporaneous SPEC, the full introducing change-set diff, and a generic
+  // test-engineering HarnessProfile based on scaffoldingLevel:
+  //   E0 (or no changeContext): nothing
+  //   E1: spec.md
+  //   E2: spec.md + change-set.diff
+  //   E3: spec.md + change-set.diff + harness-profile.md
+  // The artifact hashes (when generated) are folded into taskDefinition via
+  // the Policy A spread pattern, so legacy tasks that omit changeContext
+  // produce byte-identical taskDefinition hashes.
+  const scaffolding = input.scaffoldingLevel ?? "minimal";
+  const scaffoldingRank = scaffolding === "E3" ? 3 : scaffolding === "E2" ? 2 : scaffolding === "E1" ? 1 : 0;
+  let changeContextHashes: { spec: string; changeSet?: string; harnessProfile?: string } | undefined;
+  let changeContextArtifacts: { spec?: string; changeSet?: string; harnessProfile?: string } | undefined;
+  if (input.changeContext && scaffoldingRank >= 1) {
+    const specPath = join(taskDir, "spec.md");
+    await writeFile(specPath, `${input.changeContext.spec.trim()}\n`);
+    const specHash = sha256(await readFile(specPath));
+    changeContextHashes = { spec: specHash };
+    changeContextArtifacts = { spec: "spec.md" };
+
+    if (scaffoldingRank >= 2) {
+      // Generate the full introducing diff deterministically from the local
+      // mirror. The introducing commit's parent is <commit>^ (first parent).
+      const diffResult = await runCommandSafe(
+        "git",
+        ["-C", input.source.repoPath, "diff", `${input.changeContext.introducingCommit}^`, input.changeContext.introducingCommit],
+        { timeout: 60_000, maxBuffer: 1024 * 1024 * 8 }
+      );
+      if (!diffResult.ok) {
+        throw new Error(
+          `Could not generate change-set.diff: git diff ${input.changeContext.introducingCommit}^ ${input.changeContext.introducingCommit} in ${input.source.repoPath} failed: ${(diffResult.stderr || diffResult.stdout).trim()}`
+        );
+      }
+      const changeSetPath = join(taskDir, "change-set.diff");
+      const changeSetContents = Buffer.from(diffResult.stdout, "utf8");
+      await writeFile(changeSetPath, changeSetContents);
+      changeContextHashes.changeSet = sha256(changeSetContents);
+      changeContextArtifacts.changeSet = "change-set.diff";
+    }
+
+    if (scaffoldingRank >= 3 && input.changeContext.harnessProfile) {
+      const harnessProfilePath = join(taskDir, "harness-profile.md");
+      await writeFile(harnessProfilePath, `${input.changeContext.harnessProfile.trim()}\n`);
+      changeContextHashes.harnessProfile = sha256(await readFile(harnessProfilePath));
+      changeContextArtifacts.harnessProfile = "harness-profile.md";
+    }
+  }
+
   await writeFile(
     join(verificationDir, "reproducer-contract.md"),
     "A creditable repro.sql exits successfully only when the observed behavior violates the assertion encoded by the " +
@@ -1284,7 +1409,13 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
     // job, unchanged, per the documented taskDefinitionHash/bundleHash
     // boundary below.
     agentWorkspaceHash,
-    buildContractHash
+    buildContractHash,
+    // Policy A: changeContext hashes are only present when the task actually
+    // declares changeContext and scaffoldingLevel selected at least E1. Legacy
+    // tasks (001/002/003) omit the key entirely, so their serialized
+    // taskDefinition — and therefore taskDefinitionHash — is byte-identical
+    // to what it was before #212.
+    ...(changeContextHashes ? { changeContext: changeContextHashes } : {})
   };
   const taskDefinitionHash = sha256(stableJson(taskDefinition));
 
@@ -1341,7 +1472,17 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
     scaffoldingLevel: input.scaffoldingLevel ?? "minimal",
     budget: input.budget ?? {},
     buildProfile: input.build?.mode ?? defaultBuildMode(),
-    artifacts: { sourceManifest: "source-manifest.json", prompt: "prompt.md", workspace: "workspace" },
+    artifacts: {
+      sourceManifest: "source-manifest.json",
+      prompt: "prompt.md",
+      workspace: "workspace",
+      // Policy A: change-context artifact references are only present when
+      // the materializer actually wrote those files. Legacy tasks produce
+      // byte-identical manifests.
+      ...(changeContextArtifacts?.spec ? { spec: changeContextArtifacts.spec } : {}),
+      ...(changeContextArtifacts?.changeSet ? { changeSet: changeContextArtifacts.changeSet } : {}),
+      ...(changeContextArtifacts?.harnessProfile ? { harnessProfile: changeContextArtifacts.harnessProfile } : {})
+    },
     hashes: {
       sourceTree: source.sourceHash,
       prompt: taskDefinition.promptHash,
@@ -2301,5 +2442,227 @@ export function historicalPostgres003TaskSpec(
     scaffoldingLevel: "minimal",
     budget: {},
     prompt: historicalPostgres003TaskPrompt()
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Case: postgres-change-16867 (#212) — HistoricalChangeTask v0 vertical slice
+// ---------------------------------------------------------------------------
+
+/**
+ * Operator-supplied private truth for the #16867 change-oriented task (#212).
+ * Passed at runtime via `loadHistoricalPostgresChange16867PrivateTruth()` —
+ * never committed to this repository. The script
+ * `scripts/historical-postgres-212.ts` reads this from a local JSON file
+ * pointed to by `HONEYRAIL_PG_212_PRIVATE_TRUTH`. Synthetic values are used
+ * in unit tests.
+ */
+export type HistoricalPostgresChange16867PrivateTruth = {
+  upstreamBug: string;
+  historicalRevision: string;
+  referenceRevision: string;
+  introducingCommit: string;
+  structuredOracle: HistoricalPostgresStructuredOracle;
+};
+
+/**
+ * Loads and validates operator-supplied private truth for the #16867 task
+ * from a local JSON file. Same loud-failure discipline as
+ * `loadHistoricalPostgres003PrivateTruth()`.
+ */
+export async function loadHistoricalPostgresChange16867PrivateTruth(filePath: string): Promise<HistoricalPostgresChange16867PrivateTruth> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(await readFile(filePath, "utf8"));
+  } catch (error) {
+    throw new Error(`loadHistoricalPostgresChange16867PrivateTruth: could not read or parse ${filePath}: ${(error as Error).message}`);
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`loadHistoricalPostgresChange16867PrivateTruth: ${filePath} must contain a JSON object`);
+  }
+  const value = raw as Record<string, unknown>;
+  const upstreamBug = typeof value.upstreamBug === "string" ? value.upstreamBug.trim() : "";
+  if (!upstreamBug) throw new Error(`loadHistoricalPostgresChange16867PrivateTruth: ${filePath} missing or empty "upstreamBug"`);
+  const historicalRevision = exactRevision(
+    typeof value.historicalRevision === "string" ? value.historicalRevision.trim() : "",
+    `loadHistoricalPostgresChange16867PrivateTruth: ${filePath} "historicalRevision"`
+  );
+  const referenceRevision = exactRevision(
+    typeof value.referenceRevision === "string" ? value.referenceRevision.trim() : "",
+    `loadHistoricalPostgresChange16867PrivateTruth: ${filePath} "referenceRevision"`
+  );
+  const introducingCommit = exactRevision(
+    typeof value.introducingCommit === "string" ? value.introducingCommit.trim() : "",
+    `loadHistoricalPostgresChange16867PrivateTruth: ${filePath} "introducingCommit"`
+  );
+  const oracle = value.structuredOracle;
+  if (!oracle || typeof oracle !== "object" || Array.isArray(oracle)) {
+    throw new Error(`loadHistoricalPostgresChange16867PrivateTruth: ${filePath} missing or invalid "structuredOracle"`);
+  }
+  const oracleObj = oracle as Record<string, unknown>;
+  for (const side of ["historical", "reference"] as const) {
+    const sideVal = oracleObj[side];
+    if (!sideVal || typeof sideVal !== "object" || Array.isArray(sideVal)) {
+      throw new Error(`loadHistoricalPostgresChange16867PrivateTruth: ${filePath} structuredOracle.${side} must be an object`);
+    }
+    const sideValObj = sideVal as Record<string, unknown>;
+    if ("ordered" in sideValObj && typeof sideValObj.ordered !== "boolean") {
+      throw new Error(
+        `loadHistoricalPostgresChange16867PrivateTruth: ${filePath} structuredOracle.${side}.ordered must be a boolean when present; got ${typeof sideValObj.ordered}`
+      );
+    }
+    assertValidExpectedRows(sideValObj.rows);
+    assertNoDelimiterInExpectedRows(sideValObj.rows, "|");
+  }
+  if (structuredExpectationsOverlap(oracleObj.historical as HistoricalPostgresStructuredExpectation, oracleObj.reference as HistoricalPostgresStructuredExpectation)) {
+    throw new Error(
+      `loadHistoricalPostgresChange16867PrivateTruth: ${filePath} structuredOracle.historical and .reference expectations overlap and cannot be attributed unambiguously`
+    );
+  }
+  return { upstreamBug, historicalRevision, referenceRevision, introducingCommit, structuredOracle: value.structuredOracle as HistoricalPostgresStructuredOracle };
+}
+
+/**
+ * Contemporaneous SPEC for the #16867 change-oriented task. Written as
+ * `task/spec.md` at scaffolding level E1+.
+ *
+ * CONTENT POLICY: this text must contain only information available at or
+ * before the introducing commit's timestamp (2019-03-22, PostgreSQL 12-era).
+ * Prohibited hindsight markers that must NOT appear here or in any future
+ * revision: SAVEPOINT, "unreleased savepoint", subtransaction,
+ * TBLOCK_SUBCOMMIT, "nested transaction state", "missing switch branch",
+ * "enumerate every blockState", "BUG #16867", or any future-fix wording.
+ */
+export function historicalPostgresChange16867Spec(): string {
+  return `# Transaction Chaining — Contemporaneous Specification
+
+## Feature Summary
+
+PostgreSQL (development tip at the time of this commit) adds support for
+**transaction chaining** via the SQL-standard syntax:
+
+\`\`\`sql
+COMMIT AND CHAIN;
+ROLLBACK AND CHAIN;
+\`\`\`
+
+When a transaction ends with \`AND CHAIN\`, the server immediately opens a
+new transaction that inherits the session-level transaction characteristics
+of the one that just ended — specifically \`transaction_isolation\`,
+\`transaction_read_only\`, and \`transaction_deferrable\`.
+
+## Expected Invariant
+
+After \`COMMIT AND CHAIN\` (or \`ROLLBACK AND CHAIN\`), the newly opened
+transaction must reflect the same isolation level and read-only /
+deferrable settings that the preceding transaction was using. In
+particular, if the session default isolation level is \`repeatable read\`
+and the user issues \`COMMIT AND CHAIN\`, the chained transaction's
+\`transaction_isolation\` must be \`repeatable read\`.
+
+## Scope of Verification
+
+A correct implementation preserves the above invariant under every
+combination of:
+
+- The three isolation levels that PostgreSQL supports (\`read committed\`,
+  \`repeatable read\`, \`serializable\`)
+- Both chaining verbs (\`COMMIT AND CHAIN\`, \`ROLLBACK AND CHAIN\`)
+- Interaction with other transaction control statements that may appear
+  before the chaining verb within the same transaction
+
+The test surface should cover all of these axes. A failure is any case
+where \`SHOW transaction_isolation\` inside the chained transaction returns
+a value different from what the session's default isolation level mandates.
+`;
+}
+
+/**
+ * Generic test-engineering HarnessProfile for database correctness tasks.
+ * Written as `task/harness-profile.md` at scaffolding level E3. Deliberately
+ * domain-generic — reusable across unrelated tasks. Must not contain
+ * bug-specific terminology.
+ */
+export function historicalPostgresChange16867HarnessProfile(): string {
+  return `# HarnessProfile: Database Correctness Test Engineering
+
+## Methodology
+
+1. **Identify the invariant**: what observable property must hold?
+2. **Enumerate boundary conditions**: which SQL statement combinations
+   exercise the invariant under different code paths?
+3. **Write self-checking reproducers**: each test script encodes its own
+   pass/fail assertion and exits successfully only when the invariant is
+   violated.
+4. **Verify determinism**: run each reproducer at least twice to confirm
+   the result is stable (not timing-dependent).
+5. **Minimize**: strip the reproducer to the smallest sequence of
+   statements that still triggers the violation.
+
+## Reproducer Structure
+
+A reproducer is a \`.sql\` file executed via \`psql\`. It must:
+
+- Set up any prerequisite session state (e.g. \`SET default_transaction_isolation\`).
+- Execute the sequence of statements under test.
+- Query observable state (e.g. \`SHOW\` commands) and compare against the
+  expected invariant using \\gset, DO blocks, or similar.
+- Call a deliberate failure mechanism (e.g. a division-by-zero or an
+  explicit \`\\q 1\`) if and only if the invariant is violated.
+- Exit with status 0 when the invariant holds (no bug) and non-zero when
+  violated (bug present).
+`;
+}
+
+/**
+ * Public task prompt for the #16867 change-oriented task (#212). Same
+ * discipline as all other task prompts: describes the *category* of behaviour
+ * to investigate without naming the specific failure mechanism. The prompt is
+ * the same at all scaffolding levels — only the supplementary artifacts
+ * (spec.md, change-set.diff, harness-profile.md) vary.
+ */
+export function historicalPostgresChange16867TaskPrompt(): string {
+  return `# PostgreSQL correctness-testing assignment
+
+Investigate the supplied PostgreSQL source and a locally running PostgreSQL instance for a correctness issue involving transaction chaining and session-level transaction characteristics. Design focused SQL tests that exercise transaction chaining (COMMIT AND CHAIN, ROLLBACK AND CHAIN) under different isolation levels and transaction control sequences, inspect relevant source and documentation, and save any useful test scripts in the writable workspace.
+
+If you observe a reproducible behavioral correctness problem, write \`finding.json\` with \`status: "reproduced"\`, a concise summary, and the name of a runnable SQL reproducer. The reproducer must encode its own assertion and exit successfully only when the observed behavior violates that assertion. If no reproducible issue is found, write \`finding.json\` with \`status: "not-reproduced"\` and a concise summary.\n`;
+}
+
+/**
+ * Builds the `HistoricalPostgresTaskSpec` for the #16867 change-oriented task.
+ *
+ * @param repoPath Local PostgreSQL mirror path.
+ * @param privateTruth Operator-supplied private truth (loaded at runtime).
+ * @param scaffoldingLevel E0/E1/E2/E3 — controls which change-context
+ *   artifacts are materialized. Defaults to "E0" (blind baseline).
+ * @param knownReproducerPath Optional canonical verification reproducer.
+ */
+export function historicalPostgresChange16867TaskSpec(
+  repoPath: string,
+  privateTruth: HistoricalPostgresChange16867PrivateTruth,
+  scaffoldingLevel: "E0" | "E1" | "E2" | "E3" = "E0",
+  knownReproducerPath?: string
+): HistoricalPostgresTaskSpec {
+  return {
+    taskId: "postgres-change-16867",
+    source: {
+      repoPath,
+      historicalRevision: privateTruth.historicalRevision,
+      referenceRevision: privateTruth.referenceRevision
+    },
+    truth: {
+      upstreamBug: privateTruth.upstreamBug,
+      knownReproducerPath,
+      structuredOracle: privateTruth.structuredOracle
+    },
+    scaffoldingLevel,
+    budget: {},
+    prompt: historicalPostgresChange16867TaskPrompt(),
+    changeContext: {
+      spec: historicalPostgresChange16867Spec(),
+      introducingCommit: privateTruth.introducingCommit,
+      harnessProfile: historicalPostgresChange16867HarnessProfile()
+    }
   };
 }

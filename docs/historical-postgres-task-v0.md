@@ -14,6 +14,9 @@ case/
     task-manifest.json       # agent-visible: opaque id, hashes, execution settings only
     source-manifest.json     # agent-visible: sanitized {schemaVersion, sourceHash, gitDirPresent}
     workspace/               # agent-owned finding and repro files
+    spec.md                  # (E1+) contemporaneous specification, when changeContext is present
+    change-set.diff          # (E2+) full introducing-commit diff, when changeContext is present
+    harness-profile.md       # (E3)  generic test-engineering methodology, when changeContext is present
   reference/                 # grader-owned only, never mounted into an agent
     reference-manifest.json  # protocol-level metadata (no revisions, no bug identity)
     truth.json                # the one place the bug identity and both revisions live
@@ -113,6 +116,39 @@ The executor (`psqlArgs()` in `runtime.ts`) already bakes `-X -t -A` (no psqlrc,
 **The structured oracle is additional to the public self-asserting contract, not a replacement for it.** The agent-visible prompt still promises: "the reproducer must encode its own assertion and exit successfully only when the observed behavior violates that assertion." A submission whose captured stdout matches the declared oracle but whose own exit status doesn't follow that contract (`historical.execution.ok !== true` or `reference.execution.ok !== false`) is `invalid_submission` — step 4 of the 4-step classifier, unchanged.
 
 `resolveOracleReproduction()` dispatches on which oracle is declared — `structuredOracle` first, then `behavioralOracle`, then the legacy exit-status path — so the dispatch order is: structured → behavioral → exit-status, each mutually exclusive. `gradeHistoricalPostgresSubmission()`'s `oracleDriven` flag is `Boolean(task.truth.behavioralOracle) || Boolean(task.truth.structuredOracle)` so either oracle family activates the 4-step structural classifier.
+
+### Change-oriented tasks: `changeContext` and E0-E3 scaffolding (#212)
+
+`HistoricalPostgresTaskSpec.changeContext` (optional, `HistoricalPostgresChangeContext`) extends the contract for tasks that evaluate an agent's ability to find a regression *introduced by a known commit*, with progressively more context exposed via `scaffoldingLevel`:
+
+- **E0** (blind baseline): the agent receives only the source, prompt, and live instance - no additional context. `changeContext` is present in the spec but no artifacts are materialized under `task/`.
+- **E1**: additionally materializes `task/spec.md` - a contemporaneous specification that describes the feature and the invariant to verify, using only information available at or before the introducing commit's timestamp.
+- **E2**: additionally materializes `task/change-set.diff` - the full `git diff <parent>..<introducing-commit>`, generated deterministically from the local mirror.
+- **E3**: additionally materializes `task/harness-profile.md` - a generic test-engineering methodology profile (not bug-specific; reusable across unrelated tasks).
+
+The same underlying task (bug identity, oracle, grading) is used at every level - only the agent-visible artifact subset varies. This enables controlled experiments measuring how much additional context (spec, diff, methodology) helps or hurts agent performance on the same regression.
+
+**Policy A compliance.** Legacy tasks (001/002/003) that omit `changeContext` entirely produce byte-identical manifests and hashes: the `changeContext` key in `taskDefinition` and the `spec`/`changeSet`/`harnessProfile` keys in `taskManifest.artifacts` are all omitted (not present-as-null) when absent, via the same spread pattern used for `behavioralOracle`/`fixEvidence`. `test/historical-postgres-212-task.test.ts`'s Policy A tests prove this by materializing a legacy case-001 spec and confirming both `taskDefinitionHash` and `bundleHash` match their pre-#212 values exactly.
+
+**Hash coverage.** When change-context artifacts are materialized, their SHA-256 hashes are folded into `taskDefinition.changeContext` (and therefore into `taskDefinitionHash`). Different scaffolding levels on the same task produce different `taskDefinitionHash` values, since each level exposes a different set of artifact hashes.
+
+**Contemporaneous-context rule.** `spec.md` must contain only information available at or before the introducing commit's timestamp. Prohibited hindsight markers (tested in `test/historical-postgres-212-task.test.ts`): SAVEPOINT, subtransaction, TBLOCK_SUBCOMMIT, BUG number references, future-fix wording. The spec describes the feature and the invariant; the agent must independently discover where the invariant breaks.
+
+#### Case: `postgres-change-16867` (#212) - BUG #16867 vertical slice
+
+The first change-oriented task. Its opaque `taskId` is `postgres-change-16867`. It exercises the transaction-chaining feature (COMMIT AND CHAIN / ROLLBACK AND CHAIN) introduced by commit `280a408b48d5ee42969f981bceb9e9426c3a344c` (2019-03-22, PostgreSQL 12-era), where the chained transaction's isolation level could revert to `read committed` instead of inheriting the session default. The fix commit is `8a55cb5ba9655ffb1cf0a3042aaa6f5eef8c5a85` (Fujii Masao, 2021-02-19).
+
+Uses the **structured-output oracle** (`grading-protocol: "submitted-reproducer-structured-oracle-v1"`): the historical (buggy) side outputs `[["read committed"]]` and the reference (fixed) side outputs `[["repeatable read"]]` from `SHOW transaction_isolation` after the chaining sequence. Mutually exclusive, deterministic, no LLM judge.
+
+Like case 003, operator-supplied private truth is loaded at runtime via `loadHistoricalPostgresChange16867PrivateTruth()` / `HONEYRAIL_PG_212_PRIVATE_TRUTH` and is never committed to the repository. The env-var convention is `HONEYRAIL_PG_212_*`; scaffolding level is set via `HONEYRAIL_PG_212_SCAFFOLDING` (default `E0`).
+
+```sh
+export HONEYRAIL_PG_212_MIRROR=/path/to/local/postgres-mirror
+export HONEYRAIL_PG_212_PRIVATE_TRUTH=/private/path/to/private-truth.json
+export HONEYRAIL_PG_212_SCAFFOLDING=E2
+export HONEYRAIL_PG_212_AGENT_COMMAND=/path/in/agent-image/to/agent
+npm run historical-pg-212
+```
 
 ### Grading protocol identifiers
 
