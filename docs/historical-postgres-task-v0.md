@@ -136,15 +136,49 @@ The same underlying task (bug identity, oracle, grading) is used at every level 
 
 #### Case: `postgres-change-16867` (#212) - BUG #16867 vertical slice
 
-The first change-oriented task. Its opaque `taskId` is `postgres-change-16867`. It exercises the transaction-chaining feature (COMMIT AND CHAIN / ROLLBACK AND CHAIN) introduced by commit `280a408b48d5ee42969f981bceb9e9426c3a344c` (2019-03-22, PostgreSQL 12-era), where the chained transaction's isolation level could revert to `read committed` instead of inheriting the session default. The fix commit is `8a55cb5ba9655ffb1cf0a3042aaa6f5eef8c5a85` (Fujii Masao, 2021-02-19).
+The first change-oriented task. Its opaque `taskId` is `postgres-change-16867`. It exercises the transaction-chaining feature (COMMIT AND CHAIN / ROLLBACK AND CHAIN) introduced by commit `280a408b48d5ee42969f981bceb9e9426c3a344c` (2019-03-22, PostgreSQL 12devel), where `COMMIT AND CHAIN` after a `SAVEPOINT` fails to start a new chained transaction, causing isolation level to revert to the session default instead of being preserved.
+
+**Revisions.**
+- Historical: `280a408b48d5ee42969f981bceb9e9426c3a344c` (PG 12devel, "Transaction chaining" introducing commit). `postgres --version`: `postgres (PostgreSQL) 12devel`.
+- Reference: `fadcc4e81bd99e6032ae042cae53be0c6eea7580` (REL_12_STABLE, "Fix bug in COMMIT AND CHAIN command", Fujii Masao, 2021-02-19). Build profile: `--without-readline --without-zlib --without-icu`, prefix `/opt/honeyrail/postgres`.
+
+**Canonical verification.** The reproducer SQL primes `SaveTransactionCharacteristics()` via a non-savepoint `COMMIT AND CHAIN` first (so the static `save_XactIsoLevel` holds REPEATABLE READ), then exercises the savepoint path:
+
+```sql
+\set QUIET on
+START TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+COMMIT AND CHAIN;
+SAVEPOINT x;
+COMMIT AND CHAIN;
+SHOW transaction_isolation;
+```
+
+On the historical (buggy) revision, `CommitTransactionCommand()` has no `TBLOCK_SUBCOMMIT` case, so the chain silently fails and `SHOW` returns the session default `read committed`. On the reference (fixed) revision, the added `TBLOCK_SUBCOMMIT` handler calls `RestoreTransactionCharacteristics()`, and `SHOW` returns `repeatable read`. A self-assertion `DO` block raises on `repeatable read` (exit non-zero = bug absent).
+
+**Observed output (real Docker verification, 2026-09-08):**
+| Revision | stdout | exit | classification |
+|---|---|---|---|
+| historical `280a408b` | `read committed` | 0 (ok) | reproduced |
+| reference `fadcc4e81b` | `repeatable read` | non-zero (RAISE) | not reproduced |
+
+**Determinism.** 10 consecutive runs per revision produced byte-identical stdout every time.
+
+**Infrastructure error.** An unresolvable revision (`0000...0000`) is correctly classified as `infrastructure_error`.
+
+**Trial.** A scripted fake agent (inline bash writing the reproducer + finding.json) produces a `completed` trial with `rediscovered` grade through `runHistoricalPostgresTrial()`.
 
 Uses the **structured-output oracle** (`grading-protocol: "submitted-reproducer-structured-oracle-v1"`): the historical (buggy) side outputs `[["read committed"]]` and the reference (fixed) side outputs `[["repeatable read"]]` from `SHOW transaction_isolation` after the chaining sequence. Mutually exclusive, deterministic, no LLM judge.
+
+**Note on `SaveTransactionCharacteristics()` priming.** The reproducer requires an initial non-savepoint `COMMIT AND CHAIN` to prime the static `save_XactIsoLevel` variable. Without it, on the reference revision `RestoreTransactionCharacteristics()` restores the uninitialized default (XACT_READ_UNCOMMITTED = `read uncommitted`) because the chain flag check in `CommitTransactionCommand()` runs against the subtransaction state (where `chain` is false), not the parent. This is consistent with the upstream regression test, which relies on prior chain operations within the same session to prime the saved state.
+
+**Fix evidence.** Because the historical and reference revisions are on different branches (master vs REL_12_STABLE) with a ~39MB tree diff, `materializeHistoricalPostgresTask()` uses operator-supplied fix evidence (`truth.knownFixEvidencePath`) containing the focused 3-file, 58-insertion fix commit diff rather than auto-generating a cross-branch diff. The fix evidence env var is `HONEYRAIL_PG_212_FIX_EVIDENCE`.
 
 Like case 003, operator-supplied private truth is loaded at runtime via `loadHistoricalPostgresChange16867PrivateTruth()` / `HONEYRAIL_PG_212_PRIVATE_TRUTH` and is never committed to the repository. The env-var convention is `HONEYRAIL_PG_212_*`; scaffolding level is set via `HONEYRAIL_PG_212_SCAFFOLDING` (default `E0`).
 
 ```sh
 export HONEYRAIL_PG_212_MIRROR=/path/to/local/postgres-mirror
 export HONEYRAIL_PG_212_PRIVATE_TRUTH=/private/path/to/private-truth.json
+export HONEYRAIL_PG_212_FIX_EVIDENCE=/private/path/to/fix-evidence.diff
 export HONEYRAIL_PG_212_SCAFFOLDING=E2
 export HONEYRAIL_PG_212_AGENT_COMMAND=/path/in/agent-image/to/agent
 npm run historical-pg-212

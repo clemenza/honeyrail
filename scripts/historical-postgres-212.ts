@@ -19,6 +19,7 @@ if (!Array.isArray(args) || args.some((value) => typeof value !== "string")) {
   throw new Error("HONEYRAIL_PG_212_AGENT_ARGS must be a JSON array of strings when set.");
 }
 const knownReproducer = String(process.env.HONEYRAIL_PG_212_REPRODUCER || "").trim();
+const knownFixEvidence = String(process.env.HONEYRAIL_PG_212_FIX_EVIDENCE || "").trim();
 const scaffoldingLevel = (String(process.env.HONEYRAIL_PG_212_SCAFFOLDING || "E0").trim()) as "E0" | "E1" | "E2" | "E3";
 if (!["E0", "E1", "E2", "E3"].includes(scaffoldingLevel)) {
   throw new Error(`HONEYRAIL_PG_212_SCAFFOLDING must be E0, E1, E2, or E3; got "${scaffoldingLevel}".`);
@@ -33,7 +34,7 @@ const privateTruth = await loadHistoricalPostgresChange16867PrivateTruth(private
 
 await mkdir(artifactDir, { recursive: true });
 const result = await runHistoricalPostgresTrial({
-  task: historicalPostgresChange16867TaskSpec(resolve(mirror), privateTruth, scaffoldingLevel, knownReproducer ? resolve(knownReproducer) : undefined),
+  task: historicalPostgresChange16867TaskSpec(resolve(mirror), privateTruth, scaffoldingLevel, knownReproducer ? resolve(knownReproducer) : undefined, knownFixEvidence ? resolve(knownFixEvidence) : undefined),
   agent: { command, args, timeoutMs, env: process.env.HONEYRAIL_PG_212_AGENT_ENV ? JSON.parse(process.env.HONEYRAIL_PG_212_AGENT_ENV) : undefined },
   artifactDir,
   session: network || image ? { isolation: { ...(network ? { network: network as "none" | "bridge" } : {}), ...(image ? { image } : {}) } } : undefined

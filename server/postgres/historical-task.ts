@@ -2642,7 +2642,8 @@ export function historicalPostgresChange16867TaskSpec(
   repoPath: string,
   privateTruth: HistoricalPostgresChange16867PrivateTruth,
   scaffoldingLevel: "E0" | "E1" | "E2" | "E3" = "E0",
-  knownReproducerPath?: string
+  knownReproducerPath?: string,
+  knownFixEvidencePath?: string
 ): HistoricalPostgresTaskSpec {
   return {
     taskId: "postgres-change-16867",
@@ -2654,6 +2655,7 @@ export function historicalPostgresChange16867TaskSpec(
     truth: {
       upstreamBug: privateTruth.upstreamBug,
       knownReproducerPath,
+      knownFixEvidencePath,
       structuredOracle: privateTruth.structuredOracle
     },
     scaffoldingLevel,
