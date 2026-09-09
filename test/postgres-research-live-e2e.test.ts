@@ -643,19 +643,22 @@ test(
     let runtimeContainerGoneAt: number | undefined;
     let sawAgentContainer = false;
     let sawRuntimeContainer = false;
+    const sampleContainerState = async () => {
+      const listing = await runCommandSafe("docker", ["ps", "-a", "--filter", "name=honeyrail-pg-", "--format", "{{.Names}}"], {
+        timeout: 10_000
+      }).catch(() => ({ ok: false, stdout: "", stderr: "", code: 1 }));
+      const present = new Set(listing.stdout.split("\n").filter(Boolean));
+      const agentNowPresent = [...present].some((name) => name.startsWith("honeyrail-pg-research-"));
+      const runtimeNowPresent = [...present].some((name) => name.startsWith("honeyrail-pg-runtime-"));
+      if (agentNowPresent) sawAgentContainer = true;
+      else if (sawAgentContainer && agentContainerGoneAt === undefined) agentContainerGoneAt = Date.now();
+      if (runtimeNowPresent) sawRuntimeContainer = true;
+      else if (sawRuntimeContainer && runtimeContainerGoneAt === undefined) runtimeContainerGoneAt = Date.now();
+    };
     let polling = true;
     const pollLoop = (async () => {
       while (polling) {
-        const listing = await runCommandSafe("docker", ["ps", "-a", "--filter", "name=honeyrail-pg-", "--format", "{{.Names}}"], {
-          timeout: 10_000
-        }).catch(() => ({ ok: false, stdout: "", stderr: "", code: 1 }));
-        const present = new Set(listing.stdout.split("\n").filter(Boolean));
-        const agentNowPresent = [...present].some((name) => name.startsWith("honeyrail-pg-research-"));
-        const runtimeNowPresent = [...present].some((name) => name.startsWith("honeyrail-pg-runtime-"));
-        if (agentNowPresent) sawAgentContainer = true;
-        else if (sawAgentContainer && agentContainerGoneAt === undefined) agentContainerGoneAt = Date.now();
-        if (runtimeNowPresent) sawRuntimeContainer = true;
-        else if (sawRuntimeContainer && runtimeContainerGoneAt === undefined) runtimeContainerGoneAt = Date.now();
+        await sampleContainerState();
         await new Promise((resolve) => setTimeout(resolve, 150));
       }
     })();
@@ -674,6 +677,12 @@ test(
     } finally {
       polling = false;
       await pollLoop;
+      // The session promise settles only after environment cleanup. Take one
+      // final sample after joining the poller so a last-millisecond runtime
+      // removal cannot be missed merely because the periodic loop stopped.
+      // This strengthens the observation; it does not infer or relax either
+      // container's termination state.
+      await sampleContainerState();
     }
 
     assert.ok(caught instanceof PostgresResearchTimeoutError, `expected PostgresResearchTimeoutError, got ${caught}`);
@@ -690,6 +699,7 @@ test(
     assert.equal(manifest!.cleanup?.runtimeContainerRemoved, true);
     assert.equal(manifest!.cleanup?.sessionTimedOut, true, "evidence must identify this as a session timeout, not an agent timeout");
     assert.equal(manifest!.cleanup?.cancelGraceExceeded, false, "the agent container was killed and awaited well inside the grace bound");
+    assert.equal((caught as PostgresResearchTimeoutError).agentTermination?.confirmedStopped, true, "the agent container termination must be explicitly confirmed");
 
     // The ordering invariant itself: the agent container must have been
     // confirmed gone no later than the runtime container - i.e. agent

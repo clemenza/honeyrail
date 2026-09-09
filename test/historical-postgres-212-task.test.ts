@@ -115,6 +115,15 @@ test("E3 HarnessProfile preserves the Historical PostgreSQL self-asserting exit 
   assert.match(profile, /invariant holds, the same script must exit non-zero/);
   assert.equal(profile.includes("exit with status 0 when the invariant holds"), false);
   assert.equal(profile.includes("explicit `\\q 1`) if and only if the invariant is violated"), false);
+  for (const marker of [
+    "default_transaction_isolation",
+    "show transaction_isolation",
+    "savepoint",
+    "tblock_subcommit",
+    "bug #16867"
+  ]) {
+    assert.equal(profile.includes(marker), false, `HarnessProfile leaks target-specific marker: ${marker}`);
+  }
 });
 
 test("prompt does not leak bug identity, fix SHA, or hindsight terminology", () => {

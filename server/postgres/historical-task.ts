@@ -1324,7 +1324,7 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
           "-C", input.source.repoPath,
           "-c", "color.ui=false",
           "-c", "diff.external=",
-          "diff", "--no-ext-diff", "--no-color",
+          "diff", "--no-ext-diff", "--no-color", "--no-textconv", "--diff-algorithm=myers", "--no-renames",
           `${input.changeContext.introducingCommit}^`, input.changeContext.introducingCommit
         ],
         { timeout: 60_000, maxBuffer: 1024 * 1024 * 8 }
@@ -2599,16 +2599,15 @@ COMMIT AND CHAIN;
 ROLLBACK AND CHAIN;
 \`\`\`
 
-When a transaction ends with \`AND CHAIN\`, the server immediately opens a
-new transaction that inherits the session-level transaction characteristics
-of the one that just ended — specifically \`transaction_isolation\`,
-\`transaction_read_only\`, and \`transaction_deferrable\`.
+When a transaction ends with \`AND CHAIN\`, the server immediately starts a
+new transaction with the same effective transaction characteristics as the
+transaction that just finished — specifically transaction isolation,
+read-only/read-write, and deferrable.
 
 ## Expected Invariant
 
-After \`COMMIT AND CHAIN\` (or \`ROLLBACK AND CHAIN\`), the newly opened
-transaction must reflect the same isolation level and read-only /
-deferrable settings that the preceding transaction was using.
+After \`COMMIT AND CHAIN\` (or \`ROLLBACK AND CHAIN\`), the newly started
+transaction must retain those effective transaction characteristics.
 `;
 }
 
@@ -2639,10 +2638,9 @@ export function historicalPostgresChange16867HarnessProfile(): string {
 
 A reproducer is a \`.sql\` file executed via \`psql\`. It must:
 
-- Set up any prerequisite session state (e.g. \`SET default_transaction_isolation\`).
+- Set up the prerequisite database or session state required by the hypothesis.
 - Execute the sequence of statements under test.
-- Query observable state (e.g. \`SHOW\` commands) and compare against the
-  expected invariant using \\gset, DO blocks, or similar.
+- Capture externally observable behavior that discriminates the hypothesis.
 - Exit with status 0 only when the suspected correctness violation is
   observed; use a deliberate failure mechanism (e.g. a division-by-zero or
   an explicit \`\\q 1\`) when the invariant holds.
