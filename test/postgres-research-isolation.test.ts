@@ -150,6 +150,19 @@ test("buildResearchContainerArgs mounts the research surface and nothing else", 
   assert.equal(args[args.indexOf("--network") + 1], "none");
 });
 
+test("buildResearchContainerArgs mounts an explicitly supplied public task context read-only", () => {
+  const publicTaskDir = "/host/trial/task";
+  const args = buildResearchContainerArgs(
+    { mounts: { ...MOUNTS, publicTaskDir }, command: ["true"], env: { HONEYRAIL_TASK_DIR: RESEARCH_CONTAINER_PATHS.task } },
+    "public-task-context"
+  );
+  const mounts = args.filter((_value, index) => args[index - 1] === "-v");
+  assert.ok(mounts.includes(`${publicTaskDir}:${RESEARCH_CONTAINER_PATHS.task}:ro`));
+  assert.ok(args.includes(`HONEYRAIL_TASK_DIR=${RESEARCH_CONTAINER_PATHS.task}`));
+  assert.equal(mounts.some((mount) => mount.includes("reference")), false);
+  assert.equal(mounts.some((mount) => mount.includes("truth")), false);
+});
+
 test("buildResearchContainerArgs hardens the container with the same flags as the exam room", () => {
   const args = buildResearchContainerArgs({ mounts: MOUNTS, command: ["true"] }, "c2");
 

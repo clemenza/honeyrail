@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { resolveHistoricalPostgresTaskSpecFromEnv } from "../server/postgres/historical-postgres-task-env.js";
+import { materializeHistoricalPostgresTask } from "../server/postgres/historical-task.js";
+import { createSyntheticPostgresSourceRepo } from "./helpers/postgres-source-fixture.js";
 
 /**
  * PR #208 review, Blocking 3: `scripts/historical-postgres-180-pilot.ts` and
@@ -61,6 +63,70 @@ test("resolveHistoricalPostgresTaskSpecFromEnv: postgres-historical-003 resolves
     HONEYRAIL_PG_199_PRIVATE_TRUTH: privateTruthPath
   });
   assert.equal(spec.taskId, "postgres-historical-003");
+});
+
+test("resolveHistoricalPostgresTaskSpecFromEnv: postgres-change-001 requires its mirror and private truth", async () => {
+  await assert.rejects(
+    () => resolveHistoricalPostgresTaskSpecFromEnv("postgres-change-001", {}),
+    /HONEYRAIL_PG_212_MIRROR and HONEYRAIL_PG_212_PRIVATE_TRUTH/
+  );
+});
+
+test("resolveHistoricalPostgresTaskSpecFromEnv: postgres-change-001 keeps the reproducer optional and rejects invalid scaffolding", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "honeyrail-pg212-env-"));
+  const privateTruthPath = join(dir, "private-truth.json");
+  await writeFile(
+    privateTruthPath,
+    JSON.stringify({
+      upstreamBug: "Synthetic private upstream identity",
+      historicalRevision: "a".repeat(40),
+      referenceRevision: "b".repeat(40),
+      introducingCommit: "a".repeat(40),
+      structuredOracle: { historical: { rows: [["historical-row"]] }, reference: { rows: [["reference-row"]] } }
+    })
+  );
+  const env = {
+    HONEYRAIL_PG_212_MIRROR: "/tmp/some-mirror",
+    HONEYRAIL_PG_212_PRIVATE_TRUTH: privateTruthPath
+  };
+  const spec = await resolveHistoricalPostgresTaskSpecFromEnv("postgres-change-001", env);
+  assert.equal(spec.taskId, "postgres-change-001");
+  assert.equal(spec.truth.knownReproducerPath, undefined);
+  await assert.rejects(
+    () => resolveHistoricalPostgresTaskSpecFromEnv("postgres-change-001", { ...env, HONEYRAIL_PG_212_SCAFFOLDING: "E4" }),
+    /HONEYRAIL_PG_212_SCAFFOLDING/
+  );
+});
+
+test("resolveHistoricalPostgresTaskSpecFromEnv: postgres-change-001 passes explicit fix evidence through the shared normal path", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-pg212-resolver-evidence-"));
+  const repo = await createSyntheticPostgresSourceRepo(root);
+  const privateTruthPath = join(root, "private-truth.json");
+  const fixEvidencePath = join(root, "private-fix-evidence.diff");
+  await writeFile(
+    privateTruthPath,
+    JSON.stringify({
+      upstreamBug: "Synthetic private upstream identity",
+      historicalRevision: repo.laterRef,
+      // This is deliberately unresolved. Successful materialization proves
+      // the resolver supplied the explicit evidence rather than falling back
+      // to the automatic historical-vs-reference git diff.
+      referenceRevision: "0".repeat(40),
+      introducingCommit: repo.laterRef,
+      structuredOracle: { historical: { rows: [["historical-row"]] }, reference: { rows: [["reference-row"]] } }
+    })
+  );
+  await writeFile(fixEvidencePath, "private focused fix evidence\n");
+
+  const spec = await resolveHistoricalPostgresTaskSpecFromEnv("postgres-change-001", {
+    HONEYRAIL_PG_212_MIRROR: repo.repoPath,
+    HONEYRAIL_PG_212_PRIVATE_TRUTH: privateTruthPath,
+    HONEYRAIL_PG_212_FIX_EVIDENCE: fixEvidencePath,
+    HONEYRAIL_PG_212_SCAFFOLDING: "E2"
+  });
+  assert.equal(spec.truth.knownFixEvidencePath, fixEvidencePath);
+  const layout = await materializeHistoricalPostgresTask(spec, join(root, "task-bundle"));
+  assert.equal(layout.truthManifest.fixEvidence, "expected-behavior/fix-evidence");
 });
 
 test("resolveHistoricalPostgresTaskSpecFromEnv: an unknown task id is rejected clearly", async () => {

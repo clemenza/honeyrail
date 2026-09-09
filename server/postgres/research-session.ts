@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
+import { resolve } from "node:path";
 import { nowIso, runCommandSafe } from "../utils.js";
 import {
   DEFAULT_CANCEL_GRACE_MS,
@@ -493,6 +494,13 @@ export type PostgresResearchIsolationOptions = {
 
 export type PostgresResearchSessionOptions = WithPostgresResearchEnvironmentOptions & {
   isolation?: PostgresResearchIsolationOptions;
+  /**
+   * An already-public task/context directory to expose read-only to an
+   * isolated agent at `HONEYRAIL_TASK_DIR`. This is intentionally optional:
+   * existing research sessions and legacy Historical PostgreSQL tasks retain
+   * their exact agent surface unless a caller opts in.
+   */
+  publicTaskDir?: string;
 };
 
 /**
@@ -863,7 +871,11 @@ export async function runAgentInPostgresResearchEnvironment(
           await env.start();
           const scratchDir = await createAgentScratchDir(env.root);
           const prefix = agent.envPrefix ?? "HR_PG";
-          const injected = { ...env.agentEnvironment(prefix), [`${prefix}_WORK_DIR`]: scratchDir };
+          const injected = {
+            ...env.agentEnvironment(prefix),
+            [`${prefix}_WORK_DIR`]: scratchDir,
+            ...(options.publicTaskDir ? { HONEYRAIL_TASK_DIR: resolve(options.publicTaskDir) } : {})
+          };
           const result = await runAgentProcess(unisolatedLaunch(env, agent, injected), agent, signal);
           // Unisolated mode has no separate container to confirm - the
           // process closing *is* the confirmation - so confirmedStopped is
@@ -905,7 +917,10 @@ export async function runAgentInPostgresResearchEnvironment(
         // already created this, but make it explicit rather than assumed.
         await appendFile(env.logPath, "");
 
-        const injected = containerAgentEnvironment(env.connectionInfo(), agent.envPrefix);
+        const injected = {
+          ...containerAgentEnvironment(env.connectionInfo(), agent.envPrefix),
+          ...(options.publicTaskDir ? { HONEYRAIL_TASK_DIR: RESEARCH_CONTAINER_PATHS.task } : {})
+        };
         const containerName = `honeyrail-pg-research-${randomUUID()}`;
 
         // #209/#210 round 4: created here (mirroring scripts/tinytable-exam-
@@ -948,6 +963,7 @@ export async function runAgentInPostgresResearchEnvironment(
               // The same view the runtime container is running, so the agent
               // inspects literally the files the server is executing.
               buildViewDir: env.buildView.dir,
+              publicTaskDir: options.publicTaskDir,
               dshHomeDir: isolation.dshHomeDir
             },
             command: [agent.command, ...(agent.args ?? [])],

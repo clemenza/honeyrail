@@ -41,6 +41,7 @@ import type { RunCommand } from "./runtime.js";
  *   /workspace/runtime/socket      the cluster's socket directory  rw
  *   /workspace/runtime/postgres.log the server log                 ro
  *   /workspace/agent               scratch for repros/results      rw
+ *   /honeyrail/task                optional public task context     ro
  *   /opt/honeyrail/postgres        the selected build              ro
  *
  * Never mounted: the attachment tree, the grader-private directory, the
@@ -127,6 +128,12 @@ export type ResearchContainerMounts = {
    * never the shared cache entry itself.
    */
   buildViewDir: string;
+  /**
+   * Host path of an already-agent-visible task/context directory. Mounted
+   * read-only only when a caller explicitly supplies it; never use this for
+   * a grader reference tree, truth bundle, or any other private material.
+   */
+  publicTaskDir?: string;
   /**
    * Host path of a per-trial, initially-empty directory mounted read-write
    * at `DSH_HOME_CONTAINER_PATH` with `$DSH_HOME` pointed at it (#209/#210
@@ -236,6 +243,7 @@ export function buildResearchContainerArgs(options: ResearchContainerOptions, co
     "-v", `${resolve(m.socketDir)}:${paths.socket}:rw`,
     "-v", `${resolve(m.logPath)}:${paths.log}:ro`,
     "-v", `${resolve(m.scratchDir)}:${paths.scratch}:rw`,
+    ...(m.publicTaskDir ? ["-v", `${resolve(m.publicTaskDir)}:${paths.task}:ro`] : []),
     "-v", `${resolve(m.buildViewDir)}:${paths.postgres}:ro`,
     ...(m.dshHomeDir ? ["-v", `${resolve(m.dshHomeDir)}:${DSH_HOME_CONTAINER_PATH}:rw`, "-e", `DSH_HOME=${DSH_HOME_CONTAINER_PATH}`] : []),
     "-w", paths.scratch,
