@@ -128,6 +128,8 @@ The executor (`psqlArgs()` in `runtime.ts`) already bakes `-X -t -A` (no psqlrc,
 
 The same underlying task (bug identity, oracle, grading) is used at every level - only the agent-visible artifact subset varies. This enables controlled experiments measuring how much additional context (spec, diff, methodology) helps or hurts agent performance on the same regression.
 
+For a change-oriented task, the materialized public `task/` tree is mounted read-only into the real isolated agent container at `/honeyrail/task` and exposed as `HONEYRAIL_TASK_DIR`. The mount contains no grader reference sibling: `reference/`, `truth.json`, canonical reproducers, fix evidence, and oracle values remain outside the agent mount namespace. Legacy tasks that omit `changeContext` retain their previous surface and receive no task-context mount.
+
 **Policy A compliance.** Legacy tasks (001/002/003) that omit `changeContext` entirely produce byte-identical manifests and hashes: the `changeContext` key in `taskDefinition` and the `spec`/`changeSet`/`harnessProfile` keys in `taskManifest.artifacts` are all omitted (not present-as-null) when absent, via the same spread pattern used for `behavioralOracle`/`fixEvidence`. `test/historical-postgres-212-task.test.ts`'s Policy A tests prove this by materializing a legacy case-001 spec and confirming both `taskDefinitionHash` and `bundleHash` match their pre-#212 values exactly.
 
 **Hash coverage.** When change-context artifacts are materialized, their SHA-256 hashes are folded into `taskDefinition.changeContext` (and therefore into `taskDefinitionHash`). Different scaffolding levels on the same task produce different `taskDefinitionHash` values, since each level exposes a different set of artifact hashes.

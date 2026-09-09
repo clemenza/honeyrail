@@ -32,6 +32,8 @@ export const RESEARCH_CONTAINER_PATHS = {
   socket: "/workspace/runtime/socket",
   log: "/workspace/runtime/postgres.log",
   scratch: "/workspace/agent",
+  /** Optional read-only, agent-visible task context for change-oriented trials. */
+  task: "/honeyrail/task",
   postgres: "/opt/honeyrail/postgres",
   bin: "/opt/honeyrail/postgres/bin",
   lib: "/opt/honeyrail/postgres/lib"

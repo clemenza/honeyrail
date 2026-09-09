@@ -96,6 +96,27 @@ test("spec.md content does not contain prohibited hindsight markers", () => {
   }
 });
 
+test("spec.md is contemporaneous requirement text, not an operator-authored test strategy", () => {
+  const specContent = historicalPostgresChange16867Spec().toLowerCase();
+  for (const marker of [
+    "scope of verification",
+    "test surface should cover",
+    "every combination",
+    "interaction with other transaction control",
+    "both chaining verbs"
+  ]) {
+    assert.ok(!specContent.includes(marker), `spec.md leaks test methodology: ${marker}`);
+  }
+});
+
+test("E3 HarnessProfile preserves the Historical PostgreSQL self-asserting exit contract", () => {
+  const profile = historicalPostgresChange16867HarnessProfile().toLowerCase();
+  assert.match(profile, /exit[s]? successfully \(status 0\) only when the suspected\s+correctness violation is observed/);
+  assert.match(profile, /invariant holds, the same script must exit non-zero/);
+  assert.equal(profile.includes("exit with status 0 when the invariant holds"), false);
+  assert.equal(profile.includes("explicit `\\q 1`) if and only if the invariant is violated"), false);
+});
+
 test("prompt does not leak bug identity, fix SHA, or hindsight terminology", () => {
   const prompt = historicalPostgresChange16867TaskPrompt();
   for (const marker of [
@@ -676,6 +697,42 @@ test("checkedTaskSpec rejects non-40-hex changeContext.introducingCommit", async
   );
 });
 
+test("checkedTaskSpec rejects unknown change-oriented scaffolding levels", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-212-scaffolding-"));
+  const repo = await createSyntheticPostgresSourceRepo(root);
+  const spec: HistoricalPostgresTaskSpec = {
+    taskId: "synthetic-invalid-scaffolding",
+    source: { repoPath: repo.repoPath, historicalRevision: repo.laterRef, referenceRevision: repo.ref },
+    truth: { upstreamBug: "Synthetic #scaffolding", structuredOracle: SYNTHETIC_ORACLE },
+    build: { mode: "host" },
+    prompt: "Test.",
+    scaffoldingLevel: "E4",
+    changeContext: { spec: "Contemporaneous context.", introducingCommit: repo.laterRef }
+  };
+  await assert.rejects(
+    () => materializeHistoricalPostgresTask(spec, join(root, "case")),
+    /scaffoldingLevel.*E0, E1, E2, or E3/i
+  );
+});
+
+test("checkedTaskSpec requires a HarnessProfile for E3", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-212-harness-profile-"));
+  const repo = await createSyntheticPostgresSourceRepo(root);
+  const spec: HistoricalPostgresTaskSpec = {
+    taskId: "synthetic-missing-harness",
+    source: { repoPath: repo.repoPath, historicalRevision: repo.laterRef, referenceRevision: repo.ref },
+    truth: { upstreamBug: "Synthetic #harness", structuredOracle: SYNTHETIC_ORACLE },
+    build: { mode: "host" },
+    prompt: "Test.",
+    scaffoldingLevel: "E3",
+    changeContext: { spec: "Contemporaneous context.", introducingCommit: repo.laterRef }
+  };
+  await assert.rejects(
+    () => materializeHistoricalPostgresTask(spec, join(root, "case")),
+    /harnessProfile is required when scaffoldingLevel is E3/i
+  );
+});
+
 test("HistoricalChangeTask rejects a source revision that resolves differently from its introducing change", async () => {
   const root = await mkdtemp(join(tmpdir(), "honeyrail-212-causal-binding-"));
   const repo = await createSyntheticPostgresSourceRepo(root);
@@ -685,6 +742,7 @@ test("HistoricalChangeTask rejects a source revision that resolves differently f
     truth: { upstreamBug: "Synthetic #causal", structuredOracle: SYNTHETIC_ORACLE },
     build: { mode: "host" },
     prompt: "Test.",
+    scaffoldingLevel: "E2",
     changeContext: {
       spec: "Contemporaneous context.",
       introducingCommit: repo.laterRef

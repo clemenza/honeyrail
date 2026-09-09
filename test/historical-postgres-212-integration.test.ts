@@ -16,6 +16,7 @@ import {
   type PostgresResearchEnvironment
 } from "../server/postgres/research-environment.js";
 import { resolveHistoricalPostgresTaskSpecFromEnv } from "../server/postgres/historical-postgres-task-env.js";
+import { RESEARCH_CONTAINER_PATHS } from "../server/postgres/agent-container.js";
 import { runCommandSafe } from "../server/utils.js";
 
 // ---------------------------------------------------------------------------
@@ -323,5 +324,78 @@ test(
     assert.equal(result.status, "completed", JSON.stringify(result, null, 2));
     assert.ok(result.grade, "trial must produce a grade");
     assert.equal(result.grade!.status, "rediscovered");
+  }
+);
+
+test(
+  "#212 E0-E3 public task context reaches the actual isolated agent surface",
+  { skip: config.state !== "FULLY_CONFIGURED" || !knownFixEvidence ? "integration env vars plus HONEYRAIL_PG_212_FIX_EVIDENCE are required" : false, timeout: 600_000 },
+  async () => {
+    const historicalRevision = "280a408b48d5ee42969f981bceb9e9426c3a344c";
+    const expectedDiff = await runCommandSafe(
+      "git",
+      ["-C", resolve(mirror), "diff", `${historicalRevision}^`, historicalRevision],
+      { timeout: 60_000, maxBuffer: 1024 * 1024 * 8 }
+    );
+    assert.equal(expectedDiff.ok, true, expectedDiff.stderr || expectedDiff.stdout);
+    const root = await mkdtemp(join(tmpdir(), "honeyrail-pg212-agent-surface-"));
+    const levels = ["E0", "E1", "E2", "E3"] as const;
+    const expectedVisibility = {
+      E0: { spec: false, changeSet: false, harness: false },
+      E1: { spec: true, changeSet: false, harness: false },
+      E2: { spec: true, changeSet: true, harness: false },
+      E3: { spec: true, changeSet: true, harness: true }
+    } as const;
+    const observer = [
+      "set -eu",
+      ': "${HONEYRAIL_TASK_DIR:?public task context was not injected}"',
+      'printf "task_dir=%s\\n" "$HONEYRAIL_TASK_DIR" > "$HR_PG_WORK_DIR/task-surface.txt"',
+      'for entry in spec.md change-set.diff harness-profile.md; do',
+      '  if test -r "$HONEYRAIL_TASK_DIR/$entry"; then echo "$entry=present"; else echo "$entry=absent"; fi',
+      'done >> "$HR_PG_WORK_DIR/task-surface.txt"',
+      'find "$HONEYRAIL_TASK_DIR" -type f -print | sort > "$HR_PG_WORK_DIR/public-task-files.txt"',
+      'test ! -e "$HONEYRAIL_TASK_DIR/../reference"',
+      'test ! -e "$HONEYRAIL_TASK_DIR/truth.json"',
+      'if test -r "$HONEYRAIL_TASK_DIR/change-set.diff"; then cp "$HONEYRAIL_TASK_DIR/change-set.diff" "$HR_PG_WORK_DIR/observed-change-set.diff"; fi',
+      `printf '%s' '{"status":"not-reproduced","summary":"public task context observed"}' > "$HR_PG_WORK_DIR/finding.json"`
+    ].join("\n");
+
+    for (const level of levels) {
+      const task = await resolveHistoricalPostgresTaskSpecFromEnv("postgres-change-001", {
+        HONEYRAIL_PG_212_MIRROR: resolve(mirror),
+        HONEYRAIL_PG_212_REPRODUCER: resolve(knownReproducer),
+        HONEYRAIL_PG_212_PRIVATE_TRUTH: resolve(privateTruthPath),
+        HONEYRAIL_PG_212_FIX_EVIDENCE: resolve(knownFixEvidence),
+        HONEYRAIL_PG_212_SCAFFOLDING: level
+      });
+      const artifactDir = join(root, level);
+      const result = await runHistoricalPostgresTrial({
+        task,
+        agent: { command: "/bin/sh", args: ["-c", observer], timeoutMs: 120_000 },
+        artifactDir
+      });
+      assert.equal(result.status, "completed", JSON.stringify(result, null, 2));
+      const observed = await readFile(join(artifactDir, "agent-workspace", "task-surface.txt"), "utf8");
+      assert.match(observed, new RegExp(`task_dir=${RESEARCH_CONTAINER_PATHS.task}`));
+      assert.match(observed, new RegExp(`spec\\.md=${expectedVisibility[level].spec ? "present" : "absent"}`));
+      assert.match(observed, new RegExp(`change-set\\.diff=${expectedVisibility[level].changeSet ? "present" : "absent"}`));
+      assert.match(observed, new RegExp(`harness-profile\\.md=${expectedVisibility[level].harness ? "present" : "absent"}`));
+      const visibleFiles = await readFile(join(artifactDir, "agent-workspace", "public-task-files.txt"), "utf8");
+      for (const privateMarker of [
+        `${RESEARCH_CONTAINER_PATHS.task}/reference/`,
+        `${RESEARCH_CONTAINER_PATHS.task}/truth.json`,
+        `${RESEARCH_CONTAINER_PATHS.task}/verification/`,
+        `${RESEARCH_CONTAINER_PATHS.task}/expected-behavior/`
+      ]) {
+        assert.equal(visibleFiles.includes(privateMarker), false, `${level} agent surface leaked ${privateMarker}`);
+      }
+      if (level === "E2" || level === "E3") {
+        assert.equal(
+          await readFile(join(artifactDir, "agent-workspace", "observed-change-set.diff"), "utf8"),
+          expectedDiff.stdout,
+          `${level} agent-observed change-set must equal the full introducing diff`
+        );
+      }
+    }
   }
 );

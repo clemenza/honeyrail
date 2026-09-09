@@ -831,6 +831,12 @@ function checkedTaskSpec(spec: HistoricalPostgresTaskSpec): HistoricalPostgresTa
       throw new Error("changeContext.spec is required when changeContext is present");
     }
     exactRevision(spec.changeContext.introducingCommit, "changeContext.introducingCommit");
+    if (!(["E0", "E1", "E2", "E3"] as const).includes(spec.scaffoldingLevel as "E0" | "E1" | "E2" | "E3")) {
+      throw new Error("changeContext requires scaffoldingLevel to be exactly E0, E1, E2, or E3");
+    }
+    if (spec.scaffoldingLevel === "E3" && !String(spec.changeContext.harnessProfile || "").trim()) {
+      throw new Error("changeContext.harnessProfile is required when scaffoldingLevel is E3");
+    }
     if (spec.changeContext.harnessProfile !== undefined && !String(spec.changeContext.harnessProfile || "").trim()) {
       throw new Error("changeContext.harnessProfile must be non-empty when present");
     }
@@ -1314,7 +1320,13 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
       // mirror. The introducing commit's parent is <commit>^ (first parent).
       const diffResult = await runCommandSafe(
         "git",
-        ["-C", input.source.repoPath, "diff", `${input.changeContext.introducingCommit}^`, input.changeContext.introducingCommit],
+        [
+          "-C", input.source.repoPath,
+          "-c", "color.ui=false",
+          "-c", "diff.external=",
+          "diff", "--no-ext-diff", "--no-color",
+          `${input.changeContext.introducingCommit}^`, input.changeContext.introducingCommit
+        ],
         { timeout: 60_000, maxBuffer: 1024 * 1024 * 8 }
       );
       if (!diffResult.ok) {
@@ -1922,7 +1934,14 @@ export async function runHistoricalPostgresTrial(input: {
         // upstreamBug/commitFest/referenceRevision, which stay grader-private.
         env: { ...(input.agent.env ?? {}), HONEYRAIL_TASK_ID: task.taskId, HONEYRAIL_TASK_PROMPT: task.prompt }
       },
-      { ...input.session, isolation: { ...(input.session?.isolation ?? {}), ...(dshHomeDir ? { dshHomeDir } : {}) } }
+      {
+        ...input.session,
+        // `taskLayout.taskDir` contains only the public task projection. The
+        // sibling reference directory holds truth, fix evidence, and the
+        // canonical reproducer and is never handed to the research session.
+        ...(task.changeContext ? { publicTaskDir: taskLayout.taskDir } : {}),
+        isolation: { ...(input.session?.isolation ?? {}), ...(dshHomeDir ? { dshHomeDir } : {}) }
+      }
     );
     const scoredEligible = session.isolation.scoredEligible;
     // What this specific execution actually resolved - see
@@ -2589,25 +2608,7 @@ of the one that just ended — specifically \`transaction_isolation\`,
 
 After \`COMMIT AND CHAIN\` (or \`ROLLBACK AND CHAIN\`), the newly opened
 transaction must reflect the same isolation level and read-only /
-deferrable settings that the preceding transaction was using. In
-particular, if the session default isolation level is \`repeatable read\`
-and the user issues \`COMMIT AND CHAIN\`, the chained transaction's
-\`transaction_isolation\` must be \`repeatable read\`.
-
-## Scope of Verification
-
-A correct implementation preserves the above invariant under every
-combination of:
-
-- The three isolation levels that PostgreSQL supports (\`read committed\`,
-  \`repeatable read\`, \`serializable\`)
-- Both chaining verbs (\`COMMIT AND CHAIN\`, \`ROLLBACK AND CHAIN\`)
-- Interaction with other transaction control statements that may appear
-  before the chaining verb within the same transaction
-
-The test surface should cover all of these axes. A failure is any case
-where \`SHOW transaction_isolation\` inside the chained transaction returns
-a value different from what the session's default isolation level mandates.
+deferrable settings that the preceding transaction was using.
 `;
 }
 
@@ -2625,9 +2626,10 @@ export function historicalPostgresChange16867HarnessProfile(): string {
 1. **Identify the invariant**: what observable property must hold?
 2. **Enumerate boundary conditions**: which SQL statement combinations
    exercise the invariant under different code paths?
-3. **Write self-checking reproducers**: each test script encodes its own
-   pass/fail assertion and exits successfully only when the invariant is
-   violated.
+3. **Write self-asserting reproducers**: encode the suspected regression so
+   the script exits successfully (status 0) only when the suspected
+   correctness violation is observed. On an implementation where the
+   invariant holds, the same script must exit non-zero.
 4. **Verify determinism**: run each reproducer at least twice to confirm
    the result is stable (not timing-dependent).
 5. **Minimize**: strip the reproducer to the smallest sequence of
@@ -2641,10 +2643,9 @@ A reproducer is a \`.sql\` file executed via \`psql\`. It must:
 - Execute the sequence of statements under test.
 - Query observable state (e.g. \`SHOW\` commands) and compare against the
   expected invariant using \\gset, DO blocks, or similar.
-- Call a deliberate failure mechanism (e.g. a division-by-zero or an
-  explicit \`\\q 1\`) if and only if the invariant is violated.
-- Exit with status 0 when the invariant holds (no bug) and non-zero when
-  violated (bug present).
+- Exit with status 0 only when the suspected correctness violation is
+  observed; use a deliberate failure mechanism (e.g. a division-by-zero or
+  an explicit \`\\q 1\`) when the invariant holds.
 `;
 }
 
