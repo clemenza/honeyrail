@@ -51,3 +51,14 @@ environment variables and rerun with them unset as shown above.
 - Follow existing TypeScript style and keep changes scoped.
 - Prefer structured APIs and existing helpers over ad hoc string handling.
 - Add focused tests for regressions in lifecycle, project management, auth, or ops scripts.
+
+## Evaluation And Roadmap Discipline
+
+- Follow `docs/evaluation-protocol.md` for experiment planning, metrics, evidence, partitioning, and closure; use `docs/templates/experiment-report.md` for experiment records. These are contributor/reviewer rules; consult the protocol's implementation-status table before claiming a rule is automatically enforced.
+- Historical PostgreSQL is the mainline. Justify new Capability Lab work with an observed PG capability gap. Gate generic providers, exploration frameworks, and self-improvement on evidence rather than adding them merely because three task definitions exist.
+- Distinguish implementation completion, scripted-agent validation, and real-model capability evidence. Do not auto-close an experiment parent from an implementation PR without its empirical acceptance evidence.
+- Preserve frozen corpus/task inputs and existing raw verdicts. New scoring, budget, prompt, truth, or environment contracts require explicit versioning; do not reinterpret old runs silently.
+- Keep all predeclared formal attempts visible, including timeouts, invalid submissions, integrity failures, and infrastructure failures. Report conditional rediscovery alongside end-to-end outcomes; missing data is not zero and skipped checks are not passes.
+- Partition evaluation by causal family, record prior exposure, and never use a tuned family as evidence of independent transfer. Corpus v0 has no pristine HOLDOUT; runtime isolation does not establish absence of model pretraining contamination.
+- Keep private truth and raw operator telemetry out of public reports and agent inputs. Retain bounded sanitized failure evidence without changing an established verdict merely to improve report completeness.
+- For documentation-only work, inspect the full diff, verify local links and commands, and run `git diff --check`. Do not run model trials or modify live operator state to validate prose.
