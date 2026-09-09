@@ -1,10 +1,10 @@
 # HoneyRail
 
-Give it an engineering goal. Get back evidence.
+Evaluate AI database test engineers against real PostgreSQL software.
 
-HoneyRail is an open-source runtime for long-horizon, verifiable engineering work.
+HoneyRail is an open-source evaluation and research platform for AI Database Test Engineering. Its current focus is Historical PostgreSQL: evaluate agents on already-fixed correctness defects using controlled execution, deterministic grading, and reproducible evidence.
 
-It orchestrates mature coding agents and deterministic tools through persisted DAG workflows, artifacts, evidence, evaluators, quality gates, human approvals, and reproducible engineering harnesses.
+The platform includes a runtime for long-horizon engineering work: persisted DAG workflows, coding-agent adapters, artifacts, evidence, evaluators, quality gates, and human approvals. That runtime supports the database evaluation loop.
 
 We don't build another coding agent. We harness the best ones.
 
@@ -12,9 +12,18 @@ HoneyRail starts from the Agent Gateway execution/control-plane subsystem: isola
 
 ## Why
 
-Coding agents are becoming long-running engineering executors. Raw terminal sessions are useful, but they do not provide enough lifecycle management, isolation, verification, auditability, or approval control once agents start changing real repositories.
+The central question is whether an AI agent can design meaningful database tests and produce a mechanically verified finding within a fixed budget. A completed agent session or a passing harness self-test does not answer that question by itself.
 
-HoneyRail adds a local runtime around those agents so each engineering goal can become tracked work: a project, branch, worktree, session, checks, events, artifacts, and an explicit merge decision.
+PostgreSQL supplies real engineering tasks. The Capability Lab, currently including tinytable, supplies cheaper experiments for specific capability gaps. Historical PostgreSQL establishes the evaluation method before any claim about previously unknown defects on PostgreSQL HEAD.
+
+## Start with the evaluation evidence
+
+1. Read the [current milestone and evidence status](ROADMAP.md#current-evidence-status) to distinguish shipped infrastructure from measured agent capability.
+2. Inspect the [frozen Historical PostgreSQL corpus](docs/historical-postgres-corpus-v0.md) and [task/grading contract](docs/historical-postgres-task-v0.md), including the separate E0–E3 change-oriented task surface.
+3. Prepare the [PostgreSQL research environment](docs/postgres-research-environment.md). Historical tasks additionally require operator-supplied source/truth inputs and research images; the console quickstart below does not provision a scored experiment.
+4. Before a formal experiment, use the [evaluation protocol](docs/evaluation-protocol.md) and [experiment report template](docs/templates/experiment-report.md). Inspect all attempts, failure attribution, and evidence, not just aggregate success rates.
+
+Harness integration tests and scripted agents validate plumbing. Real-model capability claims require separate experiment evidence. Corpus v0 currently has no pristine HOLDOUT partition.
 
 ## What It Does
 
@@ -70,11 +79,11 @@ See [docs/architecture.md](docs/architecture.md) for the current implementation 
 Clone the repository:
 
 ```sh
-git clone https://github.com/clemenza/honeyrail.git
+git clone --recurse-submodules https://github.com/clemenza/honeyrail.git
 cd honeyrail
 ```
 
-Install dependencies:
+For an existing checkout, run `git submodule update --init --recursive` to populate the pinned `vendor/tinytable-evals` dependency. Then install dependencies:
 
 ```sh
 npm install
@@ -163,9 +172,9 @@ The current UI exposes commit, checks, and merge actions directly on worktrees. 
 
 Tasks remain atomic execution primitives: one agent execution, one worktree, one session, and one verification/merge lifecycle. Run/Step orchestration sits above tasks rather than changing that meaning.
 
-M1 orchestration can run explicit DAGs through `agent-task`, `shell`, `check`, and `approval` executors. Runs and steps persist in SQLite, resume on server restart, and are exposed through REST and MCP.
+The orchestration layer can run explicit DAGs through `agent-task`, `shell`, `check`, and `approval` executors. Runs and steps persist in SQLite, resume on server restart, and are exposed through REST and MCP.
 
-M2 adds first-class verification data above execution status. A step can now emit artifacts, record evidence, run deterministic evaluators, and apply a quality gate before downstream steps proceed. Execution success and verification success are intentionally separate.
+The verification layer adds first-class verification data above execution status. A step can emit artifacts, record evidence, run deterministic evaluators, and apply a quality gate before downstream steps proceed. Execution success and verification success are intentionally separate.
 
 For concrete REST payloads, see [docs/orchestration-dag-example.md](docs/orchestration-dag-example.md).
 
@@ -181,7 +190,7 @@ See [docs/human-in-the-loop.md](docs/human-in-the-loop.md) for the `interaction`
 - Mobile/PWA: a focused session view for phone and tablet operation, including chat/terminal tabs, pinned composer, image input, and common control actions.
 - MCP: tools for projects, sessions, tasks, worktrees, checks, merge proposal/approval, and dashboard state.
 
-Mobile is an interface, not the product identity. The core product is the runtime for verifiable engineering work.
+Mobile provides operator access to the execution runtime that supports the evaluation platform.
 
 ## Supported Agents
 
@@ -238,13 +247,13 @@ Local generated or runtime directories such as `dist/`, `node_modules/`, `output
 
 ## Project Status
 
-HoneyRail is pre-1.0 developer tooling. APIs, UI flows, and MCP tool shapes may evolve as the project hardens. Issues and focused pull requests are welcome.
+HoneyRail is pre-1.0 research and developer tooling. Three Historical PostgreSQL cases, a frozen corpus, a TrialSet runner, and an E0–E3 change-task vertical slice are implemented. These are engineering deliverables; they do not establish reliable three-bug rediscovery, holdout generalization, or novel defect yield. See the dated evidence status in [ROADMAP.md](ROADMAP.md#current-evidence-status). APIs, UI flows, and MCP tool shapes may evolve.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). M1/M2 orchestration and verification primitives are present as alpha interfaces. The Database Testing Harness is also available as a PostgreSQL Alpha. Later milestones harden environment abstraction, benchmarking, distributed operation, and stable contracts.
+See [ROADMAP.md](ROADMAP.md). Its M0–M6 labels refer to the current PG-led evaluation milestones; older documents may use M1/M2 for the already-shipped orchestration/verification layers. The next gate is trustworthy real-agent experiment evidence, followed by validation on unrelated causal families.
 
-## First Major Milestone: Database Testing Harness
+## Supporting PostgreSQL lifecycle harness
 
 The Database Testing Harness Alpha is implemented for PostgreSQL transaction/restart validation through Docker or local PostgreSQL binaries. It deploys a temporary target, runs deterministic SQL checks, records artifacts and evidence, evaluates DB assertions, writes quality gate decisions, and produces a final Markdown report.
 
