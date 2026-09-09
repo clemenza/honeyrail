@@ -14,7 +14,7 @@ This document defines contributor and reviewer requirements for HoneyRail's loca
 | Partition controls | Frozen v0 task partitions; HOLDOUT empty | Causal-family registry, exposure ledger and holdout access review are manual requirements; automatic enforcement is not implemented |
 | Acceptance | CI, runtime integration tests and task-specific tests | Registration, empirical report review and issue closure are reviewer responsibilities, not automated gates |
 
-`scripts/historical-postgres-212.ts` calls `runHistoricalPostgresTrial()` directly; it does not use the frozen-corpus pilot/TrialSet boundary. Its CLI supports `none`/`bridge` networking but does not configure the restricted-egress path used by the scored DSH TrialSet. Its printed result alone therefore does not prove a real-model experiment meets this protocol. A bridge-network diagnostic run or a scripted agent MUST NOT be promoted into capability evidence. Reuse the existing restricted-egress and eligibility mechanisms when adding the smallest required change-task experiment entry point; do not insert change tasks into the frozen three-task corpus.
+`scripts/historical-postgres-212.ts` calls `runHistoricalPostgresTrial()` directly; it does not use the frozen-corpus pilot/TrialSet boundary. Its CLI supports `none`/`bridge` networking and, since the #216 execution-gap fix, restricted model egress via `HONEYRAIL_PG_212_EGRESS_UPSTREAM_URL` (the same scored `isolation.restrictedEgress` mechanism the DSH TrialSet uses) plus an explicit `HONEYRAIL_PG_212_AGENT_TRAJECTORY=dsh` trajectory expectation. A bridge-network diagnostic run or a scripted agent MUST NOT be promoted into capability evidence. Do not insert change tasks into the frozen three-task corpus.
 
 ## Evidence levels and claims
 

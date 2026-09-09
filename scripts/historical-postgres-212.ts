@@ -26,6 +26,26 @@ if (!["E0", "E1", "E2", "E3"].includes(scaffoldingLevel)) {
 }
 const network = String(process.env.HONEYRAIL_PG_212_AGENT_NETWORK || "").trim();
 const image = String(process.env.HONEYRAIL_PG_212_AGENT_IMAGE || "").trim();
+// Scored real-model egress (#216 execution gap): restricted egress routes the
+// agent at a per-trial relay sidecar that can reach exactly one upstream (its
+// model API) - see server/postgres/research-session.ts isolation.restrictedEgress.
+// Mutually exclusive with HONEYRAIL_PG_212_AGENT_NETWORK, which research-session
+// already rejects when combined, but this script validates it up front with a
+// clearer operator-facing message.
+const egressUpstreamUrl = String(process.env.HONEYRAIL_PG_212_EGRESS_UPSTREAM_URL || "").trim();
+if (network && egressUpstreamUrl) {
+  throw new Error(
+    "HONEYRAIL_PG_212_AGENT_NETWORK and HONEYRAIL_PG_212_EGRESS_UPSTREAM_URL are mutually exclusive: a restricted-egress session derives its own internal network."
+  );
+}
+// Explicit DSH trajectory expectation ("dsh" or unset) - the caller that chose
+// the agent says whether DSH-shaped telemetry is owed, never inferred from the
+// command (#210 review round 5, Blocking 1). "dsh" requires the agent to
+// persist a usable session transcript for a scored-eligible trial.
+const trajectoryExpectation = String(process.env.HONEYRAIL_PG_212_AGENT_TRAJECTORY || "").trim();
+if (trajectoryExpectation && trajectoryExpectation !== "dsh") {
+  throw new Error('HONEYRAIL_PG_212_AGENT_TRAJECTORY must be "dsh" when set.');
+}
 const artifactDir = resolve(process.env.HONEYRAIL_PG_212_ARTIFACT_DIR || "output/historical-pg-212");
 const timeoutMs = Number(process.env.HONEYRAIL_PG_212_AGENT_TIMEOUT_MS || 30 * 60_000);
 if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("HONEYRAIL_PG_212_AGENT_TIMEOUT_MS must be a positive number of milliseconds.");
@@ -37,7 +57,8 @@ const result = await runHistoricalPostgresTrial({
   task: historicalPostgresChange16867TaskSpec(resolve(mirror), privateTruth, scaffoldingLevel, knownReproducer ? resolve(knownReproducer) : undefined, knownFixEvidence ? resolve(knownFixEvidence) : undefined),
   agent: { command, args, timeoutMs, env: process.env.HONEYRAIL_PG_212_AGENT_ENV ? JSON.parse(process.env.HONEYRAIL_PG_212_AGENT_ENV) : undefined },
   artifactDir,
-  session: network || image ? { isolation: { ...(network ? { network: network as "none" | "bridge" } : {}), ...(image ? { image } : {}) } } : undefined
+  session: network || image || egressUpstreamUrl ? { isolation: { ...(egressUpstreamUrl ? { restrictedEgress: { upstreamUrl: egressUpstreamUrl } } : {}), ...(network ? { network: network as "none" | "bridge" } : {}), ...(image ? { image } : {}) } } : undefined,
+  ...(trajectoryExpectation === "dsh" ? { trajectoryExpectation: "dsh" as const } : {})
 });
 process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 
@@ -49,7 +70,8 @@ process.stdout.write(
     `  scoredEligible:           ${result.scoredEligible}\n` +
     `  diagnostic grader result: ${result.grade ? result.grade.status : "N/A"}\n` +
     `  official scored result:   ${officialScoredResult}\n` +
-    `  scaffoldingLevel:         ${scaffoldingLevel}\n`
+    `  scaffoldingLevel:         ${scaffoldingLevel}\n` +
+    `  trajectoryExpectation:    ${trajectoryExpectation || "none"}\n`
 );
 
 const integrationFailed = result.status === "blocked" || result.status === "infrastructure_error" || result.status === "integrity_error";

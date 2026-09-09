@@ -186,6 +186,16 @@ export HONEYRAIL_PG_212_AGENT_COMMAND=/path/in/agent-image/to/agent
 npm run historical-pg-212
 ```
 
+A real-model scored attempt (#216 execution-gap fix) additionally wires restricted egress and, for a DSH agent, trajectory collection:
+
+```sh
+export HONEYRAIL_PG_212_EGRESS_UPSTREAM_URL=https://api.deepseek.com   # restricted egress, mutually exclusive with HONEYRAIL_PG_212_AGENT_NETWORK
+export HONEYRAIL_PG_212_AGENT_TRAJECTORY=dsh                          # require DSH-shaped session telemetry as scored core evidence
+export HONEYRAIL_PG_212_AGENT_IMAGE=honeyrail-postgres-research-agent-dsh:latest
+export HONEYRAIL_PG_212_AGENT_ENV='{"DEEPSEEK_API_KEY":"...","DSH_PERMISSION_MODE":"danger-full-access"}'
+npm run historical-pg-212
+```
+
 ### Grading protocol identifiers
 
 `reference/truth.json` and `reference-manifest.json` both carry `gradingProtocol`, one of three honestly distinct values:
