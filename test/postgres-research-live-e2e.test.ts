@@ -183,6 +183,49 @@ async function containerExists(name: string): Promise<boolean> {
   return result.stdout.split("\n").map((line) => line.trim()).includes(name);
 }
 
+type ResearchContainerObservation = {
+  sawAgentContainer: boolean;
+  sawRuntimeContainer: boolean;
+  agentContainerGoneAt?: number;
+  runtimeContainerGoneAt?: number;
+};
+
+/** A failed Docker query is UNKNOWN, never evidence that a container is absent. */
+async function observeResearchContainers(runCommand: RunCommand = runCommandSafe): Promise<Set<string>> {
+  let listing;
+  try {
+    listing = await runCommand("docker", ["ps", "-a", "--filter", "name=honeyrail-pg-", "--format", "{{.Names}}"], {
+      timeout: 10_000
+    });
+  } catch (error) {
+    throw new Error(`failed to observe Docker container state: ${(error as Error).message}`);
+  }
+  if (!listing.ok) {
+    throw new Error(`failed to observe Docker container state: ${(listing.stderr || listing.stdout || "docker ps returned a non-zero exit status").trim()}`);
+  }
+  return new Set(listing.stdout.split("\n").filter(Boolean));
+}
+
+function recordResearchContainerObservation(observation: ResearchContainerObservation, present: Set<string>, now = Date.now()) {
+  const agentNowPresent = [...present].some((name) => name.startsWith("honeyrail-pg-research-"));
+  const runtimeNowPresent = [...present].some((name) => name.startsWith("honeyrail-pg-runtime-"));
+  if (agentNowPresent) observation.sawAgentContainer = true;
+  else if (observation.sawAgentContainer && observation.agentContainerGoneAt === undefined) observation.agentContainerGoneAt = now;
+  if (runtimeNowPresent) observation.sawRuntimeContainer = true;
+  else if (observation.sawRuntimeContainer && observation.runtimeContainerGoneAt === undefined) observation.runtimeContainerGoneAt = now;
+}
+
+test("a failed Docker container observation is UNKNOWN and never records disappearance", async () => {
+  const observation: ResearchContainerObservation = {
+    sawAgentContainer: true,
+    sawRuntimeContainer: true
+  };
+  const failedDockerPs: RunCommand = async () => ({ ok: false, stdout: "", stderr: "daemon unavailable", code: 1 });
+  await assert.rejects(() => observeResearchContainers(failedDockerPs), /failed to observe Docker container state: daemon unavailable/);
+  assert.equal(observation.agentContainerGoneAt, undefined);
+  assert.equal(observation.runtimeContainerGoneAt, undefined);
+});
+
 test(
   "the scored pipeline: real ref -> builder container -> runtime container -> live PostgreSQL -> isolated agent -> restart -> ordered cleanup",
   { timeout: E2E_TIMEOUT_MS },
@@ -639,21 +682,12 @@ test(
     // runtime container before the agent container was confirmed terminated,
     // the runtime container's disappearance would be observed at or before
     // the agent container's, which the assertion below would catch.
-    let agentContainerGoneAt: number | undefined;
-    let runtimeContainerGoneAt: number | undefined;
-    let sawAgentContainer = false;
-    let sawRuntimeContainer = false;
+    const observation: ResearchContainerObservation = {
+      sawAgentContainer: false,
+      sawRuntimeContainer: false
+    };
     const sampleContainerState = async () => {
-      const listing = await runCommandSafe("docker", ["ps", "-a", "--filter", "name=honeyrail-pg-", "--format", "{{.Names}}"], {
-        timeout: 10_000
-      }).catch(() => ({ ok: false, stdout: "", stderr: "", code: 1 }));
-      const present = new Set(listing.stdout.split("\n").filter(Boolean));
-      const agentNowPresent = [...present].some((name) => name.startsWith("honeyrail-pg-research-"));
-      const runtimeNowPresent = [...present].some((name) => name.startsWith("honeyrail-pg-runtime-"));
-      if (agentNowPresent) sawAgentContainer = true;
-      else if (sawAgentContainer && agentContainerGoneAt === undefined) agentContainerGoneAt = Date.now();
-      if (runtimeNowPresent) sawRuntimeContainer = true;
-      else if (sawRuntimeContainer && runtimeContainerGoneAt === undefined) runtimeContainerGoneAt = Date.now();
+      recordResearchContainerObservation(observation, await observeResearchContainers());
     };
     let polling = true;
     const pollLoop = (async () => {
@@ -705,14 +739,14 @@ test(
     // confirmed gone no later than the runtime container - i.e. agent
     // termination was awaited before (or, at worst, alongside) runtime/
     // filesystem cleanup, never after it.
-    assert.ok(sawAgentContainer, "the poll must have observed the agent container while it existed");
-    assert.ok(sawRuntimeContainer, "the poll must have observed the runtime container while it existed");
-    assert.ok(agentContainerGoneAt !== undefined, "the agent container must have been confirmed gone");
-    assert.ok(runtimeContainerGoneAt !== undefined, "the runtime container must have been confirmed gone");
+    assert.ok(observation.sawAgentContainer, "the poll must have observed the agent container while it existed");
+    assert.ok(observation.sawRuntimeContainer, "the poll must have observed the runtime container while it existed");
+    assert.ok(observation.agentContainerGoneAt !== undefined, "the agent container must have been confirmed gone");
+    assert.ok(observation.runtimeContainerGoneAt !== undefined, "the runtime container must have been confirmed gone");
     assert.ok(
-      agentContainerGoneAt! <= runtimeContainerGoneAt!,
+      observation.agentContainerGoneAt! <= observation.runtimeContainerGoneAt!,
       "the agent container must be confirmed terminated before final PostgreSQL/runtime cleanup is complete - " +
-        `agent gone at ${agentContainerGoneAt}, runtime gone at ${runtimeContainerGoneAt}`
+        `agent gone at ${observation.agentContainerGoneAt}, runtime gone at ${observation.runtimeContainerGoneAt}`
     );
 
     // The proof that final state also matters: no leaked runtime or agent

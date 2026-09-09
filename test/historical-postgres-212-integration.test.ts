@@ -106,6 +106,20 @@ const knownFixEvidence = String(process.env.HONEYRAIL_PG_212_FIX_EVIDENCE || "")
 
 const config = classifyHistoricalPostgres212IntegrationConfig({ mirror, reproducer: knownReproducer, privateTruthPath });
 
+async function canonicalIntroducingDiff(repoPath: string, introducingCommit: string) {
+  return runCommandSafe(
+    "git",
+    [
+      "-C", resolve(repoPath),
+      "-c", "color.ui=false",
+      "-c", "diff.external=",
+      "diff", "--no-ext-diff", "--no-color", "--no-textconv", "--diff-algorithm=myers", "--no-renames",
+      `${introducingCommit}^`, introducingCommit
+    ],
+    { timeout: 60_000, maxBuffer: 1024 * 1024 * 8 }
+  );
+}
+
 test(
   "#212 known local PostgreSQL verification distinguishes the pinned historical and corrected revisions",
   { skip: config.state === "UNCONFIGURED" ? "HONEYRAIL_PG_212_MIRROR, HONEYRAIL_PG_212_REPRODUCER, HONEYRAIL_PG_212_PRIVATE_TRUTH are not set" : false },
@@ -172,11 +186,7 @@ test(
     const historicalRevision = "280a408b48d5ee42969f981bceb9e9426c3a344c";
     assert.equal(privateTruth.historicalRevision, historicalRevision);
     assert.equal(privateTruth.introducingCommit, historicalRevision);
-    const expectedDiff = await runCommandSafe(
-      "git",
-      ["-C", resolve(mirror), "diff", `${historicalRevision}^`, historicalRevision],
-      { timeout: 60_000, maxBuffer: 1024 * 1024 * 8 }
-    );
+    const expectedDiff = await canonicalIntroducingDiff(mirror, historicalRevision);
     assert.equal(expectedDiff.ok, true, expectedDiff.stderr || expectedDiff.stdout);
 
     const root = await mkdtemp(join(tmpdir(), "honeyrail-pg212-e2-materialization-"));
@@ -332,11 +342,7 @@ test(
   { skip: config.state !== "FULLY_CONFIGURED" || !knownFixEvidence ? "integration env vars plus HONEYRAIL_PG_212_FIX_EVIDENCE are required" : false, timeout: 600_000 },
   async () => {
     const historicalRevision = "280a408b48d5ee42969f981bceb9e9426c3a344c";
-    const expectedDiff = await runCommandSafe(
-      "git",
-      ["-C", resolve(mirror), "diff", `${historicalRevision}^`, historicalRevision],
-      { timeout: 60_000, maxBuffer: 1024 * 1024 * 8 }
-    );
+    const expectedDiff = await canonicalIntroducingDiff(mirror, historicalRevision);
     assert.equal(expectedDiff.ok, true, expectedDiff.stderr || expectedDiff.stdout);
     const root = await mkdtemp(join(tmpdir(), "honeyrail-pg212-agent-surface-"));
     const levels = ["E0", "E1", "E2", "E3"] as const;
