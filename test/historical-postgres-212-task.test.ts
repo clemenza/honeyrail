@@ -40,7 +40,7 @@ const SYNTHETIC_16867_PRIVATE_TRUTH: HistoricalPostgresChange16867PrivateTruth =
 
 test("historicalPostgresChange16867TaskSpec carries operator-supplied private truth behind an opaque task id", () => {
   const spec = historicalPostgresChange16867TaskSpec("/unused/repo/path", SYNTHETIC_16867_PRIVATE_TRUTH, "E0");
-  assert.equal(spec.taskId, "postgres-change-16867");
+  assert.equal(spec.taskId, "postgres-change-001");
   assert.equal(spec.source.historicalRevision, SYNTHETIC_16867_PRIVATE_TRUTH.historicalRevision);
   assert.equal(spec.source.referenceRevision, SYNTHETIC_16867_PRIVATE_TRUTH.referenceRevision);
   assert.equal(spec.truth.upstreamBug, SYNTHETIC_16867_PRIVATE_TRUTH.upstreamBug);
@@ -98,11 +98,17 @@ test("spec.md content does not contain prohibited hindsight markers", () => {
 
 test("prompt does not leak bug identity, fix SHA, or hindsight terminology", () => {
   const prompt = historicalPostgresChange16867TaskPrompt();
-  assert.ok(!prompt.includes("16867"));
-  assert.ok(!prompt.includes("8a55cb5b"));
-  assert.ok(!prompt.includes("TBLOCK_SUBCOMMIT"));
-  assert.ok(!prompt.toLowerCase().includes("savepoint"));
-  assert.ok(!prompt.toLowerCase().includes("subtransaction"));
+  for (const marker of [
+    "16867",
+    "8a55cb5b",
+    "COMMIT AND CHAIN",
+    "ROLLBACK AND CHAIN",
+    "SAVEPOINT",
+    "TBLOCK_SUBCOMMIT",
+    "subtransaction"
+  ]) {
+    assert.ok(!prompt.toLowerCase().includes(marker.toLowerCase()), `prompt leaks feature-specific marker: ${marker}`);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -115,8 +121,8 @@ test("E0: no change-context artifacts are materialized", async () => {
   // Use repo.ref as introducing commit (it exists in the repo)
   const privateTruth: HistoricalPostgresChange16867PrivateTruth = {
     ...SYNTHETIC_16867_PRIVATE_TRUTH,
-    historicalRevision: repo.ref,
-    referenceRevision: repo.laterRef,
+    historicalRevision: repo.laterRef,
+    referenceRevision: repo.ref,
     introducingCommit: repo.laterRef
   };
   const spec = historicalPostgresChange16867TaskSpec(repo.repoPath, privateTruth, "E0");
@@ -136,8 +142,8 @@ test("E1: only spec.md is materialized", async () => {
   const repo = await createSyntheticPostgresSourceRepo(root);
   const privateTruth: HistoricalPostgresChange16867PrivateTruth = {
     ...SYNTHETIC_16867_PRIVATE_TRUTH,
-    historicalRevision: repo.ref,
-    referenceRevision: repo.laterRef,
+    historicalRevision: repo.laterRef,
+    referenceRevision: repo.ref,
     introducingCommit: repo.laterRef
   };
   const spec = historicalPostgresChange16867TaskSpec(repo.repoPath, privateTruth, "E1");
@@ -160,8 +166,8 @@ test("E2: spec.md and change-set.diff are materialized", async () => {
   const repo = await createSyntheticPostgresSourceRepo(root);
   const privateTruth: HistoricalPostgresChange16867PrivateTruth = {
     ...SYNTHETIC_16867_PRIVATE_TRUTH,
-    historicalRevision: repo.ref,
-    referenceRevision: repo.laterRef,
+    historicalRevision: repo.laterRef,
+    referenceRevision: repo.ref,
     introducingCommit: repo.laterRef
   };
   const spec = historicalPostgresChange16867TaskSpec(repo.repoPath, privateTruth, "E2");
@@ -184,8 +190,8 @@ test("E3: spec.md, change-set.diff, and harness-profile.md are materialized", as
   const repo = await createSyntheticPostgresSourceRepo(root);
   const privateTruth: HistoricalPostgresChange16867PrivateTruth = {
     ...SYNTHETIC_16867_PRIVATE_TRUTH,
-    historicalRevision: repo.ref,
-    referenceRevision: repo.laterRef,
+    historicalRevision: repo.laterRef,
+    referenceRevision: repo.ref,
     introducingCommit: repo.laterRef
   };
   const spec = historicalPostgresChange16867TaskSpec(repo.repoPath, privateTruth, "E3");
@@ -319,8 +325,8 @@ test("changeContext hashes are part of taskDefinitionHash: different scaffolding
   const repo = await createSyntheticPostgresSourceRepo(root);
   const privateTruth: HistoricalPostgresChange16867PrivateTruth = {
     ...SYNTHETIC_16867_PRIVATE_TRUTH,
-    historicalRevision: repo.ref,
-    referenceRevision: repo.laterRef,
+    historicalRevision: repo.laterRef,
+    referenceRevision: repo.ref,
     introducingCommit: repo.laterRef
   };
   const specE0 = historicalPostgresChange16867TaskSpec(repo.repoPath, privateTruth, "E0");
@@ -349,13 +355,13 @@ test("changeContext hashes are part of taskDefinitionHash: different scaffolding
 // Grading protocol: structured oracle
 // ---------------------------------------------------------------------------
 
-test("postgres-change-16867 materializes under the structured-oracle grading protocol", async () => {
+test("postgres-change-001 materializes under the structured-oracle grading protocol", async () => {
   const root = await mkdtemp(join(tmpdir(), "honeyrail-212-protocol-"));
   const repo = await createSyntheticPostgresSourceRepo(root);
   const privateTruth: HistoricalPostgresChange16867PrivateTruth = {
     ...SYNTHETIC_16867_PRIVATE_TRUTH,
-    historicalRevision: repo.ref,
-    referenceRevision: repo.laterRef,
+    historicalRevision: repo.laterRef,
+    referenceRevision: repo.ref,
     introducingCommit: repo.laterRef
   };
   const spec = historicalPostgresChange16867TaskSpec(repo.repoPath, privateTruth, "E1");
@@ -454,23 +460,27 @@ test("no file anywhere under the materialized task/ tree leaks the bug identity,
   const root = await mkdtemp(join(tmpdir(), "honeyrail-212-leak-"));
   const repo = await createSyntheticPostgresSourceRepo(root);
   const reproPath = join(root, "known-repro.sql");
+  const fixEvidencePath = join(root, "future-regression-test-material.diff");
   const reproContents =
     "\\set ON_ERROR_STOP off\n" +
     "-- synthetic-canonical-reproducer for 16867 leak test\n" +
     "SELECT 1;\n";
+  const fixEvidenceContents = "future-regression-test-material\n-- grader-private fix evidence for 16867\n";
   await writeFile(reproPath, reproContents);
+  await writeFile(fixEvidencePath, fixEvidenceContents);
 
   const privateTruth: HistoricalPostgresChange16867PrivateTruth = {
     ...SYNTHETIC_16867_PRIVATE_TRUTH,
-    historicalRevision: repo.ref,
-    referenceRevision: repo.laterRef,
+    historicalRevision: repo.laterRef,
+    referenceRevision: repo.ref,
     introducingCommit: repo.laterRef
   };
-  const spec = historicalPostgresChange16867TaskSpec(repo.repoPath, privateTruth, "E3", reproPath);
+  const spec = historicalPostgresChange16867TaskSpec(repo.repoPath, privateTruth, "E3", reproPath, fixEvidencePath);
   const task = await materializeHistoricalPostgresTask(spec, join(root, "case"));
 
   const taskFiles = await readTreeAsText(task.taskDir);
   const secrets: Record<string, string> = {
+    "raw upstream identity token": "16867",
     "upstream bug id": privateTruth.upstreamBug,
     "historical revision": spec.source.historicalRevision,
     "reference revision": spec.source.referenceRevision,
@@ -479,6 +489,10 @@ test("no file anywhere under the materialized task/ tree leaks the bug identity,
     "canonical reproducer host path": reproPath,
     "canonical reproducer contents": reproContents,
     "canonical reproducer hash": task.truthManifest.canonicalReproducerSha256!,
+    "fix-evidence host path": fixEvidencePath,
+    "fix-evidence contents": fixEvidenceContents,
+    "fix-evidence hash": task.truthManifest.fixEvidenceSha256!,
+    "future regression-test material": "future-regression-test-material",
     "historical expected tuple field 0": privateTruth.structuredOracle.historical.rows[0][0],
     "reference expected tuple field 0": privateTruth.structuredOracle.reference.rows[0][0]
   };
@@ -491,6 +505,7 @@ test("no file anywhere under the materialized task/ tree leaks the bug identity,
 
   assert.ok(!taskFiles.some((file) => file.text.includes("canonical-reproducer.sql")));
   assert.ok(!taskFiles.some((file) => file.text.includes("truth.json")));
+  assert.equal(JSON.parse(await readFile(join(task.taskDir, "source-manifest.json"), "utf8")).gitDirPresent, false);
 
   // Verify the canonical reproducer IS retained grader-side under reference/
   const referenceFiles = await readTreeAsText(task.referenceDir);
@@ -504,8 +519,8 @@ test("change-set.diff at E2+ does not leak the historical or reference revision 
   const repo = await createSyntheticPostgresSourceRepo(root);
   const privateTruth: HistoricalPostgresChange16867PrivateTruth = {
     ...SYNTHETIC_16867_PRIVATE_TRUTH,
-    historicalRevision: repo.ref,
-    referenceRevision: repo.laterRef,
+    historicalRevision: repo.laterRef,
+    referenceRevision: repo.ref,
     introducingCommit: repo.laterRef
   };
   const spec = historicalPostgresChange16867TaskSpec(repo.repoPath, privateTruth, "E2");
@@ -658,5 +673,25 @@ test("checkedTaskSpec rejects non-40-hex changeContext.introducingCommit", async
   await assert.rejects(
     () => materializeHistoricalPostgresTask(spec, join(root, "case")),
     /40-character commit SHA/i
+  );
+});
+
+test("HistoricalChangeTask rejects a source revision that resolves differently from its introducing change", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-212-causal-binding-"));
+  const repo = await createSyntheticPostgresSourceRepo(root);
+  const spec: HistoricalPostgresTaskSpec = {
+    taskId: "synthetic-causal-mismatch",
+    source: { repoPath: repo.repoPath, historicalRevision: repo.ref, referenceRevision: repo.laterRef },
+    truth: { upstreamBug: "Synthetic #causal", structuredOracle: SYNTHETIC_ORACLE },
+    build: { mode: "host" },
+    prompt: "Test.",
+    changeContext: {
+      spec: "Contemporaneous context.",
+      introducingCommit: repo.laterRef
+    }
+  };
+  await assert.rejects(
+    () => materializeHistoricalPostgresTask(spec, join(root, "case")),
+    /must resolve to the same commit/i
   );
 });

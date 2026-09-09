@@ -211,7 +211,7 @@ export type HistoricalPostgresTaskSpec = {
    *
    * The materializer handles this generically: "if changeContext is present,
    * materialize the artifacts the scaffoldingLevel selects" — never
-   * "if taskId == postgres-change-16867".
+   * "if taskId == postgres-change-001".
    */
   changeContext?: HistoricalPostgresChangeContext;
 };
@@ -765,6 +765,20 @@ function exactRevision(value: string, field: string) {
   return value.toLowerCase();
 }
 
+async function resolveHistoricalPostgresCommit(repoPath: string, revision: string, field: string): Promise<string> {
+  const result = await runCommandSafe(
+    "git",
+    ["-C", repoPath, "rev-parse", "--verify", `${revision}^{commit}`],
+    { timeout: 60_000, maxBuffer: 1024 * 1024 }
+  );
+  if (!result.ok) {
+    throw new Error(
+      `Could not resolve ${field} ${revision} in ${repoPath}: ${(result.stderr || result.stdout).trim()}`
+    );
+  }
+  return exactRevision(result.stdout.trim(), `${field} resolved commit`);
+}
+
 function checkedTaskSpec(spec: HistoricalPostgresTaskSpec): HistoricalPostgresTaskSpec {
   if (!/^[a-z0-9][a-z0-9-]{2,}$/i.test(spec.taskId)) throw new Error("taskId must be a stable, opaque slug");
   if (!String(spec.source.repoPath || "").trim()) throw new Error("source.repoPath is required");
@@ -1228,7 +1242,27 @@ function buildSafeSessionEvidence(session: PostgresResearchSessionResult, execut
 
 /** Materializes a clean scored task tree and a separate grader-only reference tree. */
 export async function materializeHistoricalPostgresTask(spec: HistoricalPostgresTaskSpec, root: string): Promise<HistoricalPostgresTaskLayout> {
-  const input = checkedTaskSpec(spec);
+  let input = checkedTaskSpec(spec);
+  if (input.changeContext) {
+    // A change-oriented task must expose the exact change that produced the
+    // source tree the agent investigates. Checking resolved object IDs, not
+    // merely the pinned input strings, rejects aliases and unrelated commits
+    // without introducing a broader revision-relation model.
+    const [historicalRevision, introducingCommit] = await Promise.all([
+      resolveHistoricalPostgresCommit(input.source.repoPath, input.source.historicalRevision, "source.historicalRevision"),
+      resolveHistoricalPostgresCommit(input.source.repoPath, input.changeContext.introducingCommit, "changeContext.introducingCommit")
+    ]);
+    if (historicalRevision !== introducingCommit) {
+      throw new Error(
+        `HistoricalChangeTask source.historicalRevision (${historicalRevision}) must resolve to the same commit as changeContext.introducingCommit (${introducingCommit}).`
+      );
+    }
+    input = {
+      ...input,
+      source: { ...input.source, historicalRevision },
+      changeContext: { ...input.changeContext, introducingCommit }
+    };
+  }
   const taskDir = join(root, "task");
   const sourceDir = join(taskDir, "source");
   const workspaceDir = join(taskDir, "workspace");
@@ -2446,7 +2480,7 @@ export function historicalPostgres003TaskSpec(
 }
 
 // ---------------------------------------------------------------------------
-// Case: postgres-change-16867 (#212) — HistoricalChangeTask v0 vertical slice
+// Case: postgres-change-001 (#212) — HistoricalChangeTask v0 vertical slice
 // ---------------------------------------------------------------------------
 
 /**
@@ -2527,7 +2561,7 @@ export async function loadHistoricalPostgresChange16867PrivateTruth(filePath: st
  * `task/spec.md` at scaffolding level E1+.
  *
  * CONTENT POLICY: this text must contain only information available at or
- * before the introducing commit's timestamp (2019-03-22, PostgreSQL 12-era).
+ * before the introducing commit's timestamp (2019-03-24, PostgreSQL 12-era).
  * Prohibited hindsight markers that must NOT appear here or in any future
  * revision: SAVEPOINT, "unreleased savepoint", subtransaction,
  * TBLOCK_SUBCOMMIT, "nested transaction state", "missing switch branch",
@@ -2624,7 +2658,7 @@ A reproducer is a \`.sql\` file executed via \`psql\`. It must:
 export function historicalPostgresChange16867TaskPrompt(): string {
   return `# PostgreSQL correctness-testing assignment
 
-Investigate the supplied PostgreSQL source and a locally running PostgreSQL instance for a correctness issue involving transaction chaining and session-level transaction characteristics. Design focused SQL tests that exercise transaction chaining (COMMIT AND CHAIN, ROLLBACK AND CHAIN) under different isolation levels and transaction control sequences, inspect relevant source and documentation, and save any useful test scripts in the writable workspace.
+Investigate transaction state, session-level transaction characteristics, and transaction-control behavior. Form hypotheses, design focused SQL tests, inspect relevant source and documentation, execute experiments, and report any reproducible functional correctness defect.
 
 If you observe a reproducible behavioral correctness problem, write \`finding.json\` with \`status: "reproduced"\`, a concise summary, and the name of a runnable SQL reproducer. The reproducer must encode its own assertion and exit successfully only when the observed behavior violates that assertion. If no reproducible issue is found, write \`finding.json\` with \`status: "not-reproduced"\` and a concise summary.\n`;
 }
@@ -2646,7 +2680,7 @@ export function historicalPostgresChange16867TaskSpec(
   knownFixEvidencePath?: string
 ): HistoricalPostgresTaskSpec {
   return {
-    taskId: "postgres-change-16867",
+    taskId: "postgres-change-001",
     source: {
       repoPath,
       historicalRevision: privateTruth.historicalRevision,

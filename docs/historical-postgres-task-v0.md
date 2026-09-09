@@ -134,9 +134,9 @@ The same underlying task (bug identity, oracle, grading) is used at every level 
 
 **Contemporaneous-context rule.** `spec.md` must contain only information available at or before the introducing commit's timestamp. Prohibited hindsight markers (tested in `test/historical-postgres-212-task.test.ts`): SAVEPOINT, subtransaction, TBLOCK_SUBCOMMIT, BUG number references, future-fix wording. The spec describes the feature and the invariant; the agent must independently discover where the invariant breaks.
 
-#### Case: `postgres-change-16867` (#212) - BUG #16867 vertical slice
+#### Case: `postgres-change-001` (#212) - BUG #16867 vertical slice
 
-The first change-oriented task. Its opaque `taskId` is `postgres-change-16867`. It exercises the transaction-chaining feature (COMMIT AND CHAIN / ROLLBACK AND CHAIN) introduced by commit `280a408b48d5ee42969f981bceb9e9426c3a344c` (2019-03-22, PostgreSQL 12devel), where `COMMIT AND CHAIN` after a `SAVEPOINT` fails to start a new chained transaction, causing isolation level to revert to the session default instead of being preserved.
+The first change-oriented task. Its opaque, agent-visible `taskId` is `postgres-change-001`; BUG #16867 remains grader-private/operator metadata. It exercises the transaction-chaining feature (COMMIT AND CHAIN / ROLLBACK AND CHAIN) introduced by commit `280a408b48d5ee42969f981bceb9e9426c3a344c` (2019-03-24, PostgreSQL 12devel), where `COMMIT AND CHAIN` after a `SAVEPOINT` fails to start a new chained transaction, causing isolation level to revert to the session default instead of being preserved.
 
 **Revisions.**
 - Historical: `280a408b48d5ee42969f981bceb9e9426c3a344c` (PG 12devel, "Transaction chaining" introducing commit). `postgres --version`: `postgres (PostgreSQL) 12devel`.

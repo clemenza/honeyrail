@@ -15,6 +15,8 @@ import {
   withPostgresResearchEnvironment,
   type PostgresResearchEnvironment
 } from "../server/postgres/research-environment.js";
+import { resolveHistoricalPostgresTaskSpecFromEnv } from "../server/postgres/historical-postgres-task-env.js";
+import { runCommandSafe } from "../server/utils.js";
 
 // ---------------------------------------------------------------------------
 // Integration-config classifier
@@ -123,7 +125,7 @@ test(
   await cp(resolve(knownReproducer), join(workspace, "repro.sql"));
   await writeFile(
     join(workspace, "finding.json"),
-    JSON.stringify({ status: "reproduced", summary: "Known local historical-change-16867 verification", reproducer: "repro.sql" })
+    JSON.stringify({ status: "reproduced", summary: "Known local change-task verification", reproducer: "repro.sql" })
   );
   const task = historicalPostgresChange16867TaskSpec(resolve(mirror), privateTruth, "E0", resolve(knownReproducer), knownFixEvidence ? resolve(knownFixEvidence) : undefined);
   const grade = await gradeHistoricalPostgresSubmission({
@@ -150,7 +152,7 @@ test(
   assert.ok(!publicManifest.includes(privateTruth.upstreamBug));
   assert.ok(!publicManifest.includes(privateTruth.referenceRevision));
   assert.ok(!("referenceRevision" in layout.taskManifest));
-  assert.equal(layout.taskManifest.taskId, "postgres-change-16867");
+  assert.equal(layout.taskManifest.taskId, "postgres-change-001");
   assert.equal(layout.truthManifest.upstreamBug, privateTruth.upstreamBug);
   assert.ok(layout.truthManifest.commitFest == null);
   assert.equal(layout.truthManifest.referenceRevision, task.source.referenceRevision);
@@ -160,6 +162,33 @@ test(
   assert.equal(layout.truthManifest.gradingProtocol, "submitted-reproducer-structured-oracle-v1");
   assert.equal(layout.referenceManifest.gradingProtocol, "submitted-reproducer-structured-oracle-v1");
 });
+
+test(
+  "#212 E2 materialization binds the historical source to the complete introducing change-set",
+  { skip: config.state !== "FULLY_CONFIGURED" || !knownFixEvidence ? "integration env vars plus HONEYRAIL_PG_212_FIX_EVIDENCE are required" : false },
+  async () => {
+    const privateTruth = await loadHistoricalPostgresChange16867PrivateTruth(privateTruthPath);
+    const historicalRevision = "280a408b48d5ee42969f981bceb9e9426c3a344c";
+    assert.equal(privateTruth.historicalRevision, historicalRevision);
+    assert.equal(privateTruth.introducingCommit, historicalRevision);
+    const expectedDiff = await runCommandSafe(
+      "git",
+      ["-C", resolve(mirror), "diff", `${historicalRevision}^`, historicalRevision],
+      { timeout: 60_000, maxBuffer: 1024 * 1024 * 8 }
+    );
+    assert.equal(expectedDiff.ok, true, expectedDiff.stderr || expectedDiff.stdout);
+
+    const root = await mkdtemp(join(tmpdir(), "honeyrail-pg212-e2-materialization-"));
+    const task = historicalPostgresChange16867TaskSpec(
+      resolve(mirror), privateTruth, "E2", resolve(knownReproducer), resolve(knownFixEvidence)
+    );
+    const layout = await materializeHistoricalPostgresTask(task, join(root, "task-bundle"));
+    assert.equal(layout.truthManifest.historicalRevision, historicalRevision);
+    const sourceManifest = JSON.parse(await readFile(join(layout.referenceDir, "source-manifest.json"), "utf8"));
+    assert.equal(sourceManifest.resolvedCommit, historicalRevision);
+    assert.equal(await readFile(join(layout.taskDir, "change-set.diff"), "utf8"), expectedDiff.stdout);
+  }
+);
 
 // ---------------------------------------------------------------------------
 // 10x determinism: each revision must produce identical output every run
@@ -280,11 +309,12 @@ test(
       `printf '%s' '{"status":"reproduced","summary":"scripted fake agent","reproducer":"repro.sql"}' > "$W/finding.json"`,
     ].join("\n");
 
-    const task = historicalPostgresChange16867TaskSpec(
-      resolve(mirror), truth, "E0",
-      resolve(knownReproducer),
-      knownFixEvidence ? resolve(knownFixEvidence) : undefined
-    );
+    const task = await resolveHistoricalPostgresTaskSpecFromEnv("postgres-change-001", {
+      HONEYRAIL_PG_212_MIRROR: resolve(mirror),
+      HONEYRAIL_PG_212_REPRODUCER: resolve(knownReproducer),
+      HONEYRAIL_PG_212_PRIVATE_TRUTH: resolve(privateTruthPath),
+      ...(knownFixEvidence ? { HONEYRAIL_PG_212_FIX_EVIDENCE: resolve(knownFixEvidence) } : {})
+    });
     const result = await runHistoricalPostgresTrial({
       task,
       agent: { command: "/bin/bash", args: ["-c", inlineScript], timeoutMs: 120_000 },
