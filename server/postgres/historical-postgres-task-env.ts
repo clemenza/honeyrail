@@ -4,6 +4,7 @@ import {
   historicalPostgres002TaskSpec,
   historicalPostgres003TaskSpec,
   historicalPostgresChange16867TaskSpec,
+  historicalPostgresChange18574TaskSpec,
   loadHistoricalPostgres003PrivateTruth,
   loadHistoricalPostgresChange16867PrivateTruth,
   type HistoricalPostgresTaskSpec
@@ -63,6 +64,24 @@ export async function resolveHistoricalPostgresTaskSpecFromEnv(taskId: string, e
     return historicalPostgresChange16867TaskSpec(
       resolve(mirror),
       privateTruth,
+      scaffoldingLevel,
+      knownReproducer ? resolve(knownReproducer) : undefined,
+      knownFixEvidence ? resolve(knownFixEvidence) : undefined
+    );
+  }
+  if (taskId === "postgres-change-002") {
+    const mirror = String(env.HONEYRAIL_PG_221_MIRROR || "").trim();
+    const knownReproducer = String(env.HONEYRAIL_PG_221_REPRODUCER || "").trim();
+    const knownFixEvidence = String(env.HONEYRAIL_PG_221_FIX_EVIDENCE || "").trim();
+    const scaffoldingLevel = (String(env.HONEYRAIL_PG_221_SCAFFOLDING || "E0").trim()) as "E0" | "E1" | "E2" | "E3";
+    if (!mirror) {
+      throw new Error("Set HONEYRAIL_PG_221_MIRROR for postgres-change-002.");
+    }
+    if (!["E0", "E1", "E2", "E3"].includes(scaffoldingLevel)) {
+      throw new Error(`HONEYRAIL_PG_221_SCAFFOLDING must be E0, E1, E2, or E3; got "${scaffoldingLevel}".`);
+    }
+    return historicalPostgresChange18574TaskSpec(
+      resolve(mirror),
       scaffoldingLevel,
       knownReproducer ? resolve(knownReproducer) : undefined,
       knownFixEvidence ? resolve(knownFixEvidence) : undefined

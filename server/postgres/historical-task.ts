@@ -2722,18 +2722,21 @@ export function historicalPostgresChange16867TaskSpec(
  * (`parent(ee895a655) -> expected behavior`, `ee895a655 -> BUG #18574
  * behavior`). Also `source.historicalRevision` for the change-oriented task,
  * since `checkedTaskSpec()` requires `historicalRevision` to resolve to the
- * same commit as `changeContext.introducingCommit`.
+ * same commit as `changeContext.introducingCommit`. Not the #200
+ * blind-discovery task's own `historicalRevision` (`7696b2ea...`), which is
+ * a much later REL_14_STABLE release snapshot unsuitable as a focused
+ * two-revision comparator for a change-oriented task.
  */
 export const HISTORICAL_POSTGRES_18574_INTRODUCING_COMMIT = "ee895a655ce4341546facd6f23e3e8f2931b96bf";
 
 /**
- * The commit that actually fixed BUG #18574 upstream (on `master`, the same
- * lineage as the introducing commit above - not the #200 blind-discovery
- * task's own `referenceRevision`, which is a much later REL_14_STABLE
- * release snapshot unsuitable as a focused two-revision comparator). Its own
- * commit message confirms both the bug and the coding it patches: "Fix edge
- * case in plpgsql's make_callstmt_target()... Per bug #18574 from Song
- * Hongyu. Back-patch to v14 where this coding was introduced."
+ * The commit that actually fixed BUG #18574 upstream, on `master` (the same
+ * lineage as the introducing commit above). Its own commit message confirms
+ * both the bug and the coding it patches: "Fix edge case in plpgsql's
+ * make_callstmt_target()... Per bug #18574 from Song Hongyu. Back-patch to
+ * v14 where this coding was introduced." This *is* the same commit as the
+ * #200 blind-discovery task's own `referenceRevision` - reused as-is, not a
+ * new pin.
  */
 export const HISTORICAL_POSTGRES_18574_FIX_COMMIT = "7f875fb5bd603d8640cc7aca2c79c604aacd3890";
 
@@ -2747,6 +2750,42 @@ export const HISTORICAL_POSTGRES_18574_FIX_COMMIT = "7f875fb5bd603d8640cc7aca2c7
  * that must NOT appear here or in any future revision: "stale", "drop"/
  * "recreate" of the called procedure, "cache lookup failed", any OID
  * wording, "BUG #18574", or any future-fix wording.
+ *
+ * POSITIVE PROVENANCE MAPPING (#221 review round 2, Blocking 2 - a negative
+ * leakage test only proves prohibited words are absent, not that every
+ * substantive statement is actually grounded; this maps each one to its
+ * contemporaneous source so that can be checked directly):
+ *
+ * - "Feature Summary" paragraph 1 (re-planning cost, `ResourceOwner`
+ *   requirement for a saved plan) -> introducing commit message ("forced us
+ *   to re-plan CALL and DO statements each time through... because use of a
+ *   saved plan requires having a ResourceOwner to hold a reference count on
+ *   the plan, and we had no suitable resowner at hand").
+ * - "Feature Summary" paragraph 2 (dedicated `ResourceOwner` for non-atomic
+ *   procedures/DO blocks containing CALL/DO) -> introducing commit message
+ *   ("when running a non-atomic procedure or DO block that contains any
+ *   CALL or DO commands, plpgsql creates a ResourceOwner that will be used
+ *   to pin the plans of the CALL/DO commands... we can just save CALL/DO
+ *   plans normally, whether or not they are used across transaction
+ *   boundaries").
+ * - "Feature Summary" paragraph 3 (CALL statement target determined once,
+ *   expected to remain associated with the statement while its plan is
+ *   reused) -> introducing diff, `src/pl/plpgsql/src/pl_exec.c`
+ *   `exec_stmt_call()`/`make_callstmt_target()` hunk: the post-commit code
+ *   only calls `make_callstmt_target()` inside `if (expr->plan == NULL)`,
+ *   i.e. exactly once per statement for as long as its plan is cached - an
+ *   observable fact of the diff itself, not narrative added around it.
+ * - "Expected Invariant" -> the general correctness expectation for *any*
+ *   plan-caching optimization (an optimization must not change externally
+ *   observable behavior versus not caching) applied to the specific
+ *   observable this diff introduces (CALL statement target resolution tied
+ *   to plan reuse) - same category of grounding as
+ *   `historicalPostgresChange16867Spec()`'s invariant, which restates
+ *   `AND CHAIN`'s documented semantics rather than quoting the commit
+ *   verbatim. An earlier draft additionally referenced "current search
+ *   path" here; removed (#221 review round 2) because no contemporaneous
+ *   source for that specific qualifier was found in the introducing
+ *   commit's message or diff - conservative wording only.
  */
 export function historicalPostgresChange18574Spec(): string {
   return `# Repeated CALL/DO Plan Caching — Contemporaneous Specification
@@ -2776,11 +2815,13 @@ with that statement for as long as the statement's plan is reused.
 
 ## Expected Invariant
 
-For a given \`CALL\` statement executed repeatedly within a session, the
-procedure invoked by each execution must be the procedure that the
-\`CALL\` statement's arguments and current search path actually resolve to
-at the time of that execution — regardless of whether the statement's plan
-was freshly built or reused from a previous execution.
+Caching a statement's plan for reuse must not change the statement's
+externally observable behavior compared to planning it fresh on every
+execution. In particular, for a given \`CALL\` statement executed
+repeatedly within a session, the procedure identity resolved for each
+execution must correctly reflect what that statement's plan currently
+points to — regardless of whether the plan was just built or is being
+reused from a previous execution.
 `;
 }
 
