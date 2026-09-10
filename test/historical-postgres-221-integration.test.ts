@@ -7,9 +7,11 @@ import {
   gradeHistoricalPostgresSubmission,
   historicalPostgresChange18574TaskSpec,
   materializeHistoricalPostgresTask,
+  resolveOracleReproduction,
   runHistoricalPostgresTrial,
   type HistoricalPostgresOracleAttribution
 } from "../server/postgres/historical-task.js";
+import { classifyExecutionValidity } from "../server/postgres/historical-behavioral-oracle.js";
 import {
   withPostgresResearchEnvironment,
   type PostgresResearchEnvironment
@@ -211,49 +213,61 @@ test(
 // 10x determinism: each revision must produce identical output every run
 // ---------------------------------------------------------------------------
 
+/**
+ * "Determinism" for this task means stable *semantic* behavioral-oracle
+ * attribution across repeated runs, not raw stdout/stderr equality (#223
+ * review round 3, Blocking 2): the historical side's second observation
+ * embeds a dynamic OID (`cache lookup failed for function <OID>`), so raw
+ * byte-for-byte comparison would be meaningless (or flaky, if a run ever
+ * happened to reuse an OID). Reuses the same production helper the real
+ * grader calls (`resolveOracleReproduction()`, `classifyExecutionValidity()`)
+ * rather than a bug-specific regex parser reimplemented in the test.
+ */
+async function repeatedSemanticAttribution(revision: string, mirrorPath: string, reproducerPath: string, task: ReturnType<typeof historicalPostgresChange18574TaskSpec>) {
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-pg221-determ-"));
+  const outcomes: Array<{ valid: boolean; reproduced: boolean; attributedTo?: string }> = [];
+  await withPostgresResearchEnvironment(
+    { root, source: { repoPath: resolve(mirrorPath), ref: revision }, build: { configureArgs: ["--without-readline", "--without-zlib", "--without-icu"] } },
+    async (env: PostgresResearchEnvironment) => {
+      await env.start();
+      for (let i = 0; i < 10; i++) {
+        const execution = await env.psqlFile(resolve(reproducerPath));
+        const validity = classifyExecutionValidity(execution);
+        const { reproduced, attribution } = resolveOracleReproduction({ execution, revision, spec: task });
+        outcomes.push({ valid: validity.valid, reproduced, attributedTo: attribution?.attributedTo });
+      }
+    }
+  );
+  return outcomes;
+}
+
 test(
-  "#221 10x determinism: historical revision produces identical output on every run",
+  "#221 10x determinism: historical revision attributes to \"historical\" with a satisfied oracle on every run",
   { skip: config.state !== "FULLY_CONFIGURED" ? "integration env vars not set" : false, timeout: 600_000 },
   async () => {
-    const root = await mkdtemp(join(tmpdir(), "honeyrail-pg221-determ-hist-"));
-    const results: string[] = [];
-    await withPostgresResearchEnvironment(
-      { root, source: { repoPath: resolve(mirror), ref: HISTORICAL_REVISION }, build: { configureArgs: ["--without-readline", "--without-zlib", "--without-icu"] } },
-      async (env: PostgresResearchEnvironment) => {
-        await env.start();
-        for (let i = 0; i < 10; i++) {
-          const r = await env.psqlFile(resolve(knownReproducer));
-          results.push(r.stdout);
-        }
-      }
-    );
-    assert.equal(results.length, 10);
-    for (let i = 1; i < 10; i++) {
-      assert.equal(results[i], results[0], `historical run ${i + 1} differs from run 1`);
-    }
+    const task = historicalPostgresChange18574TaskSpec(resolve(mirror), "E0", resolve(knownReproducer), resolve(knownFixEvidence));
+    const outcomes = await repeatedSemanticAttribution(HISTORICAL_REVISION, mirror, knownReproducer, task);
+    assert.equal(outcomes.length, 10);
+    outcomes.forEach((outcome, i) => {
+      assert.equal(outcome.valid, true, `historical run ${i + 1}: execution was not valid/interpretable`);
+      assert.equal(outcome.reproduced, true, `historical run ${i + 1}: historical oracle was not satisfied`);
+      assert.equal(outcome.attributedTo, "historical", `historical run ${i + 1}: attributedTo was "${outcome.attributedTo}", expected "historical"`);
+    });
   }
 );
 
 test(
-  "#221 10x determinism: reference revision produces identical output on every run",
+  "#221 10x determinism: reference revision attributes to \"reference\" with a satisfied oracle on every run",
   { skip: config.state !== "FULLY_CONFIGURED" ? "integration env vars not set" : false, timeout: 600_000 },
   async () => {
-    const root = await mkdtemp(join(tmpdir(), "honeyrail-pg221-determ-ref-"));
-    const results: string[] = [];
-    await withPostgresResearchEnvironment(
-      { root, source: { repoPath: resolve(mirror), ref: "7f875fb5bd603d8640cc7aca2c79c604aacd3890" }, build: { configureArgs: ["--without-readline", "--without-zlib", "--without-icu"] } },
-      async (env: PostgresResearchEnvironment) => {
-        await env.start();
-        for (let i = 0; i < 10; i++) {
-          const r = await env.psqlFile(resolve(knownReproducer));
-          results.push(r.stdout);
-        }
-      }
-    );
-    assert.equal(results.length, 10);
-    for (let i = 1; i < 10; i++) {
-      assert.equal(results[i], results[0], `reference run ${i + 1} differs from run 1`);
-    }
+    const task = historicalPostgresChange18574TaskSpec(resolve(mirror), "E0", resolve(knownReproducer), resolve(knownFixEvidence));
+    const outcomes = await repeatedSemanticAttribution("7f875fb5bd603d8640cc7aca2c79c604aacd3890", mirror, knownReproducer, task);
+    assert.equal(outcomes.length, 10);
+    outcomes.forEach((outcome, i) => {
+      assert.equal(outcome.valid, true, `reference run ${i + 1}: execution was not valid/interpretable`);
+      assert.equal(outcome.reproduced, false, `reference run ${i + 1}: historical oracle must not be satisfied on the reference build`);
+      assert.equal(outcome.attributedTo, "reference", `reference run ${i + 1}: attributedTo was "${outcome.attributedTo}", expected "reference"`);
+    });
   }
 );
 

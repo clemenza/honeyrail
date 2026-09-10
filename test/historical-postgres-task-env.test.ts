@@ -132,3 +132,76 @@ test("resolveHistoricalPostgresTaskSpecFromEnv: postgres-change-001 passes expli
 test("resolveHistoricalPostgresTaskSpecFromEnv: an unknown task id is rejected clearly", async () => {
   await assert.rejects(() => resolveHistoricalPostgresTaskSpecFromEnv("postgres-historical-999", {}), /No task-spec resolver registered for taskId "postgres-historical-999"/);
 });
+
+// ---------------------------------------------------------------------------
+// postgres-change-002 (#221/#223 review round 3, Blocking 1): unlike
+// postgres-change-001, the reproducer and fix evidence are both required -
+// no optional fallback to an auto-generated (and here unusable, ~3.5-years-
+// apart) historical-vs-reference diff is reachable through this shared
+// resolver.
+// ---------------------------------------------------------------------------
+
+test("resolveHistoricalPostgresTaskSpecFromEnv: postgres-change-002 rejects mirror only, mentioning the missing reproducer and fix evidence", async () => {
+  await assert.rejects(
+    () => resolveHistoricalPostgresTaskSpecFromEnv("postgres-change-002", { HONEYRAIL_PG_221_MIRROR: "/tmp/some-mirror" }),
+    /HONEYRAIL_PG_221_MIRROR, HONEYRAIL_PG_221_REPRODUCER, and HONEYRAIL_PG_221_FIX_EVIDENCE/
+  );
+});
+
+test("resolveHistoricalPostgresTaskSpecFromEnv: postgres-change-002 rejects mirror+reproducer without fix evidence", async () => {
+  await assert.rejects(
+    () =>
+      resolveHistoricalPostgresTaskSpecFromEnv("postgres-change-002", {
+        HONEYRAIL_PG_221_MIRROR: "/tmp/some-mirror",
+        HONEYRAIL_PG_221_REPRODUCER: "/tmp/some-reproducer.sql"
+      }),
+    /HONEYRAIL_PG_221_MIRROR, HONEYRAIL_PG_221_REPRODUCER, and HONEYRAIL_PG_221_FIX_EVIDENCE/
+  );
+});
+
+test("resolveHistoricalPostgresTaskSpecFromEnv: postgres-change-002 rejects mirror+fix evidence without a reproducer", async () => {
+  await assert.rejects(
+    () =>
+      resolveHistoricalPostgresTaskSpecFromEnv("postgres-change-002", {
+        HONEYRAIL_PG_221_MIRROR: "/tmp/some-mirror",
+        HONEYRAIL_PG_221_FIX_EVIDENCE: "/tmp/some-fix-evidence.diff"
+      }),
+    /HONEYRAIL_PG_221_MIRROR, HONEYRAIL_PG_221_REPRODUCER, and HONEYRAIL_PG_221_FIX_EVIDENCE/
+  );
+});
+
+test("resolveHistoricalPostgresTaskSpecFromEnv: postgres-change-002 resolves once all three are present, with fix evidence passed through - no auto-generated fallback reachable", async () => {
+  const spec = await resolveHistoricalPostgresTaskSpecFromEnv("postgres-change-002", {
+    HONEYRAIL_PG_221_MIRROR: "/tmp/some-mirror",
+    HONEYRAIL_PG_221_REPRODUCER: "/tmp/some-reproducer.sql",
+    HONEYRAIL_PG_221_FIX_EVIDENCE: "/tmp/some-fix-evidence.diff"
+  });
+  assert.equal(spec.taskId, "postgres-change-002");
+  assert.equal(spec.truth.knownReproducerPath, "/tmp/some-reproducer.sql");
+  assert.equal(spec.truth.knownFixEvidencePath, "/tmp/some-fix-evidence.diff");
+});
+
+test("resolveHistoricalPostgresTaskSpecFromEnv: postgres-change-002 rejects invalid scaffolding even when fully configured", async () => {
+  await assert.rejects(
+    () =>
+      resolveHistoricalPostgresTaskSpecFromEnv("postgres-change-002", {
+        HONEYRAIL_PG_221_MIRROR: "/tmp/some-mirror",
+        HONEYRAIL_PG_221_REPRODUCER: "/tmp/some-reproducer.sql",
+        HONEYRAIL_PG_221_FIX_EVIDENCE: "/tmp/some-fix-evidence.diff",
+        HONEYRAIL_PG_221_SCAFFOLDING: "E4"
+      }),
+    /HONEYRAIL_PG_221_SCAFFOLDING/
+  );
+});
+
+test("resolveHistoricalPostgresTaskSpecFromEnv: postgres-change-002 accepts each valid scaffolding level", async () => {
+  for (const level of ["E0", "E1", "E2", "E3"]) {
+    const spec = await resolveHistoricalPostgresTaskSpecFromEnv("postgres-change-002", {
+      HONEYRAIL_PG_221_MIRROR: "/tmp/some-mirror",
+      HONEYRAIL_PG_221_REPRODUCER: "/tmp/some-reproducer.sql",
+      HONEYRAIL_PG_221_FIX_EVIDENCE: "/tmp/some-fix-evidence.diff",
+      HONEYRAIL_PG_221_SCAFFOLDING: level
+    });
+    assert.equal(spec.scaffoldingLevel, level);
+  }
+});
