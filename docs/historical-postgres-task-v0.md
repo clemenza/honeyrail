@@ -196,6 +196,49 @@ export HONEYRAIL_PG_212_AGENT_ENV='{"DEEPSEEK_API_KEY":"...","DSH_PERMISSION_MOD
 npm run historical-pg-212
 ```
 
+#### Case: `postgres-change-002` (#221) - BUG #18574 unrelated-family transfer task
+
+The second change-oriented task, added for #216's required unrelated-causal-family transfer validation (do not tune the generic prompt/HarnessProfile on `postgres-change-001`'s exact failure trajectory, then claim improvement on the same case). Its opaque, agent-visible `taskId` is `postgres-change-002`; BUG #18574 remains grader-private/operator metadata, same discipline as `postgres-historical-002` (#200). Unrelated causal family: PL/pgSQL `CALL`/cached-plan invalidation after DDL, not transaction control.
+
+Unlike `postgres-change-001`, no operator-supplied private-truth file is needed at all: the introducing/fix commits and the behavioral oracle were already public before this task existed (#185/#200/#211), so `historicalPostgresChange18574TaskSpec()` hardcodes them directly (same style as `historicalPostgres002TaskSpec()`) rather than loading a private JSON file. Only the canonical verification reproducer and fix evidence stay operator-private, same as case 002's own script.
+
+**Revisions.**
+- Historical: `ee895a655ce4341546facd6f23e3e8f2931b96bf` ("Improve performance of repeated CALLs within plpgsql procedures.", Tom Lane/Pavel Stehule, 2021-01-25). This is the confirmed introducing commit from #211's first-bad-commit validation - not `postgres-historical-002`'s own `historicalRevision` (`7696b2ea...`, a much later REL_14_STABLE release snapshot unsuitable as a focused two-revision comparator for a change-oriented task).
+- Reference: `7f875fb5bd603d8640cc7aca2c79c604aacd3890` ("Fix edge case in plpgsql's make_callstmt_target().", Tom Lane, 2024-08-07) - the actual upstream fix, on the same `master` lineage as the introducing commit (its own message: "Per bug #18574 from Song Hongyu. Back-patch to v14 where this coding was introduced."). This **is** `postgres-historical-002`'s own `referenceRevision`, reused as-is.
+
+**Canonical verification.** The reproducer creates a called procedure `p2` (one `OUT` parameter) and a wrapper procedure `p1` that `CALL`s `p2` with a non-writable argument for that parameter, so `make_callstmt_target()` raises the baseline "not writable" error the first time `p1`'s inner `CALL` statement's plan is built. `CALL p1()` at top level (non-atomic) establishes the baseline and, on both revisions, caches that inner `CALL` statement's plan; `p2` is then dropped and recreated (new OID); a second top-level `CALL p1()` produces the two ordered observations the behavioral oracle matches. A third, wrapped invocation (same session state, so deterministically reproduces the second observation's error) exists solely to set the script's own exit status - `\set ON_ERROR_STOP off` makes psql exit 0 regardless of any error by default, so the exit-status self-assertion re-enables `ON_ERROR_STOP` just before this final check.
+
+**Observed output (real Docker verification, 2026-09-10):** on the historical (buggy) revision, the second `CALL p1()` fails with `cache lookup failed for function <OID>` (the stale cached target); on the reference (fixed) revision, the baseline "not writable" error recurs instead. Matches `historicalPostgresBug18574BehavioralOracle()` exactly, `grade.status: "rediscovered"` for a submission using the canonical reproducer, `attributedTo: "historical"` / `"reference"` respectively. 3/3 repeated runs produced identical classification.
+
+Uses the same **behavioral oracle** as `postgres-historical-002` (`grading-protocol: "submitted-reproducer-behavioral-oracle-v1"`), shared verbatim via `historicalPostgresBug18574BehavioralOracle()` - never redeclared, so the two tasks' truth can never drift apart.
+
+**Fix evidence.** The introducing and fix commits are ~3.5 years apart on `master`, so auto-generating fix evidence from a historical-vs-reference diff would produce years of unrelated changes. `HONEYRAIL_PG_221_FIX_EVIDENCE` supplies the fix commit's own diff instead (e.g. `git show 7f875fb5bd603d8640cc7aca2c79c604aacd3890 > fix-evidence.diff`) - same discipline as `postgres-change-001`'s cross-branch fix evidence.
+
+**HarnessProfile.** E3 reuses `historicalPostgresChange16867HarnessProfile()` directly (function call, never copied) - `test/historical-postgres-221-task.test.ts` proves the materialized `harness-profile.md` is byte-for-byte identical to `postgres-change-001`'s frozen E3 content, which is what #216's transfer-validation contamination rule requires.
+
+The env-var convention is `HONEYRAIL_PG_221_*`; scaffolding level is set via `HONEYRAIL_PG_221_SCAFFOLDING` (default `E0`).
+
+```sh
+export HONEYRAIL_PG_221_MIRROR=/path/to/local/postgres-mirror
+export HONEYRAIL_PG_221_REPRODUCER=/private/path/to/known-repro.sql
+export HONEYRAIL_PG_221_FIX_EVIDENCE=/private/path/to/fix-evidence.diff
+export HONEYRAIL_PG_221_SCAFFOLDING=E2
+export HONEYRAIL_PG_221_AGENT_COMMAND=/path/in/agent-image/to/agent
+npm run historical-pg-221
+```
+
+A real-model scored attempt wires restricted egress and DSH trajectory collection exactly as `postgres-change-001` does (#217/#219, reused unchanged - no second eligibility classifier):
+
+```sh
+export HONEYRAIL_PG_221_EGRESS_UPSTREAM_URL=https://api.deepseek.com
+export HONEYRAIL_PG_221_AGENT_TRAJECTORY=dsh
+export HONEYRAIL_PG_221_AGENT_IMAGE=honeyrail-postgres-research-agent-dsh:latest
+export HONEYRAIL_PG_221_AGENT_ENV='{"DEEPSEEK_API_KEY":"...","DSH_PERMISSION_MODE":"danger-full-access"}'
+npm run historical-pg-221
+```
+
+The formal E0-E3 real-agent transfer experiment itself (preregistration, execution, results) is tracked separately in #222 - out of scope for this implementation.
+
 ### Grading protocol identifiers
 
 `reference/truth.json` and `reference-manifest.json` both carry `gradingProtocol`, one of three honestly distinct values:

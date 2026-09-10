@@ -4,6 +4,7 @@ import {
   historicalPostgres002TaskSpec,
   historicalPostgres003TaskSpec,
   historicalPostgresChange16867TaskSpec,
+  historicalPostgresChange18574TaskSpec,
   loadHistoricalPostgres003PrivateTruth,
   loadHistoricalPostgresChange16867PrivateTruth,
   type HistoricalPostgresTaskSpec
@@ -67,6 +68,27 @@ export async function resolveHistoricalPostgresTaskSpecFromEnv(taskId: string, e
       knownReproducer ? resolve(knownReproducer) : undefined,
       knownFixEvidence ? resolve(knownFixEvidence) : undefined
     );
+  }
+  if (taskId === "postgres-change-002") {
+    const mirror = String(env.HONEYRAIL_PG_221_MIRROR || "").trim();
+    const knownReproducer = String(env.HONEYRAIL_PG_221_REPRODUCER || "").trim();
+    const knownFixEvidence = String(env.HONEYRAIL_PG_221_FIX_EVIDENCE || "").trim();
+    const scaffoldingLevel = (String(env.HONEYRAIL_PG_221_SCAFFOLDING || "E0").trim()) as "E0" | "E1" | "E2" | "E3";
+    // Unlike postgres-change-001 (where the reproducer is optional and fix
+    // evidence can fall back to an auto-generated historical-vs-reference
+    // diff), postgres-change-002's two revisions are ~3.5 years apart on
+    // master - an auto-generated diff would be years of unrelated changes,
+    // not focused fix evidence. scripts/historical-postgres-221.ts and
+    // test/historical-postgres-221-integration.test.ts's FULLY_CONFIGURED
+    // already require all three; this shared resolver must not be a looser
+    // path to the same task (#223 review round 3, Blocking 1).
+    if (!mirror || !knownReproducer || !knownFixEvidence) {
+      throw new Error("Set HONEYRAIL_PG_221_MIRROR, HONEYRAIL_PG_221_REPRODUCER, and HONEYRAIL_PG_221_FIX_EVIDENCE for postgres-change-002.");
+    }
+    if (!["E0", "E1", "E2", "E3"].includes(scaffoldingLevel)) {
+      throw new Error(`HONEYRAIL_PG_221_SCAFFOLDING must be E0, E1, E2, or E3; got "${scaffoldingLevel}".`);
+    }
+    return historicalPostgresChange18574TaskSpec(resolve(mirror), scaffoldingLevel, resolve(knownReproducer), resolve(knownFixEvidence));
   }
   throw new Error(`No task-spec resolver registered for taskId "${taskId}".`);
 }

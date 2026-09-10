@@ -2292,6 +2292,32 @@ If you observe a reproducible behavioral correctness problem, write \`finding.js
 const HISTORICAL_POSTGRES_002_BASELINE_ERROR = '^procedure parameter "r1" is an output parameter but corresponding argument is not writable$';
 
 /**
+ * BUG #18574's behavioral oracle - the exact confirmed observations from
+ * #185's manual validation against real PostgreSQL 14.13 (buggy) and 14.14
+ * (fixed) builds. Shared verbatim between the blind-discovery task
+ * (`historicalPostgres002TaskSpec()`, below) and the change-oriented task
+ * (`historicalPostgresChange18574TaskSpec()`, #221) - same underlying bug,
+ * same truth, never duplicated or redeclared. Generic, declarative oracle
+ * (see historical-behavioral-oracle.ts): requires the submitted reproducer's
+ * own captured stderr to contain these two ERROR observations, in order,
+ * before the historical ref counts as reproduced or the reference ref counts
+ * as the baseline. This is what keeps an unrelated revision-discriminating
+ * script from earning `rediscovered` credit for a different bug entirely.
+ */
+export function historicalPostgresBug18574BehavioralOracle(): HistoricalPostgresBehavioralOracle {
+  return {
+    historical: [
+      { label: "first CALL", matches: HISTORICAL_POSTGRES_002_BASELINE_ERROR },
+      { label: "second CALL", matches: "^cache lookup failed for function \\d+$" }
+    ],
+    reference: [
+      { label: "first CALL", matches: HISTORICAL_POSTGRES_002_BASELINE_ERROR },
+      { label: "second CALL", matches: HISTORICAL_POSTGRES_002_BASELINE_ERROR }
+    ]
+  };
+}
+
+/**
  * @param knownReproducerPath Optional private path (e.g. from
  *   `HONEYRAIL_PG_200_REPRODUCER`) to a canonical verification reproducer.
  *   Used only to compute a provenance hash for the truth bundle; never read
@@ -2322,22 +2348,7 @@ export function historicalPostgres002TaskSpec(repoPath: string, knownReproducerP
       // to pgsql-bugs, not submitted through a CommitFest - so commitFest is
       // omitted rather than fabricated. See HistoricalPostgresTaskSpec.truth.
       knownReproducerPath,
-      // Generic, declarative oracle (see historical-behavioral-oracle.ts):
-      // requires the submitted reproducer's own captured stderr to contain
-      // these two ERROR observations, in order, before the historical ref
-      // counts as reproduced or the reference ref counts as the baseline.
-      // This is what keeps an unrelated revision-discriminating script from
-      // earning `rediscovered` credit for a different bug entirely.
-      behavioralOracle: {
-        historical: [
-          { label: "first CALL", matches: HISTORICAL_POSTGRES_002_BASELINE_ERROR },
-          { label: "second CALL", matches: "^cache lookup failed for function \\d+$" }
-        ],
-        reference: [
-          { label: "first CALL", matches: HISTORICAL_POSTGRES_002_BASELINE_ERROR },
-          { label: "second CALL", matches: HISTORICAL_POSTGRES_002_BASELINE_ERROR }
-        ]
-      }
+      behavioralOracle: historicalPostgresBug18574BehavioralOracle()
     },
     scaffoldingLevel: "minimal",
     budget: {},
@@ -2697,6 +2708,189 @@ export function historicalPostgresChange16867TaskSpec(
     changeContext: {
       spec: historicalPostgresChange16867Spec(),
       introducingCommit: privateTruth.introducingCommit,
+      harnessProfile: historicalPostgresChange16867HarnessProfile()
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// postgres-change-002 (#221): BUG #18574 unrelated-family transfer validation
+// ---------------------------------------------------------------------------
+
+/**
+ * #211's experimentally-confirmed first-bad-commit validation for BUG #18574
+ * (`parent(ee895a655) -> expected behavior`, `ee895a655 -> BUG #18574
+ * behavior`). Also `source.historicalRevision` for the change-oriented task,
+ * since `checkedTaskSpec()` requires `historicalRevision` to resolve to the
+ * same commit as `changeContext.introducingCommit`. Not the #200
+ * blind-discovery task's own `historicalRevision` (`7696b2ea...`), which is
+ * a much later REL_14_STABLE release snapshot unsuitable as a focused
+ * two-revision comparator for a change-oriented task.
+ */
+export const HISTORICAL_POSTGRES_18574_INTRODUCING_COMMIT = "ee895a655ce4341546facd6f23e3e8f2931b96bf";
+
+/**
+ * The commit that actually fixed BUG #18574 upstream, on `master` (the same
+ * lineage as the introducing commit above). Its own commit message confirms
+ * both the bug and the coding it patches: "Fix edge case in plpgsql's
+ * make_callstmt_target()... Per bug #18574 from Song Hongyu. Back-patch to
+ * v14 where this coding was introduced." This *is* the same commit as the
+ * #200 blind-discovery task's own `referenceRevision` - reused as-is, not a
+ * new pin.
+ */
+export const HISTORICAL_POSTGRES_18574_FIX_COMMIT = "7f875fb5bd603d8640cc7aca2c79c604aacd3890";
+
+/**
+ * Contemporaneous SPEC for the #18574 change-oriented task. Written as
+ * `task/spec.md` at scaffolding level E1+.
+ *
+ * CONTENT POLICY (same discipline as `historicalPostgresChange16867Spec()`):
+ * this text must contain only information available at or before the
+ * introducing commit's timestamp (2021-01-25). Prohibited hindsight markers
+ * that must NOT appear here or in any future revision: "stale", "drop"/
+ * "recreate" of the called procedure, "cache lookup failed", any OID
+ * wording, "BUG #18574", or any future-fix wording.
+ *
+ * POSITIVE PROVENANCE MAPPING (#221 review round 2, Blocking 2 - a negative
+ * leakage test only proves prohibited words are absent, not that every
+ * substantive statement is actually grounded; this maps each one to its
+ * contemporaneous source so that can be checked directly):
+ *
+ * - "Feature Summary" paragraph 1 (re-planning cost, `ResourceOwner`
+ *   requirement for a saved plan) -> introducing commit message ("forced us
+ *   to re-plan CALL and DO statements each time through... because use of a
+ *   saved plan requires having a ResourceOwner to hold a reference count on
+ *   the plan, and we had no suitable resowner at hand").
+ * - "Feature Summary" paragraph 2 (dedicated `ResourceOwner` for non-atomic
+ *   procedures/DO blocks containing CALL/DO) -> introducing commit message
+ *   ("when running a non-atomic procedure or DO block that contains any
+ *   CALL or DO commands, plpgsql creates a ResourceOwner that will be used
+ *   to pin the plans of the CALL/DO commands... we can just save CALL/DO
+ *   plans normally, whether or not they are used across transaction
+ *   boundaries").
+ * - "Feature Summary" paragraph 3 (CALL statement target determined once,
+ *   expected to remain associated with the statement while its plan is
+ *   reused) -> introducing diff, `src/pl/plpgsql/src/pl_exec.c`
+ *   `exec_stmt_call()`/`make_callstmt_target()` hunk: the post-commit code
+ *   only calls `make_callstmt_target()` inside `if (expr->plan == NULL)`,
+ *   i.e. exactly once per statement for as long as its plan is cached - an
+ *   observable fact of the diff itself, not narrative added around it.
+ * - "Expected Invariant" -> the general correctness expectation for *any*
+ *   plan-caching optimization (an optimization must not change externally
+ *   observable behavior versus not caching) applied to the specific
+ *   observable this diff introduces (CALL statement target resolution tied
+ *   to plan reuse) - same category of grounding as
+ *   `historicalPostgresChange16867Spec()`'s invariant, which restates
+ *   `AND CHAIN`'s documented semantics rather than quoting the commit
+ *   verbatim. An earlier draft additionally referenced "current search
+ *   path" here; removed (#221 review round 2) because no contemporaneous
+ *   source for that specific qualifier was found in the introducing
+ *   commit's message or diff - conservative wording only.
+ */
+export function historicalPostgresChange18574Spec(): string {
+  return `# Repeated CALL/DO Plan Caching — Contemporaneous Specification
+
+## Feature Summary
+
+PostgreSQL (development tip at the time of this commit) improves the
+performance of repeated \`CALL\`/\`DO\` statements executed within a
+non-atomic PL/pgSQL procedure or \`DO\` block. Previously, each execution of
+a \`CALL\`/\`DO\` statement in a non-atomic context re-planned the statement
+from scratch, because using a saved (cached) plan requires a
+\`ResourceOwner\` to hold a reference count on the plan, and no such
+resource owner was available across transaction boundaries in that context.
+
+When a non-atomic procedure or \`DO\` block contains any \`CALL\`/\`DO\`
+commands, PL/pgSQL now creates a dedicated \`ResourceOwner\` that survives
+for the duration of the enclosing procedure/block's execution, and uses it
+to pin the plans of those \`CALL\`/\`DO\` commands. This lets a
+\`CALL\`/\`DO\` statement's plan be saved and reused normally across
+repeated invocations and across transaction boundaries, instead of being
+rebuilt on every execution.
+
+As part of this change, the target of a \`CALL\` statement — the called
+procedure's identity and output-argument row shape, resolved from the
+statement's plan — is determined once and is expected to remain associated
+with that statement for as long as the statement's plan is reused.
+
+## Expected Invariant
+
+Caching a statement's plan for reuse must not change the statement's
+externally observable behavior compared to planning it fresh on every
+execution. In particular, for a given \`CALL\` statement executed
+repeatedly within a session, the procedure identity resolved for each
+execution must correctly reflect what that statement's plan currently
+points to — regardless of whether the plan was just built or is being
+reused from a previous execution.
+`;
+}
+
+/**
+ * Public task prompt for the #18574 change-oriented task (#221). Same
+ * discipline as all other task prompts: describes the *category* of
+ * behaviour to investigate without naming the specific failure mechanism.
+ * The prompt is the same at all scaffolding levels — only the supplementary
+ * artifacts (spec.md, change-set.diff, harness-profile.md) vary.
+ */
+export function historicalPostgresChange18574TaskPrompt(): string {
+  return `# PostgreSQL correctness-testing assignment
+
+Investigate PL/pgSQL procedure execution, including repeated \`CALL\`/\`DO\` statement behavior across multiple invocations within a session, DDL/object lifecycle interactions with an active session, plan/cache invalidation, and session-lifetime correctness. Form hypotheses, design focused SQL tests, inspect relevant source and documentation, execute experiments, and report any reproducible functional correctness defect.
+
+If you observe a reproducible behavioral correctness problem, write \`finding.json\` with \`status: "reproduced"\`, a concise summary, and the name of a runnable SQL reproducer. The reproducer must encode its own assertion and exit successfully only when the observed behavior violates that assertion. If no reproducible issue is found, write \`finding.json\` with \`status: "not-reproduced"\` and a concise summary.\n`;
+}
+
+/**
+ * Builds the `HistoricalPostgresTaskSpec` for the #18574 change-oriented
+ * task. Reuses BUG #18574's existing behavioral-oracle contract
+ * (`historicalPostgresBug18574BehavioralOracle()`, shared with
+ * `historicalPostgres002TaskSpec()` above, unchanged) and the exact same
+ * generic Test-Engineer HarnessProfile frozen for `postgres-change-001`
+ * (`historicalPostgresChange16867HarnessProfile()` - called directly, never
+ * copied, so E3 content is provably byte-identical across both tasks).
+ *
+ * Unlike `postgres-change-001`, no operator-supplied private-truth file is
+ * needed: the introducing/fix commits and the behavioral oracle are already
+ * public (#200/#211/#185), so nothing here is a fresh secret. Only the
+ * canonical verification reproducer and fix evidence stay operator-private,
+ * exactly as case 002's own script (`scripts/historical-postgres-200.ts`)
+ * already treats them.
+ *
+ * @param repoPath Local PostgreSQL mirror path.
+ * @param scaffoldingLevel E0/E1/E2/E3 — controls which change-context
+ *   artifacts are materialized. Defaults to "E0" (blind baseline).
+ * @param knownReproducerPath Optional canonical verification reproducer.
+ * @param knownFixEvidencePath Recommended: the introducing and fix commits
+ *   are ~3.5 years apart on `master`, so auto-generating fix evidence via
+ *   `git diff historicalRevision referenceRevision` would produce years of
+ *   unrelated changes, not focused fix evidence. Supply the fix commit's own
+ *   diff (`git show` of `HISTORICAL_POSTGRES_18574_FIX_COMMIT`) instead.
+ */
+export function historicalPostgresChange18574TaskSpec(
+  repoPath: string,
+  scaffoldingLevel: "E0" | "E1" | "E2" | "E3" = "E0",
+  knownReproducerPath?: string,
+  knownFixEvidencePath?: string
+): HistoricalPostgresTaskSpec {
+  return {
+    taskId: "postgres-change-002",
+    source: {
+      repoPath,
+      historicalRevision: HISTORICAL_POSTGRES_18574_INTRODUCING_COMMIT,
+      referenceRevision: HISTORICAL_POSTGRES_18574_FIX_COMMIT
+    },
+    truth: {
+      upstreamBug: "PostgreSQL BUG #18574",
+      knownReproducerPath,
+      knownFixEvidencePath,
+      behavioralOracle: historicalPostgresBug18574BehavioralOracle()
+    },
+    scaffoldingLevel,
+    budget: {},
+    prompt: historicalPostgresChange18574TaskPrompt(),
+    changeContext: {
+      spec: historicalPostgresChange18574Spec(),
+      introducingCommit: HISTORICAL_POSTGRES_18574_INTRODUCING_COMMIT,
       harnessProfile: historicalPostgresChange16867HarnessProfile()
     }
   };
