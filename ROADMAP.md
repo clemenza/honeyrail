@@ -8,18 +8,18 @@ This roadmap is directional, not a feature promise. Milestones advance on eviden
 
 ## Current evidence status
 
-Snapshot: **2026-09-09**, reviewed against `main` at `d9f88bc` and the linked issue/PR records. This is a dated evidence assessment, not a live issue dashboard. Missing empirical evidence means the claim is unestablished by these records; it does not prove no private experiment exists.
+Snapshot: **2026-09-11**, reviewed against `main` at `d3298ad` and the linked issue/PR records. This is a dated evidence assessment, not a live issue dashboard. Missing empirical evidence means the claim is unestablished by these records; it does not prove no private experiment exists.
 
 | Deliverable | Evidence | Status and limit |
 |---|---|---|
 | Historical PG environment and three task definitions | [#179](https://github.com/clemenza/honeyrail/issues/179), [#184](https://github.com/clemenza/honeyrail/issues/184), [#199](https://github.com/clemenza/honeyrail/issues/199), [#200](https://github.com/clemenza/honeyrail/issues/200) | Implementation complete; configured grading/control validation is not independent model rediscovery |
-| Frozen Corpus v0 | [#201](https://github.com/clemenza/honeyrail/issues/201), [committed manifest](corpus/historical-postgres-corpus-v0.json) | Three cases frozen; TRAIN 001, FRONTIER 002/003, HOLDOUT empty; no pristine holdout claim |
+| Frozen Corpus v0 | [#178](https://github.com/clemenza/honeyrail/issues/178), [#185](https://github.com/clemenza/honeyrail/issues/185), [#201](https://github.com/clemenza/honeyrail/issues/201), [committed manifest](corpus/historical-postgres-corpus-v0.json) | Corpus construction trackers closed complete; three cases frozen; TRAIN 001, FRONTIER 002/003, HOLDOUT empty; no pristine holdout claim |
 | Experiment execution foundation | [#207](https://github.com/clemenza/honeyrail/pull/207), [#208](https://github.com/clemenza/honeyrail/pull/208), [#210](https://github.com/clemenza/honeyrail/pull/210) | Preflight, TrialSet and failure evidence shipped; recorded TRAIN reruns include timeout/workspace-limit outcomes excluded from the capability dataset |
-| Formal Historical PG pilot | [#180](https://github.com/clemenza/honeyrail/issues/180) is closed | Closure needs empirical reconciliation: linked implementation PRs explicitly do not establish its formal dataset/analysis acceptance; a complete report is not established by the reviewed records |
-| Change-oriented task | [#212](https://github.com/clemenza/honeyrail/issues/212), merged [#213](https://github.com/clemenza/honeyrail/pull/213) | E0–E3 task surface, grading and scripted-agent validation shipped; official real-model E0–E3 experiment integration/results remain a separate gate |
+| Legacy frozen-corpus pilot | [#180](https://github.com/clemenza/honeyrail/issues/180) is closed | Historical closure still needs explicit empirical reconciliation or a successor disposition; do not retroactively treat the newer change-oriented studies as satisfying this older experiment identity |
+| Change-oriented Historical PG studies | [#216](https://github.com/clemenza/honeyrail/issues/216)/[#220](https://github.com/clemenza/honeyrail/pull/220), [#222](https://github.com/clemenza/honeyrail/issues/222)/[#224](https://github.com/clemenza/honeyrail/pull/224), [#233](https://github.com/clemenza/honeyrail/issues/233)/[#236](https://github.com/clemenza/honeyrail/pull/236) | Three formal E0–E3 studies completed with frozen constants and retained evidence: two transaction-chaining sibling cases plus one unrelated PL/pgSQL/cache-invalidation family. All authoritative rediscovery outcomes are misses; context changed localization/efficiency, and the grader-legible reproducer gap recurred across two causal families and two grading protocols |
 | Runtime integration reliability | [#205](https://github.com/clemenza/honeyrail/issues/205), [#213](https://github.com/clemenza/honeyrail/pull/213) | Timeout-observation fix and repeated validation recorded; reconcile each failure signature before closing #205 |
 
-The immediate research question is whether contemporaneous requirements, a complete introducing change-set, and generic test methodology improve valid outcomes within a fixed budget. Neither the corpus freeze nor the change-task vertical slice establishes reliable three-bug rediscovery or independent transfer.
+The immediate research question has narrowed: which classes of contemporaneous engineering information improve which discovery stages, and can the recurring grader-legible reproducer gap be improved by a transferable Capability Lab intervention without contaminating unseen-family validation. The three completed studies do not establish reliable bug rediscovery: all authoritative outcomes remain misses, Study 3 is a within-family sibling replication, and only Study 2 provides unrelated-family transfer evidence.
 
 ## Current shipped foundation
 
@@ -67,7 +67,7 @@ Exam isolation, engine-access modes, truth adjudication, transcript/trajectory, 
 
 ### M1 — Historical PostgreSQL Discovery Foundation — current mainline
 
-**M1 engineering acceptance:** implemented research environment, three-case frozen corpus, shared task/grader execution, isolated truth, deterministic controls, TrialSet identity and retained failure evidence. Reconcile the remaining roll-up acceptance items in [#178](https://github.com/clemenza/honeyrail/issues/178)/[#185](https://github.com/clemenza/honeyrail/issues/185); do not describe their completed implementation children as new work.
+**M1 engineering acceptance:** implemented research environment, three-case frozen corpus, shared task/grader execution, isolated truth, deterministic controls, TrialSet identity and retained failure evidence. Corpus-construction trackers [#178](https://github.com/clemenza/honeyrail/issues/178)/[#185](https://github.com/clemenza/honeyrail/issues/185) are closed complete. Keep the older #180 pilot's empirical-acceptance history distinct from the newer change-oriented experiment identities.
 
 **M1 capability acceptance:** repeated real-agent attempts for each of the three cases under predeclared budgets, a declared reliability target, valid machine-confirmed outcomes, complete attempt accounting and uncertainty. Infrastructure validation alone does not satisfy this gate. A small pilot may produce an informative negative result without meeting the reliability target.
 
@@ -76,12 +76,12 @@ Report **End-to-End Budget Success**, **Conditional Historical Bug Rediscovery**
 **Immediate critical path:**
 
 ```text
-Reconcile corpus/pilot acceptance and runtime failure records
-→ register a small formal experiment and its complete attempt ledger
-→ complete any concrete change-task eligibility/egress/reporting integration gap
-→ run and report real-agent baseline/context comparisons
-→ validate a frozen intervention on unrelated causal families
-→ derive only the diagnosis or Capability Lab work supported by those results
+Reconcile the legacy #180 pilot record and remaining runtime failure records
+→ freeze contemporaneous-context provenance/exposure governance (#228/#229)
+→ select/register family-003 and reserve unseen family-004 (#230)
+→ materialize and run the C0–C3 information-context study (#231/#232)
+→ train/freeze the smallest grader-legible reproducer intervention in the Capability Lab (#237)
+→ validate the frozen intervention only on a separately reserved unseen family
 ```
 
 The blind Corpus v0 baseline stays frozen. The change-oriented E0–E3 track gets its own experiment/task identity; it must not be added to or substituted into the old corpus silently. Its current standalone CLI does not establish the same official experiment boundary as the frozen-corpus TrialSet; see the [implementation status](docs/evaluation-protocol.md#implementation-status).
@@ -122,9 +122,10 @@ The blind Corpus v0 baseline stays frozen. The change-oriented E0–E3 track get
 ## Current priorities
 
 ### P0
-- Reconcile [#178](https://github.com/clemenza/honeyrail/issues/178)/[#185](https://github.com/clemenza/honeyrail/issues/185) child completion and [#180](https://github.com/clemenza/honeyrail/issues/180) empirical acceptance. Link evidence or remaining work before updating their completion claims.
-- Close the experiment integration gaps and produce a small formal real-agent report, including all failed attempts and conditional/end-to-end metrics. [#212](https://github.com/clemenza/honeyrail/issues/212) is the completed task implementation, not a completed E0–E3 experiment.
-- Reconcile [#205](https://github.com/clemenza/honeyrail/issues/205) with [#213](https://github.com/clemenza/honeyrail/pull/213): record which failure signatures are resolved and give residual signatures explicit follow-ups.
+- Keep the legacy [#180](https://github.com/clemenza/honeyrail/issues/180) pilot record explicitly reconciled or assigned to a successor; do not conflate it with the completed change-oriented studies.
+- Execute the information-context sequence [#228](https://github.com/clemenza/honeyrail/issues/228) → [#229](https://github.com/clemenza/honeyrail/issues/229) → [#230](https://github.com/clemenza/honeyrail/issues/230) → [#231](https://github.com/clemenza/honeyrail/issues/231) → [#232](https://github.com/clemenza/honeyrail/issues/232) while preserving TRAIN / FRONTIER / HOLDOUT separation.
+- Build and freeze the smallest PG-pulled Capability Lab intervention for the repeated grader-legible reproducer gap ([#237](https://github.com/clemenza/honeyrail/issues/237)); reserve independent family-004 transfer until after the intervention is frozen.
+- Reconcile [#205](https://github.com/clemenza/honeyrail/issues/205) by failure signature; keep residual live-cluster flakiness separate from agent-capability outcomes.
 
 ### P1
 - Minimal metric/uncertainty reporting from [#75](https://github.com/clemenza/honeyrail/issues/75)/[#76](https://github.com/clemenza/honeyrail/issues/76); a reviewed supplement is sufficient before building a statistics subsystem.
