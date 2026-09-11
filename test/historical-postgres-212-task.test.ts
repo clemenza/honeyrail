@@ -762,3 +762,35 @@ test("HistoricalChangeTask rejects a source revision that resolves differently f
     /must resolve to the same commit/i
   );
 });
+
+test("HistoricalChangeTask allows a diverging source revision when changeContext.allowHistoricalSourceDivergence is set (#233)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-212-causal-divergence-allowed-"));
+  const repo = await createSyntheticPostgresSourceRepo(root);
+  // A third commit, later than both repo.ref and repo.laterRef - the frozen
+  // source snapshot. introducingCommit stays repo.laterRef (which has
+  // repo.ref as its diffable parent), deliberately a different, earlier
+  // commit than the source snapshot - exactly #233's Task 003 shape.
+  const evenLaterRef = await createAdditionalSyntheticCommit(repo.repoPath, "even-later-frozen-source");
+  const spec: HistoricalPostgresTaskSpec = {
+    taskId: "synthetic-causal-divergence-allowed",
+    source: { repoPath: repo.repoPath, historicalRevision: evenLaterRef, referenceRevision: repo.ref },
+    truth: { upstreamBug: "Synthetic #divergence", structuredOracle: SYNTHETIC_ORACLE },
+    build: { mode: "host" },
+    prompt: "Test.",
+    scaffoldingLevel: "E2",
+    changeContext: {
+      spec: "Contemporaneous context.",
+      introducingCommit: repo.laterRef,
+      allowHistoricalSourceDivergence: true
+    }
+  };
+  const task = await materializeHistoricalPostgresTask(spec, join(root, "case"));
+  // The materialized source tree still reflects source.historicalRevision
+  // (laterRef), not the shown introducingCommit (ref) - divergence only
+  // relaxes the equality check, it never silently substitutes one for the
+  // other.
+  const changeSetPath = join(root, "case", "task", "change-set.diff");
+  const changeSet = await readFile(changeSetPath, "utf8");
+  assert.ok(changeSet.length > 0, "change-set.diff must be generated from the introducing commit even when it diverges from source.historicalRevision");
+  assert.ok("changeSet" in task.taskManifest.artifacts, "changeSet artifact must be materialized at E2");
+});
