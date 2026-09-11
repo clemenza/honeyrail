@@ -13,10 +13,11 @@ E2: E1 + introducing implementation change-set
 E3: E2 + frozen generic Test-Engineer HarnessProfile
 ```
 
-The current evidence base contains two preregistered real-agent pilots on unrelated causal families:
+The current evidence base contains three preregistered real-agent pilots: two on unrelated causal families, plus a within-family sibling replication of Study 1:
 
 - `postgres-change-001` / PostgreSQL BUG #16867 — transaction chaining × SAVEPOINT; formal report merged in PR #220.
-- `postgres-change-002` / PostgreSQL BUG #18574 — PL/pgSQL CALL cached-plan invalidation after DDL; formal report in PR #224.
+- `postgres-change-002` / PostgreSQL BUG #18574 — PL/pgSQL CALL cached-plan invalidation after DDL; unrelated-family transfer validation; formal report in PR #224.
+- `postgres-historical-003` / PostgreSQL BUG #18118 — sibling defect in Study 1's own transaction-chaining family, not an independent cross-family observation; formal report in PR #236.
 
 The paper must preserve HoneyRail's evidence discipline: authoritative grader outcomes remain primary; trajectory analysis is diagnostic; no same-case tuning is presented as transfer; public historical cases are not claimed to be unseen by model pretraining.
 
