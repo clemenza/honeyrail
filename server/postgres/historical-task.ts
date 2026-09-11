@@ -244,6 +244,25 @@ export type HistoricalPostgresChangeContext = {
    * terminology — it should be reusable across unrelated tasks.
    */
   harnessProfile?: string;
+  /**
+   * When true, `materializeHistoricalPostgresTask()` skips its default check
+   * that `source.historicalRevision` and `changeContext.introducingCommit`
+   * resolve to the same commit (#212's original guarantee: the agent's
+   * source tree and the diff it is shown always come from one change).
+   *
+   * This exists for a within-family sibling-defect replication study (#233)
+   * whose frozen source/oracle (`historicalPostgres003TaskSpec()`, #199/#201)
+   * deliberately postdates the introducing commit it exposes as E2/E3
+   * context — re-materializing the task around the introduction commit would
+   * change the already-validated task and weaken attribution, so the shown
+   * diff and the scored source snapshot are intentionally allowed to differ.
+   *
+   * Default `false`/absent preserves the original #212 guarantee byte-for-
+   * byte for every existing `HistoricalChangeTask` (`postgres-change-001`/
+   * `-002`). Only set this deliberately, per task, with the reason recorded
+   * at the call site — it is not a general escape hatch.
+   */
+  allowHistoricalSourceDivergence?: boolean;
 };
 
 export type HistoricalPostgresTaskLayout = {
@@ -1258,9 +1277,9 @@ export async function materializeHistoricalPostgresTask(spec: HistoricalPostgres
       resolveHistoricalPostgresCommit(input.source.repoPath, input.source.historicalRevision, "source.historicalRevision"),
       resolveHistoricalPostgresCommit(input.source.repoPath, input.changeContext.introducingCommit, "changeContext.introducingCommit")
     ]);
-    if (historicalRevision !== introducingCommit) {
+    if (historicalRevision !== introducingCommit && !input.changeContext.allowHistoricalSourceDivergence) {
       throw new Error(
-        `HistoricalChangeTask source.historicalRevision (${historicalRevision}) must resolve to the same commit as changeContext.introducingCommit (${introducingCommit}).`
+        `HistoricalChangeTask source.historicalRevision (${historicalRevision}) must resolve to the same commit as changeContext.introducingCommit (${introducingCommit}). Set changeContext.allowHistoricalSourceDivergence to intentionally show a different commit's diff than the scored source snapshot.`
       );
     }
     input = {
@@ -2472,11 +2491,22 @@ If you observe a reproducible behavioral correctness problem, write \`finding.js
  *   `scripts/historical-postgres-199.ts` requires this for its real trial
  *   entrypoint; the parameter stays optional here so synthetic/unit-test
  *   specs can omit it.
+ * @param scaffoldingLevel Defaults to `"minimal"` — the original #199/#201
+ *   blind-discovery materialization, byte-identical to this function's
+ *   behavior before #233. Pass `"E0"`/`"E1"`/`"E2"`/`"E3"` together with
+ *   `changeContext` (e.g. `historicalPostgres003ChangeContext()`) to run
+ *   #233's within-family sibling-replication E0-E3 ladder on this same
+ *   frozen source/oracle instead.
+ * @param changeContext Optional; see `scaffoldingLevel`. Omitted by every
+ *   existing caller (Corpus v0 scoring, #200/#201 freeze) — Policy A: the
+ *   serialized key stays absent, so no legacy hash moves.
  */
 export function historicalPostgres003TaskSpec(
   repoPath: string,
   privateTruth: HistoricalPostgresCase003PrivateTruth,
-  knownReproducerPath?: string
+  knownReproducerPath?: string,
+  scaffoldingLevel: "minimal" | "E0" | "E1" | "E2" | "E3" = "minimal",
+  changeContext?: HistoricalPostgresChangeContext
 ): HistoricalPostgresTaskSpec {
   return {
     // Opaque, matching `postgres-historical-001`/`-002` convention. The
@@ -2503,9 +2533,39 @@ export function historicalPostgres003TaskSpec(
       // `rediscovered` credit for a different bug or mechanism entirely.
       structuredOracle: privateTruth.structuredOracle
     },
-    scaffoldingLevel: "minimal",
+    scaffoldingLevel,
     budget: {},
-    prompt: historicalPostgres003TaskPrompt()
+    prompt: historicalPostgres003TaskPrompt(),
+    ...(changeContext ? { changeContext } : {})
+  };
+}
+
+/**
+ * The original transaction-chaining feature commit, shared ancestor of both
+ * Study 1's BUG #16867 and Task 003's BUG #18118 (#233's "sibling defect in
+ * the broader transaction-chaining feature family" framing). Public — named
+ * directly in #233's own issue text, unlike Task 003's own historical/
+ * reference revisions and upstream bug identity, which stay operator-private
+ * (`loadHistoricalPostgres003PrivateTruth()`).
+ */
+export const HISTORICAL_POSTGRES_TRANSACTION_CHAINING_INTRODUCING_COMMIT = "280a408b48d5ee42969f981bceb9e9426c3a344c";
+
+/**
+ * `changeContext` for #233's Task 003 within-family sibling-replication
+ * E0-E3 experiment. Reuses Study 1's SPEC and HarnessProfile byte-for-byte
+ * (`historicalPostgresChange16867Spec()`/`historicalPostgresChange16867HarnessProfile()`
+ * called directly, never copied) per #233's explicit preference for maximal
+ * comparability, and sets `allowHistoricalSourceDivergence: true` because
+ * Task 003's frozen #199/#201 historical/reference revisions are deliberately
+ * later in history than `280a408b` (#233's "Source/snapshot rule": do not
+ * re-materialize Task 003 around the introduction commit).
+ */
+export function historicalPostgres003ChangeContext(): HistoricalPostgresChangeContext {
+  return {
+    spec: historicalPostgresChange16867Spec(),
+    introducingCommit: HISTORICAL_POSTGRES_TRANSACTION_CHAINING_INTRODUCING_COMMIT,
+    harnessProfile: historicalPostgresChange16867HarnessProfile(),
+    allowHistoricalSourceDivergence: true
   };
 }
 

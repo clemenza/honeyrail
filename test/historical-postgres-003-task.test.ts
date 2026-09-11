@@ -6,8 +6,12 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   gradeHistoricalPostgresSubmission,
+  HISTORICAL_POSTGRES_TRANSACTION_CHAINING_INTRODUCING_COMMIT,
+  historicalPostgres003ChangeContext,
   historicalPostgres003TaskPrompt,
   historicalPostgres003TaskSpec,
+  historicalPostgresChange16867HarnessProfile,
+  historicalPostgresChange16867Spec,
   loadHistoricalPostgres003PrivateTruth,
   materializeHistoricalPostgresTask,
   resolveOracleReproduction,
@@ -15,7 +19,7 @@ import {
   type HistoricalPostgresTaskSpec
 } from "../server/postgres/historical-task.js";
 import { evaluateStructuredOracleAttribution } from "../server/postgres/historical-structured-oracle.js";
-import { createSyntheticPostgresSourceRepo } from "./helpers/postgres-source-fixture.js";
+import { createAdditionalSyntheticCommit, createSyntheticPostgresSourceRepo } from "./helpers/postgres-source-fixture.js";
 import { readTreeAsText } from "./helpers/read-tree-as-text.js";
 import { SYNTHETIC_ORACLE } from "./helpers/synthetic-oracle-fixture.js";
 
@@ -189,6 +193,70 @@ test("structuredOracle/gradingProtocol presence is covered by bundleHash but not
   assert.equal(a.truthManifest.taskDefinitionHash, b.truthManifest.taskDefinitionHash);
   assert.notEqual(a.truthManifest.bundleHash, b.truthManifest.bundleHash);
   assert.notEqual(a.referenceManifest.gradingProtocol, b.referenceManifest.gradingProtocol);
+});
+
+// ---------------------------------------------------------------------------
+// #233: within-family sibling-replication E0-E3 scaffolding for Task 003,
+// reusing the same frozen #199/#201 source/oracle.
+// ---------------------------------------------------------------------------
+
+test("historicalPostgres003TaskSpec defaults to scaffoldingLevel 'minimal' and omits changeContext (Policy A, unchanged before #233)", () => {
+  const spec = historicalPostgres003TaskSpec("/unused/repo/path", SYNTHETIC_003_PRIVATE_TRUTH);
+  assert.equal(spec.scaffoldingLevel, "minimal");
+  assert.ok(!("changeContext" in spec), "changeContext key must be genuinely absent, not present-as-undefined");
+});
+
+test("historicalPostgres003ChangeContext reuses Study 1's SPEC and HarnessProfile byte-for-byte, and opts into source divergence", () => {
+  const changeContext = historicalPostgres003ChangeContext();
+  assert.equal(changeContext.spec, historicalPostgresChange16867Spec());
+  assert.equal(changeContext.harnessProfile, historicalPostgresChange16867HarnessProfile());
+  assert.equal(changeContext.introducingCommit, HISTORICAL_POSTGRES_TRANSACTION_CHAINING_INTRODUCING_COMMIT);
+  assert.equal(changeContext.allowHistoricalSourceDivergence, true);
+  // Never leaks Task 003's own upstream bug identity or hindsight wording -
+  // it is Study 1's contemporaneous content, verbatim.
+  assert.ok(!changeContext.spec.toLowerCase().includes("18118"));
+  assert.ok(!changeContext.spec.toLowerCase().includes("savepoint"));
+});
+
+test("historicalPostgres003TaskSpec threads scaffoldingLevel/changeContext through to materialization (E0: no artifacts, E3: all three)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "honeyrail-historical-003-scaffolding-"));
+  const repo = await createSyntheticPostgresSourceRepo(root);
+  const evenLaterRef = await createAdditionalSyntheticCommit(repo.repoPath, "task-003-frozen-source");
+  const privateTruth: HistoricalPostgresCase003PrivateTruth = {
+    ...SYNTHETIC_003_PRIVATE_TRUTH,
+    historicalRevision: evenLaterRef,
+    referenceRevision: repo.laterRef
+  };
+  // A synthetic stand-in for historicalPostgres003ChangeContext() - the real
+  // one pins a real-world commit that does not exist in this synthetic repo.
+  const syntheticChangeContext = {
+    spec: "Synthetic contemporaneous spec.",
+    // repo.laterRef, not repo.ref: the diff generator needs a diffable
+    // parent (<commit>^), and repo.ref is the repo's very first commit.
+    introducingCommit: repo.laterRef,
+    harnessProfile: "Synthetic harness profile.",
+    allowHistoricalSourceDivergence: true
+  };
+
+  const e0 = await materializeHistoricalPostgresTask(
+    historicalPostgres003TaskSpec(repo.repoPath, privateTruth, undefined, "E0", syntheticChangeContext),
+    join(root, "e0")
+  );
+  assert.ok(!("spec" in e0.taskManifest.artifacts));
+  assert.ok(!("changeSet" in e0.taskManifest.artifacts));
+  assert.ok(!("harnessProfile" in e0.taskManifest.artifacts));
+
+  const e3 = await materializeHistoricalPostgresTask(
+    historicalPostgres003TaskSpec(repo.repoPath, privateTruth, undefined, "E3", syntheticChangeContext),
+    join(root, "e3")
+  );
+  assert.equal(e3.taskManifest.artifacts.spec, "spec.md");
+  assert.equal(e3.taskManifest.artifacts.changeSet, "change-set.diff");
+  assert.equal(e3.taskManifest.artifacts.harnessProfile, "harness-profile.md");
+  // The frozen #199/#201-style oracle/grading protocol is unaffected by
+  // scaffolding level - #233 must not change what this task scores against.
+  assert.equal(e3.truthManifest.gradingProtocol, "submitted-reproducer-structured-oracle-v1");
+  assert.deepEqual(e3.truthManifest.structuredOracle, privateTruth.structuredOracle);
 });
 
 // ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 import {
   historicalPostgres001TaskSpec,
   historicalPostgres002TaskSpec,
+  historicalPostgres003ChangeContext,
   historicalPostgres003TaskSpec,
   historicalPostgresChange16867TaskSpec,
   historicalPostgresChange18574TaskSpec,
@@ -46,6 +47,22 @@ export async function resolveHistoricalPostgresTaskSpecFromEnv(taskId: string, e
       throw new Error("Set HONEYRAIL_PG_199_MIRROR, HONEYRAIL_PG_199_REPRODUCER, and HONEYRAIL_PG_199_PRIVATE_TRUTH for postgres-historical-003.");
     }
     const privateTruth = await loadHistoricalPostgres003PrivateTruth(privateTruthPath);
+    // #233's within-family sibling-replication E0-E3 ladder, reusing this
+    // same frozen #199/#201 source/oracle. Unset (default "minimal")
+    // preserves the original Corpus v0 scoring behavior byte-for-byte.
+    const scaffoldingLevel = String(env.HONEYRAIL_PG_199_SCAFFOLDING || "").trim();
+    if (scaffoldingLevel) {
+      if (!["E0", "E1", "E2", "E3"].includes(scaffoldingLevel)) {
+        throw new Error(`HONEYRAIL_PG_199_SCAFFOLDING must be E0, E1, E2, or E3 when set; got "${scaffoldingLevel}".`);
+      }
+      return historicalPostgres003TaskSpec(
+        resolve(mirror),
+        privateTruth,
+        resolve(knownReproducer),
+        scaffoldingLevel as "E0" | "E1" | "E2" | "E3",
+        historicalPostgres003ChangeContext()
+      );
+    }
     return historicalPostgres003TaskSpec(resolve(mirror), privateTruth, resolve(knownReproducer));
   }
   if (taskId === "postgres-change-001") {
