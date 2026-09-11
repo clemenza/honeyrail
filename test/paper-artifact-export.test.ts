@@ -9,9 +9,17 @@ import { PaperArtifactExportError, exportPaperArtifact } from "../server/postgre
 const IMAGE_ID = "sha256:26b7bc8ca5f45f3b043132743309d11baa755576872fb16e999c925fe4342ee9";
 const EXP222 = "exp222-e0e3-dsh-2026-09-10";
 const EXP216 = "exp216-e0e3-dsh-2026-09-09";
+const EXP233 = "exp233-e0e3-dsh-2026-09-11";
+const EXP233_IMAGE_ID = "sha256:0201ea99a292767382fb72bbfb0493e29da1f04d4814c07df47c92904e65a804";
+// Stand-in for exp233's real, operator-private revisions - a fixture value
+// only, structurally a 40-hex-char SHA, chosen so a leak of it into exported
+// output is unambiguously detectable and distinguishable from any of the
+// legitimately-public exp216/exp222 revisions above.
+const EXP233_PRIVATE_HISTORICAL = "1".repeat(36) + "aaaa";
+const EXP233_PRIVATE_REFERENCE = "2".repeat(36) + "bbbb";
 
 type FixtureConfig = {
-  experimentId: typeof EXP222 | typeof EXP216;
+  experimentId: typeof EXP222 | typeof EXP216 | typeof EXP233;
   root: string;
 };
 
@@ -24,11 +32,19 @@ function identityFor(experimentId: FixtureConfig["experimentId"]) {
       reference: "fadcc4e81bd99e6032ae042cae53be0c6eea7580"
     };
   }
+  if (experimentId === EXP222) {
+    return {
+      taskId: "postgres-change-002",
+      repositoryCommit: "84b44e47e4623bb2965bcb2fc3f735b89bfb6079",
+      historical: "ee895a655ce4341546facd6f23e3e8f2931b96bf",
+      reference: "7f875fb5bd603d8640cc7aca2c79c604aacd3890"
+    };
+  }
   return {
-    taskId: "postgres-change-002",
-    repositoryCommit: "84b44e47e4623bb2965bcb2fc3f735b89bfb6079",
-    historical: "ee895a655ce4341546facd6f23e3e8f2931b96bf",
-    reference: "7f875fb5bd603d8640cc7aca2c79c604aacd3890"
+    taskId: "postgres-historical-003",
+    repositoryCommit: "b7b99162a093302fea8a346fa44623d89c74892f",
+    historical: EXP233_PRIVATE_HISTORICAL,
+    reference: EXP233_PRIVATE_REFERENCE
   };
 }
 
@@ -52,7 +68,7 @@ function hashesFor(level: string) {
   };
 }
 
-async function writeCompletedAttempt(root: string, taskId: string, level: "E0" | "E1" | "E2" | "E3") {
+async function writeCompletedAttempt(root: string, taskId: string, level: "E0" | "E1" | "E2" | "E3", imageId: string = IMAGE_ID) {
   const dir = join(root, level);
   const hashes = hashesFor(level);
   await mkdir(join(dir, "task-bundle", "task", "workspace"), { recursive: true });
@@ -73,7 +89,7 @@ async function writeCompletedAttempt(root: string, taskId: string, level: "E0" |
   await writeJson(join(dir, "reference-manifest.json"), {
     schemaVersion: 1,
     taskId,
-    gradingProtocol: taskId === "postgres-change-001" ? "submitted-reproducer-structured-oracle-v1" : "submitted-reproducer-behavioral-oracle-v1",
+    gradingProtocol: taskId === "postgres-change-002" ? "submitted-reproducer-behavioral-oracle-v1" : "submitted-reproducer-structured-oracle-v1",
     taskDefinitionHash: hashes.taskDefinition,
     truthBundleHash: hashes.truthBundle
   });
@@ -85,7 +101,7 @@ async function writeCompletedAttempt(root: string, taskId: string, level: "E0" |
       isolated: true,
       scoredEligible: true,
       restrictedEgressVerified: true,
-      imageIdentity: { reference: "honeyrail-postgres-research-agent-dsh:latest", id: IMAGE_ID }
+      imageIdentity: { reference: "honeyrail-postgres-research-agent-dsh:latest", id: imageId }
     },
     executionEnvironment: {
       buildMode: "container",
@@ -162,10 +178,11 @@ async function writeCompletedAttempt(root: string, taskId: string, level: "E0" |
 
 async function makeFixture(config: FixtureConfig) {
   const identity = identityFor(config.experimentId);
+  const imageId = config.experimentId === EXP233 ? EXP233_IMAGE_ID : IMAGE_ID;
   await mkdir(config.root, { recursive: true });
   const perConditionMaterializationHashes: Record<string, unknown> = {};
   for (const level of ["E0", "E1", "E2", "E3"] as const) {
-    await writeCompletedAttempt(config.root, identity.taskId, level);
+    await writeCompletedAttempt(config.root, identity.taskId, level, imageId);
     perConditionMaterializationHashes[level] = hashesFor(level);
   }
   if (config.experimentId === EXP216) {
@@ -182,7 +199,7 @@ async function makeFixture(config: FixtureConfig) {
     scaffoldingLevels: ["E0", "E1", "E2", "E3"],
     executionOrder: ["E0", "E1", "E2", "E3"],
     agentBackend: "DSH CLI, headless profile",
-    agentImage: { reference: "honeyrail-postgres-research-agent-dsh:latest", id: IMAGE_ID },
+    agentImage: { reference: "honeyrail-postgres-research-agent-dsh:latest", id: imageId },
     postgresRevisions: { historical: identity.historical, reference: identity.reference },
     agentTimeoutMs: 1_800_000,
     tokenToolBudgetPolicy: "not enforced by this path",
@@ -298,6 +315,69 @@ test("preserves Study 1 infrastructure attempt and retry relationship in the pub
   assert.equal(retry.predecessor, "E2-ATTEMPT-1");
   assert.equal(retry.officialResult, "miss");
   assert.equal(await readFile(join(output, "E2-ATTEMPT-1-INFRASTRUCTURE-ERROR", "agent-stderr.txt"), "utf8"), "driver interrupted before scored completion\n");
+});
+
+test("exports exp233 (private-revision Corpus v0 task) and never publishes the real historical/reference revisions", async () => {
+  const root = await tempDir();
+  const source = join(root, EXP233);
+  const output = join(root, "out");
+  await makeFixture({ experimentId: EXP233, root: source });
+
+  const result = await exportPaperArtifact({ experimentId: EXP233, sourceDir: source, outputDir: output });
+  assert.equal(result.experimentId, EXP233);
+  // The evidence itself still exports normally - only the revision values
+  // are special-cased, nothing else about exp233 is treated differently.
+  assert.ok(await readFile(join(output, "E0", "agent-transcript.ndjson"), "utf8"));
+  assert.ok(await readFile(join(output, "E2", "task", "change-set.diff"), "utf8"));
+  assert.ok(await readFile(join(output, "E3", "task", "harness-profile.md"), "utf8"));
+
+  const publicExperimentManifest = JSON.parse(await readFile(join(output, "experiment-manifest.json"), "utf8"));
+  assert.equal(publicExperimentManifest.postgresRevisions, "[REDACTED_OPERATOR_PRIVATE_REVISIONS]");
+  assert.deepEqual(publicExperimentManifest.publicationProjection.redactions, ["artifactRoot", "postgresRevisions"]);
+
+  const provenance = JSON.parse(await readFile(join(output, "provenance.json"), "utf8"));
+  assert.equal(provenance.historicalRevision, "[REDACTED_OPERATOR_PRIVATE_REVISION]");
+  assert.equal(provenance.referenceRevision, "[REDACTED_OPERATOR_PRIVATE_REVISION]");
+
+  // The decisive check: walk every exported file's raw bytes and confirm the
+  // real private revisions (fixture stand-ins for the operator-private real
+  // ones) do not appear anywhere, under any projection, in any attempt.
+  async function walkAndAssertNoRevisionLeak(dir: string): Promise<void> {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walkAndAssertNoRevisionLeak(path);
+        continue;
+      }
+      const text = await readFile(path, "utf8").catch(() => "");
+      assert.doesNotMatch(text, new RegExp(EXP233_PRIVATE_HISTORICAL), `${path} must not contain the private historicalRevision`);
+      assert.doesNotMatch(text, new RegExp(EXP233_PRIVATE_REFERENCE), `${path} must not contain the private referenceRevision`);
+    }
+  }
+  await walkAndAssertNoRevisionLeak(output);
+});
+
+test("rejects an exp233 source manifest whose postgresRevisions are malformed (structural-only validation for private-revision studies)", async () => {
+  const root = await tempDir();
+  const source = join(root, EXP233);
+  await makeFixture({ experimentId: EXP233, root: source });
+  const manifestPath = join(source, "experiment-manifest.json");
+
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  manifest.postgresRevisions = { historical: "not-a-sha", reference: EXP233_PRIVATE_REFERENCE };
+  await writeJson(manifestPath, manifest);
+  await assert.rejects(
+    () => exportPaperArtifact({ experimentId: EXP233, sourceDir: source, outputDir: join(root, "out-malformed") }),
+    /40-character hex SHA/
+  );
+
+  const sameRevision = JSON.parse(await readFile(manifestPath, "utf8"));
+  sameRevision.postgresRevisions = { historical: EXP233_PRIVATE_HISTORICAL, reference: EXP233_PRIVATE_HISTORICAL };
+  await writeJson(manifestPath, sameRevision);
+  await assert.rejects(
+    () => exportPaperArtifact({ experimentId: EXP233, sourceDir: source, outputDir: join(root, "out-same") }),
+    /must differ/
+  );
 });
 
 test("same frozen input exported twice is byte-equivalent", async () => {

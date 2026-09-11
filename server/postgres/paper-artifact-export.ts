@@ -17,12 +17,30 @@ type AttemptSpec = {
 };
 
 type ExperimentSpec = {
-  shortId: "exp216" | "exp222";
+  shortId: "exp216" | "exp222" | "exp233";
   experimentId: string;
   taskId: string;
   sourceCommit: string;
-  historicalRevision: string;
-  referenceRevision: string;
+  /**
+   * `"public"`: `historicalRevision`/`referenceRevision` below are the real
+   * pinned commits (exp216/exp222 - change-tasks whose introducing/fix
+   * commits were already public before the task existed), validated by
+   * literal equality against the source experiment's own manifest, and
+   * republished as-is in every exported artifact.
+   *
+   * `"private"`: this study's revisions are operator-private per an existing
+   * Corpus v0 blind-discovery task's own disclosure policy (#199/#201/#211 -
+   * Task 003/exp233). `historicalRevision`/`referenceRevision` below MUST be
+   * omitted (never hardcode the real value here - this file is committed to
+   * the public `clemenza/honeyrail` repository). Validation falls back to
+   * structural checks only (well-formed, distinct 40-hex-char SHAs), and
+   * every exported artifact that would otherwise carry the real value
+   * (`experiment-manifest.json`'s `postgresRevisions`, `provenance.json`'s
+   * `historicalRevision`/`referenceRevision`) is redacted instead.
+   */
+  revisionDisclosure: "public" | "private";
+  historicalRevision?: string;
+  referenceRevision?: string;
   canonicalIssue: string;
   canonicalReport: string;
   defaultSource: string;
@@ -39,6 +57,7 @@ const EXPERIMENT_SPECS: Record<string, ExperimentSpec> = {
     experimentId: "exp216-e0e3-dsh-2026-09-09",
     taskId: "postgres-change-001",
     sourceCommit: "7f5d0f76769cb4d4b729000265205ccec004de2d",
+    revisionDisclosure: "public",
     historicalRevision: "280a408b48d5ee42969f981bceb9e9426c3a344c",
     referenceRevision: "fadcc4e81bd99e6032ae042cae53be0c6eea7580",
     canonicalIssue: "https://github.com/clemenza/honeyrail/issues/216",
@@ -73,12 +92,38 @@ const EXPERIMENT_SPECS: Record<string, ExperimentSpec> = {
     experimentId: "exp222-e0e3-dsh-2026-09-10",
     taskId: "postgres-change-002",
     sourceCommit: "84b44e47e4623bb2965bcb2fc3f735b89bfb6079",
+    revisionDisclosure: "public",
     historicalRevision: "ee895a655ce4341546facd6f23e3e8f2931b96bf",
     referenceRevision: "7f875fb5bd603d8640cc7aca2c79c604aacd3890",
     canonicalIssue: "https://github.com/clemenza/honeyrail/issues/222",
     canonicalReport: "https://github.com/clemenza/honeyrail/pull/224",
     defaultSource: "output/historical-pg-221/exp222-e0e3-dsh-2026-09-10",
     expectedAgentImageId: SHARED_AGENT_IMAGE_ID,
+    attempts: [
+      { attemptId: "E0", condition: "E0", sourceDirectory: "E0", predecessor: null, expectedDisposition: "completed", expectedOfficialResult: "miss" },
+      { attemptId: "E1", condition: "E1", sourceDirectory: "E1", predecessor: null, expectedDisposition: "completed", expectedOfficialResult: "miss" },
+      { attemptId: "E2", condition: "E2", sourceDirectory: "E2", predecessor: null, expectedDisposition: "completed", expectedOfficialResult: "miss" },
+      { attemptId: "E3", condition: "E3", sourceDirectory: "E3", predecessor: null, expectedDisposition: "completed", expectedOfficialResult: "miss" }
+    ],
+    ignoredFormalPrefixDirectories: []
+  },
+  "exp233-e0e3-dsh-2026-09-11": {
+    shortId: "exp233",
+    experimentId: "exp233-e0e3-dsh-2026-09-11",
+    taskId: "postgres-historical-003",
+    sourceCommit: "b7b99162a093302fea8a346fa44623d89c74892f",
+    // Task 003 is a frozen Corpus v0 blind-discovery task (#199/#201/#211);
+    // unlike exp216/exp222's change-tasks, its historical/reference
+    // revisions are operator-private and must never appear in this public
+    // repository - see the revisionDisclosure doc comment above.
+    revisionDisclosure: "private",
+    canonicalIssue: "https://github.com/clemenza/honeyrail/issues/233",
+    canonicalReport: "https://github.com/clemenza/honeyrail/pull/236",
+    defaultSource: "output/historical-pg-199/exp233-e0e3-dsh-2026-09-11",
+    // Rebuilt fresh on a different machine/session than exp216/exp222 (same
+    // unchanged Dockerfiles, per the exp233 report) - a different resolved
+    // digest is expected, not a discrepancy.
+    expectedAgentImageId: "sha256:0201ea99a292767382fb72bbfb0493e29da1f04d4814c07df47c92904e65a804",
     attempts: [
       { attemptId: "E0", condition: "E0", sourceDirectory: "E0", predecessor: null, expectedDisposition: "completed", expectedOfficialResult: "miss" },
       { attemptId: "E1", condition: "E1", sourceDirectory: "E1", predecessor: null, expectedDisposition: "completed", expectedOfficialResult: "miss" },
@@ -285,19 +330,25 @@ async function copySafeText(
   return true;
 }
 
-function sanitizedExperimentManifest(raw: JsonRecord, sourceSha: string): JsonRecord {
+function sanitizedExperimentManifest(raw: JsonRecord, sourceSha: string, revisionDisclosure: "public" | "private"): JsonRecord {
   const engineeringDryRun = raw.engineeringDryRun;
   const publicDryRun = isRecord(engineeringDryRun)
     ? { ...engineeringDryRun, path: typeof engineeringDryRun.path === "string" ? basename(engineeringDryRun.path) : engineeringDryRun.path }
     : engineeringDryRun;
+  const redactRevisions = revisionDisclosure === "private";
   return {
     ...raw,
     artifactRoot: "[REDACTED_OPERATOR_ARTIFACT_ROOT]",
+    ...(redactRevisions ? { postgresRevisions: "[REDACTED_OPERATOR_PRIVATE_REVISIONS]" } : {}),
     engineeringDryRun: publicDryRun,
     publicationProjection: {
       schemaVersion: 1,
       sourceSha256: sourceSha,
-      redactions: ["artifactRoot", ...(isRecord(engineeringDryRun) ? ["engineeringDryRun.path"] : [])]
+      redactions: [
+        "artifactRoot",
+        ...(redactRevisions ? ["postgresRevisions"] : []),
+        ...(isRecord(engineeringDryRun) ? ["engineeringDryRun.path"] : [])
+      ]
     }
   };
 }
@@ -395,7 +446,24 @@ async function validateExperiment(sourceRoot: string, spec: ExperimentSpec): Pro
   assertEqual(manifest.taskId, spec.taskId, "taskId");
   assertEqual(manifest.scaffoldingLevels, SCAFFOLDING_LEVELS, "scaffoldingLevels");
   assertEqual(manifest.executionOrder, SCAFFOLDING_LEVELS, "executionOrder");
-  assertEqual(manifest.postgresRevisions, { historical: spec.historicalRevision, reference: spec.referenceRevision }, "PostgreSQL revisions");
+  if (spec.revisionDisclosure === "public") {
+    assertEqual(manifest.postgresRevisions, { historical: spec.historicalRevision, reference: spec.referenceRevision }, "PostgreSQL revisions");
+  } else {
+    // Never compare against a hardcoded literal for a private-revision study
+    // (this file is committed to the public clemenza/honeyrail repository) -
+    // structural validation only. The real values are redacted from every
+    // exported artifact by sanitizedExperimentManifest()/the provenance.json
+    // projection below, not merely left unchecked.
+    const revisions = requiredRecord(manifest.postgresRevisions, "experiment postgresRevisions");
+    const historical = requiredString(revisions.historical, "postgresRevisions.historical");
+    const reference = requiredString(revisions.reference, "postgresRevisions.reference");
+    if (!/^[a-f0-9]{40}$/i.test(historical) || !/^[a-f0-9]{40}$/i.test(reference)) {
+      throw new PaperArtifactExportError("postgresRevisions.historical/reference must each be a 40-character hex SHA.");
+    }
+    if (historical === reference) {
+      throw new PaperArtifactExportError("postgresRevisions.historical and .reference must differ.");
+    }
+  }
   assertEqual(manifest.agentTimeoutMs, 1_800_000, "agent timeout");
   assertEqual(manifest.trajectoryExpectation, "dsh", "trajectory expectation");
   assertEqual(manifest.modelVersion, "deepseek-v4-flash", "model version");
@@ -560,7 +628,7 @@ export async function exportPaperArtifact(input: {
     const rawManifest = await readFile(join(sourceRoot, "experiment-manifest.json"));
     const rawManifestSha = sha256(rawManifest);
     const publicManifestPath = join(stagingRoot, "experiment-manifest.json");
-    await writeGeneratedJson(publicManifestPath, sanitizedExperimentManifest(manifest, rawManifestSha), privateRoots);
+    await writeGeneratedJson(publicManifestPath, sanitizedExperimentManifest(manifest, rawManifestSha, spec.revisionDisclosure), privateRoots);
     sourceEvidence.push({ sourcePath: "experiment-manifest.json", sourceSha256: rawManifestSha, publicPath: "experiment-manifest.json", projection: "sanitized" });
 
     const ledgerEntries: ExportAttemptLedgerEntry[] = [];
@@ -598,8 +666,8 @@ export async function exportPaperArtifact(input: {
       sourceRepository: "clemenza/honeyrail",
       sourceCommit: spec.sourceCommit,
       taskId: spec.taskId,
-      historicalRevision: spec.historicalRevision,
-      referenceRevision: spec.referenceRevision,
+      historicalRevision: spec.revisionDisclosure === "public" ? spec.historicalRevision : "[REDACTED_OPERATOR_PRIVATE_REVISION]",
+      referenceRevision: spec.revisionDisclosure === "public" ? spec.referenceRevision : "[REDACTED_OPERATOR_PRIVATE_REVISION]",
       rawArtifactSha256: input.rawArchiveSha256 ?? null,
       publicEvidenceManifestSha256: evidenceManifestSha,
       canonicalIssue: spec.canonicalIssue,

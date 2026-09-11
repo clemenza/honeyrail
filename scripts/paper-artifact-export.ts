@@ -20,6 +20,7 @@ function usage(): string {
     "Supported experiment ids:",
     "  exp216-e0e3-dsh-2026-09-09",
     "  exp222-e0e3-dsh-2026-09-10",
+    "  exp233-e0e3-dsh-2026-09-11",
     "",
     "If --source is omitted, the frozen experiment's canonical output/... path is used.",
     `Exporter version: ${PAPER_ARTIFACT_EXPORT_VERSION}`
