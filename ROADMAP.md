@@ -98,7 +98,7 @@ The blind Corpus v0 baseline stays frozen. The change-oriented E0–E3 track get
 
 ### M3 — Capability Lab v1, PG-pulled
 
-- Create synthetic/microbench tasks only for gaps observed in M1/M2
+- Create synthetic/microbench tasks only for gaps observed in M1/M2. First instance: the [grader-legible observable archetypes](docs/capability-lab-grader-legible.md) pulled by the repeated reproducer-output gap in Studies 1–3.
 - Possible providers: tinytable, PG subsystem microtasks, planner/metamorphic tasks, state-transition tasks, deterministic concurrency micro-models
 - Revive tinytable MVCC/WAL/planner/etc. only if PG evidence justifies the cost
 
@@ -124,7 +124,7 @@ The blind Corpus v0 baseline stays frozen. The change-oriented E0–E3 track get
 ### P0
 - Keep the legacy [#180](https://github.com/clemenza/honeyrail/issues/180) pilot record explicitly reconciled or assigned to a successor; do not conflate it with the completed change-oriented studies.
 - Execute the information-context sequence [#228](https://github.com/clemenza/honeyrail/issues/228) → [#229](https://github.com/clemenza/honeyrail/issues/229) → [#230](https://github.com/clemenza/honeyrail/issues/230) → [#231](https://github.com/clemenza/honeyrail/issues/231) → [#232](https://github.com/clemenza/honeyrail/issues/232) while preserving TRAIN / FRONTIER / HOLDOUT separation.
-- Build and freeze the smallest PG-pulled Capability Lab intervention for the repeated grader-legible reproducer gap ([#237](https://github.com/clemenza/honeyrail/issues/237)); reserve independent family-004 transfer until after the intervention is frozen.
+- Run the registered real-agent paired pilot on the frozen grader-legible reproducer intervention ([#237](https://github.com/clemenza/honeyrail/issues/237)). Its TRAIN archetype set, external grader, paired runner and content-hashed frozen candidate are implemented and harness-validated ([design](docs/capability-lab-grader-legible.md), [record](docs/experiments/capability-grader-legible-237-2026-09-22.md)); no model has run against them, so no capability result exists yet. Reserve independent family-004 transfer until after that pilot.
 - Reconcile [#205](https://github.com/clemenza/honeyrail/issues/205) by failure signature; keep residual live-cluster flakiness separate from agent-capability outcomes.
 
 ### P1

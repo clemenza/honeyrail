@@ -1,0 +1,116 @@
+# Capability Lab: grader-legible observable and reproducer-output construction
+
+Tracking issue: [#237](https://github.com/clemenza/honeyrail/issues/237). Protocol: [evaluation-report-v1](evaluation-protocol.md).
+
+## The observed gap
+
+Three formal Historical PostgreSQL studies — [#216](https://github.com/clemenza/honeyrail/issues/216)/[#220](https://github.com/clemenza/honeyrail/issues/220), [#222](https://github.com/clemenza/honeyrail/issues/222)/[#224](https://github.com/clemenza/honeyrail/issues/224), [#233](https://github.com/clemenza/honeyrail/issues/233)/[#236](https://github.com/clemenza/honeyrail/issues/236) — showed the same downstream failure shape: a trajectory can reach plausible or precise localization and still submit a reproducer whose discriminating signal is consumed inside the script rather than surfaced as a minimal external observable. Self-asserting procedural blocks, swallowed errors, message text in place of the raw behavior, extra diagnostic output, internal pass/fail branching.
+
+That is three recurrences across two causal families and two grading protocols — not three independent family observations. It is enough to justify a narrowly scoped Capability Lab intervention; it is not enough to claim a general capability law.
+
+The capability under test is the downstream transformation, not PostgreSQL diagnosis:
+
+```text
+behavioral hypothesis -> discriminating experiment -> minimal observable
+  -> externally machine-checkable reproducer
+```
+
+## TRAIN / FRONTIER / HOLDOUT discipline
+
+The exact historical cases are TRAIN evidence for *identifying* the gap only. Nothing here is tuned on `#16867`, `#18574` or `#18118`; their frozen graders are untouched; family-003 and the reserved family-004 are not consumed. Every archetype is a neutral synthetic fixture that preserves the output-shape challenge without reproducing a historical bug, SQL snippet, state name or grader-private tuple.
+
+Transfer validation of the frozen intervention belongs on the separately reserved unseen family-004 path defined by [#229](https://github.com/clemenza/honeyrail/issues/229)/[#230](https://github.com/clemenza/honeyrail/issues/230)/[#232](https://github.com/clemenza/honeyrail/issues/232), after the freeze. [#232](https://github.com/clemenza/honeyrail/issues/232) remains an information-context experiment and must not consume this intervention in C0–C3.
+
+## The TRAIN archetype set
+
+Six archetypes, one per output-shape failure class, in `server/capability/grader-legible-archetypes.ts`. Identities are opaque (`cap-glo-001` … `cap-glo-006`) so the class name — which names the very mistake under test — never reaches the agent.
+
+| Archetype | Failure class | What the reproducer must expose |
+|---|---|---|
+| `cap-glo-001` | swallowed raw error | the fixture's own raw error line and exit status, unmodified |
+| `cap-glo-002` | self-asserting procedural wrapper | the raw value, not a computed verdict |
+| `cap-glo-003` | extra diagnostic rows/output | the signal alone, with no surrounding dump |
+| `cap-glo-004` | wrong observable channel | the channel that discriminates, not the one that always speaks |
+| `cap-glo-005` | overfit internal branching | both raw sides, leaving the comparison to the external observer |
+| `cap-glo-006` | nondeterministic / multi-row shape | a deterministic projection of an unstably ordered result |
+
+Each archetype carries a grader-private expected observation contract and at least one bad-but-plausible self-asserting solution shape. The bad shapes exist so CI can prove the grader distinguishes them; they are never materialized into an agent workspace.
+
+Each fixture is a small deterministic POSIX-sh program with no network and no external dependencies, so the whole set runs in seconds with no Docker, no PostgreSQL and no model.
+
+## Task surface and grading
+
+Materialization (`grader-legible-fixture.ts`) splits agent-visible from operator-side material:
+
+```text
+<root>/
+  archetype-manifest.json   operator-side identity + hashes (never truth)
+  bin/<fixtureCommand>      the synthetic system under test (on PATH)
+  state/                    grader-owned fixture state (invocations.log, counters)
+  workspace/                the ONLY agent-visible directory
+    BRIEF.md
+    SUBMISSION-CONTRACT.md
+    INTERVENTION.md         candidate condition only
+  runs/<index>/             raw stdout.txt, stderr.txt, exit-status.txt per execution
+  attempt.json              retained attempt record
+```
+
+The agent writes one file, `workspace/reproducer.sh`. The harness executes it with `/bin/sh` twice, in fresh scratch directories sharing one fixture state directory, with a constructed (not inherited) environment. Raw stdout, stderr and exit status are captured outside the agent and retained before grading.
+
+`grader-legible-grader.ts` then compares those raw channels against the private observation contract. It never parses the submitted script, never reads prose, and never honours an agent-asserted verdict: a self-asserting submission fails because the raw differential is absent from every channel, not because the grader pattern-matched the word "PASS". The expected observation is never written to disk — `archetype-manifest.json` records only its hash — and grader diagnostics do not echo expected values.
+
+### Outcomes and attribution
+
+`completed` is the only status that carries a capability outcome. `invalid_submission`, `integrity_error` and `infrastructure_error` are retained separately, so retry and infrastructure failures never read as capability misses.
+
+Within a completed attempt, failure-stage attribution runs in this order, which is what lets a paired comparison say *where* improvement happened:
+
+1. `no_discriminating_experiment` — the fixture's own invocation log shows the discriminating experiment never ran; the miss is upstream of output-shape construction.
+2. `nondeterministic_output` — repeated executions disagreed.
+3. `exit_status_mismatch`, `stdout_shape_mismatch`, `stderr_signal_missing` — the experiment ran and the observable was encoded badly.
+
+Secondary diagnostics (discriminating-observable selection, determinism, per-channel matches, submission bytes, fixture invocation count) are reported, never graded.
+
+Primary endpoint: **grader-legible reproducer success @ fixed task/budget** — grader-legible successes over completed attempts, reported per condition alongside the non-capability outcome counts.
+
+## The intervention
+
+`server/capability/grader-legible-intervention.ts` holds one methodology card plus its content hash. It is not a framework, a profile system or a prompt optimizer. It states reusable principles only — external observer owns pass/fail, expose the smallest raw differential, do not catch or translate the target signal, pick the channel that discriminates, stabilize cardinality/order/format, separate exploration from the final artifact, validate against the declared contract rather than hidden truth. A test asserts it mentions no PostgreSQL, case, family or fixture-specific term.
+
+The baseline condition is the empty intervention, so paired conditions differ in exactly one materialized file. `runGraderLegiblePairedExperiment()` records each attempt's as-presented task-surface hash and refuses to report a comparison when the two conditions diverge anywhere but `INTERVENTION.md`.
+
+## Running it
+
+```sh
+# Unit + integration tests (no Docker, no PostgreSQL, no model)
+npm run test:capability-glo-237
+
+# Paired baseline-vs-candidate run.
+# Default provider is scripted: harness validation, NOT capability evidence.
+HONEYRAIL_CAP_GLO_EXPERIMENT_ID=<id> \
+HONEYRAIL_CAP_GLO_ARTIFACT_DIR=output/capability-grader-legible/<id> \
+  npm run capability-glo-237
+
+# Real-agent run (the only provider that produces capability evidence)
+HONEYRAIL_CAP_GLO_PROVIDER=command \
+HONEYRAIL_CAP_GLO_AGENT_COMMAND=<agent> \
+HONEYRAIL_CAP_GLO_AGENT_ARGS='["--flag","value"]' \
+HONEYRAIL_CAP_GLO_AGENT_TIMEOUT_MS=600000 \
+  npm run capability-glo-237
+
+# Freeze the candidate intervention before any family-004 transfer validation
+npm run capability-glo-237-freeze
+```
+
+The agent command runs with the agent-visible workspace as its cwd; nothing but `reproducer.sh` is read back from it. A scripted run always reports `capabilityEvidenceEligible: false` — per the [evaluation protocol](evaluation-protocol.md#evidence-levels-and-claims), a scripted agent validates the instrument and says nothing about model capability.
+
+## Freeze and transfer
+
+`npm run capability-glo-237-freeze` writes `corpus/capability-grader-legible-intervention-v1.json`: the intervention id, body and hash, plus the archetype set hash and per-archetype hashes. It is idempotent and refuses to overwrite a differing freeze. A later unseen-family run re-derives the hash with `assertFrozenGraderLegibleIntervention()` and refuses a body that has drifted, so "validated the frozen intervention" cannot quietly become "validated a tweaked one".
+
+## Limitations
+
+- The archetypes are synthetic. They reproduce the output-shape challenge, not real subsystem complexity; success here is not evidence of Historical PostgreSQL capability.
+- The gap evidence is three recurrences across two causal families, one of them a within-family sibling replication.
+- Harness validation with scripted shapes demonstrates that the instrument separates self-asserting from grader-legible output. It is not a measurement of whether the intervention helps a model; that requires a real-agent paired run under a registered plan.
+- Six archetypes is a small, non-probabilistic sample. Counts, not rates with confidence claims, until repetitions are predeclared.

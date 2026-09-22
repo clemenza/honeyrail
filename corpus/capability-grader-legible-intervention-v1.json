@@ -1,0 +1,51 @@
+{
+  "intervention": {
+    "body": "# Constructing a grader-legible reproducer\n\nYou may already know *why* the system behaves as it does. This note is about\nthe step after that: turning a behavioral hypothesis into an artifact whose\ndiscriminating signal an external, automated observer can read directly.\n\n## The transformation\n\n    behavioral hypothesis\n      -> discriminating experiment\n      -> minimal observable\n      -> externally machine-checkable reproducer\n\nMost of the work is in the last two arrows. A correct diagnosis submitted with\nan unreadable observable is scored the same as no diagnosis at all.\n\n## Principles\n\n1. **The external observer owns pass/fail.** Your script's job is to make the\n   behavior happen and let its raw effect reach an output channel. It is not\n   your script's job to decide whether the behavior is correct. Any verdict\n   your script computes is invisible to the evaluator - it sees bytes on\n   channels, not your reasoning.\n\n2. **Expose the smallest raw differential.** Identify the one observation that\n   differs between the behavior you are claiming and the behavior that would\n   occur without it. Emit that, unmodified. Everything that does not\n   discriminate is noise, however informative it felt while exploring.\n\n3. **Do not catch or translate the target signal.** If the discriminating\n   signal is an error, a non-zero status, or a rejection, it must arrive at the\n   observer in its original form and on its original channel. Suppressing it,\n   rephrasing it as prose, or converting it into a success status destroys the\n   only thing that was being measured. Catch an error only when the contract\n   explicitly asks you to.\n\n4. **Pick the channel that actually discriminates.** Ask, for each candidate\n   channel: would this differ if the behavior were absent? A message emitted on\n   every path discriminates nothing, no matter how descriptive it is. Prefer the\n   channel that changes: a returned value, a status, a raw error.\n\n5. **Stabilize cardinality, order and format.** If the same experiment can emit\n   the same information in different shapes on different executions, an\n   automated comparator cannot use it. Impose a deterministic projection -\n   fixed ordering, fixed row count, fixed formatting - without altering the\n   content being observed.\n\n6. **Separate exploration from the final artifact.** Diagnostic scaffolding -\n   progress messages, intermediate dumps, banners, extra probes - belongs to\n   the investigation, not the submission. Build the reproducer fresh from what\n   you learned rather than trimming down your exploration script.\n\n7. **Validate against the declared contract, not against hidden truth.** Before\n   submitting, re-read the stated submission contract and check your artifact\n   against it channel by channel: which channel, what shape, what status, what\n   must be absent. Run it more than once and compare the raw outputs to each\n   other. You cannot verify your answer; you can verify your output shape, and\n   that is the part that is failing.\n\n## Final check\n\nAsk, literally: if an automated comparator saw only my stdout, my stderr and my\nexit status - with no access to my script, my comments and my reasoning - could\nit distinguish the behavior I am claiming from its absence?\n",
+    "frozenFor": "unseen-family transfer validation (#229/#230/#232 reserved family-004 path)",
+    "interventionHash": "6c91b112134a6afa0976902b83bc0c5a4cf3dfd8a0fe31055fff622ffcc867f2",
+    "interventionId": "cap-glo-intervention-v1",
+    "provenance": "honeyrail#237 Capability Lab TRAIN; derived from the recurring gap in #216/#220, #222/#224, #233/#236, not from those cases' content",
+    "schemaVersion": 1
+  },
+  "notes": [
+    "TRAIN only. The archetypes are synthetic fixtures; they reproduce no historical bug, oracle or grader-private tuple.",
+    "Transfer validation of this intervention belongs on the separately reserved unseen family-004 path (#229/#230/#232), after this freeze.",
+    "Re-deriving interventionHash from interventionId + body is the integrity check; a changed body is a new intervention ID."
+  ],
+  "schemaVersion": 1,
+  "trainArchetypeSet": {
+    "archetypes": [
+      {
+        "archetypeHash": "f1a01d4ba6ce2811fac3da1bf32578df02c435efa03e3b534ae9f9260a6af079",
+        "archetypeId": "cap-glo-001",
+        "failureClass": "swallowed-raw-error"
+      },
+      {
+        "archetypeHash": "6914c6c819536944d5677972b98371642c0edb756df065a4aef8f3d845d6db71",
+        "archetypeId": "cap-glo-002",
+        "failureClass": "self-asserting-wrapper"
+      },
+      {
+        "archetypeHash": "33bf7a6b5d2d1ca797fcc38f8ecffed20ec429b0925ff7085fd5ffe0df1f8fe2",
+        "archetypeId": "cap-glo-003",
+        "failureClass": "extra-diagnostic-output"
+      },
+      {
+        "archetypeHash": "fc2bb530df0b605444a6e1670997761d1f79459db1eabab39012e18a287e7ee5",
+        "archetypeId": "cap-glo-004",
+        "failureClass": "wrong-observable-channel"
+      },
+      {
+        "archetypeHash": "8622725f4ac9568e0d3d09818e6726b77de3668ee5bb4ccf55e2d747fb4bc83c",
+        "archetypeId": "cap-glo-005",
+        "failureClass": "overfit-internal-branching"
+      },
+      {
+        "archetypeHash": "a048d1be6ea21221ded9124c0d263ae55493ff15a6b6231d02f9bbf3049fb329",
+        "archetypeId": "cap-glo-006",
+        "failureClass": "nondeterministic-row-shape"
+      }
+    ],
+    "archetypeSetHash": "c02ba99ccdf69ee28bda1071ae73b153539278f659c4c18b2996f4c25bf5a666"
+  }
+}
