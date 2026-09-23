@@ -17,17 +17,34 @@
  * It is not a generic experiment framework: there is one task family, one
  * grader, two conditions, and no provider abstraction beyond "scripted shape
  * or one agent command".
+ *
+ * When a provider requests isolation, the chain a report's
+ * `capabilityEvidenceEligible` stands on is, in order:
+ *
+ *   1. image identity resolved  - the tag names an image that exists locally,
+ *      and the content-addressed id it resolved to is retained;
+ *   2. isolated execution established - proven *per attempt*, by a marker file
+ *      the container itself writes before the agent process starts (see
+ *      `CONTAINER_STARTED_MARKER`);
+ *   3. the agent process ran inside it;
+ *   4. every attempt's evidence retained, whatever its outcome.
+ *
+ * Step 1 is not step 2. An image can exist and `docker run` still fail before
+ * any container exists - a network that is not defined, a daemon hiccup - and
+ * that failure leaves exactly the same on-disk trace as "the agent ran and
+ * wrote nothing". Only step 2's marker separates them.
  */
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { nowIso, runCommandSafe } from "../utils.js";
 import {
   GRADER_LEGIBLE_CONTAINER_PATHS,
   GRADER_LEGIBLE_DEFAULT_NETWORK,
-  buildGraderLegibleContainerArgs
+  buildGraderLegibleContainerArgs,
+  graderLegibleImageEntrypoint
 } from "./grader-legible-container.js";
 import { startGraderLegibleFacadeBroker } from "./grader-legible-facade.js";
 import { resolveImageIdentity, type ContainerImageIdentity } from "../postgres/image-identity.js";
@@ -63,6 +80,23 @@ export const DEFAULT_SUBMISSION_TIMEOUT_MS = 30_000;
 export const DEFAULT_AGENT_TIMEOUT_MS = 10 * 60_000;
 
 type SpawnCapture = { stdout: string; stderr: string; exitStatus: number | null; timedOut: boolean; spawnError: string | null };
+
+/**
+ * Filename, inside the facade channel directory, that the container touches
+ * before it execs the agent command.
+ *
+ * The channel is already bind-mounted read-write in both directions, so this
+ * needs no new mount, and the broker ignores it: it polls for
+ * `*.request.json` only. Its presence on the host after `docker run` returns is
+ * the only evidence available here that a container actually started - that the
+ * image was found, the network attached and the mounts applied. `docker run`'s
+ * exit status cannot answer that: a failure to create the container and an
+ * agent that ran and exited nonzero are both just a nonzero exit.
+ */
+const CONTAINER_STARTED_MARKER = "container-started.marker";
+
+/** A `SpawnCapture` plus the per-attempt proof that the container really ran. */
+type IsolatedSpawnCapture = SpawnCapture & { isolationEstablished: boolean };
 
 function captureSpawn(
   command: string,
@@ -273,6 +307,12 @@ export type GraderLegibleAttempt = {
     agentWallMs: number | null;
     agentExitStatus: number | null;
     agentTimedOut: boolean;
+    /**
+     * Whether a container demonstrably started for this attempt, proven by the
+     * marker it wrote from inside. `null` when the provider claimed no
+     * isolation, where the question does not apply.
+     */
+    isolationEstablished: boolean | null;
     submissionBytes: number | null;
     fixtureInvocationCount: number;
     executionsCaptured: number;
@@ -389,6 +429,9 @@ export async function runGraderLegibleAttempt(input: {
   let agentTimedOut = false;
   let agentSpawnFailed = false;
   let providerDiagnostic: string | null = null;
+  // `null` where the question does not apply: a scripted provider, or a command
+  // provider that never asked for isolation and therefore claims none.
+  let isolationEstablished: boolean | null = null;
 
   if (provider.kind === "scripted") {
     await writeFile(join(layout.workspaceDir, GRADER_LEGIBLE_SUBMISSION_FILENAME), provider.script(archetype, condition));
@@ -400,27 +443,35 @@ export async function runGraderLegibleAttempt(input: {
 
     const agentTimeoutMs = provider.timeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS;
     const agentStartedMs = Date.now();
-    const capture = provider.isolation
+    const isolatedCapture: IsolatedSpawnCapture | null = provider.isolation
       ? await runIsolatedAgentCommand(provider, provider.isolation, layout, investigationStateDir, agentTimeoutMs)
-      : await captureSpawn(provider.command, provider.args ?? [], {
-          cwd: layout.workspaceDir,
-          // Unisolated: the host environment is inherited as before, because an
-          // agent launched this way is an operator smoke test and typically
-          // needs its own credentials and toolchain. `HONEYRAIL_FIXTURE_STATE`
-          // is supplied so the agent can actually run the fixture, but it is
-          // overridable - an unisolated run makes no isolation claim at all.
-          env: { HONEYRAIL_FIXTURE_STATE: investigationStateDir, ...process.env, ...(provider.env ?? {}) },
-          timeoutMs: agentTimeoutMs
-        });
+      : null;
+    const capture: SpawnCapture =
+      isolatedCapture ??
+      (await captureSpawn(provider.command, provider.args ?? [], {
+        cwd: layout.workspaceDir,
+        // Unisolated: the host environment is inherited as before, because an
+        // agent launched this way is an operator smoke test and typically
+        // needs its own credentials and toolchain. `HONEYRAIL_FIXTURE_STATE`
+        // is supplied so the agent can actually run the fixture, but it is
+        // overridable - an unisolated run makes no isolation claim at all.
+        env: { HONEYRAIL_FIXTURE_STATE: investigationStateDir, ...process.env, ...(provider.env ?? {}) },
+        timeoutMs: agentTimeoutMs
+      }));
     agentWallMs = Date.now() - agentStartedMs;
     agentExitStatus = capture.exitStatus;
     agentTimedOut = capture.timedOut;
     agentSpawnFailed = Boolean(capture.spawnError);
+    isolationEstablished = isolatedCapture?.isolationEstablished ?? null;
     await Promise.all([
       writeFile(join(artifactDir, "agent-stdout.txt"), capture.stdout),
       writeFile(join(artifactDir, "agent-stderr.txt"), capture.stderr)
     ]);
-    if (capture.spawnError) providerDiagnostic = `agent command could not start: ${capture.spawnError}`;
+    if (isolationEstablished === false) {
+      providerDiagnostic =
+        "container did not start: isolation was not established (docker run failed before the agent process began - " +
+        "check network policy and image availability)";
+    } else if (capture.spawnError) providerDiagnostic = `agent command could not start: ${capture.spawnError}`;
     else if (capture.timedOut) providerDiagnostic = `agent command exceeded its ${agentTimeoutMs}ms budget`;
   }
 
@@ -452,6 +503,7 @@ export async function runGraderLegibleAttempt(input: {
         agentWallMs,
         agentExitStatus,
         agentTimedOut,
+        isolationEstablished,
         ...extra
       },
       artifactDir
@@ -468,18 +520,25 @@ export async function runGraderLegibleAttempt(input: {
     // is an invalid submission. Both stay out of the capability denominator.
     const status: GraderLegibleAttemptStatus = validation.integrity
       ? "integrity_error"
-      : providerDiagnostic
+      : isolationEstablished === false || providerDiagnostic
         ? "infrastructure_error"
         : "invalid_submission";
-    // An agent killed at its wall-clock budget spent a budget the harness
-    // enforced; only a spawn failure is the harness's own fault.
+    // A container that never started is never an invalid submission: there was
+    // no agent process to submit anything, so it is checked ahead of the
+    // timeout and spawn-error branches and does not depend on what the
+    // provider diagnostic happens to say.
+    //
+    // Below that: an agent killed at its wall-clock budget spent a budget the
+    // harness enforced; only a spawn failure is the harness's own fault.
     const primaryCause: GraderLegibleAttemptCause = validation.integrity
       ? "isolation_or_integrity"
-      : agentTimedOut
-        ? "agent_resource_limit"
-        : agentSpawnFailed
-          ? "infrastructure"
-          : "agent_invalid_submission";
+      : isolationEstablished === false
+        ? "isolation_or_integrity"
+        : agentTimedOut
+          ? "agent_resource_limit"
+          : agentSpawnFailed
+            ? "infrastructure"
+            : "agent_invalid_submission";
     return finish(
       status,
       primaryCause,
@@ -533,6 +592,11 @@ export async function runGraderLegibleAttempt(input: {
  *
  * The container name is derived, not taken from `attemptId`: an attempt id
  * contains `:` separators that docker rejects in a `--name`.
+ *
+ * The returned `isolationEstablished` is the per-attempt half of the isolation
+ * claim: `true` only when the container itself wrote `CONTAINER_STARTED_MARKER`
+ * into the shared channel, which it can only do from inside a container that
+ * actually started.
  */
 async function runIsolatedAgentCommand(
   provider: Extract<GraderLegibleCandidateProvider, { kind: "command" }>,
@@ -540,7 +604,7 @@ async function runIsolatedAgentCommand(
   layout: GraderLegibleArchetypeLayout,
   investigationStateDir: string,
   timeoutMs: number
-): Promise<SpawnCapture> {
+): Promise<IsolatedSpawnCapture> {
   const containerName = `honeyrail-cap-glo-${randomUUID().slice(0, 12)}`;
   const facadeDir = join(layout.root, "facade-channel");
   await mkdir(facadeDir, { recursive: true });
@@ -558,11 +622,33 @@ async function runIsolatedAgentCommand(
     await broker.stop();
   }
 
-  async function runContainer(): Promise<SpawnCapture> {
+  async function runContainer(): Promise<IsolatedSpawnCapture> {
+  // `sh -c SCRIPT NAME ARG...`: inside SCRIPT, `$0` is the unused placeholder,
+  // `$1` the marker path, and after `shift` the rest of `$@` is the real
+  // command and its arguments, `exec`'d so the agent keeps pid 1 and the
+  // container's exit status stays the agent's own. The only new requirement on
+  // the operator's image is `/bin/sh`.
+  //
+  // The wrapper has to take the `--entrypoint` slot - appended as CMD it would
+  // become *arguments to* an image that declares an entrypoint rather than the
+  // program run - so the image's own entrypoint is read back and re-exec'd
+  // ahead of `command`, reproducing exactly the argv docker would have built.
+  const markerContainerPath = `${GRADER_LEGIBLE_CONTAINER_PATHS.facade}/${CONTAINER_STARTED_MARKER}`;
+  const markerHostPath = join(facadeDir, CONTAINER_STARTED_MARKER);
+  const imageEntrypoint = await graderLegibleImageEntrypoint(isolation.image);
   const args = buildGraderLegibleContainerArgs(
     {
       mounts: { workspaceDir: layout.workspaceDir, facadeBinDir: layout.facadeBinDir, facadeDir },
-      command: [provider.command, ...(provider.args ?? [])],
+      entrypoint: "sh",
+      command: [
+        "-c",
+        'touch "$1"; shift; exec "$@"',
+        "_",
+        markerContainerPath,
+        ...imageEntrypoint,
+        provider.command,
+        ...(provider.args ?? [])
+      ],
       image: isolation.image,
       network: isolation.network,
       // No `HONEYRAIL_FIXTURE_STATE` here. The fixture no longer runs inside
@@ -590,7 +676,12 @@ async function runIsolatedAgentCommand(
     // workspace the grader is about to read.
     await runCommandSafe("docker", ["rm", "-f", containerName], { timeout: 30_000 });
   }
-  return capture;
+  // Checked whatever the outcome was, including a timeout: an agent that hit
+  // its budget still ran inside a container, and that is a resource limit, not
+  // a failure of isolation.
+  const isolationEstablished = (await stat(markerHostPath).catch(() => null)) !== null;
+  await rm(markerHostPath, { force: true });
+  return { ...capture, isolationEstablished };
   }
 }
 
@@ -821,13 +912,19 @@ export async function runGraderLegiblePairedExperiment(input: {
     archetypeSetHash,
     archetypeIds: archetypes.map((archetype) => archetype.archetypeId),
     providerLabel: input.provider.label,
-    // `isolation !== undefined` now means isolation was *verified*, not merely
-    // requested: control only reaches this line for an isolated provider when
-    // the `resolveImageIdentity()` preflight above already succeeded, and the
-    // resolved content-addressed id is retained below rather than the mutable
-    // tag the operator typed.
+    // Isolation must be *verified*, not merely configured - which is what
+    // `isolation !== undefined` alone said, and why a `docker run` that failed
+    // before creating any container could still produce an "eligible" report.
+    // So: a real agent identity, a requested isolation whose image actually
+    // resolved, and no attempt that was supposed to run isolated and did not.
+    // `null` passes because it only occurs for an unisolated provider, which
+    // the `isolation !== undefined` clause has already excluded.
     capabilityEvidenceEligible:
-      input.provider.kind === "command" && Boolean(input.provider.realAgentIdentity) && input.provider.isolation !== undefined,
+      input.provider.kind === "command" &&
+      Boolean(input.provider.realAgentIdentity) &&
+      input.provider.isolation !== undefined &&
+      imageIdentity !== null &&
+      attempts.every((attempt) => attempt.telemetry.isolationEstablished !== false),
     realAgentIdentity: describeRealAgent(input.provider, input.submissionTimeoutMs, imageIdentity),
     pairedTaskSurfaceHash: sha256(stableJson(surfaceHashes)),
     executionsPerAttempt: GRADER_LEGIBLE_EXECUTIONS_PER_ATTEMPT,

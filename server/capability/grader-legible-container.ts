@@ -43,7 +43,10 @@
  * behavior and makes no isolation claim (see `capabilityEvidenceEligible` in
  * grader-legible-run.ts). When isolation *is* requested,
  * `runGraderLegiblePairedExperiment()` resolves the image identity before the
- * first attempt, so a claimed-isolated run cannot silently proceed unisolated.
+ * first attempt - and that resolution proves only that the image exists.
+ * Whether a container then actually started is established separately, per
+ * attempt, by a marker the container writes into the facade channel before the
+ * agent runs; `capabilityEvidenceEligible` requires both.
  */
 
 import { resolve } from "node:path";
@@ -86,6 +89,14 @@ export type GraderLegibleContainerOptions = {
   mounts: GraderLegibleContainerMounts;
   /** Argv to run inside the container, cwd=/workspace. */
   command: readonly string[];
+  /**
+   * `--entrypoint`. Omitted, `command` is the image's CMD and the image's own
+   * entrypoint still wraps it, which is the behavior every archetype relies on.
+   * Set, `command` is passed to this program instead - used by the isolated
+   * runner to prefix the argv with a marker step, which it can only do by
+   * taking the entrypoint slot and re-execing the image's entrypoint itself.
+   */
+  entrypoint?: string;
   /** Operator-supplied; there is no default and no implicit pull. */
   image: string;
   /**
@@ -125,8 +136,37 @@ export function buildGraderLegibleContainerArgs(options: GraderLegibleContainerO
   for (const [key, value] of Object.entries(options.env ?? {})) {
     args.push("-e", `${key}=${value}`);
   }
+  if (options.entrypoint !== undefined) args.push("--entrypoint", options.entrypoint);
   args.push(options.image, ...options.command);
   return args;
+}
+
+/**
+ * The image's configured exec-form entrypoint, or `[]` when it declares none.
+ *
+ * Needed only by the isolated runner: overriding `--entrypoint` to interpose a
+ * marker step discards whatever the image declared, so the wrapper has to put
+ * it back. Reading it here keeps that faithful to the image instead of
+ * assuming, as an earlier draft did, that `command` is the whole argv - the
+ * #237 stub image's entrypoint *is* the agent, and `command` is only the
+ * fixture name it is invoked with.
+ *
+ * A shell-form entrypoint arrives from docker already normalized to
+ * `["/bin/sh", "-c", ...]`, so it needs no special handling. A failed inspect
+ * yields `[]`: the caller has already established the image exists, and if it
+ * has not, the run is about to fail for that reason anyway.
+ */
+export async function graderLegibleImageEntrypoint(image: string, runCommand = runCommandSafe): Promise<string[]> {
+  const result = await runCommand("docker", ["image", "inspect", image, "--format", "{{json .Config.Entrypoint}}"], {
+    timeout: 20_000
+  });
+  if (!result.ok) return [];
+  try {
+    const parsed: unknown = JSON.parse(result.stdout.trim() || "null");
+    return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : [];
+  } catch {
+    return [];
+  }
 }
 
 /**

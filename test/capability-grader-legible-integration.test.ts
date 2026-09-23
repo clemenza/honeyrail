@@ -324,6 +324,67 @@ test("an agent confined to the container can still solve the task", async (t) =>
   // every capability miss under isolation would be uninterpretable.
   assert.equal(attempt.status, "completed", attempt.diagnostics.join(" | "));
   assert.equal(attempt.grade?.result, "grader_legible", attempt.diagnostics.join(" | "));
+  // The positive half of the isolation-established signal: a container that did
+  // start says so from inside, so the flag distinguishes outcomes rather than
+  // being uniformly false and vacuously safe.
+  assert.equal(attempt.telemetry.isolationEstablished, true);
+});
+
+test("a container that never starts is an isolation failure, not an invalid submission", async (t) => {
+  const reason = await isolationSkipReason();
+  if (reason) return t.skip(reason);
+
+  const archetype = graderLegibleArchetype("cap-glo-002");
+  const artifactRoot = await scratch();
+  // A valid, locally-present image on a network that does not exist. `docker
+  // run` then fails while *creating* the container, before any agent process
+  // exists - and leaves behind exactly what "the agent ran and submitted
+  // nothing" leaves behind. Before the marker, the report scored this as
+  // `agent_invalid_submission` and still called itself capability evidence.
+  const report = await runGraderLegiblePairedExperiment({
+    experimentId: "cap-glo-isolation-not-established",
+    artifactRoot,
+    archetypes: [archetype],
+    submissionTimeoutMs: 5_000,
+    provider: {
+      kind: "command",
+      label: "command:stub-agent (unreachable network)",
+      command: archetype.fixtureCommand,
+      args: [...CAP_GLO_002_INVOCATION],
+      timeoutMs: 60_000,
+      isolation: { image: STUB_AGENT_IMAGE, network: "honeyrail-cap-glo-network-that-does-not-exist" },
+      realAgentIdentity: {
+        model: "test-model-1",
+        agentName: "test-agent",
+        agentVersion: "0.0.0-test",
+        commandIdentity: "agent-bin",
+        repositoryCommit: "0000000000000000000000000000000000000000"
+      }
+    }
+  });
+
+  assert.ok(report.attempts.length > 0, "the run should have produced attempts");
+  for (const attempt of report.attempts) {
+    const context = attempt.diagnostics.join(" | ");
+    assert.equal(attempt.telemetry.isolationEstablished, false, context);
+    // The attribution that matters: blaming the agent for a failure of the
+    // harness's own infrastructure is how a broken run becomes a capability
+    // number.
+    assert.equal(attempt.primaryCause, "isolation_or_integrity", context);
+    assert.equal(attempt.status, "infrastructure_error", context);
+  }
+
+  // No agent ran, so nothing can have been submitted. A `reproducer.sh` here
+  // would mean the workspace was written by something other than the agent.
+  for (const attempt of report.attempts) {
+    const entries = await readdir(join(attempt.artifactDir, "workspace"));
+    assert.ok(!entries.includes("reproducer.sh"), `a submission appeared without any agent: ${entries.join(", ")}`);
+  }
+
+  // Driven through the paired experiment, not a bare attempt: the eligibility
+  // gate is a property of the report, and it is the thing that previously let
+  // a run with zero established containers present itself as evidence.
+  assert.equal(report.capabilityEvidenceEligible, false);
 });
 
 test("the container exposes the facade and nothing of the fixture, the manifest or the grader-owned state", async (t) => {
@@ -365,10 +426,17 @@ test("the container exposes the facade and nothing of the fixture, the manifest 
     assert.ok(!pathEntrySource.includes(`${archetypeArg})`), "the PATH entry leaks the fixture's branch structure");
   }
 
-  // The channel carries request/response files and never fixture source.
+  // The channel carries request/response files, the container-start marker and
+  // never fixture source. The marker is the harness's own: the container
+  // touches it before the agent starts, which is how the host learns a
+  // container really ran, so the agent necessarily sees it here.
   const facadeListing = await readFile(join(workspace, "facade-listing.txt"), "utf8");
   for (const entry of facadeListing.split("\n").filter((line) => line.trim() && line.trim() !== "." && line.trim() !== "..")) {
-    assert.match(entry.trim(), /\.(request|response)\.(json|tmp)$/, `unexpected entry in the facade channel: ${entry}`);
+    assert.match(
+      entry.trim(),
+      /(\.(request|response)\.(json|tmp)|^container-started\.marker)$/,
+      `unexpected entry in the facade channel: ${entry}`
+    );
   }
   assert.ok(!facadeListing.includes(CAP_GLO_002_PRIVATE_VALUE));
 
