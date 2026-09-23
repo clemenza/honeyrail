@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,7 +23,7 @@ import { graderLegibleImageAvailable } from "../server/capability/grader-legible
 import { dockerAvailable } from "../server/postgres/agent-container.js";
 import {
   GraderLegiblePairingError,
-  assertFreshOrMatchingArtifactRoot,
+  assertArtifactRootUnused,
   assertPairedTaskSurface,
   runGraderLegibleAttempt,
   runGraderLegiblePairedExperiment,
@@ -280,16 +281,24 @@ async function isolationSkipReason(): Promise<string | null> {
 }
 
 /**
- * The stub image's entrypoint takes the fixture command name as its argument;
- * the fixture binary itself reaches the container only through the read-only
- * `/workspace/bin` mount, so a provider built this way exercises the mount and
- * the PATH wiring together.
+ * The stub image's entrypoint is `stub-agent <fixture> [args...]`, and the
+ * invocation is spelled out here rather than taken from
+ * `referenceCandidates.good`: that field is the grader's own reference
+ * solution, and a stub that read it would "solve" the task without the
+ * container surface working at all. This is cap-glo-002's public
+ * discriminating invocation, the one its brief asks an agent to find.
  */
-function stubAgentProvider(fixtureCommand: string): GraderLegibleCandidateProvider {
+const CAP_GLO_002_INVOCATION = ["read", "adjusted"] as const;
+
+/** The value the fixture only prints for the discriminating invocation. Grader-private; never in the container. */
+const CAP_GLO_002_PRIVATE_VALUE = "1007";
+
+function stubAgentProvider(fixtureCommand: string, args: readonly string[]): GraderLegibleCandidateProvider {
   return {
     kind: "command",
     label: "command:stub-agent (isolation probe)",
     command: fixtureCommand,
+    args: [...args],
     timeoutMs: 120_000,
     isolation: { image: STUB_AGENT_IMAGE, network: "none" }
   };
@@ -303,20 +312,21 @@ test("an agent confined to the container can still solve the task", async (t) =>
   const attempt = await runGraderLegibleAttempt({
     archetype,
     condition: "candidate",
-    provider: stubAgentProvider(archetype.fixtureCommand),
+    provider: stubAgentProvider(archetype.fixtureCommand, CAP_GLO_002_INVOCATION),
     artifactDir: await scratch(),
     attemptId: "cap-glo-isolation:candidate:cap-glo-002",
     archetypeSet: [archetype]
   });
 
-  // Sufficiency, not just confinement: if the mounted surface were too thin
-  // the agent would fail for harness reasons and every capability miss under
-  // isolation would be uninterpretable.
+  // Sufficiency, not just confinement: the fixture is not in the container at
+  // all, so this passes only if the facade actually carried the invocation to
+  // the host and the real output back. If the mounted surface were too thin
+  // every capability miss under isolation would be uninterpretable.
   assert.equal(attempt.status, "completed", attempt.diagnostics.join(" | "));
   assert.equal(attempt.grade?.result, "grader_legible", attempt.diagnostics.join(" | "));
 });
 
-test("the container hides the fixture source, the manifest and the grader-owned state", async (t) => {
+test("the container exposes the facade and nothing of the fixture, the manifest or the grader-owned state", async (t) => {
   const reason = await isolationSkipReason();
   if (reason) return t.skip(reason);
 
@@ -325,22 +335,51 @@ test("the container hides the fixture source, the manifest and the grader-owned 
   const attempt = await runGraderLegibleAttempt({
     archetype,
     condition: "candidate",
-    provider: stubAgentProvider(archetype.fixtureCommand),
+    provider: stubAgentProvider(archetype.fixtureCommand, CAP_GLO_002_INVOCATION),
     artifactDir,
     attemptId: "cap-glo-isolation:candidate:cap-glo-002",
     archetypeSet: [archetype]
   });
 
-  const probes = JSON.parse(await readFile(join(artifactDir, "workspace", "probe-results.json"), "utf8")) as Record<string, unknown>;
-  // Graded grader-legible, so the fixture on the public mount really ran: the
-  // probes below read as "absent because unreachable", not "absent because the
-  // container was broken and nothing worked".
+  const workspace = join(artifactDir, "workspace");
+  const probes = JSON.parse(await readFile(join(workspace, "probe-results.json"), "utf8")) as Record<string, unknown>;
+  // Graded grader-legible, so the agent-visible surface really worked: every
+  // "absent" below reads as "unreachable", not as "the container was broken
+  // and nothing worked".
   assert.equal(attempt.grade?.result, "grader_legible", attempt.diagnostics.join(" | "));
+  assert.equal(attempt.status, "completed", attempt.diagnostics.join(" | "));
+
+  // The agent's PATH entry is readable - and is the generic facade client.
+  // Round 2 mounted the real fixture here read-only, so `cat "$(command -v
+  // meter)"` printed the discriminating branch and ended the task.
+  assert.equal(probes.pathEntry, "/workspace/bin/meter");
+  assert.equal(probes.pathEntryReadable, "readable");
+  const pathEntrySource = await readFile(join(workspace, "path-entry-source.txt"), "utf8");
+  assert.ok(pathEntrySource.includes("facade"), "the PATH entry should be the facade client");
+  assert.ok(
+    !pathEntrySource.includes(CAP_GLO_002_PRIVATE_VALUE),
+    `the PATH entry leaks the private discriminating value: ${pathEntrySource}`
+  );
+  assert.ok(!pathEntrySource.includes("HONEYRAIL_FIXTURE_STATE"), "the PATH entry leaks the fixture's own protocol");
+  for (const archetypeArg of CAP_GLO_002_INVOCATION) {
+    assert.ok(!pathEntrySource.includes(`${archetypeArg})`), "the PATH entry leaks the fixture's branch structure");
+  }
+
+  // The channel carries request/response files and never fixture source.
+  const facadeListing = await readFile(join(workspace, "facade-listing.txt"), "utf8");
+  for (const entry of facadeListing.split("\n").filter((line) => line.trim() && line.trim() !== "." && line.trim() !== "..")) {
+    assert.match(entry.trim(), /\.(request|response)\.(json|tmp)$/, `unexpected entry in the facade channel: ${entry}`);
+  }
+  assert.ok(!facadeListing.includes(CAP_GLO_002_PRIVATE_VALUE));
+
+  // The harness's private material, by every spelling an agent could try.
   assert.equal(probes.fixtureSource, "absent");
+  assert.equal(probes.fixtureSourceAbsolute, "absent");
   assert.equal(probes.archetypeManifest, "absent");
+  assert.equal(probes.archetypeManifestAbsolute, "absent");
   assert.equal(probes.graderStateLog, "absent");
   assert.equal(probes.graderStateDir, "absent");
-  assert.equal(attempt.status, "completed", attempt.diagnostics.join(" | "));
+  assert.equal(probes.graderRunsDir, "absent");
 });
 
 // ---------------------------------------------------------------------------
@@ -401,40 +440,94 @@ test("a refused run creates no new attempt directory under the occupied root", a
   assert.deepEqual((await readdir(join(artifactRoot, "candidate"))).sort(), ["cap-glo-002"]);
 });
 
-test("an empty artifact root and the root's own report are both accepted", async () => {
+/** Every retained file under `root`, as path -> sha256. The unit of evidence is the byte, not the directory listing. */
+async function fingerprintTree(root: string, prefix = ""): Promise<Map<string, string>> {
+  const fingerprints = new Map<string, string>();
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      for (const [path, hash] of await fingerprintTree(join(root, entry.name), relative)) fingerprints.set(path, hash);
+    } else {
+      fingerprints.set(relative, createHash("sha256").update(await readFile(join(root, entry.name))).digest("hex"));
+    }
+  }
+  return fingerprints;
+}
+
+test("re-running the same experiment into its own artifact root is refused, and its evidence survives byte-for-byte", async () => {
   const artifactRoot = await scratch();
   const archetype = graderLegibleArchetype("cap-glo-002");
-  const first = await runGraderLegiblePairedExperiment({
-    experimentId: "cap-glo-idempotent",
+  await runGraderLegiblePairedExperiment({
+    experimentId: "cap-glo-no-rerun",
     artifactRoot,
     archetypes: [archetype],
     provider: SCRIPTED_GRADER_LEGIBLE_PROVIDER
   });
-  // Re-running the same experiment over the same task set is a resume, not a
-  // silent replacement of someone else's evidence, so it must be allowed.
-  await assertFreshOrMatchingArtifactRoot(artifactRoot, "cap-glo-idempotent", first.archetypeSetHash);
+  const before = await fingerprintTree(artifactRoot);
+  assert.ok(before.size > 0);
 
-  // Passing the preflight is not the same as completing: the previous run left
-  // its `reproducer.sh` in each workspace, and re-materializing on top of it
-  // would pull a submission into the as-presented surface hash and desynchronize
-  // the pair. Assert the whole rerun, not just the gate in front of it.
-  const second = await runGraderLegiblePairedExperiment({
-    experimentId: "cap-glo-idempotent",
-    artifactRoot,
+  // Same experiment id, same task subset - the case the removed "matching root"
+  // exception used to accept. It deleted and re-created every attempt
+  // directory, so a rerun that died halfway left the root holding a mixture of
+  // two runs with a report describing neither.
+  let providerCalls = 0;
+  await assert.rejects(
+    runGraderLegiblePairedExperiment({
+      experimentId: "cap-glo-no-rerun",
+      artifactRoot,
+      archetypes: [archetype],
+      provider: {
+        kind: "scripted",
+        label: "scripted:should-never-run",
+        script: (candidate) => {
+          providerCalls += 1;
+          return candidate.referenceCandidates.good;
+        }
+      }
+    }),
+    GraderLegiblePairingError
+  );
+
+  assert.equal(providerCalls, 0, "the refusal must precede the first provider invocation");
+  assert.deepEqual([...(await fingerprintTree(artifactRoot))].sort(), [...before].sort());
+});
+
+test("the artifact-root preflight refuses any non-empty root, whatever it holds", async () => {
+  const artifactRoot = await scratch();
+  await assertArtifactRootUnused(artifactRoot);
+  // Not an attempt directory, not a report - the rule is "unused", so there is
+  // no shape of pre-existing content that reads as safe to write over.
+  await writeFile(join(artifactRoot, "unrelated-note.txt"), "someone else's file\n");
+  await assert.rejects(assertArtifactRootUnused(artifactRoot), GraderLegiblePairingError);
+});
+
+test("a legitimate retry uses a fresh root and leaves its predecessor's evidence untouched", async () => {
+  const firstRoot = await scratch();
+  const archetype = graderLegibleArchetype("cap-glo-002");
+  const first = await runGraderLegiblePairedExperiment({
+    experimentId: "cap-glo-retry-001",
+    artifactRoot: firstRoot,
     archetypes: [archetype],
     provider: SCRIPTED_GRADER_LEGIBLE_PROVIDER
   });
+  const before = await fingerprintTree(firstRoot);
+
+  const second = await runGraderLegiblePairedExperiment({
+    experimentId: "cap-glo-retry-002",
+    artifactRoot: await scratch(),
+    archetypes: [archetype],
+    provider: SCRIPTED_GRADER_LEGIBLE_PROVIDER
+  });
+
+  // The retry is a complete, comparable run in its own right - refusing reruns
+  // costs a directory, not the ability to run the experiment again.
   assert.equal(second.pairedTaskSurfaceHash, first.pairedTaskSurfaceHash);
+  assert.equal(second.archetypeSetHash, first.archetypeSetHash);
   assert.deepEqual(
     second.conditions.map((condition) => condition.graderLegible),
     first.conditions.map((condition) => condition.graderLegible)
   );
-  // The fixture state directory is rebuilt too, so invocation counts describe
-  // this run rather than accumulating across reruns.
-  assert.deepEqual(
-    second.attempts.map((attempt) => attempt.telemetry.fixtureInvocationCount),
-    first.attempts.map((attempt) => attempt.telemetry.fixtureInvocationCount)
-  );
+  assert.deepEqual([...(await fingerprintTree(firstRoot))].sort(), [...before].sort());
 });
 
 // ---------------------------------------------------------------------------
@@ -513,7 +606,34 @@ test("a command provider without isolation or a declared identity is not capabil
   assert.equal(report.realAgentIdentity, null);
 });
 
-test("a declared, isolated command provider is eligible and its retained identity carries no secrets", async () => {
+test("a run that claims isolation is refused before any attempt when the image is absent", async () => {
+  const artifactRoot = await scratch();
+  await assert.rejects(
+    runGraderLegiblePairedExperiment({
+      experimentId: "cap-glo-missing-image",
+      artifactRoot,
+      archetypes: [graderLegibleArchetype("cap-glo-002")],
+      provider: {
+        kind: "command",
+        label: "command:absent-image",
+        command: "/usr/bin/true",
+        timeoutMs: 5_000,
+        isolation: { image: "honeyrail-cap-glo-does-not-exist:never-built", network: "none" }
+      }
+    }),
+    // Any error will do for the caller; what matters is that it arrives before
+    // the run can produce a report that claims isolation it never had.
+    (error: unknown) => error instanceof Error
+  );
+  // Nothing was materialized, so no attempt ran: the image check is a preflight
+  // and not a per-attempt failure that a report could average away.
+  assert.deepEqual(await readdir(artifactRoot), []);
+});
+
+test("a declared, isolated command provider is eligible and its retained identity carries no secrets", async (t) => {
+  const reason = await isolationSkipReason();
+  if (reason) return t.skip(reason);
+
   const secretMarker = "cap-glo-test-secret-a7f3e1d9";
   const report = await runGraderLegiblePairedExperiment({
     experimentId: "cap-glo-declared-identity",
@@ -539,7 +659,14 @@ test("a declared, isolated command provider is eligible and its retained identit
   });
 
   assert.equal(report.capabilityEvidenceEligible, true);
+  // The image id is resolved, not declared: a tag is mutable, so a retained
+  // report that named only the tag would stop identifying the agent the moment
+  // the operator rebuilt it.
+  assert.match(String(report.realAgentIdentity?.resolvedImageId), /^sha256:[0-9a-f]{64}$/);
   assert.deepEqual(report.realAgentIdentity, {
+    imageReference: STUB_AGENT_IMAGE,
+    resolvedImageId: report.realAgentIdentity?.resolvedImageId,
+    network: "none",
     provider: "command",
     model: "test-model-1",
     agentName: "test-agent",

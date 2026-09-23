@@ -5,7 +5,8 @@
  *
  * ```text
  * archetype-manifest.json   operator-side identity + hashes (never truth)
- * bin/<fixtureCommand>      the synthetic system under test (on PATH)
+ * bin/<fixtureCommand>      the synthetic system under test (never agent-visible)
+ * facade-bin/<fixtureCommand>  generic facade client, the agent's PATH entry
  * state/                    grader-owned fixture state (invocations.log, counters)
  * workspace/                the agent-visible workspace
  *   BRIEF.md
@@ -21,8 +22,16 @@
  * This layout *describes* the split; it does not enforce it. Nothing here is
  * a filesystem boundary, so for a real agent command the separation is only
  * as real as the environment the agent runs in: `grader-legible-container.ts`
- * bind-mounts `workspace/` and `bin/` and nothing else, and an unisolated run
- * has no boundary at all and must not claim one.
+ * bind-mounts `workspace/` and `facade-bin/` and nothing else, and an
+ * unisolated run has no boundary at all and must not claim one.
+ *
+ * `bin/` and `facade-bin/` hold files with the *same names* and unrelated
+ * contents. `bin/<fixtureCommand>` is the archetype's real program, whose
+ * source is the discriminating truth the agent is asked to discover; it is
+ * used by the host-side graded executions and by the facade broker, and is
+ * never mounted into any container. `facade-bin/<fixtureCommand>` is the
+ * generic client from `grader-legible-facade.ts`, byte-identical across
+ * archetypes, and is what an isolated agent finds on PATH.
  * The archetype's `failureClass`, its expected observation contract and its
  * reference candidate shapes are never written into `workspace/`; the
  * manifest records only a hash of the observation contract, so retained
@@ -39,14 +48,26 @@ import {
   type GraderLegibleArchetype
 } from "./grader-legible-archetypes.js";
 import type { GraderLegibleIntervention } from "./grader-legible-intervention.js";
+import { GRADER_LEGIBLE_FACADE_CLIENT } from "./grader-legible-facade.js";
 
 export type GraderLegibleArchetypeLayout = {
   archetypeId: string;
   root: string;
   /** Agent-visible directory; also where the submitted reproducer is expected. */
   workspaceDir: string;
-  /** Prepended to PATH for every execution. Not agent-visible as a directory listing target. */
+  /**
+   * The real fixture. Prepended to PATH for the harness's own graded
+   * executions and opened by the facade broker. Never mounted into a
+   * container: its contents are the archetype's discriminating truth.
+   */
   binDir: string;
+  /**
+   * The generic facade client, one file per archetype named after the
+   * fixture. This is the directory an isolated agent gets on PATH in place of
+   * `binDir`. Built unconditionally, so an unisolated smoke run and an
+   * isolated run materialize the same tree.
+   */
+  facadeBinDir: string;
   /** Grader-owned fixture state (`invocations.log`, per-fixture counters). */
   stateDir: string;
   runsDir: string;
@@ -86,11 +107,13 @@ export async function materializeGraderLegibleArchetype(
 ): Promise<GraderLegibleArchetypeLayout> {
   const workspaceDir = join(root, "workspace");
   const binDir = join(root, "bin");
+  const facadeBinDir = join(root, "facade-bin");
   const stateDir = join(root, "state");
   const runsDir = join(root, "runs");
   await Promise.all([
     mkdir(workspaceDir, { recursive: true }),
     mkdir(binDir, { recursive: true }),
+    mkdir(facadeBinDir, { recursive: true }),
     mkdir(stateDir, { recursive: true }),
     mkdir(runsDir, { recursive: true })
   ]);
@@ -98,6 +121,13 @@ export async function materializeGraderLegibleArchetype(
   const fixturePath = join(binDir, archetype.fixtureCommand);
   await writeText(fixturePath, archetype.fixtureProgram);
   await chmod(fixturePath, 0o755);
+
+  // Same name, no shared content: the facade client is a constant and carries
+  // nothing about this archetype, so an agent that reads it learns only that
+  // its invocations are forwarded.
+  const facadePath = join(facadeBinDir, archetype.fixtureCommand);
+  await writeFile(facadePath, GRADER_LEGIBLE_FACADE_CLIENT);
+  await chmod(facadePath, 0o755);
 
   await writeText(join(workspaceDir, "BRIEF.md"), buildBrief(archetype));
   await writeText(join(workspaceDir, "SUBMISSION-CONTRACT.md"), buildSubmissionContract(archetype));
@@ -124,7 +154,7 @@ export async function materializeGraderLegibleArchetype(
     })}\n`
   );
 
-  return { archetypeId: archetype.archetypeId, root, workspaceDir, binDir, stateDir, runsDir, manifestPath };
+  return { archetypeId: archetype.archetypeId, root, workspaceDir, binDir, facadeBinDir, stateDir, runsDir, manifestPath };
 }
 
 function buildBrief(archetype: GraderLegibleArchetype): string {

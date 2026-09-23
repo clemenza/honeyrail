@@ -15,14 +15,21 @@
 #      so a capability miss under isolation is a real miss and not a harness
 #      that starved the agent of the task.
 #
-#   2. Probes for the three host paths the container must NOT expose - the
-#      fixture's own source under the harness's bin/, the archetype manifest,
-#      and the grader-owned state/ invocation log - and writes the outcome of
-#      each probe to probe-results.json in the workspace. The test asserts
-#      every probe failed. Probing from inside is the only check that means
-#      anything: the alternative is asserting on the docker argv we ourselves
-#      built, which would pass just as happily if the mount semantics were
-#      wrong.
+#   2. Probes the surface from inside and writes what it found to
+#      probe-results.json, path-entry-source.txt and facade-listing.txt in the
+#      workspace. The test asserts that the harness's private material - the
+#      real bin/ holding the fixture source, state/, archetype-manifest.json
+#      and runs/ - is unreachable by every spelling, and that the PATH entry
+#      the agent *can* read is the generic facade client and carries none of
+#      the archetype's discriminating values. Probing from inside is the only
+#      check that means anything: the alternative is asserting on the docker
+#      argv we ourselves built, which would pass just as happily if the mount
+#      semantics were wrong.
+#
+# The fixture is not in this container at all. It runs on the host, reached
+# over the request/response channel bind-mounted at /workspace/.facade, so the
+# image needs `base64` and `sed` on PATH for the facade client - both are in
+# any Debian-derived base, including the one below.
 #
 # It is never pulled and never used by a scored run. Tests that need it check
 # `docker image inspect` and skip when it is absent, matching this repo's

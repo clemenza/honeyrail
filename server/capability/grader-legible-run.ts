@@ -21,13 +21,16 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { nowIso, runCommandSafe } from "../utils.js";
 import {
   GRADER_LEGIBLE_CONTAINER_PATHS,
+  GRADER_LEGIBLE_DEFAULT_NETWORK,
   buildGraderLegibleContainerArgs
 } from "./grader-legible-container.js";
+import { startGraderLegibleFacadeBroker } from "./grader-legible-facade.js";
+import { resolveImageIdentity, type ContainerImageIdentity } from "../postgres/image-identity.js";
 import { sha256, stableJson } from "../postgres/historical-task.js";
 import {
   GRADER_LEGIBLE_ARCHETYPES,
@@ -149,6 +152,18 @@ export type GraderLegibleRealAgentIdentity = {
   agentName: string;
   agentVersion: string;
   isolationPolicy: "docker" | "none";
+  /**
+   * The three isolation facts, present only when isolation was actually
+   * resolved against the local daemon before the first attempt ran.
+   *
+   * `imageReference` is the operator's tag, which is mutable;
+   * `resolvedImageId` is the content-addressed id that actually ran, so a
+   * retained report still identifies the agent after the tag has moved.
+   * `network` is the policy applied, defaulted here rather than left implicit.
+   */
+  imageReference?: string;
+  resolvedImageId?: string;
+  network?: string;
   /** Basename only: a full host path would leak the operator's layout into evidence. */
   commandIdentity: string;
   repositoryCommit: string;
@@ -178,8 +193,16 @@ export type GraderLegibleCandidateProvider =
       env?: NodeJS.ProcessEnv;
       timeoutMs?: number;
       isolation?: GraderLegibleIsolation;
-      /** The run fills in `provider`, `isolationPolicy` and `enforcedBudgets` from what it already knows. */
-      realAgentIdentity?: Omit<GraderLegibleRealAgentIdentity, "provider" | "isolationPolicy" | "enforcedBudgets">;
+      /**
+       * The run fills in `provider`, `isolationPolicy`, `enforcedBudgets` and
+       * the isolation facts from what it already knows. The image fields are
+       * not declarable here on purpose: an operator-declared image id would be
+       * a claim, and the point of resolving it is that it is an observation.
+       */
+      realAgentIdentity?: Omit<
+        GraderLegibleRealAgentIdentity,
+        "provider" | "isolationPolicy" | "enforcedBudgets" | "imageReference" | "resolvedImageId" | "network"
+      >;
     };
 
 /**
@@ -354,14 +377,10 @@ export async function runGraderLegibleAttempt(input: {
   const startedAt = nowIso();
   const startedMs = Date.now();
 
-  // Re-presenting the task means presenting it clean. `assertFreshOrMatchingArtifactRoot`
-  // has already refused any root belonging to a different experiment, so the only
-  // thing that can be here is this attempt's own previous run - and layering on top
-  // of it would corrupt the result twice over: the prior agent's `reproducer.sh`
-  // would enter `taskSurfaceHash` and fail the paired-surface check, and the
-  // retained `state/` invocation log would keep counting across runs.
-  await rm(artifactDir, { recursive: true, force: true });
-
+  // Nothing is removed here. `assertArtifactRootUnused()` has already refused
+  // any artifact root that holds a single entry, so an attempt directory under
+  // it cannot pre-exist; a recursive delete at this point could only ever
+  // destroy retained evidence, which is the one thing the protocol forbids.
   const layout = await materializeGraderLegibleArchetype(archetype, artifactDir, intervention, input.archetypeSet);
   const taskSurfaceHash = await hashAgentVisibleTaskSurface(layout.workspaceDir);
 
@@ -382,7 +401,7 @@ export async function runGraderLegibleAttempt(input: {
     const agentTimeoutMs = provider.timeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS;
     const agentStartedMs = Date.now();
     const capture = provider.isolation
-      ? await runIsolatedAgentCommand(provider, provider.isolation, layout, agentTimeoutMs)
+      ? await runIsolatedAgentCommand(provider, provider.isolation, layout, investigationStateDir, agentTimeoutMs)
       : await captureSpawn(provider.command, provider.args ?? [], {
           cwd: layout.workspaceDir,
           // Unisolated: the host environment is inherited as before, because an
@@ -503,9 +522,14 @@ export async function runGraderLegibleAttempt(input: {
 }
 
 /**
- * Runs the agent command inside a container that sees only the workspace and
- * the fixture bin. See `grader-legible-container.ts` for why a cwd alone is not
- * a boundary.
+ * Runs the agent command inside a container that sees only the workspace, the
+ * generic facade client and the facade channel. See
+ * `grader-legible-container.ts` for why a cwd alone is not a boundary, and
+ * `grader-legible-facade.ts` for why the real fixture is not mounted at all.
+ *
+ * The broker is started before the container and stopped in a `finally`,
+ * whatever the container did: a leaked broker would keep an interval alive for
+ * the rest of the process, polling a directory nobody writes to.
  *
  * The container name is derived, not taken from `attemptId`: an attempt id
  * contains `:` separators that docker rejects in a `--name`.
@@ -514,17 +538,38 @@ async function runIsolatedAgentCommand(
   provider: Extract<GraderLegibleCandidateProvider, { kind: "command" }>,
   isolation: GraderLegibleIsolation,
   layout: GraderLegibleArchetypeLayout,
+  investigationStateDir: string,
   timeoutMs: number
 ): Promise<SpawnCapture> {
   const containerName = `honeyrail-cap-glo-${randomUUID().slice(0, 12)}`;
+  const facadeDir = join(layout.root, "facade-channel");
+  await mkdir(facadeDir, { recursive: true });
+  const broker = startGraderLegibleFacadeBroker({
+    facadeDir,
+    // The REAL fixture directory. It is opened by this process only and is
+    // never passed to `buildGraderLegibleContainerArgs()`.
+    binDir: layout.binDir,
+    stateDir: investigationStateDir,
+    timeoutMs
+  });
+  try {
+    return await runContainer();
+  } finally {
+    await broker.stop();
+  }
+
+  async function runContainer(): Promise<SpawnCapture> {
   const args = buildGraderLegibleContainerArgs(
     {
-      mounts: { workspaceDir: layout.workspaceDir, binDir: layout.binDir },
+      mounts: { workspaceDir: layout.workspaceDir, facadeBinDir: layout.facadeBinDir, facadeDir },
       command: [provider.command, ...(provider.args ?? [])],
       image: isolation.image,
       network: isolation.network,
+      // No `HONEYRAIL_FIXTURE_STATE` here. The fixture no longer runs inside
+      // the container, so an in-container path for its state directory would
+      // be a variable that points at nothing; the broker supplies the real
+      // investigation state dir when it spawns the fixture on the host.
       env: {
-        HONEYRAIL_FIXTURE_STATE: `${GRADER_LEGIBLE_CONTAINER_PATHS.workspace}/${GRADER_LEGIBLE_INVESTIGATION_STATE_DIRNAME}`,
         // Explicitly constructed. Spreading `process.env` here would ship the
         // operator's whole environment - API keys included - into a container
         // whose argv is retained as evidence.
@@ -546,6 +591,7 @@ async function runIsolatedAgentCommand(
     await runCommandSafe("docker", ["rm", "-f", containerName], { timeout: 30_000 });
   }
   return capture;
+  }
 }
 
 /**
@@ -721,7 +767,21 @@ export async function runGraderLegiblePairedExperiment(input: {
 }): Promise<GraderLegibleExperimentReport> {
   const archetypes = input.archetypes ?? GRADER_LEGIBLE_ARCHETYPES;
   const archetypeSetHash = graderLegibleArchetypeSetHash(archetypes);
-  await assertFreshOrMatchingArtifactRoot(input.artifactRoot, input.experimentId, archetypeSetHash);
+  await assertArtifactRootUnused(input.artifactRoot);
+
+  // Resolve the isolation image *before* the first attempt, and let a failure
+  // propagate. A missing image or an unreachable daemon used to surface as the
+  // first attempt's `docker run` failing, after which the loop carried on and
+  // produced a report for a provider that declared isolation and never got it.
+  // Reuses the generic resolver the PostgreSQL research path already shares,
+  // rather than a second copy of image-inspection logic.
+  const imageIdentity =
+    input.provider.kind === "command" && input.provider.isolation
+      ? await resolveImageIdentity(input.provider.isolation.image, {
+          buildHint: "docker build -t <image> docker/capability-grader-legible-agent-stub (or your own operator image)"
+        })
+      : null;
+
   await mkdir(input.artifactRoot, { recursive: true });
 
   const attempts: GraderLegibleAttempt[] = [];
@@ -761,9 +821,14 @@ export async function runGraderLegiblePairedExperiment(input: {
     archetypeSetHash,
     archetypeIds: archetypes.map((archetype) => archetype.archetypeId),
     providerLabel: input.provider.label,
+    // `isolation !== undefined` now means isolation was *verified*, not merely
+    // requested: control only reaches this line for an isolated provider when
+    // the `resolveImageIdentity()` preflight above already succeeded, and the
+    // resolved content-addressed id is retained below rather than the mutable
+    // tag the operator typed.
     capabilityEvidenceEligible:
       input.provider.kind === "command" && Boolean(input.provider.realAgentIdentity) && input.provider.isolation !== undefined,
-    realAgentIdentity: describeRealAgent(input.provider, input.submissionTimeoutMs),
+    realAgentIdentity: describeRealAgent(input.provider, input.submissionTimeoutMs, imageIdentity),
     pairedTaskSurfaceHash: sha256(stableJson(surfaceHashes)),
     executionsPerAttempt: GRADER_LEGIBLE_EXECUTIONS_PER_ATTEMPT,
     conditions: GRADER_LEGIBLE_CONDITIONS.map((condition) => summarize(condition, attempts)),
@@ -775,43 +840,40 @@ export async function runGraderLegiblePairedExperiment(input: {
 }
 
 /**
- * Refuses to start a run into an artifact root that already holds evidence.
+ * Refuses to start a run into an artifact root that holds anything at all.
  *
- * This is a **preflight**, and that placement is the whole point. The check
- * used to run after the attempt loop, comparing the finished report against
+ * This is a **preflight**, and that placement is half the point. The check
+ * originally ran after the attempt loop, comparing the finished report against
  * whatever was on disk - by which time every attempt had already re-materialized
  * its condition directory over the previous run's, overwriting `reproducer.sh`,
- * `agent-stdout.txt` and the captured `runs/` of retained evidence the error
- * then claimed to be protecting. Fail-closed has to mean "before the first
- * mutation", not "before the last write".
+ * `agent-stdout.txt` and the captured `runs/` of the retained evidence the
+ * error then claimed to be protecting. Fail-closed has to mean "before the
+ * first mutation", not "before the last write".
  *
- * An empty or absent root is fresh. A root holding *this* experiment's own
- * report is a deliberate idempotent rerun and stays allowed, which is what the
- * freeze script depends on.
+ * The other half is that there is **no matching exception**. A previous version
+ * allowed a rerun whose `experimentId` and archetype set matched the report
+ * already there, and called that an idempotent rerun. It was not idempotent: it
+ * deleted and re-created every attempt directory, so a rerun that crashed
+ * halfway left the root holding a mixture of two runs' evidence with a report
+ * describing neither. "Same inputs" does not make destroying an evidence root
+ * safe, because the evidence is not a function of the inputs - it is what
+ * happened.
+ *
+ * So: any entry at all, and the run is refused. A retry uses a fresh root and a
+ * new `experimentId`, which also keeps the predecessor's evidence available for
+ * comparison. Nothing in the repo depends on the old behavior; in particular
+ * `npm run capability-glo-237-freeze` writes only
+ * `corpus/capability-grader-legible-intervention-v1.json` and never opens an
+ * experiment artifact root.
  */
-export async function assertFreshOrMatchingArtifactRoot(
-  artifactRoot: string,
-  experimentId: string,
-  archetypeSetHash: string
-): Promise<void> {
+export async function assertArtifactRootUnused(artifactRoot: string): Promise<void> {
   const contents = await readdir(artifactRoot).catch(() => null);
   if (contents === null || contents.length === 0) return;
-
-  const existing = await readFile(join(artifactRoot, "experiment-report.json"), "utf8").catch(() => null);
-  if (!existing) {
-    throw new GraderLegiblePairingError(
-      `Artifact root "${artifactRoot}" is not empty (${contents.length} entr${contents.length === 1 ? "y" : "ies"}) and holds no experiment-report.json. ` +
-        "Refusing to run: whatever is there would be overwritten attempt by attempt. Use a fresh artifact root."
-    );
-  }
-
-  const previous = JSON.parse(existing) as GraderLegibleExperimentReport;
-  if (previous.experimentId !== experimentId || previous.archetypeSetHash !== archetypeSetHash) {
-    throw new GraderLegiblePairingError(
-      `experiment-report.json at this artifact root belongs to experiment "${previous.experimentId}" (archetype set ${previous.archetypeSetHash}). ` +
-        "Refusing to overwrite retained evidence - use a fresh artifact root."
-    );
-  }
+  throw new GraderLegiblePairingError(
+    `Artifact root "${artifactRoot}" already holds ${contents.length} entr${contents.length === 1 ? "y" : "ies"}. ` +
+      "Refusing to run: a used artifact root is retained evidence, and re-running into it - even for the same experiment - " +
+      "would overwrite it attempt by attempt. Use a fresh artifact root and a new experiment id."
+  );
 }
 
 /**
@@ -824,11 +886,21 @@ export async function assertFreshOrMatchingArtifactRoot(
  */
 function describeRealAgent(
   provider: GraderLegibleCandidateProvider,
-  submissionTimeoutMs: number | undefined
+  submissionTimeoutMs: number | undefined,
+  imageIdentity: ContainerImageIdentity | null
 ): GraderLegibleRealAgentIdentity | null {
   if (provider.kind !== "command" || !provider.realAgentIdentity) return null;
   const declared = provider.realAgentIdentity;
   return {
+    // Only present for an isolated provider, and then only because the
+    // preflight resolved it. A tag is mutable; the id is what actually ran.
+    ...(provider.isolation && imageIdentity
+      ? {
+          imageReference: provider.isolation.image,
+          resolvedImageId: imageIdentity.id,
+          network: provider.isolation.network ?? GRADER_LEGIBLE_DEFAULT_NETWORK
+        }
+      : {}),
     provider: "command",
     model: declared.model,
     agentName: declared.agentName,

@@ -4,7 +4,11 @@
  *
  * Environment:
  *   HONEYRAIL_CAP_GLO_EXPERIMENT_ID   experiment identity (default: timestamped)
- *   HONEYRAIL_CAP_GLO_ARTIFACT_DIR    artifact root (default: output/capability-grader-legible)
+ *   HONEYRAIL_CAP_GLO_ARTIFACT_DIR    artifact root (default:
+ *                                     output/capability-grader-legible/<experiment-id>).
+ *                                     Must be empty or absent: the harness refuses to
+ *                                     write into a root that already holds evidence, so
+ *                                     a rerun means a new root, never an overwrite.
  *   HONEYRAIL_CAP_GLO_PROVIDER        scripted-demonstration | scripted-self-asserting |
  *                                     scripted-grader-legible | command  (default: scripted-demonstration)
  *   HONEYRAIL_CAP_GLO_AGENT_COMMAND   required when PROVIDER=command; run with the
@@ -31,7 +35,6 @@ import {
   runGraderLegiblePairedExperiment,
   type GraderLegibleCandidateProvider
 } from "../server/capability/grader-legible-run.js";
-import { graderLegibleImageAvailable } from "../server/capability/grader-legible-container.js";
 import {
   SCRIPTED_GRADER_LEGIBLE_PROVIDER,
   SCRIPTED_PAIRED_DEMONSTRATION_PROVIDER,
@@ -39,10 +42,15 @@ import {
 } from "../server/capability/grader-legible-scripted-agents.js";
 
 const providerName = String(process.env.HONEYRAIL_CAP_GLO_PROVIDER || "scripted-demonstration").trim();
-const artifactRoot = resolve(process.env.HONEYRAIL_CAP_GLO_ARTIFACT_DIR || "output/capability-grader-legible");
 const experimentId = String(
   process.env.HONEYRAIL_CAP_GLO_EXPERIMENT_ID || `cap-glo-${new Date().toISOString().replace(/[:.]/g, "-")}`
 ).trim();
+// Per-experiment by default. The harness refuses to write into an artifact
+// root that already holds anything, so a shared default root would make the
+// second invocation of this script fail rather than produce a second run.
+const artifactRoot = resolve(
+  process.env.HONEYRAIL_CAP_GLO_ARTIFACT_DIR || `output/capability-grader-legible/${experimentId}`
+);
 
 function resolveProvider(): GraderLegibleCandidateProvider {
   switch (providerName) {
@@ -98,17 +106,10 @@ function resolveProvider(): GraderLegibleCandidateProvider {
 
 const provider = resolveProvider();
 
-// Preflight, so a missing image fails once with a build hint instead of twelve
-// times as a per-attempt infrastructure error. Never pulls: which image the
-// agent ran in is part of the evidence, so it is the operator's to place.
-if (provider.kind === "command" && provider.isolation) {
-  if (!(await graderLegibleImageAvailable(provider.isolation.image))) {
-    throw new Error(
-      `Isolation image "${provider.isolation.image}" is not present locally. Build or load it first; this harness never pulls.`
-    );
-  }
-}
-
+// No image preflight here. `runGraderLegiblePairedExperiment()` resolves the
+// image identity itself before the first attempt and records the resolved id
+// in the report, so a check here would be a second, weaker copy that any other
+// caller of the library would miss.
 const report = await runGraderLegiblePairedExperiment({ experimentId, artifactRoot, provider });
 
 process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);

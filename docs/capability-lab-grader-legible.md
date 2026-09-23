@@ -45,7 +45,8 @@ Materialization (`grader-legible-fixture.ts`) splits agent-visible from operator
 ```text
 <root>/
   archetype-manifest.json   operator-side identity + hashes (never truth)
-  bin/<fixtureCommand>      the synthetic system under test (on PATH)
+  bin/<fixtureCommand>      the synthetic system under test (host-side only)
+  facade-bin/<fixtureCommand>  the generic facade client the agent gets on PATH
   state/                    grader-owned fixture state (invocations.log, counters)
   workspace/                the agent-visible workspace
     BRIEF.md
@@ -57,8 +58,8 @@ Materialization (`grader-legible-fixture.ts`) splits agent-visible from operator
 
 This layout describes the split; it does not enforce it. A working directory is not a filesystem boundary, so how real the separation is depends entirely on where the agent runs:
 
-- **Isolated (`HONEYRAIL_CAP_GLO_AGENT_IMAGE` set).** `grader-legible-container.ts` runs the agent in a Docker container built from the shared `containerHardeningArgs()` primitive, bind-mounting `workspace/` read-write and `bin/` read-only and nothing else. `archetype-manifest.json` and `state/` are simply absent from the container's mount namespace. Two Docker-gated tests probe for them from inside a container rather than asserting on the argv the harness itself built; they skip, never pull, when the daemon or the stub image is missing.
-- **Unisolated (no image).** The agent runs on the host with `workspace/` as its cwd. `bin/`, `state/` and the manifest are one `..` away. This mode is for operator smoke tests; a run made this way is not capability evidence and the report says so.
+- **Isolated (`HONEYRAIL_CAP_GLO_AGENT_IMAGE` set).** `grader-legible-container.ts` runs the agent in a Docker container built from the shared `containerHardeningArgs()` primitive, with exactly three bind mounts: `workspace/` read-write at `/workspace`, `facade-bin/` read-only at `/workspace/bin`, and the attempt's request/response channel read-write at `/workspace/.facade`. The real `bin/` is **not** mounted. Read-only prevents writing, not reading, and the fixture's source is the discriminating truth the task exists to make the agent discover by experiment — `cat "$(command -v meter)"` would end the task. Instead the agent's PATH entry is the generic facade client from `grader-legible-facade.ts`, byte-identical for every archetype; the fixture runs on the host and is reached over a polled file channel. `archetype-manifest.json`, `state/`, `runs/` and the sibling condition's tree are absent from the container's mount namespace entirely. Two Docker-gated tests probe for all of them from inside a container, using the same PATH the agent has, rather than asserting on the argv the harness itself built; they skip, never pull, when the daemon or the stub image is missing.
+- **Unisolated (no image).** The agent runs on the host with `workspace/` as its cwd and the real `bin/` on its PATH. `bin/`, `state/` and the manifest are one `..` away. This mode is for operator smoke tests; a run made this way is not capability evidence and the report says so.
 
 The agent writes one file, `workspace/reproducer.sh`. The harness executes it with `/bin/sh` twice, in fresh scratch directories sharing one fixture state directory, with a constructed (not inherited) environment. Raw stdout, stderr and exit status are captured outside the agent and retained before grading.
 
@@ -113,13 +114,13 @@ HONEYRAIL_CAP_GLO_AGENT_IDENTITY='{"model":"...","agentName":"...","agentVersion
 npm run capability-glo-237-freeze
 ```
 
-`HONEYRAIL_CAP_GLO_AGENT_IMAGE` must already exist locally; the harness preflights it with `docker image inspect` and never pulls, because which image the agent ran in is part of the evidence and therefore the operator's to place.
+`HONEYRAIL_CAP_GLO_AGENT_IMAGE` must already exist locally. Before the first attempt runs, `runGraderLegiblePairedExperiment()` resolves it through the shared `resolveImageIdentity()` and aborts the whole experiment if it is absent; it never pulls, because which image the agent ran in is part of the evidence and therefore the operator's to place. This is why "isolation was requested" can be read as "isolation was verified": an isolated run that could not resolve its image produces no attempts at all.
 
-`HONEYRAIL_CAP_GLO_AGENT_IDENTITY` is recorded into the report as `realAgentIdentity`, including the isolation policy actually applied and the budgets actually enforced. `commandIdentity` is stored as a basename only, and the provider environment is never copied into the report — a run's credentials are not part of who the agent was, and retained evidence travels further than the host does.
+`HONEYRAIL_CAP_GLO_AGENT_IDENTITY` is recorded into the report as `realAgentIdentity`, including the isolation policy actually applied, the budgets actually enforced, and — for an isolated run — the `imageReference` requested, the content-addressed `resolvedImageId` it resolved to, and the `network` policy applied. The tag alone would not identify the agent, since a rebuild can move it. `commandIdentity` is stored as a basename only, and the provider environment is never copied into the report — a run's credentials are not part of who the agent was, and retained evidence travels further than the host does.
 
 `capabilityEvidenceEligible` is `true` only when all three preconditions hold. A scripted run is always `false`; so is a bare command provider, which was equally true of a provider pointed at `/bin/false` with no isolation and no attribution. Per the [evaluation protocol](evaluation-protocol.md#evidence-levels-and-claims), a scripted agent validates the instrument and says nothing about model capability.
 
-Reruns fail closed. `runGraderLegiblePairedExperiment()` refuses an artifact root that already holds files, *before* materializing anything or invoking the provider, unless the root holds an `experiment-report.json` for the same experiment id and archetype set. Use a fresh root.
+Reruns fail closed, with no exception. `runGraderLegiblePairedExperiment()` refuses an artifact root that holds *any* entry — including one written by an identical earlier run of the same experiment id — before it creates the root, materializes anything, or invokes the provider. Nothing under a used root is ever deleted or rewritten. A retry means a fresh root and a new experiment id; the CLI's default root is per-experiment for exactly this reason. (This does not constrain `npm run capability-glo-237-freeze`, which writes to `corpus/`, a different path with its own refuse-on-drift check.)
 
 ## Freeze and transfer
 

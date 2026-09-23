@@ -1,56 +1,69 @@
 /**
  * Opt-in filesystem isolation for a #237 Capability Lab agent command.
  *
- * Round 1 of the grader-legible harness ran the agent command with the
- * agent-visible workspace as its `cwd` and called that "the only agent-visible
- * directory". A `cwd` is not a filesystem boundary: a real agent can read
- * `../bin/<fixture>` (the fixture's source, which encodes the discriminating
- * behavior), `../archetype-manifest.json` (the task's identity and hashes) and
- * `../state/` (the grader-owned invocation log that drives failure-stage
- * attribution) with one relative path. So a capability number produced that
- * way is not evidence of constructing a grader-legible observable; it may be
- * evidence of having read the fixture.
+ * Round 1 ran the agent with the workspace as its `cwd` and called that "the
+ * only agent-visible directory". A `cwd` is not a boundary: `../bin/<fixture>`,
+ * `../archetype-manifest.json` and `../state/` were all one relative path away.
  *
- * Rather than grow a provider/environment framework for this, we reuse the one
- * filesystem-isolation primitive this repo already has - the shared
- * `docker run` hardening flags in `server/containers/hardening.ts` - exactly
- * the way `server/postgres/agent-container.ts` does. The guarantee is the same
- * one documented there and is not in the flags: it is that the caller mounts
- * *only* what the agent is meant to see. A host path that is never bind-mounted
- * is absent from the container's mount namespace, not merely unmentioned.
+ * Round 2 containerized that and mounted the real `bin/` read-only. That fixed
+ * the manifest and the grader state and left the largest leak open, because
+ * read-only prevents writing, not reading, and the fixture's *source* is the
+ * discriminating truth the task exists to make the agent discover by
+ * experiment. `cat "$(command -v meter)"` ended the task.
+ *
+ * So the real `bin/` is no longer mounted anywhere. The agent's PATH entry is
+ * the generic facade client from `grader-legible-facade.ts`, and the fixture
+ * runs on the host, reached over a request/response file channel. See that
+ * module for the protocol and for why the channel polls rather than watches.
+ *
+ * We still reuse the one filesystem-isolation primitive this repo has - the
+ * shared `docker run` hardening flags in `server/containers/hardening.ts` -
+ * exactly the way `server/postgres/agent-container.ts` does. The guarantee is
+ * not in the flags: it is that the caller mounts *only* what the agent may
+ * see, and a host path that is never bind-mounted is absent from the
+ * container's mount namespace rather than merely unmentioned.
  *
  * The agent-visible surface, and nothing else:
  *
- *   /workspace          the condition's agent-visible workspace   rw
- *   /workspace/bin      the fixture, so it stays on PATH          ro
+ *   /workspace          the condition's agent-visible workspace       rw
+ *   /workspace/bin      facade-bin/: the generic client, on PATH      ro
+ *   /workspace/.facade  the request/response channel                  rw
  *
- * Never mounted: `state/` (grader-owned invocation log),
+ * Never mounted, and therefore not in the namespace at all: the real `bin/`
+ * (fixture source), `state/` (grader-owned invocation log),
  * `archetype-manifest.json` (task identity), `runs/` (retained raw
  * observations), the sibling condition's tree, and any other host path.
  *
- * `bin/` is mounted *inside* the workspace rather than beside it because the
- * workspace is the only mount point the agent's cwd can reach; read-only,
- * because the fixture is the system under test and an agent that can rewrite
- * it can manufacture whatever observation it likes. It is still visible as a
- * directory, so this boundary hides the harness's private material, not the
- * fixture's own source - that part is unchanged from the host path and is why
- * every archetype's discriminating behavior is expressed in terms an agent
- * must still *run* the fixture to observe.
+ * The facade client is mounted read-only for the same reason the fixture used
+ * to be: an agent that can rewrite its own PATH entry can manufacture whatever
+ * observation it likes. Reading it is now harmless - it is byte-identical for
+ * every archetype and contains no archetype behavior.
  *
  * Isolation is opt-in: a provider without `isolation` keeps today's host-cwd
- * behavior, and the report must not claim isolation for it (see
- * `capabilityEvidenceEligible` in grader-legible-run.ts).
+ * behavior and makes no isolation claim (see `capabilityEvidenceEligible` in
+ * grader-legible-run.ts). When isolation *is* requested,
+ * `runGraderLegiblePairedExperiment()` resolves the image identity before the
+ * first attempt, so a claimed-isolated run cannot silently proceed unisolated.
  */
 
 import { resolve } from "node:path";
 import { runCommandSafe } from "../utils.js";
 import { containerHardeningArgs } from "../containers/hardening.js";
+import { GRADER_LEGIBLE_FACADE_CONTAINER_DIR, GRADER_LEGIBLE_FACADE_DIR_ENV } from "./grader-legible-facade.js";
 
 /** Fixed, neutral in-container paths. These, not host paths, are what the agent is told. */
 export const GRADER_LEGIBLE_CONTAINER_PATHS = {
   workspace: "/workspace",
-  bin: "/workspace/bin"
+  bin: "/workspace/bin",
+  facade: GRADER_LEGIBLE_FACADE_CONTAINER_DIR
 } as const;
+
+/**
+ * Network policy when the provider does not name one. Exported so the report's
+ * `realAgentIdentity.network` records the policy actually applied rather than
+ * re-deriving a default that could drift from this one.
+ */
+export const GRADER_LEGIBLE_DEFAULT_NETWORK = "bridge";
 
 /** No host PATH is inherited: a container gets exactly what is passed with `-e`. */
 const CONTAINER_PATH = `${GRADER_LEGIBLE_CONTAINER_PATHS.bin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
@@ -58,8 +71,15 @@ const CONTAINER_PATH = `${GRADER_LEGIBLE_CONTAINER_PATHS.bin}:/usr/local/sbin:/u
 export type GraderLegibleContainerMounts = {
   /** Host path of the condition's agent-visible workspace. Read-write: the agent submits into it. */
   workspaceDir: string;
-  /** Host path of the archetype's `bin/`. Read-only: the fixture is the system under test. */
-  binDir: string;
+  /**
+   * Host path of the archetype's `facade-bin/` - the generic facade client,
+   * **not** the real fixture. Mounted at `/workspace/bin` so the agent's PATH
+   * entry keeps its name. Read-only: an agent that can rewrite its own PATH
+   * entry can manufacture any observation.
+   */
+  facadeBinDir: string;
+  /** Host path of this attempt's request/response channel. Read-write: the client writes requests here. */
+  facadeDir: string;
 };
 
 export type GraderLegibleContainerOptions = {
@@ -96,9 +116,11 @@ export function buildGraderLegibleContainerArgs(options: GraderLegibleContainerO
     // mutable tag quietly changes the agent that produced the evidence.
     "--pull=never",
     "-v", `${resolve(options.mounts.workspaceDir)}:${paths.workspace}:rw`,
-    "-v", `${resolve(options.mounts.binDir)}:${paths.bin}:ro`,
+    "-v", `${resolve(options.mounts.facadeBinDir)}:${paths.bin}:ro`,
+    "-v", `${resolve(options.mounts.facadeDir)}:${paths.facade}:rw`,
     "-w", paths.workspace,
-    "-e", `PATH=${CONTAINER_PATH}`
+    "-e", `PATH=${CONTAINER_PATH}`,
+    "-e", `${GRADER_LEGIBLE_FACADE_DIR_ENV}=${paths.facade}`
   ];
   for (const [key, value] of Object.entries(options.env ?? {})) {
     args.push("-e", `${key}=${value}`);
