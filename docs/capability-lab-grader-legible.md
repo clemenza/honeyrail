@@ -47,13 +47,18 @@ Materialization (`grader-legible-fixture.ts`) splits agent-visible from operator
   archetype-manifest.json   operator-side identity + hashes (never truth)
   bin/<fixtureCommand>      the synthetic system under test (on PATH)
   state/                    grader-owned fixture state (invocations.log, counters)
-  workspace/                the ONLY agent-visible directory
+  workspace/                the agent-visible workspace
     BRIEF.md
     SUBMISSION-CONTRACT.md
     INTERVENTION.md         candidate condition only
   runs/<index>/             raw stdout.txt, stderr.txt, exit-status.txt per execution
   attempt.json              retained attempt record
 ```
+
+This layout describes the split; it does not enforce it. A working directory is not a filesystem boundary, so how real the separation is depends entirely on where the agent runs:
+
+- **Isolated (`HONEYRAIL_CAP_GLO_AGENT_IMAGE` set).** `grader-legible-container.ts` runs the agent in a Docker container built from the shared `containerHardeningArgs()` primitive, bind-mounting `workspace/` read-write and `bin/` read-only and nothing else. `archetype-manifest.json` and `state/` are simply absent from the container's mount namespace. Two Docker-gated tests probe for them from inside a container rather than asserting on the argv the harness itself built; they skip, never pull, when the daemon or the stub image is missing.
+- **Unisolated (no image).** The agent runs on the host with `workspace/` as its cwd. `bin/`, `state/` and the manifest are one `..` away. This mode is for operator smoke tests; a run made this way is not capability evidence and the report says so.
 
 The agent writes one file, `workspace/reproducer.sh`. The harness executes it with `/bin/sh` twice, in fresh scratch directories sharing one fixture state directory, with a constructed (not inherited) environment. Raw stdout, stderr and exit status are captured outside the agent and retained before grading.
 
@@ -63,6 +68,8 @@ The agent writes one file, `workspace/reproducer.sh`. The harness executes it wi
 
 `completed` is the only status that carries a capability outcome. `invalid_submission`, `integrity_error` and `infrastructure_error` are retained separately, so retry and infrastructure failures never read as capability misses.
 
+Every attempt also carries a `primaryCause` in [evaluation-report-v1](evaluation-protocol.md) vocabulary — `agent_budget_exhausted`, `agent_invalid_submission`, `agent_resource_limit`, `external_block`, `harness_or_evaluator`, `infrastructure`, `isolation_or_integrity`, `unknown` — plus two values for attempts that reached a grade and therefore sit outside the protocol's failure vocabulary: `completed_success` and `completed_capability_miss`. Status alone cannot carry this. An agent that exhausted its budget and an agent that simply wrote nothing both end with no submission on disk, and only the cause distinguishes them. `causeCounts` sums to `A`.
+
 Within a completed attempt, failure-stage attribution runs in this order, which is what lets a paired comparison say *where* improvement happened:
 
 1. `no_discriminating_experiment` — the fixture's own invocation log shows the discriminating experiment never ran; the miss is upstream of output-shape construction.
@@ -71,7 +78,7 @@ Within a completed attempt, failure-stage attribution runs in this order, which 
 
 Secondary diagnostics (discriminating-observable selection, determinism, per-channel matches, submission bytes, fixture invocation count) are reported, never graded.
 
-Primary endpoint: **grader-legible reproducer success @ fixed task/budget** — grader-legible successes over completed attempts, reported per condition alongside the non-capability outcome counts.
+Primary endpoint: **end-to-end budget success (`D/A`)** — grader-legible successes over *every formal attempt*, reported per condition. Conditional rediscovery (`D/E`, successes over completed attempts) is reported beside it and never alone: it excludes everything that failed before grading, so an agent that times out nine times in ten and succeeds on the tenth scores `1.0` on it. The CLI prints `D/A` first for that reason.
 
 ## The intervention
 
@@ -91,18 +98,28 @@ HONEYRAIL_CAP_GLO_EXPERIMENT_ID=<id> \
 HONEYRAIL_CAP_GLO_ARTIFACT_DIR=output/capability-grader-legible/<id> \
   npm run capability-glo-237
 
-# Real-agent run (the only provider that produces capability evidence)
+# Real-agent run. Capability evidence requires all three of: a command
+# provider, an isolation image, and a declared identity.
 HONEYRAIL_CAP_GLO_PROVIDER=command \
 HONEYRAIL_CAP_GLO_AGENT_COMMAND=<agent> \
 HONEYRAIL_CAP_GLO_AGENT_ARGS='["--flag","value"]' \
 HONEYRAIL_CAP_GLO_AGENT_TIMEOUT_MS=600000 \
+HONEYRAIL_CAP_GLO_AGENT_IMAGE=<image already present locally> \
+HONEYRAIL_CAP_GLO_AGENT_NETWORK=none \
+HONEYRAIL_CAP_GLO_AGENT_IDENTITY='{"model":"...","agentName":"...","agentVersion":"...","commandIdentity":"...","repositoryCommit":"..."}' \
   npm run capability-glo-237
 
 # Freeze the candidate intervention before any family-004 transfer validation
 npm run capability-glo-237-freeze
 ```
 
-The agent command runs with the agent-visible workspace as its cwd; nothing but `reproducer.sh` is read back from it. A scripted run always reports `capabilityEvidenceEligible: false` — per the [evaluation protocol](evaluation-protocol.md#evidence-levels-and-claims), a scripted agent validates the instrument and says nothing about model capability.
+`HONEYRAIL_CAP_GLO_AGENT_IMAGE` must already exist locally; the harness preflights it with `docker image inspect` and never pulls, because which image the agent ran in is part of the evidence and therefore the operator's to place.
+
+`HONEYRAIL_CAP_GLO_AGENT_IDENTITY` is recorded into the report as `realAgentIdentity`, including the isolation policy actually applied and the budgets actually enforced. `commandIdentity` is stored as a basename only, and the provider environment is never copied into the report — a run's credentials are not part of who the agent was, and retained evidence travels further than the host does.
+
+`capabilityEvidenceEligible` is `true` only when all three preconditions hold. A scripted run is always `false`; so is a bare command provider, which was equally true of a provider pointed at `/bin/false` with no isolation and no attribution. Per the [evaluation protocol](evaluation-protocol.md#evidence-levels-and-claims), a scripted agent validates the instrument and says nothing about model capability.
+
+Reruns fail closed. `runGraderLegiblePairedExperiment()` refuses an artifact root that already holds files, *before* materializing anything or invoking the provider, unless the root holds an `experiment-report.json` for the same experiment id and archetype set. Use a fresh root.
 
 ## Freeze and transfer
 
@@ -114,3 +131,4 @@ The agent command runs with the agent-visible workspace as its cwd; nothing but 
 - The gap evidence is three recurrences across two causal families, one of them a within-family sibling replication.
 - Harness validation with scripted shapes demonstrates that the instrument separates self-asserting from grader-legible output. It is not a measurement of whether the intervention helps a model; that requires a real-agent paired run under a registered plan.
 - Six archetypes is a small, non-probabilistic sample. Counts, not rates with confidence claims, until repetitions are predeclared.
+- Isolation is opt-in and Docker-only. Without an image the agent runs on the host, where the harness's private material is one `..` away; such a run is excluded from capability evidence rather than silently reported as isolated.

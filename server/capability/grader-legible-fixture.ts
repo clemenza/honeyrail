@@ -7,7 +7,7 @@
  * archetype-manifest.json   operator-side identity + hashes (never truth)
  * bin/<fixtureCommand>      the synthetic system under test (on PATH)
  * state/                    grader-owned fixture state (invocations.log, counters)
- * workspace/                the ONLY agent-visible directory
+ * workspace/                the agent-visible workspace
  *   BRIEF.md
  *   SUBMISSION-CONTRACT.md
  *   INTERVENTION.md         candidate condition only
@@ -17,6 +17,12 @@
  * The split matters: `bin/` and `state/` sit outside `workspace/` so the
  * fixture's invocation log - the observation that drives failure-stage
  * attribution - is owned by the harness rather than produced by the agent.
+ *
+ * This layout *describes* the split; it does not enforce it. Nothing here is
+ * a filesystem boundary, so for a real agent command the separation is only
+ * as real as the environment the agent runs in: `grader-legible-container.ts`
+ * bind-mounts `workspace/` and `bin/` and nothing else, and an unisolated run
+ * has no boundary at all and must not claim one.
  * The archetype's `failureClass`, its expected observation contract and its
  * reference candidate shapes are never written into `workspace/`; the
  * manifest records only a hash of the observation contract, so retained
@@ -68,7 +74,15 @@ async function writeText(path: string, body: string): Promise<void> {
 export async function materializeGraderLegibleArchetype(
   archetype: GraderLegibleArchetype,
   root: string,
-  intervention?: GraderLegibleIntervention
+  intervention?: GraderLegibleIntervention,
+  /**
+   * The task set this materialization is actually part of. Defaults to the
+   * full six-archetype set. A run over a subset (a single-archetype test, a
+   * partial pilot) would otherwise stamp every manifest with the full set's
+   * hash, so the retained artifact would assert a task-set identity the run
+   * never had.
+   */
+  archetypeSet?: readonly GraderLegibleArchetype[]
 ): Promise<GraderLegibleArchetypeLayout> {
   const workspaceDir = join(root, "workspace");
   const binDir = join(root, "bin");
@@ -101,7 +115,7 @@ export async function materializeGraderLegibleArchetype(
       fixtureCommand: archetype.fixtureCommand,
       submissionFilename: GRADER_LEGIBLE_SUBMISSION_FILENAME,
       archetypeHash: graderLegibleArchetypeHash(archetype),
-      archetypeSetHash: graderLegibleArchetypeSetHash(),
+      archetypeSetHash: graderLegibleArchetypeSetHash(archetypeSet),
       // Identity without truth: the expected observation itself is never
       // written to disk, only its content hash.
       observationContractHash: sha256(stableJson(archetype.observationContract)),

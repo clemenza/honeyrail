@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -13,12 +13,20 @@ import {
   readGraderLegibleInvocationLog,
   validateGraderLegibleSubmission
 } from "../server/capability/grader-legible-fixture.js";
-import { graderLegibleIntervention } from "../server/capability/grader-legible-intervention.js";
+import {
+  GRADER_LEGIBLE_CANDIDATE_INTERVENTION,
+  graderLegibleIntervention,
+  graderLegibleInterventionHash
+} from "../server/capability/grader-legible-intervention.js";
+import { graderLegibleImageAvailable } from "../server/capability/grader-legible-container.js";
+import { dockerAvailable } from "../server/postgres/agent-container.js";
 import {
   GraderLegiblePairingError,
+  assertFreshOrMatchingArtifactRoot,
   assertPairedTaskSurface,
   runGraderLegibleAttempt,
-  runGraderLegiblePairedExperiment
+  runGraderLegiblePairedExperiment,
+  type GraderLegibleCandidateProvider
 } from "../server/capability/grader-legible-run.js";
 import {
   SCRIPTED_GRADER_LEGIBLE_PROVIDER,
@@ -246,4 +254,345 @@ test("a diverging task surface fails the pairing check before any comparison is 
   );
   await writeFile(join(candidate.workspaceDir, "BRIEF.md"), "an extra hint the baseline never saw\n");
   await assert.rejects(assertPairedTaskSurface(baseline.workspaceDir, candidate.workspaceDir), GraderLegiblePairingError);
+});
+
+// ---------------------------------------------------------------------------
+// Isolation (Docker-gated)
+//
+// These two tests are the only evidence that the isolation claim is true
+// rather than merely configured. Everything else in this file asserts on
+// structures the harness itself produced; only a probe from inside the
+// container can distinguish "we passed the right -v flags" from "the harness's
+// private material is actually unreachable". They are skipped - never pulled -
+// when the daemon or the stub image is absent, matching this repo's
+// no-implicit-pull rule. See docker/capability-grader-legible-agent-stub/.
+// ---------------------------------------------------------------------------
+
+const STUB_AGENT_IMAGE = "honeyrail-cap-glo-agent-stub:latest";
+
+/** Returns a skip reason, or `null` when the containerized path can actually run. */
+async function isolationSkipReason(): Promise<string | null> {
+  if (!(await dockerAvailable())) return "docker daemon is unavailable; skipping the containerized isolation path";
+  if (!(await graderLegibleImageAvailable(STUB_AGENT_IMAGE))) {
+    return `${STUB_AGENT_IMAGE} is not present locally; build it with \`docker build -t ${STUB_AGENT_IMAGE} docker/capability-grader-legible-agent-stub\` (this repo never pulls)`;
+  }
+  return null;
+}
+
+/**
+ * The stub image's entrypoint takes the fixture command name as its argument;
+ * the fixture binary itself reaches the container only through the read-only
+ * `/workspace/bin` mount, so a provider built this way exercises the mount and
+ * the PATH wiring together.
+ */
+function stubAgentProvider(fixtureCommand: string): GraderLegibleCandidateProvider {
+  return {
+    kind: "command",
+    label: "command:stub-agent (isolation probe)",
+    command: fixtureCommand,
+    timeoutMs: 120_000,
+    isolation: { image: STUB_AGENT_IMAGE, network: "none" }
+  };
+}
+
+test("an agent confined to the container can still solve the task", async (t) => {
+  const reason = await isolationSkipReason();
+  if (reason) return t.skip(reason);
+
+  const archetype = graderLegibleArchetype("cap-glo-002");
+  const attempt = await runGraderLegibleAttempt({
+    archetype,
+    condition: "candidate",
+    provider: stubAgentProvider(archetype.fixtureCommand),
+    artifactDir: await scratch(),
+    attemptId: "cap-glo-isolation:candidate:cap-glo-002",
+    archetypeSet: [archetype]
+  });
+
+  // Sufficiency, not just confinement: if the mounted surface were too thin
+  // the agent would fail for harness reasons and every capability miss under
+  // isolation would be uninterpretable.
+  assert.equal(attempt.status, "completed", attempt.diagnostics.join(" | "));
+  assert.equal(attempt.grade?.result, "grader_legible", attempt.diagnostics.join(" | "));
+});
+
+test("the container hides the fixture source, the manifest and the grader-owned state", async (t) => {
+  const reason = await isolationSkipReason();
+  if (reason) return t.skip(reason);
+
+  const archetype = graderLegibleArchetype("cap-glo-002");
+  const artifactDir = await scratch();
+  const attempt = await runGraderLegibleAttempt({
+    archetype,
+    condition: "candidate",
+    provider: stubAgentProvider(archetype.fixtureCommand),
+    artifactDir,
+    attemptId: "cap-glo-isolation:candidate:cap-glo-002",
+    archetypeSet: [archetype]
+  });
+
+  const probes = JSON.parse(await readFile(join(artifactDir, "workspace", "probe-results.json"), "utf8")) as Record<string, unknown>;
+  // Graded grader-legible, so the fixture on the public mount really ran: the
+  // probes below read as "absent because unreachable", not "absent because the
+  // container was broken and nothing worked".
+  assert.equal(attempt.grade?.result, "grader_legible", attempt.diagnostics.join(" | "));
+  assert.equal(probes.fixtureSource, "absent");
+  assert.equal(probes.archetypeManifest, "absent");
+  assert.equal(probes.graderStateLog, "absent");
+  assert.equal(probes.graderStateDir, "absent");
+  assert.equal(attempt.status, "completed", attempt.diagnostics.join(" | "));
+});
+
+// ---------------------------------------------------------------------------
+// Evidence retention: a used artifact root is refused before any mutation
+// ---------------------------------------------------------------------------
+
+test("a run into an occupied artifact root is refused before the provider or materialization is reached", async () => {
+  const artifactRoot = await scratch();
+  const staleWorkspace = join(artifactRoot, "candidate", "cap-glo-002", "workspace");
+  await mkdir(staleWorkspace, { recursive: true });
+  const stalePath = join(staleWorkspace, GRADER_LEGIBLE_SUBMISSION_FILENAME);
+  await writeFile(stalePath, "#!/bin/sh\n# retained evidence from an earlier run\n");
+  const before = await readFile(stalePath);
+
+  let providerCalls = 0;
+  const archetype = graderLegibleArchetype("cap-glo-002");
+  await assert.rejects(
+    runGraderLegiblePairedExperiment({
+      experimentId: "cap-glo-occupied-root",
+      artifactRoot,
+      archetypes: [archetype],
+      provider: {
+        kind: "scripted",
+        label: "scripted:should-never-run",
+        script: (candidate) => {
+          providerCalls += 1;
+          return candidate.referenceCandidates.good;
+        }
+      }
+    }),
+    GraderLegiblePairingError
+  );
+
+  // The point of failing closed is that nothing was touched, so the check has
+  // to be that the bytes survived - not merely that an error was thrown.
+  assert.equal(providerCalls, 0);
+  assert.deepEqual(await readFile(stalePath), before);
+});
+
+test("a refused run creates no new attempt directory under the occupied root", async () => {
+  const artifactRoot = await scratch();
+  await mkdir(join(artifactRoot, "candidate", "cap-glo-002", "workspace"), { recursive: true });
+  await writeFile(join(artifactRoot, "candidate", "cap-glo-002", "workspace", GRADER_LEGIBLE_SUBMISSION_FILENAME), "stale\n");
+
+  await assert.rejects(
+    runGraderLegiblePairedExperiment({
+      experimentId: "cap-glo-occupied-root",
+      artifactRoot,
+      archetypes: [graderLegibleArchetype("cap-glo-002")],
+      provider: SCRIPTED_GRADER_LEGIBLE_PROVIDER
+    }),
+    GraderLegiblePairingError
+  );
+
+  // Materialization runs per attempt, so a `baseline/` here would mean the
+  // refusal happened after the first attempt had already written to disk.
+  assert.deepEqual((await readdir(artifactRoot)).sort(), ["candidate"]);
+  assert.deepEqual((await readdir(join(artifactRoot, "candidate"))).sort(), ["cap-glo-002"]);
+});
+
+test("an empty artifact root and the root's own report are both accepted", async () => {
+  const artifactRoot = await scratch();
+  const archetype = graderLegibleArchetype("cap-glo-002");
+  const first = await runGraderLegiblePairedExperiment({
+    experimentId: "cap-glo-idempotent",
+    artifactRoot,
+    archetypes: [archetype],
+    provider: SCRIPTED_GRADER_LEGIBLE_PROVIDER
+  });
+  // Re-running the same experiment over the same task set is a resume, not a
+  // silent replacement of someone else's evidence, so it must be allowed.
+  await assertFreshOrMatchingArtifactRoot(artifactRoot, "cap-glo-idempotent", first.archetypeSetHash);
+
+  // Passing the preflight is not the same as completing: the previous run left
+  // its `reproducer.sh` in each workspace, and re-materializing on top of it
+  // would pull a submission into the as-presented surface hash and desynchronize
+  // the pair. Assert the whole rerun, not just the gate in front of it.
+  const second = await runGraderLegiblePairedExperiment({
+    experimentId: "cap-glo-idempotent",
+    artifactRoot,
+    archetypes: [archetype],
+    provider: SCRIPTED_GRADER_LEGIBLE_PROVIDER
+  });
+  assert.equal(second.pairedTaskSurfaceHash, first.pairedTaskSurfaceHash);
+  assert.deepEqual(
+    second.conditions.map((condition) => condition.graderLegible),
+    first.conditions.map((condition) => condition.graderLegible)
+  );
+  // The fixture state directory is rebuilt too, so invocation counts describe
+  // this run rather than accumulating across reruns.
+  assert.deepEqual(
+    second.attempts.map((attempt) => attempt.telemetry.fixtureInvocationCount),
+    first.attempts.map((attempt) => attempt.telemetry.fixtureInvocationCount)
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Attribution and rate arithmetic
+// ---------------------------------------------------------------------------
+
+test("an agent that exhausts its budget is attributed to a resource limit, not to an invalid submission", async () => {
+  const attempt = await runGraderLegibleAttempt({
+    archetype: graderLegibleArchetype("cap-glo-002"),
+    condition: "candidate",
+    provider: {
+      kind: "command",
+      label: "command:sleep (budget exhaustion)",
+      command: "/bin/sh",
+      args: ["-c", "sleep 30"],
+      timeoutMs: 400
+    },
+    artifactDir: await scratch(),
+    attemptId: "cap-glo-timeout:candidate:cap-glo-002",
+    archetypeSet: [graderLegibleArchetype("cap-glo-002")]
+  });
+
+  // Status alone cannot carry this: a timed-out agent and an agent that simply
+  // wrote nothing both end with no submission on disk.
+  assert.equal(attempt.primaryCause, "agent_resource_limit");
+  assert.equal(attempt.telemetry.agentTimedOut, true);
+  assert.equal(attempt.grade, null);
+});
+
+test("end-to-end budget success and conditional rediscovery are computed over different denominators", async () => {
+  const archetypes = [graderLegibleArchetype("cap-glo-001"), graderLegibleArchetype("cap-glo-002")];
+  const report = await runGraderLegiblePairedExperiment({
+    experimentId: "cap-glo-rate-arithmetic",
+    artifactRoot: await scratch(),
+    archetypes,
+    provider: {
+      kind: "scripted",
+      label: "scripted:one-submission-missing",
+      // An empty submission never reaches the grader, so it lands in A but not
+      // in E - exactly the attempt D/E would silently discard.
+      script: (archetype, condition) => (archetype.archetypeId === "cap-glo-001" ? "" : archetype.referenceCandidates.good)
+    }
+  });
+
+  for (const condition of report.conditions) {
+    assert.equal(condition.attempts, 2, condition.condition);
+    assert.equal(condition.completed, 1, condition.condition);
+    assert.equal(condition.graderLegible, 1, condition.condition);
+    assert.equal(condition.graderLegibleRate, 1, `D/E for ${condition.condition}`);
+    assert.equal(condition.endToEndBudgetSuccessRate, 0.5, `D/A for ${condition.condition}`);
+    assert.equal(
+      Object.values(condition.causeCounts).reduce((sum, count) => sum + count, 0),
+      condition.attempts,
+      `cause counts must sum to A for ${condition.condition}`
+    );
+    assert.equal(condition.causeCounts.completed_success, 1, condition.condition);
+    assert.equal(condition.causeCounts.agent_invalid_submission, 1, condition.condition);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Capability eligibility and identity
+// ---------------------------------------------------------------------------
+
+test("a command provider without isolation or a declared identity is not capability evidence", async () => {
+  const report = await runGraderLegiblePairedExperiment({
+    experimentId: "cap-glo-bare-command",
+    artifactRoot: await scratch(),
+    archetypes: [graderLegibleArchetype("cap-glo-002")],
+    provider: { kind: "command", label: "command:/usr/bin/true", command: "/usr/bin/true", timeoutMs: 10_000 }
+  });
+
+  // "It was a real process" was never the bar: an unisolated, unattributed
+  // command tells you nothing about which agent produced the number.
+  assert.equal(report.capabilityEvidenceEligible, false);
+  assert.equal(report.realAgentIdentity, null);
+});
+
+test("a declared, isolated command provider is eligible and its retained identity carries no secrets", async () => {
+  const secretMarker = "cap-glo-test-secret-a7f3e1d9";
+  const report = await runGraderLegiblePairedExperiment({
+    experimentId: "cap-glo-declared-identity",
+    artifactRoot: await scratch(),
+    archetypes: [graderLegibleArchetype("cap-glo-002")],
+    submissionTimeoutMs: 5_000,
+    provider: {
+      kind: "command",
+      label: "command:declared",
+      command: "/usr/bin/true",
+      env: { HONEYRAIL_TEST_API_KEY: secretMarker },
+      timeoutMs: 5_000,
+      isolation: { image: STUB_AGENT_IMAGE, network: "none" },
+      realAgentIdentity: {
+        model: "test-model-1",
+        agentName: "test-agent",
+        agentVersion: "0.0.0-test",
+        // Absolute, with a directory name that must not survive into evidence.
+        commandIdentity: "/home/operator/private-tooling/agent-bin",
+        repositoryCommit: "0000000000000000000000000000000000000000"
+      }
+    }
+  });
+
+  assert.equal(report.capabilityEvidenceEligible, true);
+  assert.deepEqual(report.realAgentIdentity, {
+    provider: "command",
+    model: "test-model-1",
+    agentName: "test-agent",
+    agentVersion: "0.0.0-test",
+    isolationPolicy: "docker",
+    // Basename only: the operator's directory layout is not part of who the
+    // agent was, and retained evidence is shared more widely than the host is.
+    commandIdentity: "agent-bin",
+    repositoryCommit: "0000000000000000000000000000000000000000",
+    enforcedBudgets: { agentTimeoutMs: 5_000, submissionTimeoutMs: 5_000 }
+  });
+  // The provider environment is the obvious place for a credential, so the
+  // report must never have copied it anywhere - not into identity, not into a
+  // diagnostic, not into a telemetry echo.
+  assert.equal(JSON.stringify(report).includes(secretMarker), false);
+});
+
+// ---------------------------------------------------------------------------
+// Paired surface and frozen intervention regressions
+// ---------------------------------------------------------------------------
+
+test("the paired task-surface comparison sees divergence inside nested subdirectories", async () => {
+  const archetype = graderLegibleArchetype("cap-glo-003");
+  const baseline = await materializeGraderLegibleArchetype(archetype, await scratch(), graderLegibleIntervention("baseline"), [archetype]);
+  const candidate = await materializeGraderLegibleArchetype(archetype, await scratch(), graderLegibleIntervention("candidate"), [archetype]);
+
+  // Identical nested content: still paired. A hash that only walked the top
+  // level would also pass here, which is why the divergent case below matters.
+  for (const layout of [baseline, candidate]) {
+    await mkdir(join(layout.workspaceDir, "notes", "deep"), { recursive: true });
+    await writeFile(join(layout.workspaceDir, "notes", "deep", "context.md"), "shared\n");
+  }
+  await assertPairedTaskSurface(baseline.workspaceDir, candidate.workspaceDir);
+
+  await writeFile(join(candidate.workspaceDir, "notes", "deep", "context.md"), "candidate-only hint\n");
+  await assert.rejects(
+    assertPairedTaskSurface(baseline.workspaceDir, candidate.workspaceDir),
+    GraderLegiblePairingError
+  );
+});
+
+test("the candidate intervention still matches its recorded hash and the frozen corpus artifact", async () => {
+  const live = graderLegibleIntervention("candidate");
+  assert.equal(live.interventionId, GRADER_LEGIBLE_CANDIDATE_INTERVENTION.interventionId);
+  assert.equal(live.interventionHash, graderLegibleInterventionHash(live.interventionId, live.body));
+
+  // The frozen artifact is what an unseen-family run would receive, so a body
+  // edit that forgot to re-freeze must fail here rather than silently produce
+  // "validated the frozen intervention" for a different text.
+  const frozen = JSON.parse(
+    await readFile(new URL("../corpus/capability-grader-legible-intervention-v1.json", import.meta.url), "utf8")
+  ) as { intervention: { interventionId: string; interventionHash: string; body: string } };
+  assert.equal(frozen.intervention.interventionId, live.interventionId);
+  assert.equal(frozen.intervention.interventionHash, live.interventionHash);
+  assert.equal(frozen.intervention.body, live.body);
 });

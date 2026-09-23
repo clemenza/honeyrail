@@ -24,6 +24,7 @@ Applies [evaluation-report-v1](../evaluation-protocol.md). Design reference: [Ca
 - Grader: `server/capability/grader-legible-grader.ts`, report schema version 1, two executions per attempt.
 - Model/provider/version: **not applicable to this record** — no model was run. The one executed paired run used a scripted provider and is explicitly `capabilityEvidenceEligible: false`.
 - Build/runtime identity: Node 24.20.0, macOS, no Docker, no PostgreSQL, no network. Fixtures are POSIX-sh; execution uses a constructed environment (`PATH` = fixture `bin` plus standard system directories, plus `HONEYRAIL_FIXTURE_STATE`), not the operator's shell environment.
+- Agent isolation: none in this record, because no agent ran. A real-agent run records its own isolation policy and declared identity in the report as `realAgentIdentity`; without a Docker image the agent would execute on the host beside the harness's private material, and such a run is `capabilityEvidenceEligible: false` by construction rather than by reviewer discretion.
 - Enforced limits: per-execution submission timeout (default 30 s, process-group kill), per-attempt agent budget (default 10 min), submission size ≤ 16 KiB.
 
 | Task ID | Opaque causal family | Partition | Prior development exposure | Task/context hash | Evidence custodian reference |
@@ -43,7 +44,7 @@ The Historical PostgreSQL cases from Studies 1–3 appear in this experiment onl
 - Retry policy: a retry is a new attempt ID into a fresh artifact root. The runner refuses to overwrite an artifact root holding another experiment's report, so a failed attempt cannot be silently replaced.
 - Engineering smoke: every scripted-provider run, including the one below, is designated engineering/harness validation and excluded from any formal capability ledger.
 - Pairing: same task surface per archetype, enforced by comparing each attempt's as-presented task-surface hash before any comparison is reported.
-- Metrics: grader-legible successes over completed attempts, per condition, with non-capability outcomes (`invalid_submission`, `integrity_error`, `infrastructure_error`) reported separately and failure-stage counts alongside. Six archetypes is a small sample; counts only, no reliability claim.
+- Metrics: primary endpoint is end-to-end budget success `D/A` — grader-legible successes over every formal attempt, per condition. Conditional rediscovery `D/E` (over completed attempts) is reported beside it and never alone, since it excludes everything that failed before grading. Non-capability outcomes (`invalid_submission`, `integrity_error`, `infrastructure_error`) are reported separately, alongside failure-stage counts and a `primaryCause` census in evaluation-report-v1 vocabulary that sums to `A`. Six archetypes is a small sample; counts only, no reliability claim.
 
 ## Attempt ledger
 
@@ -56,11 +57,13 @@ The Historical PostgreSQL cases from Studies 1–3 appear in this experiment onl
 - Planned: 12 engineering-validation cells. Started: 12. Pending: 0. Cancelled before start: 0.
 - Real-agent formal cells: **0 started**. This record is partial by design; the capability question is unanswered.
 
-| Task/partition/condition | Attempts A | Completed | Grader-legible D | D / completed | Non-capability outcomes | Failure stages |
-|---|---|---|---|---|---|---|
-| `cap-glo-*` TRAIN / baseline (scripted, engineering) | 6 | 6 | 0 | 0.000 | 0 / 0 / 0 | `exit_status_mismatch` 2, `stdout_shape_mismatch` 3, `nondeterministic_output` 1 |
-| `cap-glo-*` TRAIN / candidate (scripted, engineering) | 6 | 6 | 6 | 1.000 | 0 / 0 / 0 | — |
-| `cap-glo-*` TRAIN / real agent | 0 | 0 | 0 | N/A | N/A | N/A |
+| Task/partition/condition | Attempts A | Eligible E | Grader-legible D | D/A | D/E | Non-capability outcomes | Failure stages |
+|---|---|---|---|---|---|---|---|
+| `cap-glo-*` TRAIN / baseline (scripted, engineering) | 6 | 6 | 0 | 0.000 | 0.000 | 0 / 0 / 0 | `exit_status_mismatch` 2, `stdout_shape_mismatch` 3, `nondeterministic_output` 1 |
+| `cap-glo-*` TRAIN / candidate (scripted, engineering) | 6 | 6 | 6 | 1.000 | 1.000 | 0 / 0 / 0 | — |
+| `cap-glo-*` TRAIN / real agent | 0 | 0 | 0 | N/A | N/A | N/A | N/A |
+
+`D/A` and `D/E` coincide here only because the scripted provider never fails before grading; on a real-agent run they diverge, which is why both are recorded.
 
 **What this does and does not show.** The engineering rows are a staged demonstration: a scripted provider submitted predetermined shapes, so the 0/6 and 6/6 are properties of those shapes and of the grader, not of any model. They establish that the instrument distinguishes a self-asserting reproducer from a grader-legible one, attributes the miss to a specific stage, and retains raw observations either way. They establish nothing about whether the intervention improves an agent. Per the evaluation protocol, a scripted agent must not be promoted into capability evidence, and the runner marks these runs `capabilityEvidenceEligible: false`.
 
@@ -75,7 +78,7 @@ The Historical PostgreSQL cases from Studies 1–3 appear in this experiment onl
 | End-to-end paired run | `npm run capability-glo-237` | 12 attempts, paired surface hash verified, report written |
 | Freeze | `npm run capability-glo-237-freeze` | written and idempotent on rerun |
 
-Automated coverage of the properties #237 asks for: the six failure classes are covered exactly once; agent-visible material does not contain the expected observation or the failure-class name; grader diagnostics do not echo expected values; an invalid execution, a missing submission, an oversized submission and an agent that cannot start are each classified away from capability misses; nondeterministic output is attributed to determinism specifically; a submission that never ran the discriminating experiment is attributed upstream of output shape; a diverging task surface is refused; a rerun into an occupied artifact root is refused; a modified frozen intervention body is refused.
+Automated coverage of the properties #237 asks for: the six failure classes are covered exactly once; agent-visible material does not contain the expected observation or the failure-class name; grader diagnostics do not echo expected values; an invalid execution, a missing submission, an oversized submission and an agent that cannot start are each classified away from capability misses; nondeterministic output is attributed to determinism specifically; a submission that never ran the discriminating experiment is attributed upstream of output shape; a diverging task surface is refused; a rerun into an occupied artifact root is refused before any materialization or provider call, with the retained submission left byte-identical, while a rerun of the same experiment over the same task set is accepted and reproduces its own surface hash and counts; an agent that exhausts its budget is attributed to a resource limit rather than an invalid submission; `causeCounts` sums to `A`; a bare command provider is capability-ineligible, a declared and isolated one is eligible, and the provider environment never reaches the retained report. Two further tests probe from inside the container that the fixture source, archetype manifest and grader state are unreachable; they require Docker and a locally built stub image and skip — never pull — otherwise.
 
 ## Exit-criteria mapping (#237)
 
@@ -90,7 +93,9 @@ Automated coverage of the properties #237 asks for: the six failure classes are 
 | No family-003 C0–C3 contamination | met — not used |
 | No family-004 run during implementation/debugging | met — not consumed |
 | Candidate content-hashed and frozen before any family-004 validation | met — `corpus/capability-grader-legible-intervention-v1.json` |
-| Exact commands, environment, logs, submissions, grader results and attribution retained | met for the executed run; artifacts retained operator-side |
+| Exact commands, environment, logs, submissions, grader results and attribution retained | met for the executed run; artifacts retained operator-side, and a rerun into an occupied root is refused before it can overwrite them |
+| Real-agent runs separated from the harness's private material | instrument met (opt-in Docker isolation, probed from inside the container); **unexercised in this record — no agent ran** |
+| Real-agent runs attributable to a declared identity | instrument met (`realAgentIdentity`, required for eligibility, carries no provider environment); **unexercised in this record** |
 
 ## Decision and next steps
 

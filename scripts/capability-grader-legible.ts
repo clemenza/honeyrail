@@ -12,10 +12,18 @@
  *   HONEYRAIL_CAP_GLO_AGENT_ARGS      JSON array of arguments
  *   HONEYRAIL_CAP_GLO_AGENT_ENV       JSON object merged into the agent environment
  *   HONEYRAIL_CAP_GLO_AGENT_TIMEOUT_MS  per-attempt agent budget
+ *   HONEYRAIL_CAP_GLO_AGENT_IMAGE     docker image to confine the agent in; without it
+ *                                     the agent runs on the host and the run is not
+ *                                     capability-eligible. Must already exist locally.
+ *   HONEYRAIL_CAP_GLO_AGENT_NETWORK   container network (default: bridge)
+ *   HONEYRAIL_CAP_GLO_AGENT_IDENTITY  JSON object {model, agentName, agentVersion,
+ *                                     commandIdentity, repositoryCommit} declaring who the
+ *                                     agent is. Required for capability eligibility.
  *
- * Only `PROVIDER=command` produces capability evidence. The scripted providers
- * validate the instrument (materialization, external capture, grading,
- * attribution, pairing) and are reported as such.
+ * Capability evidence requires all three: a real agent command, an isolation
+ * image, and a declared identity. The scripted providers validate the
+ * instrument (materialization, external capture, grading, attribution,
+ * pairing) and are reported as such.
  */
 
 import { resolve } from "node:path";
@@ -23,6 +31,7 @@ import {
   runGraderLegiblePairedExperiment,
   type GraderLegibleCandidateProvider
 } from "../server/capability/grader-legible-run.js";
+import { graderLegibleImageAvailable } from "../server/capability/grader-legible-container.js";
 import {
   SCRIPTED_GRADER_LEGIBLE_PROVIDER,
   SCRIPTED_PAIRED_DEMONSTRATION_PROVIDER,
@@ -50,13 +59,34 @@ function resolveProvider(): GraderLegibleCandidateProvider {
       if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
         throw new Error("HONEYRAIL_CAP_GLO_AGENT_TIMEOUT_MS must be a positive number of milliseconds.");
       }
+      const image = String(process.env.HONEYRAIL_CAP_GLO_AGENT_IMAGE || "").trim();
+      const identity = process.env.HONEYRAIL_CAP_GLO_AGENT_IDENTITY
+        ? (JSON.parse(process.env.HONEYRAIL_CAP_GLO_AGENT_IDENTITY) as Record<string, string>)
+        : undefined;
+      if (identity) {
+        // Validated here rather than at report time: a missing field would
+        // otherwise surface as `undefined` inside retained evidence.
+        for (const field of ["model", "agentName", "agentVersion", "commandIdentity", "repositoryCommit"]) {
+          if (!identity[field]) throw new Error(`HONEYRAIL_CAP_GLO_AGENT_IDENTITY is missing "${field}".`);
+        }
+      }
       return {
         kind: "command",
         label: `command:${command}`,
         command,
         args: process.env.HONEYRAIL_CAP_GLO_AGENT_ARGS ? JSON.parse(process.env.HONEYRAIL_CAP_GLO_AGENT_ARGS) : [],
         env: process.env.HONEYRAIL_CAP_GLO_AGENT_ENV ? JSON.parse(process.env.HONEYRAIL_CAP_GLO_AGENT_ENV) : undefined,
-        timeoutMs
+        timeoutMs,
+        isolation: image ? { image, network: process.env.HONEYRAIL_CAP_GLO_AGENT_NETWORK?.trim() || undefined } : undefined,
+        realAgentIdentity: identity
+          ? {
+              model: identity.model,
+              agentName: identity.agentName,
+              agentVersion: identity.agentVersion,
+              commandIdentity: identity.commandIdentity,
+              repositoryCommit: identity.repositoryCommit
+            }
+          : undefined
       };
     }
     default:
@@ -66,7 +96,20 @@ function resolveProvider(): GraderLegibleCandidateProvider {
   }
 }
 
-const report = await runGraderLegiblePairedExperiment({ experimentId, artifactRoot, provider: resolveProvider() });
+const provider = resolveProvider();
+
+// Preflight, so a missing image fails once with a build hint instead of twelve
+// times as a per-attempt infrastructure error. Never pulls: which image the
+// agent ran in is part of the evidence, so it is the operator's to place.
+if (provider.kind === "command" && provider.isolation) {
+  if (!(await graderLegibleImageAvailable(provider.isolation.image))) {
+    throw new Error(
+      `Isolation image "${provider.isolation.image}" is not present locally. Build or load it first; this harness never pulls.`
+    );
+  }
+}
+
+const report = await runGraderLegiblePairedExperiment({ experimentId, artifactRoot, provider });
 
 process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 process.stdout.write(
@@ -76,12 +119,19 @@ process.stdout.write(
     `  paired task-surface hash:   ${report.pairedTaskSurfaceHash}\n` +
     `  provider:                   ${report.providerLabel}\n` +
     `  capability evidence:        ${report.capabilityEvidenceEligible ? "eligible" : "NOT eligible (harness validation only)"}\n` +
+    `  agent identity:             ${report.realAgentIdentity ? `${report.realAgentIdentity.agentName} ${report.realAgentIdentity.agentVersion} (${report.realAgentIdentity.model}), isolation ${report.realAgentIdentity.isolationPolicy}` : "undeclared"}\n` +
     report.conditions
       .map(
         (condition) =>
-          `  ${condition.condition.padEnd(10)} grader-legible ${condition.graderLegible}/${condition.completed} completed ` +
-          `(rate ${condition.graderLegibleRate === null ? "N/A" : condition.graderLegibleRate.toFixed(3)}), ` +
-          `non-capability outcomes ${JSON.stringify(condition.nonCapabilityOutcomes)}, stages ${JSON.stringify(condition.failureStages)}\n`
+          // D/A first and D/E second, deliberately: the conditional rate reads
+          // like a capability number but excludes everything that failed before
+          // grading, so it must never be the line a reader sees alone.
+          `  ${condition.condition.padEnd(10)} end-to-end budget success (D/A) ` +
+          `${condition.graderLegible}/${condition.attempts} = ${condition.endToEndBudgetSuccessRate === null ? "N/A" : condition.endToEndBudgetSuccessRate.toFixed(3)}, ` +
+          `conditional grader-legible rate (D/E) ${condition.graderLegible}/${condition.completed} = ` +
+          `${condition.graderLegibleRate === null ? "N/A" : condition.graderLegibleRate.toFixed(3)}\n` +
+          `  ${" ".repeat(10)} causes ${JSON.stringify(condition.causeCounts)}\n` +
+          `  ${" ".repeat(10)} non-capability outcomes ${JSON.stringify(condition.nonCapabilityOutcomes)}, stages ${JSON.stringify(condition.failureStages)}\n`
       )
       .join("") +
     `  artifacts:                  ${artifactRoot}\n`
