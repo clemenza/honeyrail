@@ -277,6 +277,10 @@ Goal
 
 The DSH x tinytable-evals mutation-testing demo (agent-as-test-engineer, kill-rate scoring) is documented in [docs/dsh-evals-demo.md](docs/dsh-evals-demo.md).
 
+## Capability Lab
+
+Controllable, dependency-free microtasks pulled by gaps observed in Historical PostgreSQL work. The first set targets grader-legible observable and reproducer-output construction — turning a behavioral hypothesis into an artifact whose discriminating signal an external evaluator can read directly. See [docs/capability-lab-grader-legible.md](docs/capability-lab-grader-legible.md) for the archetypes, grading contract, paired baseline/candidate runner and freeze workflow, and [docs/experiments/capability-grader-legible-237-2026-09-22.md](docs/experiments/capability-grader-legible-237-2026-09-22.md) for its current (partial) experiment record. The archetypes are harness-validated; no real-agent capability result exists yet. A run counts as capability evidence only with all three of a real agent command, a locally present Docker isolation image and a declared agent identity — the runner marks anything else ineligible rather than leaving it to the reader.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
