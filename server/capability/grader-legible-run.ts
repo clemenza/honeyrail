@@ -708,19 +708,31 @@ async function runIsolatedAgentCommand(
       agentExecutionEstablished: false
     };
   }
-  // `command -v` before the second marker is what makes it mean anything: it
-  // proves the program about to be exec'd is *resolvable* - found on PATH, or a
-  // path that exists with its execute bit set. It does not prove `exec` cannot
-  // fail for some other reason (a corrupt binary, a missing shared library, a
-  // shebang naming an absent interpreter); those remain indistinguishable from
-  // an agent that ran and submitted nothing. Accepted: this is the smallest
-  // reliable check that closes the common case (misconfigured command, wrong
-  // image) without putting a process supervisor inside the container.
+  // The check before the second marker is what makes it mean anything: it
+  // proves the program about to be exec'd is an *executable file* the harness
+  // could establish as a launch target. `command -v` alone is not that check -
+  // for an argument containing `/` POSIX lets it report success on a path that
+  // merely exists, so a 0644 file would set the marker and then fail `exec`
+  // with EACCES, recorded as an agent that ran and submitted nothing. So an
+  // explicit path is tested directly, and a bare name is resolved on PATH
+  // first and the resolution tested the same way.
+  //
+  // What it establishes is "the launch target exists and is an executable,
+  // non-directory file", not "`exec` cannot fail". A corrupt binary, a missing
+  // shared library or a shebang naming an absent interpreter still pass here
+  // and remain indistinguishable from an agent that ran and submitted nothing.
+  // Accepted: this is the smallest reliable check that closes the common cases
+  // (misconfigured command, wrong image, wrong permission bits) without
+  // putting a process supervisor inside the container.
   const wrapper = [
     'containerMarker="$1"; shift',
     'agentMarker="$1"; shift',
     'touch "$containerMarker"',
-    'if command -v "$1" >/dev/null 2>&1; then',
+    'case "$1" in',
+    '  */*) target="$1" ;;',
+    '  *) target=$(command -v "$1" 2>/dev/null) ;;',
+    "esac",
+    'if [ -n "$target" ] && [ -x "$target" ] && [ ! -d "$target" ]; then',
     '  touch "$agentMarker"',
     '  exec "$@"',
     "fi",

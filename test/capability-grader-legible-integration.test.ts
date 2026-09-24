@@ -515,6 +515,44 @@ test("an agent executable that never launches is an infrastructure failure, not 
   assert.equal(report.capabilityEvidenceEligible, false);
 });
 
+test("an agent path that exists but is not executable is an infrastructure failure, not an invalid submission", async (t) => {
+  const reason = await noEntrypointSkipReason();
+  if (reason) return t.skip(reason);
+
+  // The narrower sibling of the test above, and the one `command -v` alone got
+  // wrong: the configured path *does* exist inside a container that started, so
+  // for an argument containing `/` POSIX lets `command -v` report success - and
+  // the marker was written - even though the file is mode 0644 and the `exec`
+  // that follows fails with EACCES. That produced an attempt claiming the agent
+  // ran, on a report that still called itself capability evidence.
+  const report = await runGraderLegiblePairedExperiment({
+    experimentId: "cap-glo-agent-not-executable",
+    artifactRoot: await scratch(),
+    archetypes: [graderLegibleArchetype("cap-glo-002")],
+    submissionTimeoutMs: 5_000,
+    provider: launchProvider(
+      "/usr/local/bin/non-executable-stub",
+      [],
+      "command:non-executable-path (launch probe)",
+      60_000
+    )
+  });
+
+  assert.ok(report.attempts.length > 0, "the run should have produced attempts");
+  for (const attempt of report.attempts) {
+    const context = attempt.diagnostics.join(" | ");
+    assert.equal(attempt.telemetry.isolationEstablished, true, context);
+    assert.equal(attempt.telemetry.agentExecutionEstablished, false, context);
+    assert.equal(attempt.status, "infrastructure_error", context);
+    assert.equal(attempt.primaryCause, "infrastructure", context);
+
+    const entries = await readdir(join(attempt.artifactDir, "workspace"));
+    assert.ok(!entries.includes("reproducer.sh"), `a submission appeared without any agent: ${entries.join(", ")}`);
+  }
+
+  assert.equal(report.capabilityEvidenceEligible, false);
+});
+
 test("an agent that launches and submits nothing is still the agent's own outcome", async (t) => {
   const reason = await noEntrypointSkipReason();
   if (reason) return t.skip(reason);

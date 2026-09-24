@@ -64,6 +64,14 @@ RUN chmod 0755 /usr/local/bin/stub-agent
 FROM base AS no-entrypoint
 ENTRYPOINT []
 
+# A file that exists at a plausible agent path and is deliberately NOT
+# executable. `command -v` on an argument containing `/` can report success for
+# it, so it is the fixture for the case where the launch target resolves and
+# `exec` would still fail with EACCES: the harness must refuse to claim the
+# agent executed. Mode 0644 is the whole point; do not chmod it.
+RUN printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/non-executable-stub \
+  && chmod 0644 /usr/local/bin/non-executable-stub
+
 # Last, so the plain `docker build` above still produces the stub agent.
 #
 # containerHardeningArgs() runs the container --read-only with a non-root
