@@ -44,9 +44,10 @@
  * grader-legible-run.ts). When isolation *is* requested,
  * `runGraderLegiblePairedExperiment()` resolves the image identity before the
  * first attempt - and that resolution proves only that the image exists.
- * Whether a container then actually started is established separately, per
- * attempt, by a marker the container writes into the facade channel before the
- * agent runs; `capabilityEvidenceEligible` requires both.
+ * Whether a container then actually started, and whether the configured agent
+ * executable then actually launched inside it, are established separately and
+ * per attempt, by two markers the wrapper writes into the facade channel;
+ * `capabilityEvidenceEligible` requires all three.
  */
 
 import { resolve } from "node:path";
@@ -141,6 +142,14 @@ export function buildGraderLegibleContainerArgs(options: GraderLegibleContainerO
   return args;
 }
 
+/** Raised when an isolation precondition cannot be *established*, as distinct from being absent. */
+export class GraderLegibleIsolationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GraderLegibleIsolationError";
+  }
+}
+
 /**
  * The image's configured exec-form entrypoint, or `[]` when it declares none.
  *
@@ -152,21 +161,54 @@ export function buildGraderLegibleContainerArgs(options: GraderLegibleContainerO
  * fixture name it is invoked with.
  *
  * A shell-form entrypoint arrives from docker already normalized to
- * `["/bin/sh", "-c", ...]`, so it needs no special handling. A failed inspect
- * yields `[]`: the caller has already established the image exists, and if it
- * has not, the run is about to fail for that reason anyway.
+ * `["/bin/sh", "-c", ...]`, so it needs no special handling.
+ *
+ * Fails closed, and that is the whole point of the shape checks below. An
+ * earlier version returned `[]` both when the image genuinely declared no
+ * entrypoint and when the inspect or the parse failed, which conflated "there
+ * is no entrypoint" with "we could not find out". The second case silently
+ * drops the image's declared entrypoint from the argv, so the agent command
+ * runs as its own program - a different agent than the one the operator
+ * configured, reported as if it were the configured one. Only a genuinely
+ * absent (`null`/missing) entrypoint yields `[]`; anything we cannot read
+ * throws and the caller treats that attempt as an infrastructure failure.
+ *
+ * Plain `docker image inspect` plus `JSON.parse`, not a Go `--format`
+ * template, for the reason documented in `server/postgres/image-identity.ts`:
+ * templates fail unpredictably on real daemons when a key is absent from a
+ * config map, and a fail-closed reader that spuriously throws is its own
+ * problem.
  */
 export async function graderLegibleImageEntrypoint(image: string, runCommand = runCommandSafe): Promise<string[]> {
-  const result = await runCommand("docker", ["image", "inspect", image, "--format", "{{json .Config.Entrypoint}}"], {
-    timeout: 20_000
-  });
-  if (!result.ok) return [];
-  try {
-    const parsed: unknown = JSON.parse(result.stdout.trim() || "null");
-    return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : [];
-  } catch {
-    return [];
+  const result = await runCommand("docker", ["image", "inspect", image], { timeout: 20_000 });
+  if (!result.ok) {
+    throw new GraderLegibleIsolationError(
+      `could not inspect image ${image} to read its entrypoint: ${result.stderr.trim() || "docker reported a failure with no diagnostic"}`
+    );
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result.stdout);
+  } catch (error) {
+    throw new GraderLegibleIsolationError(
+      `could not parse docker image inspect output for ${image}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0 || typeof parsed[0] !== "object" || parsed[0] === null) {
+    throw new GraderLegibleIsolationError(`docker image inspect returned no record for image ${image}`);
+  }
+  const config = (parsed[0] as { Config?: unknown }).Config;
+  if (config !== undefined && config !== null && typeof config !== "object") {
+    throw new GraderLegibleIsolationError(`docker image inspect returned an unreadable Config for image ${image}`);
+  }
+  const entrypoint = (config as { Entrypoint?: unknown } | undefined | null)?.Entrypoint;
+  if (entrypoint === undefined || entrypoint === null) return [];
+  if (!Array.isArray(entrypoint) || entrypoint.some((entry) => typeof entry !== "string")) {
+    throw new GraderLegibleIsolationError(
+      `image ${image} declares an entrypoint we cannot read: expected an array of strings, got ${JSON.stringify(entrypoint)}`
+    );
+  }
+  return entrypoint as string[];
 }
 
 /**

@@ -39,17 +39,35 @@
 # present so this image can stand in for the shape of a real agent image
 # without the test depending on a second base.
 #
-# Build:
+# Build (both tags; the second is needed by the launch-attribution tests):
 #   docker build -t honeyrail-cap-glo-agent-stub:latest docker/capability-grader-legible-agent-stub
+#   docker build --target no-entrypoint -t honeyrail-cap-glo-no-entrypoint-stub:latest \
+#     docker/capability-grader-legible-agent-stub
 
-FROM node:24-bookworm-slim
+FROM node:24-bookworm-slim AS base
 
 # The stub is baked in rather than bind-mounted. A mounted stub would be a
 # fourth mount, and the thing under test is precisely which mounts exist.
 COPY stub-agent.sh /usr/local/bin/stub-agent
 RUN chmod 0755 /usr/local/bin/stub-agent
 
+# A second tag that declares no entrypoint, so `provider.command` is the program
+# actually exec'd rather than an argument to one. The isolated runner's wrapper
+# checks the program it is about to exec, which with an ENTRYPOINT is the
+# entrypoint - correct, but it leaves no way to test a *provider command* that
+# does not exist. This stage gives the tests an image where the provider command
+# is the exec target: pointed at a nonexistent path it proves the container
+# started and the agent did not launch; pointed at /bin/true it proves an agent
+# that did launch and submitted nothing is still the agent's own outcome;
+# pointed at /bin/sleep it proves a timeout is a resource limit. `node:24`
+# declares ENTRYPOINT ["docker-entrypoint.sh"], so clearing it is the point.
+FROM base AS no-entrypoint
+ENTRYPOINT []
+
+# Last, so the plain `docker build` above still produces the stub agent.
+#
 # containerHardeningArgs() runs the container --read-only with a non-root
 # --user, so nothing here may assume a writable image filesystem or a home
 # directory; the stub writes only into /workspace and /tmp.
+FROM base AS stub
 ENTRYPOINT ["/usr/local/bin/stub-agent"]

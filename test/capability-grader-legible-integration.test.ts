@@ -19,8 +19,13 @@ import {
   graderLegibleIntervention,
   graderLegibleInterventionHash
 } from "../server/capability/grader-legible-intervention.js";
-import { graderLegibleImageAvailable } from "../server/capability/grader-legible-container.js";
+import {
+  GraderLegibleIsolationError,
+  graderLegibleImageAvailable,
+  graderLegibleImageEntrypoint
+} from "../server/capability/grader-legible-container.js";
 import { dockerAvailable } from "../server/postgres/agent-container.js";
+import type { RunCommand } from "../server/postgres/runtime.js";
 import {
   GraderLegiblePairingError,
   assertArtifactRootUnused,
@@ -324,10 +329,11 @@ test("an agent confined to the container can still solve the task", async (t) =>
   // every capability miss under isolation would be uninterpretable.
   assert.equal(attempt.status, "completed", attempt.diagnostics.join(" | "));
   assert.equal(attempt.grade?.result, "grader_legible", attempt.diagnostics.join(" | "));
-  // The positive half of the isolation-established signal: a container that did
-  // start says so from inside, so the flag distinguishes outcomes rather than
-  // being uniformly false and vacuously safe.
+  // The positive half of both launch signals: a container that did start and an
+  // agent that did launch say so from inside, so the flags distinguish outcomes
+  // rather than being uniformly false and vacuously safe.
   assert.equal(attempt.telemetry.isolationEstablished, true);
+  assert.equal(attempt.telemetry.agentExecutionEstablished, true);
 });
 
 test("a container that never starts is an isolation failure, not an invalid submission", async (t) => {
@@ -367,6 +373,9 @@ test("a container that never starts is an isolation failure, not an invalid subm
   for (const attempt of report.attempts) {
     const context = attempt.diagnostics.join(" | ");
     assert.equal(attempt.telemetry.isolationEstablished, false, context);
+    // No container, so no agent either. Asserted so the two flags cannot both
+    // collapse into one signal that happens to be set by whichever ran first.
+    assert.notEqual(attempt.telemetry.agentExecutionEstablished, true, context);
     // The attribution that matters: blaming the agent for a failure of the
     // harness's own infrastructure is how a broken run becomes a capability
     // number.
@@ -385,6 +394,173 @@ test("a container that never starts is an isolation failure, not an invalid subm
   // gate is a property of the report, and it is the thing that previously let
   // a run with zero established containers present itself as evidence.
   assert.equal(report.capabilityEvidenceEligible, false);
+});
+
+// ---------------------------------------------------------------------------
+// Entrypoint inspection fails closed (no Docker: the reader is injected)
+// ---------------------------------------------------------------------------
+
+test("reading an image entrypoint distinguishes 'declares none' from 'could not find out'", async () => {
+  const inspect = (record: unknown): RunCommand => async () => ({
+    ok: true,
+    stdout: `${JSON.stringify([record])}\n`,
+    stderr: "",
+    code: 0
+  });
+
+  // A genuinely absent entrypoint is `[]`, and stays `[]`: the wrapper then
+  // execs `provider.command` directly, which is correct for such an image.
+  assert.deepEqual(await graderLegibleImageEntrypoint("img", inspect({ Config: { Entrypoint: null } })), []);
+  assert.deepEqual(await graderLegibleImageEntrypoint("img", inspect({ Config: {} })), []);
+  assert.deepEqual(
+    await graderLegibleImageEntrypoint("img", inspect({ Config: { Entrypoint: ["/bin/agent", "--serve"] } })),
+    ["/bin/agent", "--serve"]
+  );
+
+  // Everything below used to also return `[]`, which silently dropped the
+  // image's declared entrypoint and ran `provider.command` as its own program -
+  // a different agent than the operator configured, reported as the configured
+  // one. Each must now be loud.
+  const failures: RunCommand[] = [
+    async () => ({ ok: false, stdout: "", stderr: "Error: No such image: img\n", code: 1 }),
+    async () => ({ ok: true, stdout: "not json at all\n", stderr: "", code: 0 }),
+    async () => ({ ok: true, stdout: "[]\n", stderr: "", code: 0 }),
+    inspect({ Config: { Entrypoint: "/bin/agent --serve" } }),
+    inspect({ Config: { Entrypoint: ["/bin/agent", 7] } })
+  ];
+  for (const runCommand of failures) {
+    await assert.rejects(graderLegibleImageEntrypoint("img", runCommand), GraderLegibleIsolationError);
+  }
+});
+
+/**
+ * The launch-attribution tests below need an image that declares *no*
+ * entrypoint, because the wrapper checks the program it is actually about to
+ * exec - which, for an image with an ENTRYPOINT, is the entrypoint, and
+ * `provider.command` is only an argument to it. Against the stub agent a bogus
+ * `command` therefore still launches the stub. This second tag from the same
+ * Dockerfile makes `provider.command` the exec target itself.
+ */
+const NO_ENTRYPOINT_STUB_IMAGE = "honeyrail-cap-glo-no-entrypoint-stub:latest";
+
+async function noEntrypointSkipReason(): Promise<string | null> {
+  if (!(await dockerAvailable())) return "docker daemon is unavailable; skipping the containerized isolation path";
+  if (!(await graderLegibleImageAvailable(NO_ENTRYPOINT_STUB_IMAGE))) {
+    return (
+      `${NO_ENTRYPOINT_STUB_IMAGE} is not present locally; build it with ` +
+      `\`docker build --target no-entrypoint -t ${NO_ENTRYPOINT_STUB_IMAGE} docker/capability-grader-legible-agent-stub\` ` +
+      "(this repo never pulls)"
+    );
+  }
+  return null;
+}
+
+function launchProvider(command: string, args: readonly string[], label: string, timeoutMs: number): GraderLegibleCandidateProvider {
+  return {
+    kind: "command",
+    label,
+    command,
+    args: [...args],
+    timeoutMs,
+    isolation: { image: NO_ENTRYPOINT_STUB_IMAGE, network: "none" },
+    realAgentIdentity: {
+      model: "test-model-1",
+      agentName: "test-agent",
+      agentVersion: "0.0.0-test",
+      commandIdentity: "agent-bin",
+      repositoryCommit: "0000000000000000000000000000000000000000"
+    }
+  };
+}
+
+test("an agent executable that never launches is an infrastructure failure, not an invalid submission", async (t) => {
+  const reason = await noEntrypointSkipReason();
+  if (reason) return t.skip(reason);
+
+  // The container starts fine - valid image, valid network - and then the
+  // configured command does not exist inside it. `exec` fails *after* the
+  // container-started marker, so the shell exits 127 with no timeout and no
+  // spawn error the host can see: before the second marker this was
+  // indistinguishable from an agent that ran and submitted nothing, and the
+  // report still called it capability evidence.
+  const report = await runGraderLegiblePairedExperiment({
+    experimentId: "cap-glo-agent-never-launched",
+    artifactRoot: await scratch(),
+    archetypes: [graderLegibleArchetype("cap-glo-002")],
+    submissionTimeoutMs: 5_000,
+    provider: launchProvider(
+      "honeyrail-agent-that-does-not-exist",
+      [],
+      "command:missing-executable (launch probe)",
+      60_000
+    )
+  });
+
+  assert.ok(report.attempts.length > 0, "the run should have produced attempts");
+  for (const attempt of report.attempts) {
+    const context = attempt.diagnostics.join(" | ");
+    // The distinguishing pair: the container did start, the agent did not.
+    assert.equal(attempt.telemetry.isolationEstablished, true, context);
+    assert.equal(attempt.telemetry.agentExecutionEstablished, false, context);
+    assert.equal(attempt.status, "infrastructure_error", context);
+    assert.equal(attempt.primaryCause, "infrastructure", context);
+
+    // No agent process existed, so nothing can have been submitted.
+    const entries = await readdir(join(attempt.artifactDir, "workspace"));
+    assert.ok(!entries.includes("reproducer.sh"), `a submission appeared without any agent: ${entries.join(", ")}`);
+  }
+
+  // Driven through the paired experiment, because the eligibility gate is a
+  // property of the report and that is what previously mislabelled this run.
+  assert.equal(report.capabilityEvidenceEligible, false);
+});
+
+test("an agent that launches and submits nothing is still the agent's own outcome", async (t) => {
+  const reason = await noEntrypointSkipReason();
+  if (reason) return t.skip(reason);
+
+  // The control for the test above: `/bin/true` exists, so it launches, runs and
+  // exits 0 without writing a submission. Both markers are set, so the new check
+  // must not fire - otherwise it would relabel every real capability miss as
+  // infrastructure and empty the denominator.
+  const attempt = await runGraderLegibleAttempt({
+    archetype: graderLegibleArchetype("cap-glo-002"),
+    condition: "candidate",
+    provider: launchProvider("/bin/true", [], "command:/bin/true (launch control)", 60_000),
+    artifactDir: await scratch(),
+    attemptId: "cap-glo-launched-no-submission:candidate:cap-glo-002",
+    archetypeSet: [graderLegibleArchetype("cap-glo-002")]
+  });
+
+  const context = attempt.diagnostics.join(" | ");
+  assert.equal(attempt.telemetry.isolationEstablished, true, context);
+  assert.equal(attempt.telemetry.agentExecutionEstablished, true, context);
+  assert.equal(attempt.status, "invalid_submission", context);
+  assert.equal(attempt.primaryCause, "agent_invalid_submission", context);
+});
+
+test("an isolated agent that exceeds its budget is a resource limit, not a launch failure", async (t) => {
+  const reason = await noEntrypointSkipReason();
+  if (reason) return t.skip(reason);
+
+  // An agent that launched and then hung has both markers set, so the timeout
+  // attribution has to survive the new check: this stays the agent's spent
+  // budget rather than becoming an infrastructure failure.
+  const attempt = await runGraderLegibleAttempt({
+    archetype: graderLegibleArchetype("cap-glo-002"),
+    condition: "candidate",
+    provider: launchProvider("/bin/sleep", ["120"], "command:/bin/sleep (timeout probe)", 5_000),
+    artifactDir: await scratch(),
+    attemptId: "cap-glo-isolated-timeout:candidate:cap-glo-002",
+    archetypeSet: [graderLegibleArchetype("cap-glo-002")]
+  });
+
+  const context = attempt.diagnostics.join(" | ");
+  assert.equal(attempt.telemetry.isolationEstablished, true, context);
+  assert.equal(attempt.telemetry.agentExecutionEstablished, true, context);
+  assert.equal(attempt.telemetry.agentTimedOut, true, context);
+  assert.equal(attempt.primaryCause, "agent_resource_limit", context);
+  assert.equal(attempt.status, "infrastructure_error", context);
 });
 
 test("the container exposes the facade and nothing of the fixture, the manifest or the grader-owned state", async (t) => {
@@ -426,15 +602,16 @@ test("the container exposes the facade and nothing of the fixture, the manifest 
     assert.ok(!pathEntrySource.includes(`${archetypeArg})`), "the PATH entry leaks the fixture's branch structure");
   }
 
-  // The channel carries request/response files, the container-start marker and
-  // never fixture source. The marker is the harness's own: the container
-  // touches it before the agent starts, which is how the host learns a
-  // container really ran, so the agent necessarily sees it here.
+  // The channel carries request/response files, the harness's two launch markers
+  // and never fixture source. The markers are the harness's own: the wrapper
+  // touches one before looking for the agent and one immediately before
+  // exec'ing it, which is how the host learns a container really ran and that
+  // the agent really launched, so the agent necessarily sees both here.
   const facadeListing = await readFile(join(workspace, "facade-listing.txt"), "utf8");
   for (const entry of facadeListing.split("\n").filter((line) => line.trim() && line.trim() !== "." && line.trim() !== "..")) {
     assert.match(
       entry.trim(),
-      /(\.(request|response)\.(json|tmp)|^container-started\.marker)$/,
+      /(\.(request|response)\.(json|tmp)|^container-started\.marker|^agent-exec\.marker)$/,
       `unexpected entry in the facade channel: ${entry}`
     );
   }

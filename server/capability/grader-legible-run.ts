@@ -23,16 +23,23 @@
  *
  *   1. image identity resolved  - the tag names an image that exists locally,
  *      and the content-addressed id it resolved to is retained;
- *   2. isolated execution established - proven *per attempt*, by a marker file
- *      the container itself writes before the agent process starts (see
- *      `CONTAINER_STARTED_MARKER`);
- *   3. the agent process ran inside it;
+ *   2. container isolation established - proven *per attempt*, by a marker file
+ *      the in-container wrapper writes before it looks for the agent at all
+ *      (see `CONTAINER_STARTED_MARKER`);
+ *   3. agent execution established - proven *per attempt*, by a second marker
+ *      the wrapper writes only once the configured agent executable resolves,
+ *      immediately before `exec`ing it (see `AGENT_EXEC_MARKER`);
  *   4. every attempt's evidence retained, whatever its outcome.
  *
- * Step 1 is not step 2. An image can exist and `docker run` still fail before
+ * Each step is separate from the one before it, because each boundary is a
+ * place where a harness failure looks exactly like an agent failure on disk.
+ * Step 1 is not step 2: an image can exist and `docker run` still fail before
  * any container exists - a network that is not defined, a daemon hiccup - and
- * that failure leaves exactly the same on-disk trace as "the agent ran and
- * wrote nothing". Only step 2's marker separates them.
+ * that leaves the same trace as "the agent ran and wrote nothing". Step 2 is
+ * not step 3: the wrapper shell can start, write its marker and then fail to
+ * exec the agent at all (command not found, not executable), exiting nonzero
+ * with no timeout and no spawn error - which again looks like an agent that
+ * submitted nothing. Only the second marker separates those.
  */
 
 import { spawn } from "node:child_process";
@@ -95,8 +102,25 @@ type SpawnCapture = { stdout: string; stderr: string; exitStatus: number | null;
  */
 const CONTAINER_STARTED_MARKER = "container-started.marker";
 
-/** A `SpawnCapture` plus the per-attempt proof that the container really ran. */
-type IsolatedSpawnCapture = SpawnCapture & { isolationEstablished: boolean };
+/**
+ * Filename the wrapper touches only after the configured agent executable has
+ * been resolved, immediately before `exec`ing it.
+ *
+ * `CONTAINER_STARTED_MARKER` proves the *wrapper shell* started. It cannot
+ * prove the agent did: `exec "$@"` can fail after that marker is written -
+ * command not found, present but not executable - and the shell then exits
+ * nonzero with no timeout and no spawn error the host can see. Without this
+ * second marker such an attempt falls through to `agent_invalid_submission`,
+ * attributing a harness misconfiguration to the model, and can leave
+ * `capabilityEvidenceEligible: true` on a report where no agent ever ran.
+ */
+const AGENT_EXEC_MARKER = "agent-exec.marker";
+
+/**
+ * A `SpawnCapture` plus the per-attempt proofs that the container really ran
+ * and that the agent executable really launched inside it.
+ */
+type IsolatedSpawnCapture = SpawnCapture & { isolationEstablished: boolean; agentExecutionEstablished: boolean };
 
 function captureSpawn(
   command: string,
@@ -313,6 +337,16 @@ export type GraderLegibleAttempt = {
      * isolation, where the question does not apply.
      */
     isolationEstablished: boolean | null;
+    /**
+     * Whether the configured agent executable demonstrably launched inside that
+     * container, proven by a second marker the wrapper writes only after
+     * resolving it and immediately before `exec`ing it. `null` when the provider
+     * claimed no isolation, where the question does not apply.
+     *
+     * `isolationEstablished: true` with this `false` is the one case that used
+     * to be indistinguishable from an agent that ran and submitted nothing.
+     */
+    agentExecutionEstablished: boolean | null;
     submissionBytes: number | null;
     fixtureInvocationCount: number;
     executionsCaptured: number;
@@ -432,6 +466,7 @@ export async function runGraderLegibleAttempt(input: {
   // `null` where the question does not apply: a scripted provider, or a command
   // provider that never asked for isolation and therefore claims none.
   let isolationEstablished: boolean | null = null;
+  let agentExecutionEstablished: boolean | null = null;
 
   if (provider.kind === "scripted") {
     await writeFile(join(layout.workspaceDir, GRADER_LEGIBLE_SUBMISSION_FILENAME), provider.script(archetype, condition));
@@ -463,6 +498,7 @@ export async function runGraderLegibleAttempt(input: {
     agentTimedOut = capture.timedOut;
     agentSpawnFailed = Boolean(capture.spawnError);
     isolationEstablished = isolatedCapture?.isolationEstablished ?? null;
+    agentExecutionEstablished = isolatedCapture?.agentExecutionEstablished ?? null;
     await Promise.all([
       writeFile(join(artifactDir, "agent-stdout.txt"), capture.stdout),
       writeFile(join(artifactDir, "agent-stderr.txt"), capture.stderr)
@@ -471,6 +507,10 @@ export async function runGraderLegibleAttempt(input: {
       providerDiagnostic =
         "container did not start: isolation was not established (docker run failed before the agent process began - " +
         "check network policy and image availability)";
+    } else if (agentExecutionEstablished === false) {
+      providerDiagnostic =
+        "agent executable did not launch: the configured command was not found or not executable inside the container " +
+        "(the container started, so this is a provider/image misconfiguration and not an agent outcome)";
     } else if (capture.spawnError) providerDiagnostic = `agent command could not start: ${capture.spawnError}`;
     else if (capture.timedOut) providerDiagnostic = `agent command exceeded its ${agentTimeoutMs}ms budget`;
   }
@@ -504,6 +544,7 @@ export async function runGraderLegibleAttempt(input: {
         agentExitStatus,
         agentTimedOut,
         isolationEstablished,
+        agentExecutionEstablished,
         ...extra
       },
       artifactDir
@@ -520,25 +561,32 @@ export async function runGraderLegibleAttempt(input: {
     // is an invalid submission. Both stay out of the capability denominator.
     const status: GraderLegibleAttemptStatus = validation.integrity
       ? "integrity_error"
-      : isolationEstablished === false || providerDiagnostic
+      : isolationEstablished === false || agentExecutionEstablished === false || providerDiagnostic
         ? "infrastructure_error"
         : "invalid_submission";
-    // A container that never started is never an invalid submission: there was
-    // no agent process to submit anything, so it is checked ahead of the
-    // timeout and spawn-error branches and does not depend on what the
-    // provider diagnostic happens to say.
+    // Neither a container that never started nor an agent executable that never
+    // launched is an invalid submission: in both there was no agent process to
+    // submit anything. They are checked ahead of the timeout and spawn-error
+    // branches and do not depend on what the provider diagnostic happens to
+    // say. The two are attributed differently: a container that failed to
+    // start is an isolation failure, while a container that started and could
+    // not exec the configured command is a harness/provider misconfiguration.
     //
-    // Below that: an agent killed at its wall-clock budget spent a budget the
-    // harness enforced; only a spawn failure is the harness's own fault.
+    // Below that, an agent that *did* launch keeps exactly its former
+    // attribution: killed at its wall-clock budget it spent a budget the
+    // harness enforced; a spawn failure is the harness's own fault; and having
+    // run and written nothing usable remains the agent's own outcome.
     const primaryCause: GraderLegibleAttemptCause = validation.integrity
       ? "isolation_or_integrity"
       : isolationEstablished === false
         ? "isolation_or_integrity"
-        : agentTimedOut
-          ? "agent_resource_limit"
-          : agentSpawnFailed
-            ? "infrastructure"
-            : "agent_invalid_submission";
+        : agentExecutionEstablished === false
+          ? "infrastructure"
+          : agentTimedOut
+            ? "agent_resource_limit"
+            : agentSpawnFailed
+              ? "infrastructure"
+              : "agent_invalid_submission";
     return finish(
       status,
       primaryCause,
@@ -593,10 +641,13 @@ export async function runGraderLegibleAttempt(input: {
  * The container name is derived, not taken from `attemptId`: an attempt id
  * contains `:` separators that docker rejects in a `--name`.
  *
- * The returned `isolationEstablished` is the per-attempt half of the isolation
- * claim: `true` only when the container itself wrote `CONTAINER_STARTED_MARKER`
- * into the shared channel, which it can only do from inside a container that
- * actually started.
+ * The two returned flags are the per-attempt half of the isolation claim, and
+ * they are separate because the failures they catch are separate.
+ * `isolationEstablished` is `true` only when the wrapper wrote
+ * `CONTAINER_STARTED_MARKER` into the shared channel, which it can only do from
+ * inside a container that actually started. `agentExecutionEstablished` is
+ * `true` only when it also wrote `AGENT_EXEC_MARKER`, which it does only after
+ * resolving the configured executable and immediately before `exec`ing it.
  */
 async function runIsolatedAgentCommand(
   provider: Extract<GraderLegibleCandidateProvider, { kind: "command" }>,
@@ -624,27 +675,68 @@ async function runIsolatedAgentCommand(
 
   async function runContainer(): Promise<IsolatedSpawnCapture> {
   // `sh -c SCRIPT NAME ARG...`: inside SCRIPT, `$0` is the unused placeholder,
-  // `$1` the marker path, and after `shift` the rest of `$@` is the real
-  // command and its arguments, `exec`'d so the agent keeps pid 1 and the
-  // container's exit status stays the agent's own. The only new requirement on
-  // the operator's image is `/bin/sh`.
+  // `$1` and `$2` are the two marker paths, and after both `shift`s the rest of
+  // `$@` is the real command and its arguments, `exec`'d so the agent keeps pid
+  // 1 and the container's exit status stays the agent's own. The only new
+  // requirement on the operator's image is `/bin/sh`.
   //
   // The wrapper has to take the `--entrypoint` slot - appended as CMD it would
   // become *arguments to* an image that declares an entrypoint rather than the
   // program run - so the image's own entrypoint is read back and re-exec'd
   // ahead of `command`, reproducing exactly the argv docker would have built.
-  const markerContainerPath = `${GRADER_LEGIBLE_CONTAINER_PATHS.facade}/${CONTAINER_STARTED_MARKER}`;
-  const markerHostPath = join(facadeDir, CONTAINER_STARTED_MARKER);
-  const imageEntrypoint = await graderLegibleImageEntrypoint(isolation.image);
+  const containerMarkerPath = `${GRADER_LEGIBLE_CONTAINER_PATHS.facade}/${CONTAINER_STARTED_MARKER}`;
+  const agentMarkerPath = `${GRADER_LEGIBLE_CONTAINER_PATHS.facade}/${AGENT_EXEC_MARKER}`;
+  const containerMarkerHostPath = join(facadeDir, CONTAINER_STARTED_MARKER);
+  const agentMarkerHostPath = join(facadeDir, AGENT_EXEC_MARKER);
+  // Fails closed: an entrypoint we could not read is an infrastructure failure
+  // for this attempt, reported with no container started at all, rather than a
+  // silent `[]` that would run `command` as its own program - a different agent
+  // than the operator configured, recorded as if it were the configured one.
+  // Per-attempt and not a hard abort: the failure is retained as this attempt's
+  // evidence, the way a docker spawn failure already is.
+  let imageEntrypoint: string[];
+  try {
+    imageEntrypoint = await graderLegibleImageEntrypoint(isolation.image);
+  } catch (error) {
+    return {
+      stdout: "",
+      stderr: "",
+      exitStatus: null,
+      timedOut: false,
+      spawnError: error instanceof Error ? error.message : String(error),
+      isolationEstablished: false,
+      agentExecutionEstablished: false
+    };
+  }
+  // `command -v` before the second marker is what makes it mean anything: it
+  // proves the program about to be exec'd is *resolvable* - found on PATH, or a
+  // path that exists with its execute bit set. It does not prove `exec` cannot
+  // fail for some other reason (a corrupt binary, a missing shared library, a
+  // shebang naming an absent interpreter); those remain indistinguishable from
+  // an agent that ran and submitted nothing. Accepted: this is the smallest
+  // reliable check that closes the common case (misconfigured command, wrong
+  // image) without putting a process supervisor inside the container.
+  const wrapper = [
+    'containerMarker="$1"; shift',
+    'agentMarker="$1"; shift',
+    'touch "$containerMarker"',
+    'if command -v "$1" >/dev/null 2>&1; then',
+    '  touch "$agentMarker"',
+    '  exec "$@"',
+    "fi",
+    'printf "agent executable not found or not executable: %s\\n" "$1" >&2',
+    "exit 127"
+  ].join("\n");
   const args = buildGraderLegibleContainerArgs(
     {
       mounts: { workspaceDir: layout.workspaceDir, facadeBinDir: layout.facadeBinDir, facadeDir },
       entrypoint: "sh",
       command: [
         "-c",
-        'touch "$1"; shift; exec "$@"',
+        wrapper,
         "_",
-        markerContainerPath,
+        containerMarkerPath,
+        agentMarkerPath,
         ...imageEntrypoint,
         provider.command,
         ...(provider.args ?? [])
@@ -676,12 +768,13 @@ async function runIsolatedAgentCommand(
     // workspace the grader is about to read.
     await runCommandSafe("docker", ["rm", "-f", containerName], { timeout: 30_000 });
   }
-  // Checked whatever the outcome was, including a timeout: an agent that hit
-  // its budget still ran inside a container, and that is a resource limit, not
-  // a failure of isolation.
-  const isolationEstablished = (await stat(markerHostPath).catch(() => null)) !== null;
-  await rm(markerHostPath, { force: true });
-  return { ...capture, isolationEstablished };
+  // Both checked whatever the outcome was, including a timeout: an agent that
+  // hit its budget started *and* launched inside a container, and that is a
+  // resource limit, not a failure of isolation or of launching.
+  const isolationEstablished = (await stat(containerMarkerHostPath).catch(() => null)) !== null;
+  const agentExecutionEstablished = (await stat(agentMarkerHostPath).catch(() => null)) !== null;
+  await Promise.all([rm(containerMarkerHostPath, { force: true }), rm(agentMarkerHostPath, { force: true })]);
+  return { ...capture, isolationEstablished, agentExecutionEstablished };
   }
 }
 
@@ -916,15 +1009,22 @@ export async function runGraderLegiblePairedExperiment(input: {
     // `isolation !== undefined` alone said, and why a `docker run` that failed
     // before creating any container could still produce an "eligible" report.
     // So: a real agent identity, a requested isolation whose image actually
-    // resolved, and no attempt that was supposed to run isolated and did not.
-    // `null` passes because it only occurs for an unisolated provider, which
-    // the `isolation !== undefined` clause has already excluded.
+    // resolved, and every attempt having proven *both* that its container
+    // started and that the configured agent executable launched inside it.
+    //
+    // Strictly `=== true`, not `!== false`, and the `isolation !== undefined`
+    // clause is what makes that safe: past it, every attempt went through the
+    // isolated path, so neither field is ever `null` here. The looser test would
+    // let a future `null` - a field we forgot to populate - read as eligible.
     capabilityEvidenceEligible:
       input.provider.kind === "command" &&
       Boolean(input.provider.realAgentIdentity) &&
       input.provider.isolation !== undefined &&
       imageIdentity !== null &&
-      attempts.every((attempt) => attempt.telemetry.isolationEstablished !== false),
+      attempts.every(
+        (attempt) =>
+          attempt.telemetry.isolationEstablished === true && attempt.telemetry.agentExecutionEstablished === true
+      ),
     realAgentIdentity: describeRealAgent(input.provider, input.submissionTimeoutMs, imageIdentity),
     pairedTaskSurfaceHash: sha256(stableJson(surfaceHashes)),
     executionsPerAttempt: GRADER_LEGIBLE_EXECUTIONS_PER_ATTEMPT,
