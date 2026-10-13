@@ -62,7 +62,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@vitejs/plugin-react": "^5.0.0",
     "@xterm/headless": "^6.0.0",
-    "concurrently": "^9.2.1",
+    "concurrently": "^9.2.5",
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "lucide-react": "^0.468.0",
